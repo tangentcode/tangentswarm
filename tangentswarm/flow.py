@@ -236,10 +236,12 @@ class Flow:
         return True
 
     # -- 2. pull --------------------------------------------------------------
-    def pull(self, prs, cols, scratch):
+    def pull(self, prs, cols, scratch, limit=None):
+        """Start one pull. Returns the pulled PR, or None. limit: pull only while Staging has
+        fewer PRs than this (default STAGING_MIN; the swarm-advance cascade uses STAGING_MAX)."""
         staging = cols.get(board.STAGING, [])
-        if len(staging) >= STAGING_MIN:
-            return
+        if len(staging) >= (STAGING_MIN if limit is None else limit):
+            return None
         ready = [p for p in cols.get(board.READY, []) if not p['draft']]
         if not ready:
             self.note(f"Staging {len(staging)}/{STAGING_MIN} and Ready is empty: refill needed")
@@ -267,8 +269,7 @@ class Flow:
             if bad:
                 self.note(f"#{n} skipped this step: conflicts with {bad} (Ready order kept)")
                 continue
-            self.start_pull(p, scratch)
-            return
+            return p if self.start_pull(p, scratch) else None
         self.note('no Ready PR stacks cleanly on main + Human Review + Staging: one speculative rebase needed')
 
     def staging_order(self, staging):
@@ -301,10 +302,12 @@ class Flow:
         merged, why = self.merge_into_work(scratch, n, head, p['branch'])
         if merged is None:
             self.note(f"#{n} refused, work NOT pushed: {why}")
-            return
+            return False
+        self.last_work = merged  # the work commit (also for a dry run, where it is not pushed)
         if not self.dry:
             save_pull(dict(pr=n, head=head, branch=p['branch'], item=p['item'], work=merged, started=self.now()))
         self.change(f"#{n} pulled: merged head {head[:8]} into {WORK} ({merged[:8]}); staging redeploys")
+        return True
 
     def merge_work(self, n, tip, label):
         """swarm-flow merge-work: the one safe staging merge for a hand step (a -vN tip)."""

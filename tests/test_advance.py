@@ -160,3 +160,207 @@ def test_nothing_to_do_is_one_line(board_read):
     assert len(out) == 1 and calls == []
     assert out[0] == (f"nothing to do: Human Review 2/2; Staging 3/{flow.STAGING_MIN}, Ready 0; "
                       f"Auto Review: #7 not Codex-clean on {H[:8]}, #8 draft, #9 conflicts with main (GitHub mergeable)")
+
+
+# --- --cascade: the drain loop -------------------------------------------------------
+
+def test_cascade_reruns_until_no_flag_is_left(tmp_path):
+    flag, lock = tmp_path / 'rerun', tmp_path / 'lock'
+    runs, out = [], []
+
+    def body():  # two events arrive during the first pass, one during the second
+        runs.append(1)
+        if len(runs) < 3:
+            A.flag_rerun(flag)
+    assert A.run_locked(body, flag=flag, lock=lock, out=out.append, env={}) == 0
+    assert len(runs) == 3 and not flag.exists()
+    assert out == ['rerun flag found: cascade pass 2', 'rerun flag found: cascade pass 3']
+
+
+def test_a_busy_caller_flags_queues_and_exits(tmp_path):
+    import fcntl
+    flag, lock = tmp_path / 'rerun', tmp_path / 'lock'
+    out, queued = [], []
+    with open(lock, 'a') as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        rc = A.run_locked(lambda: pytest.fail('busy: must not run'), flag=flag, lock=lock, out=out.append,
+                          env={}, enqueue=lambda: queued.append(1) or 'queued for swarm-promoted')
+    assert rc == 0 and flag.exists() and queued == [1]
+    assert out[0].startswith('busy: ') and 'rerun flag set' in out[0]
+    # the holder (here: the next run) drains the flag
+    runs = []
+    A.run_locked(lambda: runs.append(1), flag=flag, lock=lock, out=out.append, env={}, if_flagged=True)
+    assert runs == [1] and not flag.exists()
+
+
+def test_if_flagged_without_a_flag_does_nothing(tmp_path):
+    out = []
+    A.run_locked(lambda: pytest.fail('no flag: must not run'), flag=tmp_path / 'rerun', lock=tmp_path / 'lock',
+                 out=out.append, env={}, if_flagged=True)
+    assert out == ['no rerun flag: nothing to do']
+
+
+def test_the_drain_loop_stops_after_max_passes(tmp_path):
+    flag, runs, out = tmp_path / 'rerun', [], []
+    A.run_locked(lambda: runs.append(1) or A.flag_rerun(flag), flag=flag, lock=tmp_path / 'lock',
+                 out=out.append, env={}, max_passes=4)
+    assert len(runs) == 4 and flag.exists() and out[-1].startswith('stopped after 4 cascade passes')
+
+
+def test_a_flag_after_the_release_takes_the_lock_again(tmp_path, monkeypatch):
+    """The race: a caller writes the flag, finds the lock busy and exits, and the holder had
+    already looked. The holder looks again after the release."""
+    flag, runs = tmp_path / 'rerun', []
+    real = A.gatelock.gate_lock
+    import contextlib
+
+    @contextlib.contextmanager
+    def lock_then_late_flag(*a, **kw):
+        with real(*a, **kw):
+            yield
+            if len(runs) == 1:
+                A.flag_rerun(flag)  # written after the inner look, before the release
+    monkeypatch.setattr(A.gatelock, 'gate_lock', lock_then_late_flag)
+    A.run_locked(lambda: runs.append(1), flag=flag, lock=tmp_path / 'lock', out=lambda s: None, env={})
+    assert len(runs) == 2 and not flag.exists()
+
+
+# --- --cascade: Staging and Ready limits ---------------------------------------------
+
+def pr(n, col, **kw):
+    return dict(dict(number=n, head=f'{n:040d}', item=f'I{n}', branch=f'b{n}', draft=False, rank=9,
+                     col=col, state='OPEN', parked=False), **kw)
+
+
+class CascadeGate(dict):
+    def __init__(self, site='work', served_files=True, served_sha=None):
+        super().__init__()
+        files = {'nodes': [{'path': 'web/a.ts' if served_files else 'README.md'}]}
+        self.update(fetch=lambda n, refresh=False: {'number': n, 'files': files, 'headRefName': f'b{n}'},
+                    site_for=lambda full, o: site, ScratchRepo=Scratch, SITES={'ptw': ('ptw.example',)},
+                    served=lambda s: ('host', served_sha, None, None, None),
+                    contains=lambda anc, desc: False)
+
+
+def cascade(monkeypatch, tmp_path, cols, g, dry=True, **kw):
+    from tangentswarm import flow as F
+    monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
+    pulled = []
+
+    def pull(self, prs, c, scratch, limit=None):
+        assert limit == A.STAGING_LIMIT
+        p = c[board.READY][0]
+        pulled.append(p['number'])
+        self.change(f"#{p['number']} pulled")
+        return p
+    monkeypatch.setattr(F.Flow, 'pull', pull)
+    monkeypatch.setattr(F.Flow, 'columns', lambda self: ({}, {k: list(v) for k, v in cols.items()}))
+    out = []
+    c = A.Cascade(g=g, dry_run=dry, out=out.append, sleep=lambda s: None, **kw)
+    c.signal(c.fill())
+    return out, pulled
+
+
+def test_fill_pulls_until_staging_holds_five(monkeypatch, tmp_path):
+    cols = {board.STAGING: [pr(n, board.STAGING) for n in (1, 2, 3)],
+            board.READY: [pr(n, board.READY) for n in (4, 5, 6, 7)],
+            board.IN_PROGRESS: [pr(8, board.IN_PROGRESS)]}
+    out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate())
+    assert pulled == [4, 5]
+    assert 'fill: Staging 5/5, Ready 2: Staging is full' in out
+    assert out.count('would run hr-gate --apply 4 (Ready -> Staging when it passes)') == 1
+    assert out[-1] == 'START_CLAUDE n=1 ready=2/6 working=1/2'
+
+
+def test_full_staging_pulls_nothing(monkeypatch, tmp_path):
+    cols = {board.STAGING: [pr(n, board.STAGING) for n in range(1, 6)],
+            board.READY: [pr(n, board.READY) for n in range(6, 12)]}
+    out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate())
+    assert pulled == [] and out == ['fill: Staging 5/5, Ready 6: Staging is full', 'signal: Ready 6/6: no new coder']
+
+
+def test_empty_ready_stops_the_fill_and_asks_for_two_coders(monkeypatch, tmp_path):
+    cols = {board.STAGING: [pr(1, board.STAGING)]}
+    out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate())
+    assert pulled == [] and out == ['fill: Staging 1/5, Ready 0: Ready is empty', 'START_CLAUDE n=2 ready=0/6 working=0/2']
+
+
+def test_no_start_claude_when_enough_coders_work(monkeypatch, tmp_path):
+    cols = {board.STAGING: [pr(n, board.STAGING) for n in range(1, 6)],
+            board.IN_PROGRESS: [pr(7, board.IN_PROGRESS), pr(8, board.IN_PROGRESS)]}
+    out, _ = cascade(monkeypatch, tmp_path, cols, CascadeGate())
+    assert out[-1] == 'signal: Ready 0/6, 2 PR(s) In Progress (aim 2): no START_CLAUDE'
+
+
+def test_a_ptw_pull_prints_the_cornerbot_request(monkeypatch, tmp_path):
+    cols = {board.STAGING: [pr(n, board.STAGING) for n in range(1, 5)], board.READY: [pr(9, board.READY)]}
+    cols[board.READY].append(pr(10, board.READY))
+    out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(site='ptw'))
+    assert pulled == [9]  # a live run waits for the redeploy here, so the dry run stops too
+    assert any(l.startswith('CORNERBOT_REQUEST (dry run): redeploy ptw.example') and '#9 b9' in l for l in out)
+    assert 'would stop the fill here: #9 waits for the cornerbot redeploy; the next cascade gates it' in out
+    assert out[-1] == 'START_CLAUDE n=2 ready=1/6 working=0/2'
+
+
+def test_a_live_pull_waits_for_the_served_sha_then_gates(monkeypatch, tmp_path):
+    """Live: the pull merged into work; the second poll serves the work commit; then advance."""
+    from tangentswarm import flow as F
+    g = CascadeGate()
+    polls = iter([None, 'w' * 40])
+    g['served'] = lambda s: ('host', next(polls), None, None, None)
+    advanced = []
+
+    def start(self, prs, c, scratch, limit=None):
+        p = c[board.READY].pop(0)
+        F.save_pull(dict(pr=p['number'], head=p['head'], branch='b', item='I', work='w' * 40, started=0))
+        return p
+
+    def advance(self, d, prs, scratch):
+        advanced.append(d['pr'])
+        F.save_pull(None)  # hr-gate --apply moved it
+        c[board.STAGING].append(pr(d['pr'], board.STAGING))
+    c = {board.STAGING: [pr(n, board.STAGING) for n in range(1, 5)], board.READY: [pr(9, board.READY)]}
+    monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
+    monkeypatch.setattr(F.Flow, 'pull', start)
+    monkeypatch.setattr(F.Flow, 'advance', advance)
+    monkeypatch.setattr(F.Flow, 'columns', lambda self: ({}, c))
+    out = []
+    casc = A.Cascade(g=g, dry_run=False, out=out.append, sleep=lambda s: None)
+    casc.fill()
+    assert advanced == [9]
+    assert 'served: host .deploy-sha wwwwwwww contains #9 ' + f'{9:040d}'[:8] in out
+    assert 'fill: Staging 5/5, Ready 0: Ready is empty' in out
+
+
+def test_a_live_ptw_pull_stops_the_fill_until_cornerbot_redeploys(monkeypatch, tmp_path):
+    from tangentswarm import flow as F
+    monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
+    F.save_pull(dict(pr=9, head='9' * 40, branch='ptw/x', item='I', work='w' * 40, started=0))
+    monkeypatch.setattr(F.Flow, 'advance', lambda *a: pytest.fail('not served yet: no gate'))
+    monkeypatch.setattr(F.Flow, 'columns', lambda self: ({}, {board.READY: [pr(4, board.READY)]}))
+    out = []
+    A.Cascade(g=CascadeGate(site='ptw', served_sha='o' * 40), out=out.append, sleep=lambda s: None).fill()
+    assert out[0].startswith('CORNERBOT_REQUEST: redeploy ptw.example from platform work wwwwwwww')
+    assert out[1].startswith('waiting: host .deploy-sha oooooooo does not contain #9')
+    assert F.load_pull()['asked'] is True  # asked once; the next cascade does not ask again
+
+
+def test_a_dry_run_goes_on_after_a_running_pull_would_end(monkeypatch, tmp_path):
+    from tangentswarm import flow as F
+    cols = {board.STAGING: [pr(n, board.STAGING) for n in range(1, 5)], board.READY: [pr(9, board.READY)]}
+    monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
+    F.save_pull(dict(pr=3, head='3' * 40, branch='b', item='I', work='w' * 40, started=0))
+    monkeypatch.setattr(F.Flow, 'advance', lambda self, d, prs, s: self.change(f"#{d['pr']} pull finished"))
+    out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False))
+    assert pulled == [9] and 'pull: would: #3 pull finished' in out
+    assert F.load_pull()['pr'] == 3  # a dry run changes nothing
+
+
+def test_a_dry_run_stops_at_a_waiting_pull(monkeypatch, tmp_path):
+    from tangentswarm import flow as F
+    cols = {board.READY: [pr(9, board.READY)]}
+    monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
+    F.save_pull(dict(pr=3, head='3' * 40, branch='b', item='I', work='w' * 40, started=0))
+    monkeypatch.setattr(F.Flow, 'advance', lambda self, d, prs, s: self.note(f"#{d['pr']} pull waiting (1 min): CI"))
+    out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False))
+    assert pulled == [] and 'note: #3 pull waiting (1 min): CI' in out
