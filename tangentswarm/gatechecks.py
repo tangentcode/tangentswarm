@@ -23,6 +23,11 @@ already in Human Review (a merge-only re-gate) stays lenient. Entry also fails w
 origin/work itself is broken (work_problem): it holds conflict markers, or its latest
 Redeploy run failed. Work commit 0d249b69 (#447) reached work with markers at 1:19 AM ET,
 its Redeploy failed, and the gate still passed.
+
+Condition 6 checks EVERY staging site (check_served_sites). Each site serves the platform
+work branch, so a PR with served files reaches all of them. Platform #493 entered Human
+Review while ptw.example.test still served 95f38a27, which did not contain its head
+37ceb8f4; the gate had read only the one site that site_for picked.
 """
 import re
 import urllib.request
@@ -139,3 +144,23 @@ def check_served(paths, entering, static_sha, has_head, err=None, tips=(), conta
             return True, f"static .deploy-sha {static_sha[:8]} contains {name} {sha[:8]} (the tip condition 9 picked)"
     why = f"static .deploy-sha {static_sha[:8]} LACKS the head: staging does not serve it yet"
     return (False, why) if entering else (True, 'lenient re-gate: ' + why)
+
+
+def check_served_sites(paths, entering, sites, has_head, tips=(), contains=None, work_bad=None):
+    """(ok, why) for condition 6 on EVERY staging site. sites: [(host, static_sha, err)].
+    Each site must serve the head (or the -vN tip condition 9 picked); one site that lags
+    fails entry (platform #493: ptw lagged while the other two served the head).
+    A re-gate (not entering) stays lenient, and names the sites that lag."""
+    if not any(SERVED_RE.search(p) for p in paths):
+        return True, 'n/a (no served files: web/, api/, app/)'
+    if work_bad:
+        return (False, work_bad) if entering else (True, 'lenient re-gate: ' + work_bad)
+    if not sites:
+        return (False, 'no staging site to check') if entering else (True, 'lenient re-gate: no staging site')
+    res = [(host, *check_served(paths, entering, sha, has_head, err, tips, contains)) for host, sha, err in sites]
+    lag = 'lenient re-gate: '
+    bad = [f"{h}: {w[len(lag):] if w.startswith(lag) else w}" for h, ok, w in res if not ok or w.startswith(lag)]
+    if bad:
+        why = f"{len(bad)} of {len(res)} staging sites do not serve it: " + '; '.join(bad)
+        return (False, why) if entering else (True, lag + why)
+    return True, f"all {len(res)} staging sites serve it: " + '; '.join(f"{h}: {w}" for h, _, w in res)

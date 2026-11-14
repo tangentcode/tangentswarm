@@ -49,7 +49,9 @@ STAGING_CAP = int(os.environ.get('SWARM_CASCADE_STAGING_CAP', '5'))  # safety bo
 READY_TARGET = int(os.environ.get('SWARM_READY_TARGET', '6'))      # START_CLAUDE while Ready is below this
 WORKING_TARGET = int(os.environ.get('SWARM_WORKING_TARGET', '2'))  # aim: about this many coders working
 DEPLOY_WAIT = int(os.environ.get('SWARM_DEPLOY_WAIT', '600'))      # seconds to wait for staging to serve a pull
+PTW_WAIT = int(os.environ.get('SWARM_PTW_WAIT', '1800'))           # seconds to wait for a cornerbot redeploy
 DEPLOY_POLL = 15
+CORNERBOT_FILE = Path(os.environ.get('SWARM_CORNERBOT_REQUEST', str(Path.home() / '.cache' / 'swarm-cornerbot-request')))
 MAX_PASSES = int(os.environ.get('SWARM_CASCADE_MAX_PASSES', '10'))  # cascade passes per lock hold
 RERUN = Path(os.environ.get('SWARM_CASCADE_RERUN', str(gatelock.LOCK.with_name('swarm-serial.rerun'))))
 CORNERBOT_SITES = ('ptw',)  # staging for these sites redeploys only through a cornerbot request
@@ -241,10 +243,12 @@ class Cascade(Advance):
                    merge cleanly with main, work and every Human Review and Staging PR
                    (Flow.pull strict). Nothing is rebased, reworked or sent back just to fill
                    Staging. Each pull: work merge (refused on a conflict or a marker),
-                   staging redeploy (ptw: print the cornerbot request), wait until the
-                   served .deploy-sha contains it, then hr-gate --apply. A pull that must
-                   wait (ptw redeploy, CI still running) stops the fill; the next cascade
-                   continues it. STAGING_CAP is only a safety bound.
+                   staging redeploy (ptw: print the cornerbot request, and write it to
+                   CORNERBOT_FILE), then poll until the .deploy-sha of EVERY staging site
+                   contains it (PTW_WAIT for ptw, DEPLOY_WAIT otherwise), then hr-gate
+                   --apply. A pull that still waits after the timeout (or for CI) stops
+                   the fill; the next cascade continues it. STAGING_CAP is only a safety
+                   bound.
       3. signal    Ready has fewer than READY_TARGET PRs: print one START_CLAUDE line for
                    swarmbot, so that about WORKING_TARGET coders work.
     """
@@ -264,50 +268,64 @@ class Cascade(Advance):
             self._seen[i] = len(lines)
 
     # -- served check -----------------------------------------------------------
-    def site(self, n):
-        """(site key, served paths?) for PR n."""
-        full = self.g['fetch'](n)
-        paths = [f['path'] for f in ((full.get('files') or {}).get('nodes') or []) if f.get('path')]
+    def touches_served(self, n):
+        """True if PR n changes served files (web/, app/, api/): every staging site serves them."""
         from . import gatechecks
-        return self.g['site_for'](full, None), any(gatechecks.SERVED_RE.search(x) for x in paths)
+        full = self.g['fetch'](n)
+        return any(gatechecks.SERVED_RE.search(f.get('path') or '')
+                   for f in ((full.get('files') or {}).get('nodes') or []))
 
-    def cornerbot_request(self, n, branch, head, work, site):
-        host = self.g['SITES'][site][0] if 'SITES' in self.g else site
-        return (f"CORNERBOT_REQUEST{' (dry run)' if self.dry else ''}: redeploy {host} from platform work "
+    def cornerbot_request(self, n, branch, head, work, host):
+        line = (f"CORNERBOT_REQUEST{' (dry run)' if self.dry else ''}: redeploy {host} from platform work "
                 f"{work[:8] if work else '(after the merge)'} (#{n} {branch} {head[:8]} is in work)")
+        if not self.dry:  # for swarmbot while this run still waits (stdout may be read only at exit)
+            try:
+                CORNERBOT_FILE.parent.mkdir(parents=True, exist_ok=True)
+                CORNERBOT_FILE.write_text(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {line}\n")
+            except OSError as e:
+                self.out(f"cornerbot request file not written: {e}")
+        return line
 
-    def served(self, d, site, wait):
-        """True once the static .deploy-sha of site contains the pulled head (polls up to wait s)."""
-        end = self.clock() + wait
+    def lagging(self, d):
+        """[(site key, host, static sha, err)] for each staging site that does not serve the
+        pulled head yet. A site serves it when its .deploy-sha is the pull's work commit or
+        contains the head (platform #493: ptw lagged while the other two served it)."""
+        if isinstance(self.g.get('_fetched'), list):
+            self.g['_fetched'].clear()  # fetch work again: a served commit may be new
+        return [(k, host, sha, err) for k, host, sha, err in self.g['served_all']()
+                if not (sha and (sha == d.get('work') or self.g['contains'](d['head'], sha)))]
+
+    def served(self, d):
+        """True once EVERY staging site serves the pulled head. Polls each .deploy-sha up to
+        DEPLOY_WAIT s, or PTW_WAIT s while a cornerbot site (ptw) lags; that site gets one
+        CORNERBOT_REQUEST per pull."""
+        from . import flow
+        start, asked = self.clock(), bool(d.get('asked'))
         while True:
-            if isinstance(self.g.get('_fetched'), list):
-                self.g['_fetched'].clear()  # fetch work again: the served commit may be new
-            host, sha, _, _, err = self.g['served'](site)
-            if sha and (sha == d.get('work') or self.g['contains'](d['head'], sha)):
-                self.out(f"served: {host} .deploy-sha {sha[:8]} contains #{d['pr']} {d['head'][:8]}")
+            lag = self.lagging(d)
+            if not lag:
+                self.out(f"served: every staging site serves #{d['pr']} {d['head'][:8]}")
                 return True
-            if self.clock() >= end:
-                self.out(f"waiting: {host} .deploy-sha {sha[:8] if sha else (err or 'empty')[:60]} does not contain "
-                         f"#{d['pr']} {d['head'][:8]} yet")
+            corner = [(k, h) for k, h, _, _ in lag if k in CORNERBOT_SITES]
+            if corner and not asked:
+                for _, host in corner:
+                    self.out(self.cornerbot_request(d['pr'], d.get('branch', ''), d['head'], d.get('work'), host))
+                asked = True
+                if not self.dry:
+                    flow.save_pull(dict(d, asked=True))
+            if self.clock() - start >= (PTW_WAIT if corner else DEPLOY_WAIT):
+                self.out(f"waiting: #{d['pr']} {d['head'][:8]} is not served yet by "
+                         + '; '.join(f"{h} ({s[:8] if s else (e or 'empty')[:60]})" for _, h, s, e in lag))
                 return False
             self.sleep(DEPLOY_POLL)
 
     def finish(self, d, prs, scratch):
-        """Bring the running pull d into Staging. True when the pull ended (moved or failed),
-        False when it still waits (redeploy, CI): the fill stops there."""
+        """Bring the running pull d into Staging: wait until every staging site serves it, then
+        hr-gate --apply. True when the pull ended (moved or failed), False when it still waits
+        (redeploy timeout, CI): the fill stops there and the next cascade continues it."""
         from . import flow
-        site, has_served = self.site(d['pr'])
-        if has_served:
-            if site in CORNERBOT_SITES:
-                if not d.get('asked'):
-                    self.out(self.cornerbot_request(d['pr'], d.get('branch', ''), d['head'], d.get('work'), site))
-                    if not self.dry:
-                        flow.save_pull(dict(d, asked=True))
-                ok = self.served(d, site, 0)
-            else:
-                ok = self.served(d, site, DEPLOY_WAIT)
-            if not ok:
-                return False
+        if self.touches_served(d['pr']) and not self.served(d):
+            return False
         before = len(self.f.did)
         self.f.advance(d, prs, scratch)
         self.flush()
@@ -350,16 +368,17 @@ class Cascade(Advance):
                     return cols
                 self.out(f"fill: #{p['number']} is the {'extra' if st else 'first'} Staging pull")
                 if self.dry:  # nothing was pushed: show the rest of the chain, then count it in Staging
-                    site, has_served = self.site(p['number'])
-                    if has_served and site in CORNERBOT_SITES:
-                        self.out(self.cornerbot_request(p['number'], p.get('branch', ''), p['head'],
-                                                        getattr(self.f, 'last_work', None), site))
-                        self.out(f"would stop the fill here: #{p['number']} waits for the cornerbot redeploy; "
-                                 "the next cascade gates it")
-                        return dict(cols, **{board.READY: [q for q in cols.get(board.READY, []) if q is not p]})
-                    elif has_served:
-                        self.out(f"would wait up to {DEPLOY_WAIT}s for the {site} .deploy-sha to contain "
-                                 f"{p['head'][:8]}")
+                    if self.touches_served(p['number']):
+                        d = dict(pr=p['number'], head=p['head'], work=getattr(self.f, 'last_work', None))
+                        lag = self.lagging(d)
+                        for k, host, _, _ in lag:
+                            if k in CORNERBOT_SITES:
+                                self.out(self.cornerbot_request(p['number'], p.get('branch', ''), p['head'],
+                                                                d['work'], host))
+                        corner = any(k in CORNERBOT_SITES for k, *_ in lag)
+                        self.out(f"would wait up to {PTW_WAIT if corner else DEPLOY_WAIT}s until every staging "
+                                 f"site serves {p['head'][:8]}"
+                                 + (f" (now lagging: {', '.join(h for _, h, _, _ in lag)})" if lag else ''))
                     self.out(f"would run hr-gate --apply {p['number']} (Ready -> Staging when it passes)")
                     cols = dict(cols, **{board.READY: [q for q in cols.get(board.READY, []) if q is not p],
                                          board.STAGING: st + [p]})
@@ -456,6 +475,10 @@ def queue_self(qdir=None):
         return f'NOT queued ({e})'
 
 
+def _say(line):
+    print(line, flush=True)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog='swarm-advance', description=__doc__.split('\n', 1)[0])
     ap.add_argument('--dry-run', action='store_true', help='print what it would do; change nothing')
@@ -466,8 +489,8 @@ def main(argv=None):
     try:
         if a.cascade:
             if a.dry_run:  # no lock, no flag: a dry run changes nothing
-                return Cascade(dry_run=True).run()
-            return run_locked(lambda: Cascade().run(), if_flagged=a.if_flagged)
+                return Cascade(dry_run=True, out=_say).run()
+            return run_locked(lambda: Cascade(out=_say).run(), if_flagged=a.if_flagged, out=_say)
         if a.dry_run:
             return Advance(dry_run=True).step()
         with gatelock.gate_lock('swarm-advance'):

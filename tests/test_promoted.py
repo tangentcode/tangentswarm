@@ -336,13 +336,24 @@ def test_fast_path_needs_staging_to_serve_a_web_head(tmp_path, clean):
     web = dict(detail(5, H5), files={'nodes': [{'path': 'web/app.ts'}]}, headRefName='b')
     for served_sha, want in (('d' * 40, [5]), ('e' * 40, [])):   # 'd...' contains the head
         g = G(tmp_path, details={5: web})
-        g.update(site_for=lambda pr, o: 'work',
-                 served=lambda site: ('staging.example', served_sha, None, None, None),
+        g.update(served_all=lambda: [('work', 'staging.example', served_sha, None)],
                  contains=lambda anc, desc: desc.startswith('d'))
         assert P.Promoter(g=g).fast_path(COLS) == want
         assert g.moves == ([('I5', board.HUMAN_REVIEW)] if want else [])
     # a .deploy-sha that cannot be read blocks entry too
     g = G(tmp_path, details={5: web})
-    g.update(site_for=lambda pr, o: 'work', served=lambda site: ('h', None, None, None, 'cannot read'),
-             contains=lambda a, d: True)
+    g.update(served_all=lambda: [('work', 'h', None, 'cannot read')], contains=lambda a, d: True)
     assert P.Promoter(g=g).fast_path(COLS) == []
+
+
+def test_fast_path_needs_every_staging_site_to_serve_the_head(tmp_path, clean):
+    """platform #493: tangentcode and minavo served the head, ptw did not; it still moved."""
+    web = dict(detail(5, H5), files={'nodes': [{'path': 'web/tc/DbItemList.mts'}]}, headRefName='avo-x')
+    g = G(tmp_path, details={5: web})
+    g.update(served_all=lambda: [('work', 'work.example.test', 'd' * 40, None),
+                                 ('minavo', 'minavo.example.test', 'd' * 40, None),
+                                 ('ptw', 'ptw.example.test', 'e' * 40, None)],
+             contains=lambda anc, desc: desc.startswith('d'))
+    p = P.Promoter(g=g)
+    assert p.fast_path(COLS) == [] and g.moves == []
+    assert 'ptw.example.test' in p.left[0][2] and '1 of 3 staging sites' in p.left[0][2]

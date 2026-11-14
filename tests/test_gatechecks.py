@@ -105,3 +105,32 @@ def test_a_broken_work_branch_fails_entry():
     assert not ok and why.startswith('origin/work has conflict markers')
     assert G.check_served(web, False, 'abc12345', lambda s: True, work_bad='w')[1] == 'lenient re-gate: w'
     assert G.check_served(['README.md'], True, None, never, work_bad='w')[0]   # no served files
+
+
+def test_every_staging_site_must_serve_the_head():
+    """platform #493: tangentcode and minavo served 37ceb8f4, ptw still served 95f38a27."""
+    web = ['web/tc/DbItemList.mts', 'api/tcode/db_bp.py']
+    has = lambda s: s != '95f38a27'
+    sites = [('work.example.test', '4fe539ad', None), ('minavo.example.test', '4fe539ad', None),
+             ('ptw.example.test', '95f38a27', None)]
+    ok, why = G.check_served_sites(web, True, sites, has)
+    assert not ok
+    assert why == ('1 of 3 staging sites do not serve it: ptw.example.test: static .deploy-sha 95f38a27 '
+                   'LACKS the head: staging does not serve it yet')
+    ok, why = G.check_served_sites(web, False, sites, has)
+    assert ok and why.startswith('lenient re-gate: 1 of 3 staging sites') and 'pawntakesworld' in why
+    ok, why = G.check_served_sites(web, True, sites[:2], has)
+    assert ok and why.startswith('all 2 staging sites serve it: work.example.test: static .deploy-sha 4fe539ad')
+
+
+def test_every_site_accepts_the_vn_tip_and_an_unreadable_site_fails_entry():
+    web = ['web/ptw/cursor.ts']
+    sites = [('a', 'aaaaaaaa', None), ('b', 'bbbbbbbb', None)]
+    contains = lambda tip, desc: (tip, desc) in {('06347b83', 'aaaaaaaa'), ('06347b83', 'bbbbbbbb')}
+    assert G.check_served_sites(web, True, sites, lambda s: False, tips=[('x-v2', '06347b83')], contains=contains)[0]
+    ok, why = G.check_served_sites(web, True, sites + [('c', None, 'cannot read /x')], lambda s: True)
+    assert not ok and 'c: cannot read the static .deploy-sha (cannot read /x)' in why
+    assert G.check_served_sites(['README.md'], True, [], never)[0]
+    assert not G.check_served_sites(web, True, [], never)[0]
+    assert G.check_served_sites(web, True, sites, never, work_bad='origin/work has markers') == \
+        (False, 'origin/work has markers')

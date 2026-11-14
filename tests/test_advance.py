@@ -232,14 +232,18 @@ def pr(n, col, **kw):
                      col=col, state='OPEN', parked=False), **kw)
 
 
+SITES3 = ('work', 'minavo', 'ptw')
+
+
 class CascadeGate(dict):
-    def __init__(self, site='work', served_files=True, served_sha=None):
+    """served: {site key: static sha}; a sha in `has` contains the head."""
+    def __init__(self, served_files=True, served=None, has=()):
         super().__init__()
         files = {'nodes': [{'path': 'web/a.ts' if served_files else 'README.md'}]}
+        self.served = dict(served or {k: 'o' * 40 for k in SITES3})
         self.update(fetch=lambda n, refresh=False: {'number': n, 'files': files, 'headRefName': f'b{n}'},
-                    site_for=lambda full, o: site, ScratchRepo=Scratch, SITES={'ptw': ('ptw.example',)},
-                    served=lambda s: ('host', served_sha, None, None, None),
-                    contains=lambda anc, desc: False)
+                    ScratchRepo=Scratch, contains=lambda anc, desc: desc in has,
+                    served_all=lambda: [(k, f'{k}.example', sha, None) for k, sha in self.served.items()])
 
 
 def cascade(monkeypatch, tmp_path, cols, g, dry=True, **kw):
@@ -304,22 +308,25 @@ def test_no_start_claude_when_enough_coders_work(monkeypatch, tmp_path):
     assert out[-1] == 'signal: Ready 0/6, 2 PR(s) In Progress (aim 2): no START_CLAUDE'
 
 
-def test_a_ptw_pull_prints_the_cornerbot_request(monkeypatch, tmp_path):
-    cols = {board.STAGING: [pr(n, board.STAGING) for n in range(1, 5)], board.READY: [pr(9, board.READY)]}
-    cols[board.READY].append(pr(10, board.READY))
-    out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(site='ptw'))
-    assert pulled == [9]  # a live run waits for the redeploy here, so the dry run stops too
+def test_a_dry_run_shows_the_cornerbot_request_and_the_wait_for_every_site(monkeypatch, tmp_path):
+    cols = {board.STAGING: [pr(1, board.STAGING)], board.READY: [pr(9, board.READY)]}
+    g = CascadeGate(served={'work': 'h' * 40, 'minavo': 'h' * 40, 'ptw': 'o' * 40}, has={'h' * 40})
+    out, pulled = cascade(monkeypatch, tmp_path, cols, g)
+    assert pulled == [9]
     assert any(l.startswith('CORNERBOT_REQUEST (dry run): redeploy ptw.example') and '#9 b9' in l for l in out)
-    assert 'would stop the fill here: #9 waits for the cornerbot redeploy; the next cascade gates it' in out
-    assert out[-1] == 'START_CLAUDE n=2 ready=1/6 working=0/2'
+    assert f'would wait up to {A.PTW_WAIT}s until every staging site serves 00000000 (now lagging: ptw.example)' in out
+    assert 'would run hr-gate --apply 9 (Ready -> Staging when it passes)' in out
 
 
-def test_a_live_pull_waits_for_the_served_sha_then_gates(monkeypatch, tmp_path):
-    """Live: the pull merged into work; the second poll serves the work commit; then advance."""
+def live(monkeypatch, tmp_path, g, polls, advance=None, ready=(9,)):
+    """A live fill: Flow.pull merges into work ('w'*40). polls: list of {site: sha} per poll."""
     from tangentswarm import flow as F
-    g = CascadeGate()
-    polls = iter([None, 'w' * 40])
-    g['served'] = lambda s: ('host', next(polls), None, None, None)
+    seq = iter(polls)
+
+    def served_all():
+        g.served = next(seq, g.served) if polls else g.served
+        return [(k, f'{k}.example', sha, None) for k, sha in g.served.items()]
+    g['served_all'] = served_all
     advanced = []
 
     def start(self, prs, c, scratch, limit=None, strict=False):
@@ -327,34 +334,54 @@ def test_a_live_pull_waits_for_the_served_sha_then_gates(monkeypatch, tmp_path):
         F.save_pull(dict(pr=p['number'], head=p['head'], branch='b', item='I', work='w' * 40, started=0))
         return p
 
-    def advance(self, d, prs, scratch):
+    def adv(self, d, prs, scratch):
         advanced.append(d['pr'])
         F.save_pull(None)  # hr-gate --apply moved it
         c[board.STAGING].append(pr(d['pr'], board.STAGING))
-    c = {board.STAGING: [pr(n, board.STAGING) for n in range(1, 5)], board.READY: [pr(9, board.READY)]}
+    c = {board.STAGING: [pr(n, board.STAGING) for n in range(1, 5)], board.READY: [pr(n, board.READY) for n in ready]}
     monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
+    monkeypatch.setattr(A, 'CORNERBOT_FILE', tmp_path / 'cornerbot')
     monkeypatch.setattr(F.Flow, 'pull', start)
-    monkeypatch.setattr(F.Flow, 'advance', advance)
+    monkeypatch.setattr(F.Flow, 'advance', advance or adv)
     monkeypatch.setattr(F.Flow, 'columns', lambda self: ({}, c))
-    out = []
-    casc = A.Cascade(g=g, dry_run=False, out=out.append, sleep=lambda s: None)
-    casc.fill()
-    assert advanced == [9]
-    assert 'served: host .deploy-sha wwwwwwww contains #9 ' + f'{9:040d}'[:8] in out
-    assert 'fill: Staging 5, Ready 0: Ready is empty' in out
+    out, now = [], [0]
+
+    def sleep(s):
+        now[0] += s
+    A.Cascade(g=g, dry_run=False, out=out.append, sleep=sleep, clock=lambda: now[0]).fill()
+    return out, advanced, now[0]
 
 
-def test_a_live_ptw_pull_stops_the_fill_until_cornerbot_redeploys(monkeypatch, tmp_path):
+def test_a_live_pull_gates_only_when_every_site_serves_the_head(monkeypatch, tmp_path):
+    """platform #493: work and minavo served the head first; ptw served it two polls later."""
+    W, O = 'w' * 40, 'o' * 40
+    polls = [{'work': O, 'minavo': O, 'ptw': O}, {'work': W, 'minavo': W, 'ptw': O},
+             {'work': W, 'minavo': W, 'ptw': O}, {'work': W, 'minavo': W, 'ptw': W}]
+    out, advanced, waited = live(monkeypatch, tmp_path, CascadeGate(), polls)
+    assert advanced == [9] and waited == 3 * A.DEPLOY_POLL
+    reqs = [l for l in out if l.startswith('CORNERBOT_REQUEST')]
+    assert len(reqs) == 1 and reqs[0].startswith('CORNERBOT_REQUEST: redeploy ptw.example from platform work wwwwwwww')
+    assert (tmp_path / 'cornerbot').read_text().endswith(reqs[0] + '\n')
+    assert "served: every staging site serves #9 00000000" in out
+
+
+def test_a_live_pull_times_out_on_a_lagging_ptw_and_stops_the_fill(monkeypatch, tmp_path):
     from tangentswarm import flow as F
-    monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
-    F.save_pull(dict(pr=9, head='9' * 40, branch='ptw/x', item='I', work='w' * 40, started=0))
-    monkeypatch.setattr(F.Flow, 'advance', lambda *a: pytest.fail('not served yet: no gate'))
-    monkeypatch.setattr(F.Flow, 'columns', lambda self: ({}, {board.READY: [pr(4, board.READY)]}))
-    out = []
-    A.Cascade(g=CascadeGate(site='ptw', served_sha='o' * 40), out=out.append, sleep=lambda s: None).fill()
-    assert out[0].startswith('CORNERBOT_REQUEST: redeploy ptw.example from platform work wwwwwwww')
-    assert out[1].startswith('waiting: host .deploy-sha oooooooo does not contain #9')
-    assert F.load_pull()['asked'] is True  # asked once; the next cascade does not ask again
+    W, O = 'w' * 40, 'o' * 40
+    g = CascadeGate(served={'work': W, 'minavo': W, 'ptw': O})
+    out, advanced, waited = live(monkeypatch, tmp_path, g, [],
+                                 advance=lambda *a: pytest.fail('ptw does not serve it: no gate'), ready=(9, 10))
+    assert advanced == [] and waited >= A.PTW_WAIT
+    assert out[-1] == "waiting: #9 00000000 is not served yet by ptw.example (oooooooo)"
+    assert F.load_pull()['asked'] is True  # the next cascade waits again but does not ask again
+
+
+def test_a_web_site_that_never_serves_times_out_after_deploy_wait(monkeypatch, tmp_path):
+    W, O = 'w' * 40, 'o' * 40
+    g = CascadeGate(served={'work': O, 'minavo': W, 'ptw': W})
+    out, advanced, waited = live(monkeypatch, tmp_path, g, [], advance=lambda *a: pytest.fail('no gate'))
+    assert advanced == [] and A.DEPLOY_WAIT <= waited < A.PTW_WAIT
+    assert not any(l.startswith('CORNERBOT_REQUEST') for l in out)
 
 
 def test_a_dry_run_goes_on_after_a_running_pull_would_end(monkeypatch, tmp_path):
