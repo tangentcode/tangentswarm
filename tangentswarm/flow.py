@@ -236,9 +236,13 @@ class Flow:
         return True
 
     # -- 2. pull --------------------------------------------------------------
-    def pull(self, prs, cols, scratch, limit=None):
+    def pull(self, prs, cols, scratch, limit=None, strict=False):
         """Start one pull. Returns the pulled PR, or None. limit: pull only while Staging has
-        fewer PRs than this (default STAGING_MIN; the swarm-advance cascade uses STAGING_MAX)."""
+        fewer PRs than this (default STAGING_MIN).
+        strict (the swarm-advance cascade): no rework to fill Staging. A Ready PR is pulled
+        only if it merges cleanly with main, with work, and with each Human Review and Staging
+        head (one pair at a time), and stacks cleanly on all of them. Any other PR is skipped
+        with a note: it is not moved, and no relay is written."""
         staging = cols.get(board.STAGING, [])
         if len(staging) >= (STAGING_MIN if limit is None else limit):
             return None
@@ -256,21 +260,31 @@ class Flow:
         for p in ready:
             conflicts[p['number']] = sum(not self.g['merge_tree_clean'](scratch.dir, sha, p['head'])
                                          for sha in [main] + [s for _, s in bases])
+        work = self.fetch_work(scratch) if strict else None
         for p in ready_order(ready, conflicts):
             n = p['number']
-            if not self.g['merge_tree_clean'](scratch.dir, main, p['head']):
+            if strict:
+                bad = [label for label, sha in [('main', main), (WORK, work)] + bases
+                       if not self.g['merge_tree_clean'](scratch.dir, sha, p['head'])]
+                if bad:
+                    self.note(f"#{n} skipped: does not merge cleanly with {', '.join(bad)} (no rework to fill Staging)")
+                    continue
+            elif not self.g['merge_tree_clean'](scratch.dir, main, p['head']):
                 self.fail(p, 'does not merge cleanly onto main: merge origin/main into the branch (no rebase)',
                           relay='merge-main')
                 continue
             # A fast-track PR takes the FIRST Staging slot (methodology#60): it stacks on main +
             # Human Review only; the Staging PRs behind it are re-stacked at their own promotion.
-            mine = bases[:len(hr)] if p['rank'] == board.FAST_TRACK else bases
+            # Strict: no re-stack, so it must stack on every Staging PR too.
+            mine = bases[:len(hr)] if p['rank'] == board.FAST_TRACK and not strict else bases
             bad = stack_conflict(scratch, main, mine, p['head'])
             if bad:
                 self.note(f"#{n} skipped this step: conflicts with {bad} (Ready order kept)")
                 continue
             return p if self.start_pull(p, scratch) else None
-        self.note('no Ready PR stacks cleanly on main + Human Review + Staging: one speculative rebase needed')
+        self.note('no Ready PR merges cleanly with main, work and every Human Review and Staging PR'
+                  if strict else
+                  'no Ready PR stacks cleanly on main + Human Review + Staging: one speculative rebase needed')
 
     def staging_order(self, staging):
         try:
@@ -280,12 +294,16 @@ class Flow:
         pos = {n: i for i, n in enumerate(order)}
         return sorted(staging, key=lambda p: (pos.get(p['number'], len(pos)), p['number']))
 
+    def fetch_work(self, scratch):
+        """Fetch origin work into the scratch repo; return its commit."""
+        git(scratch, 'fetch', '--no-tags', '--quiet', self.g['origin_url'](), f'{WORK}:refs/heads/{WORK}')
+        return git(scratch, 'rev-parse', f'refs/heads/{WORK}').stdout.strip()
+
     def merge_into_work(self, scratch, n, tip, label):
         """Merge tip into origin work and push it (a fast-forward; never with --dry-run).
         Returns (work commit, None), (work commit, 'already in work') or (None, why). The merge is refused unless it is clean
         (merge_problem_text): a conflict never reaches work."""
-        git(scratch, 'fetch', '--no-tags', '--quiet', self.g['origin_url'](), f'{WORK}:refs/heads/{WORK}')
-        work = git(scratch, 'rev-parse', f'refs/heads/{WORK}').stdout.strip()
+        work = self.fetch_work(scratch)
         if git(scratch, 'merge-base', '--is-ancestor', tip, work, check=False).returncode == 0:
             return work, 'already in work'
         why = []

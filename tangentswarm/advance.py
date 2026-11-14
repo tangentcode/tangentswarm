@@ -45,7 +45,7 @@ MINBOT = os.environ.get('SWARM_MINBOT', 'minbot')
 MINBOT_ROWS = ('1 ', '2 ', '3 ', '5 ')  # not draft, mergeable, Codex clean, Linux CI
 
 # --cascade (Michal 2026-11-14)
-STAGING_LIMIT = int(os.environ.get('SWARM_CASCADE_STAGING', '5'))  # pull while Staging is below this
+STAGING_CAP = int(os.environ.get('SWARM_CASCADE_STAGING_CAP', '5'))  # safety bound only: never more in Staging
 READY_TARGET = int(os.environ.get('SWARM_READY_TARGET', '6'))      # START_CLAUDE while Ready is below this
 WORKING_TARGET = int(os.environ.get('SWARM_WORKING_TARGET', '2'))  # aim: about this many coders working
 DEPLOY_WAIT = int(os.environ.get('SWARM_DEPLOY_WAIT', '600'))      # seconds to wait for staging to serve a pull
@@ -234,12 +234,17 @@ class Cascade(Advance):
     """swarm-advance --cascade: the whole just-in-time cascade in one serial run.
 
       1. promote   Human Review has a free slot: the fast path moves the next Staging PR.
-      2. fill      while Staging has fewer than STAGING_LIMIT PRs and Ready is not empty:
-                   pull the next Ready PR (milestone, fewest conflicts, oldest), merge it into
-                   work (refused on a conflict or a conflict marker), let staging redeploy
-                   (ptw: print the cornerbot request), wait until the served .deploy-sha
-                   contains it, then hr-gate --apply. A pull that must wait (ptw redeploy,
-                   CI still running) stops the fill; the next cascade continues it.
+      2. fill      the target is ONE fully ready PR in Staging at all times (Michal
+                   2026-11-14 6:44 PM ET: bulk pre-merging made every main merge conflict
+                   the speculative branches). Staging empty: pull ONE Ready PR (milestone,
+                   fewest conflicts, oldest). Then pull extra Ready PRs, but only ones that
+                   merge cleanly with main, work and every Human Review and Staging PR
+                   (Flow.pull strict). Nothing is rebased, reworked or sent back just to fill
+                   Staging. Each pull: work merge (refused on a conflict or a marker),
+                   staging redeploy (ptw: print the cornerbot request), wait until the
+                   served .deploy-sha contains it, then hr-gate --apply. A pull that must
+                   wait (ptw redeploy, CI still running) stops the fill; the next cascade
+                   continues it. STAGING_CAP is only a safety bound.
       3. signal    Ready has fewer than READY_TARGET PRs: print one START_CLAUDE line for
                    swarmbot, so that about WORKING_TARGET coders work.
     """
@@ -320,7 +325,7 @@ class Cascade(Advance):
             cols[board.HUMAN_REVIEW] = cols.get(board.HUMAN_REVIEW, []) + up
         with self.g['ScratchRepo']() as scratch:
             ended = None  # dry run: the running pull that would end (pull.json is not changed)
-            for _ in range(STAGING_LIMIT + 2):  # each turn ends the running pull, adds one PR, or stops
+            for _ in range(STAGING_CAP + 2):  # each turn ends the running pull, adds one PR, or stops
                 d = flow.load_pull()
                 if d and d.get('pr') != ended:
                     if not self.finish(d, prs, scratch):
@@ -332,14 +337,18 @@ class Cascade(Advance):
                     continue
                 st = cols.get(board.STAGING, [])
                 ready = [p for p in cols.get(board.READY, []) if not p.get('draft')]
-                if len(st) >= STAGING_LIMIT or not ready:
-                    self.out(f"fill: Staging {len(st)}/{STAGING_LIMIT}, Ready {len(ready)}: "
-                             + ('Staging is full' if ready else 'Ready is empty'))
+                if not ready:
+                    self.out(f"fill: Staging {len(st)}, Ready 0: Ready is empty")
                     return cols
-                p = self.f.pull(prs, cols, scratch, limit=STAGING_LIMIT)
+                if len(st) >= STAGING_CAP:
+                    self.out(f"fill: Staging {len(st)}: at the safety cap {STAGING_CAP}")
+                    return cols
+                p = self.f.pull(prs, cols, scratch, limit=STAGING_CAP, strict=True)
                 self.flush()
                 if p is None:
+                    self.out(f"fill: Staging {len(st)}: no {'extra ' if st else ''}Ready PR to pull without rework")
                     return cols
+                self.out(f"fill: #{p['number']} is the {'extra' if st else 'first'} Staging pull")
                 if self.dry:  # nothing was pushed: show the rest of the chain, then count it in Staging
                     site, has_served = self.site(p['number'])
                     if has_served and site in CORNERBOT_SITES:
@@ -451,7 +460,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog='swarm-advance', description=__doc__.split('\n', 1)[0])
     ap.add_argument('--dry-run', action='store_true', help='print what it would do; change nothing')
     ap.add_argument('--cascade', action='store_true',
-                    help='the whole cascade (promote, fill Staging, START_CLAUDE) under the lock, with rerun flag')
+                    help='the whole cascade (promote, keep one ready PR in Staging, START_CLAUDE) under the lock')
     ap.add_argument('--if-flagged', action='store_true', help='--cascade: run only if the rerun flag is set')
     a = ap.parse_args(argv)
     try:

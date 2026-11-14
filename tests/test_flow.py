@@ -340,3 +340,31 @@ def test_merge_work_says_when_the_tip_is_already_in_work(repo, tmp_path):
     s.ensure = lambda *a: None
     f = flow.Flow(out=out.append, g={'origin_url': lambda: str(origin), 'ScratchRepo': lambda: _Ctx(s)})
     assert f.merge_work(447, h['main'], 'main') == 0 and 'already in work' in out[0]
+
+
+def test_strict_pull_skips_without_rework_and_needs_every_pair_clean(monkeypatch):
+    """swarm-advance --cascade: only a PR that merges cleanly with main, work and each Human
+    Review and Staging head is pulled. Nothing is moved and no relay is written."""
+    prs = {1: card(1, HR), 3: card(3, ST), 6: card(6, RD, rank=0), 7: card(7, RD, rank=0),
+           8: card(8, RD, rank=0), 9: card(9, RD, rank=board.FAST_TRACK)}
+    dirty = {('main', prs[6]['head']), ('work', prs[7]['head']), (prs[3]['head'], prs[8]['head'])}
+    f, g = make_flow(prs, dry=False, clean=lambda a, b: (a, b) not in dirty)
+    monkeypatch.setattr(f, 'fetch_work', lambda scratch: 'work')
+    seen = {}
+    monkeypatch.setattr(flow, 'stack_conflict', lambda s, m, bases, head: seen.setdefault(head, bases) and None)
+    started = []
+    monkeypatch.setattr(f, 'start_pull', lambda p, s: started.append(p['number']) or True)
+    _, cols = f.columns()
+    p = f.pull(prs, cols, g['ScratchRepo'](), limit=5, strict=True)
+    assert p['number'] == 9 and started == [9] and g.moves == []
+    assert [n for n, _ in seen[prs[9]['head']]] == ['#1', '#3']  # strict: a fast-track stacks on Staging too
+    started.clear()
+    del prs[9]
+    cols[RD] = [prs[n] for n in (6, 7, 8)]
+    assert f.pull(prs, cols, g['ScratchRepo'](), limit=5, strict=True) is None and started == []
+    assert g.moves == []
+    notes = '\n'.join(f.notes)
+    assert '#6 skipped: does not merge cleanly with main (no rework' in notes
+    assert '#7 skipped: does not merge cleanly with work' in notes
+    assert '#8 skipped: does not merge cleanly with #3' in notes
+    assert notes.endswith('no Ready PR merges cleanly with main, work and every Human Review and Staging PR')
