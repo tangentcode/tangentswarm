@@ -646,21 +646,51 @@ class Cascade(Advance):
         ready = len([p for p in cols.get(board.READY, []) if not p.get('draft')])
         k = slots.kinds(slots.attach_prs(slots.running(), prs), slots.load())
         from . import boardcache
+        st = slots.load()
         issues = slots.backlog_issues(boardcache.snapshot(self.g['gql']), board.active_fast_track(), prs,
-                                      named=slots.load()['named'])
+                                      named=st['named'], launching=st['launching'])
         n, target = slots.start_plan(len(k['new']), issues, ready, READY_TARGET)
+        live = slots.live_claudes()
+        cap = max(0, slots.MAX_CLAUDES - live)
         facts = (f"new={len(k['new'])}/{target} rework={len(k['rework'])}/{slots.REWORK_SLOTS} "
-                 f"ready={ready}/{READY_TARGET} backlog_without_pr={len(issues)}")
+                 f"ready={ready}/{READY_TARGET} backlog_without_pr={len(issues)} "
+                 f"claudes={live}/{slots.MAX_CLAUDES} launching={len(st['launching'])}")
+        if n and not cap:
+            self.out(f"signal: {n} new-work slot(s) free, but {live} Claudes run (cap {slots.MAX_CLAUDES}): "
+                     f"no launch ({facts})")
+            return
+        n = min(n, cap)
         if n:
-            pick = [i['number'] for i in issues[:n]]
-            self.out(f"START_CLAUDE n={n} issues={','.join('#' + str(x) for x in pick)} {facts} "
-                     f"keys={';'.join(slots.key_text(i) for i in issues[:n])}")
-            if not self.dry:
-                slots.mark_named(pick)
+            pick = issues[:n]
+            self.out(f"START_CLAUDE n={n} issues={','.join('#' + str(i['number']) for i in pick)} {facts} "
+                     f"keys={';'.join(slots.key_text(i) for i in pick)}")
+            self.launch(pick)
         elif not issues:
             self.out(f"signal: no Backlog issue without a PR ({facts}): no START_CLAUDE")
         else:
             self.out(f"signal: the new-work slots are full ({facts}): no START_CLAUDE")
+
+    def launch(self, pick):
+        """MethBot 2026-11-15 3:35 AM ET: nothing consumed START_CLAUDE. Queue each named issue
+        for tangentswarm.launcher (branch, draft PR "Fixes #N", brief, worker), which the
+        swarm-promoted daemon runs outside the serial lock. The picker skips a queued issue
+        until its launch ends; it counts as named only once its draft PR exists."""
+        from . import slots, spool
+        if self.dry:
+            for i in pick:
+                self.out(f"launch: would queue #{i['number']} ({i['title'][:60]})")
+            return
+        queued = []
+        for i in pick:
+            try:
+                spool.submit('launch', '', issue=i['number'], title=i['title'])
+                queued.append(i['number'])
+            except (OSError, ValueError) as e:
+                self.out(f"launch: #{i['number']} NOT queued: {e}")
+        if queued:
+            slots.launch_mark(queued)
+            self.out(f"launch: queued {', '.join('#' + str(x) for x in queued)} for swarm-promoted "
+                     "(branch, draft PR, brief, worker)")
 
     def run(self):
         from .promoted import read_columns

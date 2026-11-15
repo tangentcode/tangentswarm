@@ -57,6 +57,8 @@ NEVER_START = {int(x) for x in os.environ.get(
     'SWARM_NEVER_START', '21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,'
     '110,116,117,120,125,202,203,204,344,350,377').split(',') if x.strip().isdigit()}
 LAUNCH_GRACE = int(os.environ.get('SWARM_LAUNCH_GRACE', '2700'))  # s: a named issue is not named again
+LAUNCHING_TTL = int(os.environ.get('SWARM_LAUNCHING_TTL', '1800'))  # s: a queued launch, until its PR exists
+MAX_CLAUDES = int(os.environ.get('SWARM_MAX_CLAUDES', '10'))  # every live Claude on the host
 TMUX_SESSION = 'agents'
 FEEDBACK_MAX = 4000
 
@@ -70,7 +72,8 @@ def load(path=None):
         d = {}
     d = d if isinstance(d, dict) else {}
     return {'parked': dict(d.get('parked') or {}), 'rework': dict(d.get('rework') or {}),
-            'relayed': dict(d.get('relayed') or {}), 'named': dict(d.get('named') or {})}
+            'relayed': dict(d.get('relayed') or {}), 'named': dict(d.get('named') or {}),
+            'launching': dict(d.get('launching') or {})}
 
 
 def save(d, path=None):
@@ -195,7 +198,7 @@ def key_text(issue):
     return f"#{n}=(ft:{'yes' if ft == 0 else 'no'},due:{when},n:{n})"
 
 
-def backlog_issues(snap, active_ft=None, prs=None, named=None, now=None):
+def backlog_issues(snap, active_ft=None, prs=None, named=None, now=None, launching=None):
     """The launch picker (Michal 2026-11-15 12:16 AM ET: START_CLAUDE named Parked #344 while
     Backlog held the approved issues). Open platform issues in the BACKLOG column (by option
     id; so never Triage, Inbox, Discuss, Active or Parked) that no open PR closes, without the
@@ -207,6 +210,7 @@ def backlog_issues(snap, active_ft=None, prs=None, named=None, now=None):
     taken = {i['number'] for _, c in boardcache.open_prs(snap) for i in boardcache.closes(c)}
     taken |= {i for p in (prs or {}).values() if p.get('state', 'OPEN') == 'OPEN' for i in p.get('closes') or ()}
     recent = {int(k) for k, t in (named or {}).items() if now - float(t) < LAUNCH_GRACE}
+    recent |= {int(k) for k, t in (launching or {}).items() if now - float(t) < LAUNCHING_TTL}
     out = []
     for it, c in boardcache.open_issues(snap):
         n = c['number']
@@ -219,6 +223,35 @@ def backlog_issues(snap, active_ft=None, prs=None, named=None, now=None):
         out.append(dict(number=n, title=c.get('title') or '', labels=labels, milestone=m.get('title'),
                         due=m.get('dueOn'), ft=board.is_active_fast_track(n, (), active_ft)))
     return sorted(out, key=launch_key)
+
+
+def launch_mark(numbers, path=None, now=None):
+    """Issues whose launch is queued: the picker skips them until the launch ends."""
+    now = time.time() if now is None else now
+    d = load(path)
+    d['launching'] = {k: t for k, t in d['launching'].items() if now - float(t) < LAUNCHING_TTL}
+    d['launching'].update({str(n): now for n in numbers})
+    save(d, path)
+
+
+def launch_done(n, path=None):
+    """The launch of issue n ended (its draft PR exists, or it failed and may be tried again)."""
+    d = load(path)
+    if d['launching'].pop(str(n), None) is not None:
+        save(d, path)
+
+
+def live_claudes(sessions=None, alive=None):
+    """How many Claude processes run on the host (any directory): the ~10 cap."""
+    alive = alive or _alive
+    n = 0
+    for f in (sessions or SESSIONS).glob('*.json'):
+        try:
+            pid = int(json.loads(f.read_text()).get('pid') or f.stem)
+        except (OSError, ValueError, TypeError):
+            continue
+        n += bool(alive(pid))
+    return n
 
 
 def mark_named(numbers, path=None, now=None):

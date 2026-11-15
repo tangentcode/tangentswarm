@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 SPOOL = Path(os.environ.get('SWARM_HANDOFF_SPOOL', str(Path.home() / '.cache' / 'swarm-handoff-spool')))
-OPS = ('stophook', 'handoff', 'status', 'request_review')
+OPS = ('stophook', 'handoff', 'status', 'request_review', 'launch')
 WAIT = int(os.environ.get('SWARM_SPOOL_WAIT', '120'))  # s a worker MCP tool waits for its answer
 MAX_AGE = 3600  # s: an unclaimed request or an unread answer older than this is dropped
 NO_DAEMON = ("no answer from the swarm-promoted daemon in {wait}s; it runs the GitHub calls outside "
@@ -39,14 +39,14 @@ def _write(path, data):
     os.replace(tmp, path)
 
 
-def submit(op, cwd, transcript=None, wait=0, spool=None, sleep=time.sleep, clock=time.monotonic):
+def submit(op, cwd, transcript=None, wait=0, spool=None, sleep=time.sleep, clock=time.monotonic, **extra):
     """Queue one request. wait > 0: wait up to that many seconds for the answer and return
     it; else return {'queued': id}."""
     if op not in OPS:
         raise ValueError(f'unknown spool op {op!r}')
     spool = spool or SPOOL
     rid = f"{time.time_ns()}-{os.getpid()}"
-    _write(spool / f'{rid}.req.json', dict(op=op, cwd=str(cwd), transcript=transcript, at=time.time()))
+    _write(spool / f'{rid}.req.json', dict(extra, op=op, cwd=str(cwd), transcript=transcript, at=time.time()))
     if not wait:
         return {'queued': rid}
     res, end = spool / f'{rid}.res.json', clock() + wait
@@ -141,6 +141,9 @@ def execute(req):
         return dict(worker_mcp.status(cwd), ok=True)
     if op == 'request_review':
         return dict(worker_mcp.do_request_review(cwd), ok=True)
+    if op == 'launch':
+        from . import launcher
+        return launcher.execute(req)
     return {'ok': False, 'error': f'unknown op {op!r}'}
 
 
@@ -159,10 +162,11 @@ def serve(run_path):
         out = execute(req)
     except Exception as e:
         out = {'ok': False, 'error': f'{type(e).__name__}: {str(e)[:600]}'}
-    if req.get('op') == 'stophook':
+    if req.get('op') in ('stophook', 'launch'):
         if not out.get('ok'):
             from .stophook import say
-            say(f"{Path(req.get('cwd') or '').name}: stop hook failed: {out['error']}")
+            what = f"launch #{req.get('issue')}" if req.get('op') == 'launch' else Path(req.get('cwd') or '').name
+            say(f"{what}: {req.get('op')} failed: {out['error']}")
     else:
         _write(run_path.with_name(run_path.name.replace('.run.json', '.res.json')), out)
     run_path.unlink(missing_ok=True)
