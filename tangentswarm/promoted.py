@@ -338,7 +338,7 @@ class Promoter:
             def clean(m, head):
                 scratch.ensure(m, head)
                 return flow.merge_commit(scratch, m, head, 'probe main') is not None
-            give = flow.Flow(dry_run=self.dry, out=lambda l: None, g=self.g).give_worker
+            give = flow.Flow(dry_run=self.dry, out=lambda l: None, g=self.g).hand_off  # (ok, note)
             return mainmerge.recheck(staging, main, clean, lambda item, col: board.move_card(self.g, item, col), say,
                                      details=details, dry=self.dry, give=give)
 

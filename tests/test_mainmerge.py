@@ -77,3 +77,18 @@ def test_find_pane_matches_window_or_worktree_and_needs_claude(monkeypatch):
     rows = ['%1\tptw-6-x\tbash\t/x', '%2\tptw-6-x\tclaude\t/x', '%3\tother\tclaude\t/y']
     assert M.find_pane(dict(number=6, branch='ptw/x'), list_panes=lambda: rows) == '%2'
     assert M.find_pane(dict(number=7, branch='ptw/z'), list_panes=lambda: rows) is None
+
+
+def test_the_daemon_gives_recheck_a_success_boolean_not_give_workers_rc():
+    """Codex on PR #26: give_worker returns (rc, note) with rc 0 = success; mainmerge reads
+    (ok, note). Flow.hand_off converts at the boundary."""
+    from tangentswarm import flow
+    f = flow.Flow(dry_run=True, out=lambda l: None, g={})
+    f.give_worker = lambda n, t: (0, 'revived')
+    assert f.hand_off(6, 't') == (True, 'revived')
+    f.give_worker = lambda n, t: (3, 'rework slots full')
+    assert f.hand_off(6, 't') == (False, 'rework slots full')
+    import inspect
+    from tangentswarm import promoted
+    src = inspect.getsource(promoted.Promoter.main_pass)
+    assert '.hand_off' in src and '.give_worker' not in src

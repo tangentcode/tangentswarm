@@ -829,7 +829,15 @@ def test_a_live_signal_queues_the_launches_and_respects_the_claude_cap(monkeypat
     out.clear()
     c.signal({})  # room again: the picker skips the queued ones
     assert any(l.startswith('START_CLAUDE n=2 issues=#42,#43') for l in out), out
-    slots.save(dict(slots.load(), launching={}))  # the launches ended
+    from tangentswarm import launches
+    slots.save(dict(slots.load(), launching={}))  # the launches ended ...
+    launches.hold('held-branch', pr=99)  # ... but one start is held for memory: it still holds a Claude
+    out.clear()
+    c.signal({})
+    start = [l for l in out if l.startswith('START_CLAUDE')]
+    assert start and start[0].startswith('START_CLAUDE n=3') and 'launching=1' in start[0], out  # 10 - 6 live - 1 held
+    launches.drop('held-branch')
+    slots.save(dict(slots.load(), launching={}))
     monkeypatch.setattr(slots, 'live_claudes', lambda: 10)
     out.clear()
     c.signal({})

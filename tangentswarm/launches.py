@@ -194,10 +194,11 @@ def launch(branch, window=None, pr=None, brief=None, start=start_scoped, send=se
     return 'launched', out
 
 
-def start_next(rank=lambda pr: 1, mem=memory, start=start_scoped, send=send_brief):
-    """Start at most one queued launch if memory admits it.
+def start_next(rank=lambda pr: 1, mem=memory, start=start_scoped, send=send_brief, room=lambda: True):
+    """Start at most one queued launch if memory admits it and room() says the Claude cap
+    has room (Codex on PR #26: the held queue drained past MAX_CLAUDES).
 
-    Returns (what, row, detail): what is 'empty', 'waiting' (memory holds it), or
+    Returns (what, row, detail): what is 'empty', 'waiting' (memory or the cap holds it), or
     launch()'s result for the first queued row."""
     rows = ordered(read_queue(), rank)
     if not rows:
@@ -205,6 +206,8 @@ def start_next(rank=lambda pr: 1, mem=memory, start=start_scoped, send=send_brie
     m = mem()
     if not admits(m):
         return 'waiting', rows[0], describe(m)
+    if not room():
+        return 'waiting', rows[0], 'the Claude cap is full'
     r = rows[0]
     what, out = launch(r['branch'], r.get('window'), r.get('pr'), r.get('brief'), start=start, send=send)
     if what == 'refused':

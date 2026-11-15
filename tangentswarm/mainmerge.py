@@ -106,7 +106,7 @@ def recheck(staging, main, clean, move, say, details=None, dry=False, cache_path
     """Relay a merge-main to each Staging PR that conflicts with the new main, and move it to
     In Progress only once its worker has the relay (Codex on PR #26: a parked Staging worker
     was demoted with no live pane to take it). give(n, text) -> (ok, note) is the
-    revive-capable handoff (Flow.give_worker); without it, send() to a live pane only. A PR
+    revive-capable handoff (Flow.hand_off, never give_worker's rc); without it, send() to a live pane only. A PR
     whose worker cannot be started stays in Staging, held from new pulls (NEEDS_WORKER).
     Returns the PR numbers that conflict."""
     cache = load_cache(cache_path)

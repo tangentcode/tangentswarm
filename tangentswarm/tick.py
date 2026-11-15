@@ -848,7 +848,11 @@ class Tick:
         if self.dry:
             self.change(f"{name} start held launch {first['branch']} ({launches.describe(m)})")
             return
-        what, row, out = launches.start_next(rank=rank, mem=lambda: m)
+        from . import slots
+        what, row, out = launches.start_next(rank=rank, mem=lambda: m,
+                                             room=lambda: slots.live_claudes() < slots.MAX_CLAUDES)
+        if what == 'waiting':
+            return self.note(first['pr'], None, f"held launch {first['branch']} waits: {out}")
         if what == 'launched':
             self.change(f"{name} started held launch in {out.get('window')} ({out.get('pane')})")
             if out.get('brief_error'):

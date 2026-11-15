@@ -359,8 +359,7 @@ class Executor:
         if self.give:
             return self.give(n, text)
         from . import flow
-        rc, said = flow.Flow(dry_run=False, out=lambda l: None, g=self.g).give_worker(n, text)
-        return rc == 0, said
+        return flow.Flow(dry_run=False, out=lambda l: None, g=self.g).hand_off(n, text)
 
     def back_to_work(self, n, text, why):
         """Relay, then In Progress, only when a worker has it (never demote into a column with

@@ -570,6 +570,12 @@ class Flow:
         else:
             self.note(f"SCREENSHOTS_NEEDED #{n}: no worker could take the screenshot job ({said})")
 
+    def hand_off(self, n, text):
+        """(ok, note): give_worker as a success boolean, for callers that take (ok, note)
+        (Codex on PR #26: mainmerge read give_worker's rc 0 as a failure)."""
+        rc, said = self.give_worker(n, text)
+        return rc == 0, said
+
     def give_worker(self, n, text):
         """(rc, last line) of slots.revive: 0 = its Claude runs and got the text."""
         from . import slots

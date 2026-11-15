@@ -173,7 +173,7 @@ def test_tick_live_starts_one_and_notes_a_refusal(monkeypatch):
     L.hold('five', now=1)
     calls = []
 
-    def start_next(rank, mem):
+    def start_next(rank, mem, room=lambda: True):
         calls.append(rank(6))
         return 'refused', L.read_queue()[0], dict(refused='busy window')
     monkeypatch.setattr(L, 'start_next', start_next)
@@ -235,3 +235,12 @@ def test_brief_line_tells_the_coder_to_use_absolute_image_urls():
     line = L.brief_line('/b/486.txt')
     assert 'absolute https URLs' in line and 'user-attachments' in line and 'swarm-shots' in line
     assert 'Never a relative file name' in line
+
+
+def test_a_held_launch_waits_while_the_claude_cap_is_full():
+    """Codex on PR #26: the memory-held queue drained past MAX_CLAUDES."""
+    from tangentswarm import launches as LZ
+    LZ.hold('b1', pr=7)
+    started = []
+    what, row, out = LZ.start_next(mem=lambda: mem(1000 * MB), start=lambda *a, **k: started.append(a), room=lambda: False)
+    assert what == 'waiting' and out == 'the Claude cap is full' and started == []

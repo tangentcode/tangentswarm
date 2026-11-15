@@ -686,6 +686,12 @@ class Cascade(Advance):
                                       named=st['named'], launching=st['launching'])
         live = slots.live_claudes()
         pending = slots.pending_launches(st)  # queued launches: each will start a Claude
+        try:
+            from . import launches
+            held = [r for r in launches.read_queue() if str(r.get('pr')) not in st['unstarted']]
+        except (OSError, ValueError):
+            held = []
+        pending = pending + [r.get('pr') or r.get('branch') for r in held]  # memory-held starts too (Codex on PR #26)
         cap = max(0, slots.MAX_CLAUDES - live - len(pending))
         unstarted = st['unstarted']
         cap = self.retry_starts(unstarted, cap)  # launched PRs with no Claude first
