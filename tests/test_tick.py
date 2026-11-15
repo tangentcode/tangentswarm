@@ -68,6 +68,86 @@ def test_window_pr():
     assert tick.window_pr('outline-join-lines') is None
 
 
+def test_window_matches_pr_numbered_legacy_and_path():
+    pr = {'number': 368, 'branch': 'ptw-attr-doc-tooltips', 'state': 'MERGED'}
+    assert tick.window_matches_pr('ptw-368-ptw-attr-doc-tooltips', '/x', pr)
+    assert tick.window_matches_pr('ptw-368-ptw-attr-doc-tooltips-b', '/x', pr)
+    assert tick.window_matches_pr('ptw-attr-doc-tooltips', '/x', pr)
+    assert tick.window_matches_pr('claude-ptw-attr-doc-tooltips', '/x', pr)
+    assert tick.window_matches_pr('bash', '/home/user/ver/platform.ptw-attr-doc-tooltips (deleted)', pr)
+    assert not tick.window_matches_pr('ptw-369-other', '/home/user/ver/platform.other', pr)
+    slash = {'number': 398, 'branch': 'mn/avo-save-as', 'state': 'MERGED'}
+    assert tick.window_matches_pr('mn-avo-save-as', '/x', slash)
+    assert tick.window_matches_pr('mn-398-avo-save-as', '/x', slash)
+
+
+def test_windows_to_close_skips_claude_node_dirty_and_open():
+    merged = {396: {'number': 396, 'state': 'MERGED', 'branch': 'avo/outline-draft-saving'}}
+    open_pr = {357: {'number': 357, 'state': 'OPEN', 'branch': 'outline-join-lines'}}
+    numbered = {'id': '%107', 'window': 'avo-396-outline-draft-saving', 'command': 'bash',
+                'claude': False, 'path': '/home/user/ver/platform.avo-outline-draft-saving (deleted)',
+                'wt': None}
+    legacy = {'id': '%101', 'window': 'ptw-attr-doc-tooltips', 'command': 'bash', 'claude': False,
+              'path': '/home/user/ver/platform.ptw-attr-doc-tooltips',
+              'wt': {'branch': 'ptw-attr-doc-tooltips', 'dirty': False, 'ahead': 0}}
+    claude = dict(numbered, id='%99', window='avo-396-outline-draft-saving', command='claude', claude=True)
+    node = dict(numbered, id='%80', command='node', claude=False)
+    dirty = dict(legacy, id='%102', window='ptw-368-ptw-attr-doc-tooltips',
+                 wt={'branch': 'ptw-attr-doc-tooltips', 'dirty': True, 'ahead': 0})
+    open_legacy = {'id': '%76', 'window': 'outline-join-lines', 'command': 'bash', 'claude': False,
+                   'path': '/home/user/ver/platform.outline-join-lines',
+                   'wt': {'branch': 'outline-join-lines', 'dirty': False, 'ahead': 0}}
+    prs = {**merged, 368: {'number': 368, 'state': 'MERGED', 'branch': 'ptw-attr-doc-tooltips'}, **open_pr}
+    got = [(p['id'], pr['number']) for p, pr in tick.windows_to_close(
+        [numbered, legacy, claude, node, dirty, open_legacy], prs)]
+    # Codex on PR #26: %107 shares its window with a live claude and node pane: kill-window
+    # would close them too, so that window stays.
+    assert got == [('%101', 368)]
+    alone = dict(numbered, widx='7')
+    others = dict(numbered, id='%108', widx='8', window_others=1)
+    two = [dict(numbered, id='%109', widx='9'), dict(numbered, id='%110', widx='9')]
+    got = [p['id'] for p, _ in tick.windows_to_close([alone, others, *two, dict(claude, widx='10')], prs)]
+    assert got == ['%107', '%109']  # one kill per window; never a window with an untracked pane
+
+
+def test_closable_closes_merged_shells_and_notes_finished_claude(monkeypatch):
+    calls = []
+
+    def fake_sh(argv, check=False, timeout=300):
+        calls.append(list(argv))
+        class R:
+            returncode = 0
+            stderr = stdout = ''
+        return R()
+
+    monkeypatch.setattr(tick, 'sh', fake_sh)
+    merged = {'number': 396, 'state': 'MERGED', 'draft': False, 'branch': 'avo/outline-draft-saving',
+              'head': HEAD, 'title': 't', 'col': 'Done', 'item': 'item', 'rank': 1, 'parked': False}
+    shell = {'id': '%107', 'window': 'avo-396-outline-draft-saving', 'command': 'bash', 'claude': False,
+             'cls': 'shell', 'pr': 396, 'parked': False, 'path': '/home/user/ver/platform.avo-outline-draft-saving (deleted)',
+             'wt': None, 'screen': ''}
+    finished = pane('finished')
+    finished['pr'] = 396
+    t = make_tick({396: merged, 7: dict(PR, col='Human Review', draft=False)}, [shell, finished], pr())
+    t.dry = False
+    t.closable()
+    assert calls == [['tmux', 'kill-window', '-t', '%107']]
+    assert t.did == ['did: closed window avo-396-outline-draft-saving (%107) for merged PR #396']
+    assert any('Claude can be closed' in n[1] for n in t.notes)
+
+
+def test_closable_dry_run_does_not_kill():
+    merged = {'number': 396, 'state': 'MERGED', 'draft': False, 'branch': 'avo/outline-draft-saving',
+              'head': HEAD, 'title': 't', 'col': 'Done', 'item': 'item', 'rank': 1, 'parked': False}
+    shell = {'id': '%107', 'window': 'avo-396-outline-draft-saving', 'command': 'bash', 'claude': False,
+             'cls': 'shell', 'pr': 396, 'parked': False,
+             'path': '/home/user/ver/platform.avo-outline-draft-saving (deleted)', 'wt': None, 'screen': ''}
+    t = make_tick({396: merged}, [shell], pr())
+    t.closable()
+    assert t.did == ['would: close window avo-396-outline-draft-saving (%107) for merged PR #396']
+    assert t.notes == []
+
+
 def test_milestone_rank():
     assert tick.milestone_rank(['PTW 15 ', None]) == 0
     assert tick.milestone_rank([None, 'ptw 16']) == 1
@@ -98,6 +178,43 @@ def test_codex_open_thread_is_findings():
     body = "**Reviewed commit:** `aaaaaaaa`\nDidn't find any major issues"
     st, why = tick.codex_status(pr(threads=[t], comments=[{'author': CODEX, 'body': body, 'createdAt': 'x'}]))
     assert st == 'findings' and '1 open' in why
+
+
+def test_an_open_thread_from_an_older_head_is_not_a_finding_on_this_head():
+    """Codex on PR #26: a clean review of the fix must advance, not restart rework."""
+    old = {'isResolved': False, 'isOutdated': False,
+           'comments': {'nodes': [{'author': CODEX, 'originalCommit': {'oid': 'b' * 40}}]}}
+    body = "**Reviewed commit:** `aaaaaaaa`\nDidn't find any major issues"
+    assert tick.codex_status(pr(threads=[old], comments=[{'author': CODEX, 'body': body, 'createdAt': 'x'}]))[0] == 'clean'
+    assert tick.codex_status(pr(threads=[old]))[0] == 'pending'  # no result on the head yet
+    here = {'isResolved': False, 'isOutdated': False,
+            'comments': {'nodes': [{'author': CODEX, 'originalCommit': {'oid': 'a' * 40}}]}}
+    assert tick.codex_status(pr(threads=[old, here]))[0] == 'findings'
+
+
+def summary(head='a' * 40, any_findings=False, unresolved=False):
+    state = {'code_review': {'commit_sha': head, 'status': 'completed', 'has_any_findings': any_findings,
+                             'has_unresolved_findings': unresolved}}
+    return {'author': CODEX, 'createdAt': 'x',
+            'body': '<!-- codex-pull-request-review-summary -->\n**Codex Review** summary\n'
+                    f'<!-- codex-review-state:v1 {__import__("json").dumps(state)} -->'}
+
+
+def test_a_codex_review_summary_without_findings_is_clean():
+    """Michal 2026-11-15 12:53 AM ET: #518/#520/#521 went back to In Progress 9 s after the
+    handoff because a reader took this summary comment as findings."""
+    assert tick.codex_status(pr(comments=[summary()])) == ('clean', 'review-state clean on head')
+    assert tick.codex_status(pr(comments=[summary(head='b' * 40)]))[0] == 'pending'  # another head
+    assert tick.codex_status(pr(comments=[summary(any_findings=True)]))[0] == 'pending'
+
+
+def test_a_codex_review_of_the_head_with_no_open_inline_thread_is_clean():
+    review = {'author': CODEX, 'commit': {'oid': 'a' * 40}, 'comments': {'totalCount': 2}}
+    done = [{'isResolved': True, 'isOutdated': False, 'comments': {'nodes': [{'author': CODEX}]}},
+            {'isResolved': False, 'isOutdated': True, 'comments': {'nodes': [{'author': CODEX}]}}]
+    assert tick.codex_status(pr(reviews=[review], threads=done))[0] == 'clean'  # resolved or outdated
+    still = [{'isResolved': False, 'isOutdated': False, 'comments': {'nodes': [{'author': CODEX}]}}]
+    assert tick.codex_status(pr(reviews=[review], threads=still))[0] == 'findings'
 
 
 def test_codex_requested_only_after_head():
@@ -197,3 +314,57 @@ def test_parked_pr_is_left_alone():
     t = make_tick({7: dict(PR, parked=True)}, [pane('finished')], pr())
     t.panes_pass(FakeScratch())
     assert t.did == [] and t.notes == []
+
+
+def test_typed_prompt_reads_input_box():
+    s = screen(['● Done.'], prompt='merge origin/main into the branch')
+    assert tick.typed_prompt(s) == 'merge origin/main into the branch'
+    assert tick.typed_prompt(screen(['● Done.'], prompt='')) == ''
+
+
+def test_attach_prs_skips_pane_with_no_worktree():
+    prs = {7: dict(PR, draft=False)}
+    panes = [
+        {'id': '%1', 'window': 'code-7-b', 'wt': None, 'path': '/tmp/gone (deleted)'},
+        {'id': '%2', 'window': 'other', 'wt': {'branch': 'b'}, 'path': '/x'},
+    ]
+    tick.attach_prs(panes, prs)
+    assert panes[0]['pr'] == 7  # from the window name
+    assert panes[1]['pr'] == 7  # from the worktree branch
+
+
+def test_panes_pass_submits_typed_input():
+    p = pane('input', screen=screen(['● Ready.'], prompt='merge origin/main into ptw/draw-at-playhead'))
+    t = make_tick({7: dict(PR, draft=False)}, [p], pr())
+    t.panes_pass(FakeScratch())
+    assert t.notes == []
+    assert t.did == ["would: #7 submit typed prompt in %9: merge origin/main into ptw/draw-at-playhead"]
+
+
+def test_a_broken_screenshot_relay_names_the_url_rule():
+    rows = [('7a screenshots current', False, '1 of 1 image(s) do not render: x.png is not an absolute https URL')]
+    (line,) = tick.gate_reasons(rows)
+    assert 'absolute https image URLs' in line and 'never a relative file name' in line and 'x.png' in line
+
+
+def _marker(path, base, n):
+    from tangentswarm import tick as T
+    for i in range(n):
+        T.State(path).mark(f'k{base + i}')
+
+
+def test_state_writers_in_several_processes_keep_every_once_key(tmp_path):
+    """Codex on PR #26: concurrent Stop hooks erased each other's once-keys."""
+    import multiprocessing
+    path = tmp_path / 'state.json'
+    stale = tick.State(path)  # e.g. the tick, loaded before the hooks ran
+    ctx = multiprocessing.get_context('fork')
+    procs = [ctx.Process(target=_marker, args=(path, k * 100, 20)) for k in range(4)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(30)
+        assert p.exitcode == 0
+    stale.data['screens']['%1'] = {'key': 'x'}
+    stale.save()  # its stale copy must not erase the 80 keys
+    assert len(tick.State(path).data['done']) == 80 and tick.State(path).data['screens'] == {'%1': {'key': 'x'}}
