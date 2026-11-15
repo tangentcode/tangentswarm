@@ -13,11 +13,11 @@ def test_only_the_three_worker_tools_are_exposed():
     assert names == ['worker_status', 'handoff', 'request_review']
 
 
-def test_outside_a_worker_worktree_every_tool_refuses(tmp_path, monkeypatch):
+def test_outside_a_worker_worktree_every_tool_refuses_with_the_reason(tmp_path, monkeypatch):
     monkeypatch.setenv('SWARM_WORKER_CWD', str(tmp_path))
-    for name in ('worker_status', 'handoff', 'request_review'):
-        with pytest.raises(Exception, match='not a worker worktree'):
-            anyio.run(W.build_server().call_tool, name, {})
+    for op in ('status', 'handoff', 'request_review'):
+        r = W.via_daemon(op)
+        assert r['ok'] is False and 'not a worker worktree' in r['error']
 
 
 def test_status_reports_the_pr_card_codex_and_ci(wt):  # noqa: F811

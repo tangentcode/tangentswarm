@@ -52,6 +52,7 @@ from . import board, gatechecks, gatelock
 HOME = Path.home()
 BIN = Path(os.environ.get('SWARM_TICK_BIN', str(HOME / 'bin')))
 POLL = int(os.environ.get('SWARM_PROMOTE_POLL', '30'))
+STOP_LOG = Path.home() / '.local' / 'state' / 'swarm-flow' / 'stop-hook.log'
 RETRY = int(os.environ.get('SWARM_PROMOTE_RETRY', '5'))
 # The idle check reads the shared board snapshot when it is younger than this (a GraphQL
 # budget: a full read every 30 s used more than the hourly quota). SIGUSR1 (a webhook event)
@@ -285,6 +286,18 @@ class Promoter:
             return f"pulls in flight ({names}): first .deploy-sha check"
         new = ', '.join(f"{k} {sha[:8] if sha else '-'}" for k, sha in key if (k, sha) not in prev)
         return f"a staging .deploy-sha changed ({new}) with pulls in flight ({names})"
+
+    def each_second(self):
+        """Cheap work between polls: serve the worker spool (tangentswarm.spool: the Stop
+        hook and swarm-worker-mcp requests from inside swarm-workers.slice)."""
+        if self.dry:
+            return
+        from . import spool
+        try:
+            for rid in spool.dispatch(log=str(STOP_LOG)):
+                say(f"spool: serving {rid}")
+        except Exception as e:
+            say(f"spool: {type(e).__name__}: {e}")
 
     def queue_cascade(self, why, now=None):
         from . import advance
@@ -526,6 +539,7 @@ def run(p, poll=POLL, retry=RETRY, sleep=time.sleep):
             what = 'idle' if limited else 'busy'
         pause = limited or (retry if what == 'busy' else poll)
         for _ in range(pause):
+            p.each_second()
             if wake['now'] and not limited:
                 wake['now'] = False
                 from . import boardcache

@@ -5,9 +5,10 @@ When a swarm Claude finishes and has pushed, nothing advanced its pull request u
 minutes Codex-clean in In Progress, #513 123 minutes and #514 71 minutes not marked ready.
 Now the Stop hook does the handoff at once; swarm-tick stays as the slow backstop.
 
-    swarm-stop-hook                 the hook (stdin: the Stop event JSON). It returns at once
-                                    and runs `swarm-stop-hook run CWD` in the background, so
-                                    the Claude never waits on GitHub.
+    swarm-stop-hook                 the hook (stdin: the Stop event JSON). It returns at once:
+                                    it only writes a request into the spool (tangentswarm.spool).
+                                    The swarm-promoted daemon, outside swarm-workers.slice
+                                    (where sudo and so the gh shim fail), runs the handoff.
     swarm-stop-hook run CWD [--dry-run]
                                     the handoff for the worktree CWD (also by hand)
     swarm-stop-hook install WORKTREE... | --all
@@ -323,10 +324,12 @@ def worktrees():
 
 # -- the hook ----------------------------------------------------------------------------
 
-def hook(stdin=sys.stdin, spawn=subprocess.Popen):
-    """The Stop hook: start the handoff in the background and return at once (exit 0, no
-    output: a Stop hook must never block the Claude)."""
-    from . import slots
+def hook(stdin=sys.stdin, submit=None):
+    """The Stop hook: queue the handoff in the spool and return at once (exit 0, no output: a
+    Stop hook must never block the Claude). It runs inside swarm-workers.slice, where sudo
+    (and so every gh read through the minbot shim) fails: the swarm-promoted daemon runs
+    the handoff outside the slice (tangentswarm.spool)."""
+    from . import slots, spool
     try:
         event = json.loads(stdin.read() or '{}')
     except ValueError:
@@ -335,13 +338,9 @@ def hook(stdin=sys.stdin, spawn=subprocess.Popen):
     if not slots.is_platform_worktree(Path(cwd)):
         return 0
     try:
-        LOG.parent.mkdir(parents=True, exist_ok=True)
-        with open(LOG, 'a') as log:
-            spawn([hook_command(), 'run', cwd] + (['--transcript', event['transcript_path']]
-                                                  if event.get('transcript_path') else []),
-                  stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
-    except OSError:
-        pass
+        (submit or spool.submit)('stophook', cwd, transcript=event.get('transcript_path'))
+    except (OSError, ValueError) as e:
+        say(f"{Path(cwd).name}: stop hook not queued: {e}")
     return 0
 
 
@@ -355,10 +354,15 @@ def main(argv=None):
     r.add_argument('cwd')
     r.add_argument('--dry-run', action='store_true')
     r.add_argument('--transcript', help='the Claude transcript (JSONL): a final question moves the card to Needs Input')
+    sv = sub.add_parser('serve', help='(the daemon) run one claimed spool request')
+    sv.add_argument('file')
     i = sub.add_parser('install')
     i.add_argument('worktrees', nargs='*')
     i.add_argument('--all', action='store_true')
     a = ap.parse_args(argv)
+    if a.cmd == 'serve':
+        from . import spool
+        return spool.serve(a.file)
     if a.cmd == 'run':
         try:
             line = run(a.cwd, dry=a.dry_run, out=print, transcript=a.transcript)

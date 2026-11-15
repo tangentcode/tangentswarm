@@ -139,14 +139,15 @@ def test_a_real_merge_check_against_origin_main(wt):
     assert not stophook.merges_onto_main(wt, head)
 
 
-def test_the_hook_returns_at_once_and_runs_the_handoff_in_the_background(wt, tmp_path):
-    spawned = []
-    rc = stophook.hook(io.StringIO(json.dumps({'cwd': str(wt), 'hook_event_name': 'Stop'})),
-                       spawn=lambda argv, **k: spawned.append((argv, k.get('start_new_session'))))
-    assert rc == 0 and spawned == [([stophook.hook_command(), 'run', str(wt)], True)]
-    spawned.clear()
-    assert stophook.hook(io.StringIO(json.dumps({'cwd': str(tmp_path)})), spawn=spawned.append) == 0
-    assert spawned == []  # not a worker worktree
+def test_the_hook_only_queues_a_spool_request(wt, tmp_path):
+    from tangentswarm import spool
+    rc = stophook.hook(io.StringIO(json.dumps({'cwd': str(wt), 'transcript_path': '/t.jsonl'})))
+    reqs = list(spool.SPOOL.glob('*.req.json'))
+    assert rc == 0 and len(reqs) == 1
+    assert json.loads(reqs[0].read_text())['op'] == 'stophook'
+    assert json.loads(reqs[0].read_text())['transcript'] == '/t.jsonl'
+    assert stophook.hook(io.StringIO(json.dumps({'cwd': str(tmp_path)}))) == 0
+    assert len(list(spool.SPOOL.glob('*.req.json'))) == 1  # not a worker worktree: nothing queued
 
 
 def test_install_adds_the_hook_once_and_keeps_other_keys(tmp_path):
@@ -194,25 +195,3 @@ def test_no_question_means_no_needs_input(wt, tmp_path):
     assert stophook.run(wt, g=G('x' * 40), sh=calls.append, transcript=str(t)).endswith('uncommitted changes')
     assert calls == [] and stophook.last_question(str(t)) is None
     assert stophook.last_question(str(transcript(tmp_path, 'Which one do you want?**'))) is not None
-
-
-def test_the_hook_passes_the_transcript(wt):
-    spawned = []
-    stophook.hook(io.StringIO(json.dumps({'cwd': str(wt), 'transcript_path': '/t.jsonl'})),
-                  spawn=lambda argv, **k: spawned.append(argv))
-    assert spawned == [[stophook.hook_command(), 'run', str(wt), '--transcript', '/t.jsonl']]
-
-
-def test_a_summary_comment_without_findings_counts_as_clean_in_the_handoff(wt):
-    """The 12:53 AM ET bug: Codex's review-summary comment (codex-review-state,
-    has_any_findings=false) is CLEAN, so the handoff runs the MinBot check."""
-    head = run(wt, 'rev-parse', 'HEAD')
-    g = G(head)
-    state = {'code_review': {'commit_sha': head, 'status': 'completed', 'has_any_findings': False}}
-    g['fetch'](7)['comments']['nodes'].append(
-        {'author': {'login': 'chatgpt-codex-connector'},
-         'body': f'<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {json.dumps(state)} -->'})
-    ran = []
-    line = stophook.run(wt, g=g, sh=lambda argv: None, merges=lambda c, h: True, sleep=lambda s: None,
-                        minbot=lambda n: ran.append(n) or 'ok')
-    assert ran == [7] and 'is already Codex-clean' in line

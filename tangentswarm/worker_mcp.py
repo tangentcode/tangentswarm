@@ -7,7 +7,9 @@ arbitrary command. (swarm-mcp, the operator's server on the host, drives tmux an
 into agents; a worker must not get that power.)
 
 Transport: stdio, one process per Claude, started by Claude Code from its MCP config, so
-there is no port and no key. The worktree is the git top level of the server's working
+there is no port and no key. The tools run their GitHub calls through the spool
+(tangentswarm.spool): inside swarm-workers.slice sudo, and so the minbot gh shim, fails, so
+the swarm-promoted daemon runs them outside the slice and writes the answer back. The worktree is the git top level of the server's working
 directory (Claude Code starts it in the project directory), or $SWARM_WORKER_CWD.
 
 Tools:
@@ -134,23 +136,40 @@ def do_request_review(wt=None, sh=None):
     return {'posted': True, 'pr': n, 'head': head}
 
 
+def via_daemon(op):
+    """Run op for this worktree through the spool: the GitHub calls need sudo (the minbot gh
+    shim), which fails inside swarm-workers.slice, so the swarm-promoted daemon runs them.
+    Never raises: an error comes back as {'ok': False, 'error': '<the real text>'}."""
+    from . import spool
+    try:
+        wt = worktree()
+    except ToolError as e:
+        return {'ok': False, 'error': str(e)}
+    try:
+        return spool.submit(op, wt, wait=spool.WAIT)
+    except Exception as e:
+        return {'ok': False, 'error': f'{type(e).__name__}: {e}'}
+
+
 async def worker_status() -> dict:
     """Your worktree, branch and head (pushed or not), your open PR, its card column, draft
-    state, the Codex state on the head and the CI checks (failed, pending, passed)."""
-    return await anyio.to_thread.run_sync(status)
+    state, the Codex state on the head and the CI checks (failed, pending, passed). On a
+    problem: {'ok': false, 'error': '...'} with the real error text."""
+    return await anyio.to_thread.run_sync(via_daemon, 'status')
 
 
 async def handoff() -> dict:
     """Call this when your work is committed and pushed: mark the PR ready, ask Codex for a
     review (once per head) and move the card to Auto Review. A head that is already
     Codex-clean gets the MinBot check instead. Nothing happens for a dirty or unpushed
-    worktree."""
-    return await anyio.to_thread.run_sync(do_handoff)
+    worktree. On a problem: {'ok': false, 'error': '...'}."""
+    return await anyio.to_thread.run_sync(via_daemon, 'handoff')
 
 
 async def request_review() -> dict:
-    """Post "@codex review" on your PR for the pushed head (once per head)."""
-    return await anyio.to_thread.run_sync(do_request_review)
+    """Post "@codex review" on your PR for the pushed head (once per head). On a problem:
+    {'ok': false, 'error': '...'}."""
+    return await anyio.to_thread.run_sync(via_daemon, 'request_review')
 
 
 TOOLS = [worker_status, handoff, request_review]
