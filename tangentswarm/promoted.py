@@ -57,6 +57,9 @@ RETRY = int(os.environ.get('SWARM_PROMOTE_RETRY', '5'))
 # budget: a full read every 30 s used more than the hourly quota). SIGUSR1 (a webhook event)
 # makes the next check read the board now.
 IDLE_AGE = int(os.environ.get('SWARM_PROMOTE_IDLE_AGE', '120'))
+# An empty Human Review queues the cascade at once when it drops to 0, then again after this
+# many seconds while it stays empty (the cascade escalates: NEEDS_REWORK, STALLED).
+CASCADE_EMPTY_HR = int(os.environ.get('SWARM_CASCADE_EMPTY_HR', '900'))
 PULL = os.environ.get('SWARM_PROMOTE_PULL') == '1'  # also run the Staging pull
 REPO = 'tangentcode/platform'
 BACKSTOP = int(os.environ.get('SWARM_PROMOTE_BACKSTOP', '900'))  # retry a leftover head at most this often
@@ -235,6 +238,8 @@ class Promoter:
         self.left = []    # [(n, head, why)] Staging PRs the last fast path did not move
         self.tried = {}   # {(n, head): time} the slow path last ran for this leftover head
         self.last_main = None  # main SHA the last main-merge recheck ran for
+        self.last_hr = None    # Human Review count at the last check
+        self.cascade_at = 0.0  # when this daemon last queued a cascade for an empty Human Review
 
     def main_sha(self):
         """origin main's SHA via git ls-remote (no API quota), or None on an error."""
@@ -244,6 +249,30 @@ class Promoter:
             return sha if len(sha) == 40 else None
         except Exception:
             return None
+
+    def cascade_due(self, cols, main_moved, now=None):
+        """Why to queue `swarm-advance --cascade` now, or None (Michal 2026-11-14 9:10 PM ET):
+        Human Review dropped to 0 (at once), it stays at 0 (again after CASCADE_EMPTY_HR s), or
+        main moved (the cascade checks each Ready PR against the new main)."""
+        now = time.time() if now is None else now
+        hr = len(cols.get(board.HUMAN_REVIEW, []))
+        prev, self.last_hr = self.last_hr, hr
+        if hr == 0 and prev is not None and prev > 0:
+            return f"Human Review dropped to 0 (was {prev})"
+        if hr == 0 and now - self.cascade_at >= CASCADE_EMPTY_HR:
+            return "Human Review is empty"
+        if main_moved and self.last_main is not None:
+            return "main moved"
+        return None
+
+    def queue_cascade(self, why, now=None):
+        from . import advance
+        self.cascade_at = time.time() if now is None else now
+        if self.dry:
+            say(f"{why}: would queue swarm-advance --cascade")
+            return
+        advance.flag_rerun(by=f"swarm-promoted: {why}")
+        say(f"{why}: cascade {advance.queue_cascade()}")
 
     def drain(self):
         """Run the queued gate requests (tangentswarm.gatelock queue) under our lock."""
@@ -398,6 +427,10 @@ class Promoter:
         waiting = gatelock.queued()
         if not retry:
             cols = read_columns(self.g['gql'], max_age=IDLE_AGE)
+            why = self.cascade_due(cols, main_moved)
+            if why:
+                self.queue_cascade(why)
+                waiting = gatelock.queued()
             from . import flow
             pull_due = needs_pull(cols, flow.load_pull())
             if not needs_promotion(cols) and not main_moved and not waiting and not pull_due:

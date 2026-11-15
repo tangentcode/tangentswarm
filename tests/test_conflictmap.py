@@ -50,3 +50,34 @@ def test_flow_uses_the_map_for_its_merge_tree_checks(monkeypatch):
     class S:
         dir = '/x'
     assert f.clean(S, A, B) and f.clean(S, B, A) and seen == [(A, B)]
+
+
+def test_conflict_files_lists_the_paths_and_the_map_keeps_them(tmp_path):
+    import subprocess
+    from types import SimpleNamespace
+    from tangentswarm import conflictmap, flow
+    r = tmp_path / 'r'
+
+    def g(*a):
+        return subprocess.run(['git', '-C', str(r), '-c', 'user.name=t', '-c', 'user.email=t@e', *a],
+                              check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(['git', 'init', '-q', '-b', 'main', str(r)], check=True)
+    (r / 'ui-file-list.mts').write_text('a\n')
+    (r / 'other.ts').write_text('o\n')
+    g('add', '.'); g('commit', '-qm', 'base')
+    g('checkout', '-qb', 'pr')
+    (r / 'ui-file-list.mts').write_text('pr\n')
+    g('commit', '-qam', 'pr')
+    pr = g('rev-parse', 'HEAD')
+    g('checkout', '-q', 'main')
+    (r / 'ui-file-list.mts').write_text('main\n')
+    (r / 'other.ts').write_text('main\n')
+    g('commit', '-qam', 'main')
+    main = g('rev-parse', 'HEAD')
+    scratch = SimpleNamespace(dir=str(r / '.git'))
+    assert flow.conflict_files(scratch, main, pr) == ['ui-file-list.mts']
+    assert flow.conflict_files(scratch, main, main) == []
+    m = conflictmap.ConflictMap(path=tmp_path / 'map.json')
+    calls = []
+    get = lambda: calls.append(1) or flow.conflict_files(scratch, main, pr)  # noqa: E731
+    assert m.files(main, pr, get) == m.files(pr, main, get) == ['ui-file-list.mts'] and len(calls) == 1

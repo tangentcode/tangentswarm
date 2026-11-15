@@ -5,6 +5,8 @@ import pytest
 
 from tangentswarm import advance as A, gqlmeter as M, promoted as P
 
+REAL_SCHEDULE = A.schedule  # conftest stubs A.schedule for every other test
+
 
 @pytest.fixture(autouse=True)
 def fresh_tally(monkeypatch):
@@ -81,12 +83,12 @@ def test_schedule_starts_one_timer_and_keeps_a_waiting_one():
         calls.append(argv)
         rc = 1 if argv[:2] == ['systemctl', '--user'] else 0
         return subprocess.CompletedProcess(argv, rc, '', '')
-    assert A.schedule(1000.0, run=run, now=lambda: 400.0) == \
+    assert REAL_SCHEDULE(1000.0, run=run, now=lambda: 400.0) == \
         f"one rerun scheduled in 660s ({A.RERUN_UNIT}.timer)"
     assert calls[1][:5] == ['systemd-run', '--user', '--collect', f'--unit={A.RERUN_UNIT}', '--on-active=660s']
     assert calls[1][-2:] == ['--cascade', '--if-flagged']
     active = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, '', '')  # noqa: E731
-    assert A.schedule(1000.0, run=active, now=lambda: 400.0).startswith('a rerun is already scheduled')
+    assert REAL_SCHEDULE(1000.0, run=active, now=lambda: 400.0).startswith('a rerun is already scheduled')
 
 
 def test_the_daemon_sleeps_until_the_reset_after_a_rate_limit():

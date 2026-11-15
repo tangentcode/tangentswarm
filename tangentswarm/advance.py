@@ -367,6 +367,7 @@ class Cascade(Advance):
     def fill(self):
         from . import flow
         prs, cols = self.columns()
+        cols = self.main_check(cols)
         if self.dry and self.moved:  # the promote step only said "would move"
             up = [p for p in cols.get(board.STAGING, []) if p['number'] in self.moved]
             cols[board.STAGING] = [p for p in cols.get(board.STAGING, []) if p not in up]
@@ -410,6 +411,7 @@ class Cascade(Advance):
                 if p is None:
                     self.out(f"fill: Staging {len(st)}: no {'extra ' if st else ''}Ready PR to pull without rework")
                     return cols
+                getattr(self, 'pulled', []).append(p['number'])
                 ft = ' (fast-track)' if p.get('rank') == board.FAST_TRACK else ''
                 self.out(f"fill: #{p['number']} is the {'extra' if st else 'first'} Staging pull{ft}")
                 if self.dry:  # nothing was pushed: show the rest of the chain, then count it in Staging
@@ -432,6 +434,100 @@ class Cascade(Advance):
                     return cols
                 prs, cols = self.columns()
         return cols
+
+    # -- rework: Ready PRs that cannot be pulled (Michal 2026-11-14 9:10 PM ET deadlock) ------
+    def main_check(self, cols):
+        """(1) Each Ready PR against origin/main with git merge-tree (local, kept per SHA pair:
+        no GraphQL). A conflict: card to In Progress and a rework relay that lists the files.
+        Returns cols without those PRs in Ready."""
+        ready = [p for p in cols.get(board.READY, []) if not p.get('draft')]
+        if not ready:
+            return cols
+        bad = []
+        with self.g['ScratchRepo']() as scratch:
+            scratch.ensure_main()
+            main = self.f.sha_of(scratch, scratch.main)
+            scratch.ensure(*[p['head'] for p in ready])
+            for p in ready:
+                if self.f.clean(scratch, main, p['head']):
+                    continue
+                self.rework(p, [('origin/main', self.f.files(scratch, main, p['head']))])
+                bad.append(p['number'])
+        self.f.cmap.save()
+        if bad:
+            self.out(f"main check: {', '.join('#' + str(n) for n in bad)} conflict with origin/main: sent to rework")
+        return dict(cols, **{board.READY: [p for p in cols.get(board.READY, []) if p['number'] not in bad]})
+
+    def unblock(self, cols, pulled):
+        """(2) Human Review or Staging is empty and no Ready PR could be pulled: never end
+        quietly. The Ready PR with the fewest conflicts (against origin/main, work and each
+        Human Review and Staging head) gets a rework relay and a NEEDS_REWORK line."""
+        from . import flow
+        hr, st = cols.get(board.HUMAN_REVIEW, []), cols.get(board.STAGING, [])
+        ready = [p for p in cols.get(board.READY, []) if not p.get('draft')]
+        if pulled or flow.load_pull() or (hr and st) or len(st) >= FLOOR:  # at the floor: no pull was wanted
+            return
+        if not ready:
+            self.out(f"STALLED: Human Review {len(hr)}, Staging {len(st)}, Ready empty: new work must reach Ready")
+            return
+        with self.g['ScratchRepo']() as scratch:
+            scratch.ensure_main()
+            main = self.f.sha_of(scratch, scratch.main)
+            bases = [('origin/main', main), (flow.WORK, self.f.fetch_work(scratch))]
+            bases += [(f"#{q['number']}", q['head']) for q in hr + st]
+            scratch.ensure(*[sha for _, sha in bases], *[p['head'] for p in ready])
+            found = []
+            for p in ready:
+                conf = [(name, self.f.files(scratch, sha, p['head'])) for name, sha in bases
+                        if not self.f.clean(scratch, sha, p['head'])]
+                found.append((len(conf), p, conf))
+        self.f.cmap.save()
+        order = {q['number']: i for i, q in enumerate(flow.ready_order(ready, {c[1]['number']: c[0] for c in found}))}
+        n_conf, p, conf = min(found, key=lambda t: (t[0], order[t[1]['number']]))
+        self.out(f"STALLED: Human Review {len(hr)}, Staging {len(st)}, no Ready PR can be pulled; "
+                 f"best candidate #{p['number']} ({n_conf} conflict(s))")
+        if conf:
+            self.rework(p, conf)
+        else:
+            self.out(f"NEEDS_REWORK #{p['number']} (no merge conflict: it fails the stack check; see the notes above)")
+
+    def rework(self, p, conflicts):
+        """Card to In Progress, NEEDS_REWORK line, and the relay: swarm-revive in a rework slot,
+        else a swarm-resume relay line. One relay per head."""
+        from . import slots
+        n, head = p['number'], p.get('head') or ''
+        files = sorted({f for _, fs in conflicts for f in fs})
+        self.out(f"NEEDS_REWORK #{n} {' '.join(files) or '(files unknown)'}")
+        where = '; '.join(f"{name}: {', '.join(fs) or 'files unknown'}" for name, fs in conflicts)
+        others = [name for name, _ in conflicts if name != 'origin/main']
+        msg = (f"Coordinator: #{n} cannot enter Staging: it conflicts with {where}. Merge origin/main into "
+               f"your branch (git fetch origin; git merge origin/main). Do not rebase and do not force-push. "
+               + (f"Then make sure it also merges cleanly with {', '.join(others)} (resolve the same files). "
+                  if others else '')
+               + "Resolve the conflicts, run the tests, push, and report the new head and the test counts.")
+        st = slots.load()
+        if st['relayed'].get(str(n)) == head and head:
+            self.out(f"rework: #{n} already has a relay for {head[:8]}: not sent again")
+            return
+        if self.dry:
+            self.out(f"would move #{n} Ready -> In Progress and send: {msg[:160]}")
+            return
+        self.f.fail(p, f"conflicts with {where}"[:200], relay='merge-main')
+        relay = Path(f"/tmp/relay-{n}-merge-main.md")
+        try:
+            relay.write_text(msg + '\n')
+        except OSError as e:
+            self.out(f"relay file not written: {e}")
+        try:
+            rc = slots.revive(n, msg, out=lambda line: self.out('revive: ' + line))
+        except Exception as e:  # the relay line below still goes out
+            self.out(f"revive: {type(e).__name__}: {str(e)[:160]}")
+            rc = 1
+        if rc:
+            self.out(f"RELAY: swarm-resume {n} {relay}")
+        st = slots.load()
+        st['relayed'][str(n)] = head
+        slots.save(st)
 
     def columns(self):
         """Flow.columns, and keep the PRs for the park and signal steps."""
@@ -490,7 +586,9 @@ class Cascade(Advance):
         if not self.promote(read_columns(self.g['gql'], max_age=0)):  # the one board read of this pass
             self.out('promote: ' + self.why[-1])
         self.out("fill: reading the board")
+        self.pulled = []
         cols = self.fill()
+        self.unblock(cols, self.pulled)
         self.park(cols)
         self.signal(cols)
         self.out(f"cascade: done in {int(self.clock() - t0)}s")

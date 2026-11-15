@@ -173,6 +173,15 @@ def merge_commit(scratch, a, b, msg, why=None):
     return git(scratch, 'commit-tree', tree, '-p', a, '-p', b, '-m', msg).stdout.strip()
 
 
+def conflict_files(scratch, a, b):
+    """The paths that conflict when b merges into a (git merge-tree --name-only; local)."""
+    r = git(scratch, 'merge-tree', '--write-tree', '--name-only', '--no-messages', a, b, check=False)
+    if r.returncode == 0:
+        return []
+    lines = [l.strip() for l in (r.stdout or '').splitlines()[1:] if l.strip()]
+    return sorted(set(lines))
+
+
 def stack_conflict(scratch, main, bases, head):
     """None if head stacks cleanly on main + bases (in order); else the base it conflicts with."""
     cur = main
@@ -244,6 +253,10 @@ class Flow:
     def clean(self, scratch, a, b):
         """git merge-tree a b is clean? Kept per SHA pair in the conflict map."""
         return self.cmap.clean(a, b, lambda: self.g['merge_tree_clean'](scratch.dir, a, b))
+
+    def files(self, scratch, a, b):
+        """The conflicting paths of a and b. Kept per SHA pair in the conflict map."""
+        return self.cmap.files(a, b, lambda: conflict_files(scratch, a, b))
 
     @staticmethod
     def sha_of(scratch, ref):

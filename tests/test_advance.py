@@ -1,5 +1,6 @@
 """swarm-advance: one step from the end of the line (promote, else pull, else MinBot pass)."""
 import pytest
+from pathlib import Path
 
 from tangentswarm import advance as A
 from tangentswarm import board, flow, promoted
@@ -60,8 +61,16 @@ class Gate(dict):
 
 
 class Scratch:
+    main = 'M' * 40
+
     def __enter__(self):
         return self
+
+    def ensure_main(self):
+        pass
+
+    def ensure(self, *revs):
+        pass
 
     def __exit__(self, *a):
         return False
@@ -249,10 +258,26 @@ class CascadeGate(dict):
                     served_all=lambda: [(k, f'{k}.example', sha, None) for k, sha in self.served.items()])
 
 
+def merge_fakes(monkeypatch, dirty=(), main_dirty=()):
+    """Flow merge-tree checks without git: a Ready head n conflicts with origin/main when n is in
+    main_dirty, and with every other base when n is in dirty."""
+    from tangentswarm import flow as F
+    monkeypatch.setattr(F.Flow, 'sha_of', staticmethod(lambda scratch, ref: ref))
+    monkeypatch.setattr(F.Flow, 'fetch_work', lambda self, scratch: 'W' * 40)
+
+    def clean(self, scratch, a, b):
+        n = int(b)
+        return n not in main_dirty if a == Scratch.main else n not in dirty
+    monkeypatch.setattr(F.Flow, 'clean', clean)
+    monkeypatch.setattr(F.Flow, 'files', lambda self, scratch, a, b: [f'f{int(b)}.ts'])
+
+
 def cascade(monkeypatch, tmp_path, cols, g, dry=True, **kw):
-    """kw dirty: Ready PRs that Flow.pull strict skips (they do not merge cleanly)."""
+    """kw dirty: Ready PRs that Flow.pull strict skips (they do not merge cleanly); main_dirty:
+    Ready PRs that conflict with origin/main (the main check sends them to rework)."""
     from tangentswarm import flow as F
     monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
+    merge_fakes(monkeypatch, kw.get('dirty', ()), kw.get('main_dirty', ()))
     pulled = []
 
     def pull(self, prs, c, scratch, limit=None, strict=False):
@@ -269,7 +294,10 @@ def cascade(monkeypatch, tmp_path, cols, g, dry=True, **kw):
     monkeypatch.setattr(F.Flow, 'columns', lambda self: ({}, {k: list(v) for k, v in cols.items()}))
     out = []
     c = A.Cascade(g=g, dry_run=dry, out=out.append, sleep=lambda s: None)
-    c.signal(c.fill())
+    c.pulled = []
+    cols_after = c.fill()
+    c.unblock(cols_after, c.pulled)
+    c.signal(cols_after)
     return out, pulled
 
 
@@ -287,8 +315,12 @@ def test_empty_staging_gets_one_pull_then_only_clean_extras(monkeypatch, tmp_pat
 def test_staging_empty_and_nothing_clean_pulls_nothing(monkeypatch, tmp_path):
     cols = {board.READY: [pr(n, board.READY) for n in range(6, 12)]}
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(), dirty=set(range(6, 12)))
-    assert pulled == [] and out == ['fill: Staging 0: no Ready PR to pull without rework',
-                                    'signal: no Active issue without a PR (new=0/3 rework=0/3 ready=6/6 active_without_pr=0): no START_CLAUDE']
+    assert pulled == [] and out[:3] == [
+        'fill: Staging 0: no Ready PR to pull without rework',
+        'STALLED: Human Review 0, Staging 0, no Ready PR can be pulled; best candidate #6 (1 conflict(s))',
+        'NEEDS_REWORK #6 f6.ts']
+    assert out[3].startswith('would move #6 Ready -> In Progress and send: Coordinator: #6 cannot enter Staging: '
+                             'it conflicts with work: f6.ts. Merge origin/main into your branch')
 
 
 def test_staging_at_the_floor_pulls_nothing(monkeypatch, tmp_path):
@@ -332,11 +364,47 @@ def test_the_pull_order_puts_the_fast_track_pr_first():
     assert [p['number'] for p in flow.ready_order(ready, {9: 3})] == [9, 7, 5]
 
 
+def test_a_ready_pr_that_conflicts_with_main_goes_to_rework_with_its_files(monkeypatch, tmp_path):
+    """(1) Michal 9:10 PM ET: #481 and #484 conflicted with origin/main and the cascade ended quietly."""
+    cols = {board.READY: [pr(481, board.READY), pr(484, board.READY), pr(486, board.READY)]}
+    out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False), main_dirty={481, 484})
+    assert pulled == [486]
+    assert 'NEEDS_REWORK #481 f481.ts' in out and 'NEEDS_REWORK #484 f484.ts' in out
+    assert any(l.startswith('would move #481 Ready -> In Progress and send: Coordinator: #481 cannot enter '
+                            'Staging: it conflicts with origin/main: f481.ts. Merge origin/main') for l in out)
+    assert 'main check: #481, #484 conflict with origin/main: sent to rework' in out
+
+
+def test_a_live_rework_moves_the_card_revives_the_claude_and_sends_one_relay_per_head(monkeypatch, tmp_path):
+    from tangentswarm import flow as F, slots
+    monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
+    monkeypatch.setattr(F, 'log', lambda line: None)
+    merge_fakes(monkeypatch, main_dirty={481})
+    moved, revived = [], []
+    g = CascadeGate()
+    g['move'] = lambda item, col: moved.append((item, col))
+    monkeypatch.setattr(slots, 'revive', lambda n, msg, out=print: revived.append((n, msg)) or 3)  # slots full
+    monkeypatch.setattr(A, 'Path', lambda p: tmp_path / Path(p).name)
+    out = []
+    c = A.Cascade(g=g, dry_run=False, out=out.append, sleep=lambda s: None)
+    cols = {board.READY: [pr(481, board.READY)]}
+    assert c.main_check(cols)[board.READY] == []
+    assert moved == [('I481', board.IN_PROGRESS)]
+    assert revived[0][0] == 481 and 'conflicts with origin/main: f481.ts' in revived[0][1]
+    assert 'do not rebase' in revived[0][1].lower() and '\n' not in revived[0][1]
+    assert f'RELAY: swarm-resume 481 {tmp_path}/relay-481-merge-main.md' in out
+    assert (tmp_path / 'relay-481-merge-main.md').read_text() == revived[0][1] + '\n'
+    c.main_check(cols)  # same head: no second relay, no second move
+    assert len(revived) == 1 and len(moved) == 1
+    assert 'rework: #481 already has a relay for 00000000: not sent again' in out
+
+
 def test_empty_ready_stops_the_fill_and_starts_coders_on_active_issues(monkeypatch, tmp_path):
     cols = {board.STAGING: [pr(1, board.STAGING)]}
     g = CascadeGate(issues=[(n, board.ACTIVE) for n in (40, 41, 42, 43, 44)])
     out, pulled = cascade(monkeypatch, tmp_path, cols, g)
     assert pulled == [] and out == ['fill: Staging 1, Ready 0: Ready is empty',
+                                    'STALLED: Human Review 0, Staging 1, Ready empty: new work must reach Ready',
                                     'START_CLAUDE n=4 issues=#40,#41,#42,#43 new=0/4 rework=0/3 ready=0/6 '
                                     'active_without_pr=5']
 
@@ -381,6 +449,7 @@ def live(monkeypatch, tmp_path, g, polls, advance=None, ready=(9,)):
         c[board.STAGING].append(pr(d['pr'], board.STAGING))
     c = {board.STAGING: [pr(1, board.STAGING)], board.READY: [pr(n, board.READY) for n in ready]}
     monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
+    merge_fakes(monkeypatch)
     monkeypatch.setattr(A, 'CORNERBOT_FILE', tmp_path / 'cornerbot')
     monkeypatch.setattr(F.Flow, 'pull', start)
     monkeypatch.setattr(F.Flow, 'advance', advance or adv)

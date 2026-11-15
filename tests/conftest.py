@@ -26,6 +26,14 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(boardcache, 'DETAILS', tmp_path / 'pr-details.json')
     from tangentswarm import gqlmeter
     monkeypatch.setattr(gqlmeter, 'LOG', tmp_path / 'gql.log')
+    from tangentswarm import advance, gatelock
+    monkeypatch.setattr(advance, 'RERUN', tmp_path / 'swarm-serial.rerun')
+    monkeypatch.setattr(advance, 'CASCADE_LOG', tmp_path / 'cascade.log')
+    monkeypatch.setattr(advance, 'CORNERBOT_FILE', tmp_path / 'cornerbot-request')
+    monkeypatch.setattr(advance, 'schedule', lambda reset, **kw: 'not scheduled (test)')
+    # a queued cascade would be run by a daemon test's drain as a REAL ~/bin/swarm-advance
+    monkeypatch.setattr(advance, 'queue_cascade', lambda qdir=None: 'not queued (test)')
+    monkeypatch.setattr(gatelock, 'QUEUE_DIR', tmp_path / 'gate-queue')
     from tangentswarm import slots
     monkeypatch.setattr(slots, 'STATE', tmp_path / 'slots.json')
     monkeypatch.setattr(slots, 'SESSIONS', tmp_path / 'claude-sessions')

@@ -357,3 +357,18 @@ def test_fast_path_needs_every_staging_site_to_serve_the_head(tmp_path, clean):
     p = P.Promoter(g=g)
     assert p.fast_path(COLS) == [] and g.moves == []
     assert 'ptw.example.test' in p.left[0][2] and '1 of 3 staging sites' in p.left[0][2]
+
+
+def test_an_empty_human_review_queues_the_cascade_at_once_then_after_a_backoff(tmp_path):
+    """Michal 9:10 PM ET: Human Review 0 must run the cascade (it escalates if it cannot fill)."""
+    from tangentswarm import advance
+    p = P.Promoter(g={}, dry_run=False)
+    hr1 = {board.HUMAN_REVIEW: [{'number': 1}]}
+    assert p.cascade_due(hr1, False, now=0) is None
+    assert p.cascade_due({}, False, now=10) == 'Human Review dropped to 0 (was 1)'
+    p.queue_cascade('Human Review dropped to 0 (was 1)', now=10)
+    assert advance.RERUN.exists()  # the queue call itself is stubbed (conftest): no real cascade
+    assert p.cascade_due({}, False, now=20) is None                       # still empty: wait
+    assert p.cascade_due({}, False, now=10 + P.CASCADE_EMPTY_HR) == 'Human Review is empty'
+    p.last_main = 'a' * 40
+    assert p.cascade_due(hr1, True, now=30) == 'main moved'

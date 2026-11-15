@@ -7,6 +7,7 @@ Human Review and Staging head with a fresh git merge-tree, which made one cascad
 
   pair   'p:<sha>:<sha>' (sorted)       True = merges cleanly
   stack  's:<hash of main, bases, head>' '' = stacks cleanly, else the base it conflicts with
+  files  'f:<sha>:<sha>' (sorted)       the paths that conflict (for a rework relay)
 
 Only full 40-hex SHAs are keys: a ref such as refs/heads/main can move, so it is never
 cached. The file keeps the newest MAX entries.
@@ -62,6 +63,12 @@ class ConflictMap:
             return fn()
         k = 's:' + hashlib.sha1(json.dumps([main, [list(b) for b in bases], head]).encode()).hexdigest()
         return self._get(k, fn, enc=lambda v: v or '', dec=lambda v: v or None)
+
+    def files(self, a, b, fn):
+        """fn() -> [path]: the files that conflict when a and b merge. Kept per SHA pair."""
+        if not (SHA.match(a or '') and SHA.match(b or '')):
+            return fn()
+        return self._get('f:' + ':'.join(sorted((a, b))), lambda: list(fn()))
 
     def conflicts_of(self, sha):
         """SHAs known to conflict with sha (pair answers only)."""

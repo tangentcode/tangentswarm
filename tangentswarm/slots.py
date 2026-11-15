@@ -24,6 +24,7 @@ one swarm-revive started; every other one is new work.
 State: ~/.local/state/swarm-flow/slots.json
   parked  {PR: {session, window, pane, worktree, branch, head, parked_at}}
   rework  {PR: {session, window, pane, worktree, branch, head, started, feedback}}
+  relayed {PR: head} the head a rework relay was sent for (the cascade sends one per head)
 
     swarm-slots              the running Claudes by slot, and the parked sessions
     swarm-slots --park [--dry-run]   park the Claude of each PR in Ready now
@@ -61,7 +62,8 @@ def load(path=None):
     except (OSError, ValueError):
         d = {}
     d = d if isinstance(d, dict) else {}
-    return {'parked': dict(d.get('parked') or {}), 'rework': dict(d.get('rework') or {})}
+    return {'parked': dict(d.get('parked') or {}), 'rework': dict(d.get('rework') or {}),
+            'relayed': dict(d.get('relayed') or {})}
 
 
 def save(d, path=None):
