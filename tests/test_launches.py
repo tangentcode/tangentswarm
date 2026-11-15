@@ -173,7 +173,7 @@ def test_tick_live_starts_one_and_notes_a_refusal(monkeypatch):
     L.hold('five', now=1)
     calls = []
 
-    def start_next(rank, mem, room=lambda: True):
+    def start_next(rank, mem, room=lambda: True, closed=lambda pr: False):
         calls.append(rank(6))
         return 'refused', L.read_queue()[0], dict(refused='busy window')
     monkeypatch.setattr(L, 'start_next', start_next)
@@ -244,3 +244,16 @@ def test_a_held_launch_waits_while_the_claude_cap_is_full():
     started = []
     what, row, out = LZ.start_next(mem=lambda: mem(1000 * MB), start=lambda *a, **k: started.append(a), room=lambda: False)
     assert what == 'waiting' and out == 'the Claude cap is full' and started == []
+
+
+def test_a_closed_prs_held_launch_never_starts():
+    """Codex on PR #26: a held launch started after its PR was closed."""
+    from tangentswarm import launches as LZ
+    LZ.hold('closed-b', pr=8)
+    LZ.hold('open-b', pr=9)
+    started = []
+    what, row, out = LZ.start_next(mem=lambda: mem(1000 * MB), start=lambda b, w=None: started.append(b) or (1, {'refused': 'x'}),
+                                   closed=lambda pr: pr == 8)
+    assert started == ['open-b'] and [r['branch'] for r in LZ.read_queue()] == []  # 8 dropped, 9 refused+dropped
+    LZ.hold('c2', pr=10)
+    assert LZ.drop_pr(10) == 1 and LZ.read_queue() == []

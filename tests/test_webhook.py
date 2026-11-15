@@ -378,3 +378,10 @@ def test_a_closed_pr_drops_its_unstarted_launch():
     slots.unstarted_add(77, branch='b', brief='', issue=5)
     Fake(col=board.IN_PROGRESS).run(W.Action('closed', 77))
     assert '77' not in slots.load()['unstarted']
+
+
+def test_a_closed_pr_drops_its_held_launch():
+    from tangentswarm import launches
+    launches.hold('b', pr=78)
+    Fake(col=board.IN_PROGRESS).run(W.Action('closed', 78))
+    assert launches.read_queue() == []

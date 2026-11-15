@@ -845,7 +845,8 @@ class Tick:
         for r in rows:
             r['pr'] = r.get('pr') or by_branch.get(r['branch'])
         rank = lambda pr: self.prs.get(pr, {}).get('rank', 1)  # noqa: E731
-        rows = launches.ordered(rows, rank)
+        rows = launches.ordered([r for r in rows if (self.prs.get(r['pr']) or {}).get('state') not in ('MERGED', 'CLOSED')],
+                                rank)
         ok = launches.admits(m)
         since = self.state.data.get('pressure_since')
         if ok:
@@ -866,7 +867,8 @@ class Tick:
             self.change(f"{name} start held launch {first['branch']} ({launches.describe(m)})")
             return
         from . import slots
-        what, row, out = launches.start_next(rank=rank, mem=lambda: m,
+        closed = lambda pr: (self.prs.get(pr) or {}).get('state') in ('MERGED', 'CLOSED')  # noqa: E731
+        what, row, out = launches.start_next(rank=rank, mem=lambda: m, closed=closed,
                                              room=lambda: slots.live_claudes() < slots.MAX_CLAUDES)
         if what == 'waiting':
             return self.note(first['pr'], None, f"held launch {first['branch']} waits: {out}")

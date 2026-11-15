@@ -194,12 +194,24 @@ def launch(branch, window=None, pr=None, brief=None, start=start_scoped, send=se
     return 'launched', out
 
 
-def start_next(rank=lambda pr: 1, mem=memory, start=start_scoped, send=send_brief, room=lambda: True):
+def drop_pr(pr):
+    """Remove the held launches of PR pr (it was closed). Returns how many."""
+    with locked_queue() as rows:
+        n = len(rows)
+        rows[:] = [r for r in rows if r.get('pr') != pr]
+        return n - len(rows)
+
+
+def start_next(rank=lambda pr: 1, mem=memory, start=start_scoped, send=send_brief, room=lambda: True,
+               closed=lambda pr: False):
     """Start at most one queued launch if memory admits it and room() says the Claude cap
     has room (Codex on PR #26: the held queue drained past MAX_CLAUDES).
 
     Returns (what, row, detail): what is 'empty', 'waiting' (memory or the cap holds it), or
     launch()'s result for the first queued row."""
+    for r in read_queue():  # Codex on PR #26: a closed PR's held launch never starts
+        if r.get('pr') and closed(r['pr']):
+            drop_pr(r['pr'])
     rows = ordered(read_queue(), rank)
     if not rows:
         return 'empty', None, None
