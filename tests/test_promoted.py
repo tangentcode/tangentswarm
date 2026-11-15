@@ -481,8 +481,9 @@ def test_a_staging_deploy_lag_over_ten_minutes_wakes_swarmbot_once_per_work_sha(
     lag = p.deploy_lag(now=1000 + P.DEPLOY_LAG + 60, wake=wake)
     assert [k for k, _, _ in lag] == ['ptw'] and wakes[0][0] == 'deploy-lag:' + 'w' * 40
     assert 'ptw.example.test (oooooooo)' in wakes[0][1] and 'work.example.test' not in wakes[0][1]
+    assert p.deploy_lag(now=1000 + P.DEPLOY_LAG + 3600, wake=wake) == [] and len(wakes) == 1  # once per SHA
     sites[1] = ('ptw', 'ptw.example.test', 'w' * 40, None)                 # caught up
-    assert p.deploy_lag(now=1000 + P.DEPLOY_LAG + 200, wake=wake) == [] and len(wakes) == 1
+    assert p.deploy_lag(now=1000 + P.DEPLOY_LAG + 3700, wake=wake) == [] and len(wakes) == 1
     work[0] = 'x' * 40                                                   # a new work SHA starts its own clock
     assert p.deploy_lag(now=5000, wake=wake) == []
 
@@ -495,3 +496,27 @@ def test_wake_exception_is_shared_and_deduped(monkeypatch):
         == 'woke swarmbot: lag'
     assert W.wake_exception(None, 'lag', key='k', now=lambda: t[0] + 5, post=posts.append).startswith('exception already')
     assert posts[0]['source'] == 'swarm-promoted' and posts[0]['why'] == 'lag'
+
+
+
+def _wakes(seen, base):
+    from tangentswarm import webhook as W
+    W.SEEN = seen
+    for i in range(15):
+        W.wake_exception(None, f'e{base + i}', key=f'k{base + i}', now=lambda: 1_000_000.0, post=lambda p: None)
+
+
+def test_wake_state_is_safe_across_processes(tmp_path):
+    """Codex on PR #41: swarm-webhook and swarm-promoted both write the wake state."""
+    import json as _json
+    import multiprocessing
+    seen = tmp_path / 'seen.json'
+    ctx = multiprocessing.get_context('fork')
+    procs = [ctx.Process(target=_wakes, args=(seen, k * 100)) for k in range(4)]
+    for pr_ in procs:
+        pr_.start()
+    for pr_ in procs:
+        pr_.join(30)
+        assert pr_.exitcode == 0
+    st = _json.loads(seen.read_text())
+    assert len(st['wake']) == 60  # every key recorded, none lost to a stale rewrite

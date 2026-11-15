@@ -704,7 +704,33 @@ def wake_exception(n, why, key=None, now=time.time, dry=False, post=None, source
 
 # -- dedupe state ------------------------------------------------------------------------
 
-_lock = threading.Lock()
+_tlock = threading.Lock()
+
+
+class _SeenLock:
+    """The SEEN state is shared by swarm-webhook and swarm-promoted (the deploy-lag wake):
+    a thread lock plus an interprocess flock around every read-modify-write (Codex on PR #41)."""
+
+    def __enter__(self):
+        import fcntl
+        _tlock.acquire()
+        try:
+            SEEN.parent.mkdir(parents=True, exist_ok=True)
+            self.f = open(SEEN.with_name(SEEN.name + '.lock'), 'a')
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+        except Exception:
+            _tlock.release()
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.f.close()
+        finally:
+            _tlock.release()
+
+
+_lock = _SeenLock()
 
 
 def _seen():
@@ -716,7 +742,7 @@ def _seen():
 
 def _save_seen(d):
     SEEN.parent.mkdir(parents=True, exist_ok=True)
-    tmp = SEEN.with_suffix('.tmp')
+    tmp = SEEN.with_name(f'{SEEN.name}.{os.getpid()}.{threading.get_ident()}.tmp')  # one per writer
     tmp.write_text(json.dumps(d))
     os.replace(tmp, SEEN)
 

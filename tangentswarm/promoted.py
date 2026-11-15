@@ -247,6 +247,7 @@ class Promoter:
         self.cascade_at = 0.0  # when this daemon last queued a cascade for an empty Human Review
         self.last_deploy = None  # the staging .deploy-sha values at the last check
         self.work_seen = (None, 0.0)  # (origin work SHA, when this daemon first saw it)
+        self.lag_woken = set()  # work SHAs whose lag already woke swarmbot (once per SHA)
         self.lag_checked = 0.0
         self.events = None       # tangentswarm.events reader (made on first use)
 
@@ -304,8 +305,9 @@ class Promoter:
             return []
         behind = [(k, host, sha) for k, host, sha, _ in sites if sha != work]
         age = now - self.work_seen[1]
-        if not behind or age < DEPLOY_LAG:
+        if not behind or age < DEPLOY_LAG or work in self.lag_woken:
             return []
+        self.lag_woken = {work}  # Codex on PR #41: once per work SHA, not again after the dedupe window
         why = (f"staging deploy lag: origin work {work[:8]} is {int(age // 60)} min old and not served by "
                + ', '.join(f"{host} ({(sha or '-')[:8]})" for _, host, sha in behind))
         if wake is None:
