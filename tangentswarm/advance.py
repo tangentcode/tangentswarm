@@ -57,6 +57,7 @@ CASCADE_LOG = Path(os.environ.get('SWARM_CASCADE_LOG', str(Path.home() / '.local
 MAX_PASSES = int(os.environ.get('SWARM_CASCADE_MAX_PASSES', '10'))  # cascade passes per lock hold
 RERUN = Path(os.environ.get('SWARM_CASCADE_RERUN', str(gatelock.LOCK.with_name('swarm-serial.rerun'))))
 REDEPLOY_LATE = int(os.environ.get('SWARM_REDEPLOY_LATE', '600'))  # lag warning only after this (Michal 2026-11-15)
+DEPLOY_FALLBACK = int(os.environ.get('SWARM_DEPLOY_FALLBACK', '180'))  # then accept a .deploy-sha that contains the head
 
 CODEX_FIELDS = """number isDraft headRefOid mergeable
  comments(last:40){nodes{author{login} body}}
@@ -592,14 +593,20 @@ def hr_gate():
     return runpy.run_path(str(BIN / 'hr-gate'), run_name='swarm_advance')
 
 
-def lagging(g, d):
+def lagging(g, d, now=time.time):
     """[(site key, host, static sha, err)] for each staging site that does not serve the
-    pulled head yet. A site serves it when its .deploy-sha is the pull's work commit or
-    contains the head (platform #493: ptw lagged while the other two served it)."""
+    pulled head yet (platform #493: ptw lagged while the others served it). Every work push
+    lands on all four staging sites within about 2.5 min (slowest 2:49; Michal 2026-11-15),
+    so "deployed" is every .deploy-sha EQUAL to the pull's work commit: file reads only.
+    After DEPLOY_FALLBACK s it falls back to "the .deploy-sha contains the head" (git), for a
+    site that already serves a newer work commit."""
+    sites = g['served_all']()
+    exact = [(k, host, sha, err) for k, host, sha, err in sites if not (sha and sha == d.get('work'))]
+    if not exact or now() - float(d.get('started') or 0) < DEPLOY_FALLBACK:
+        return exact
     if isinstance(g.get('_fetched'), list):
         g['_fetched'].clear()  # fetch work again: a served commit may be new
-    return [(k, host, sha, err) for k, host, sha, err in g['served_all']()
-            if not (sha and (sha == d.get('work') or g['contains'](d['head'], sha)))]
+    return [(k, host, sha, err) for k, host, sha, err in exact if not (sha and g['contains'](d['head'], sha))]
 
 
 def deploy_logs(env=os.environ):
