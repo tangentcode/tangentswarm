@@ -160,3 +160,44 @@ def test_install_adds_the_hook_once_and_keeps_other_keys(tmp_path):
     assert d['hooks']['Stop'] == [{'hooks': [{'type': 'command', 'command': '/bin/swarm-stop-hook'}]}]
     (w / '.claude' / 'settings.local.json').write_text('not json')
     assert stophook.install(w, command='/bin/x').startswith('not changed')
+
+
+def transcript(tmp_path, text):
+    p = tmp_path / 't.jsonl'
+    p.write_text('\n'.join(json.dumps(d) for d in [
+        {'type': 'user', 'message': {'role': 'user', 'content': 'go'}},
+        {'type': 'assistant', 'message': {'role': 'assistant', 'content': [{'type': 'text', 'text': text}]}},
+        {'type': 'assistant', 'message': {'role': 'assistant', 'content': [{'type': 'tool_use', 'name': 'Bash'}]}},
+    ]) + '\n')
+    return p
+
+
+def test_a_question_moves_an_unfinished_card_to_needs_input(wt, tmp_path):
+    (wt / 'b.txt').write_text('half done\n')  # not finished
+    g = G(run(wt, 'rev-parse', 'HEAD'))
+    g['OPT'] = {'In Progress': 'x', 'Auto Review': 'y'}  # hr-gate has no Needs Input name
+    g['project_id'], g['STATUS_FIELD'] = (lambda: 'PROJ'), 'FIELD'
+    calls = []
+    t = transcript(tmp_path, 'Two options here.\n\nShould the badge use the old colors or the new ones?')
+    line = stophook.run(wt, g=g, sh=calls.append, transcript=str(t))
+    assert calls == [['gh', 'project', 'item-edit', '--id', 'ITEM7', '--project-id', 'PROJ', '--field-id', 'FIELD',
+                      '--single-select-option-id', board.OPTION[board.NEEDS_INPUT]]]
+    assert 'stopped with a question' in line and line.endswith('Moved the card to Needs Input.')
+    assert stophook.run(wt, g=g, sh=calls.append, transcript=str(t)).endswith('uncommitted changes')  # once
+    assert len(calls) == 1
+
+
+def test_no_question_means_no_needs_input(wt, tmp_path):
+    (wt / 'b.txt').write_text('half done\n')
+    calls = []
+    t = transcript(tmp_path, 'Done with step 1. Running the tests next.')
+    assert stophook.run(wt, g=G('x' * 40), sh=calls.append, transcript=str(t)).endswith('uncommitted changes')
+    assert calls == [] and stophook.last_question(str(t)) is None
+    assert stophook.last_question(str(transcript(tmp_path, 'Which one do you want?**'))) is not None
+
+
+def test_the_hook_passes_the_transcript(wt):
+    spawned = []
+    stophook.hook(io.StringIO(json.dumps({'cwd': str(wt), 'transcript_path': '/t.jsonl'})),
+                  spawn=lambda argv, **k: spawned.append(argv))
+    assert spawned == [[stophook.hook_command(), 'run', str(wt), '--transcript', '/t.jsonl']]

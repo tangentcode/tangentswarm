@@ -23,6 +23,8 @@ The handoff (run), only for a worker worktree ~/ver/platform.<slug>:
   4. Codex findings open on the head: nothing (mn-workflow relays them). A head that does
      not merge cleanly onto origin/main: nothing (the tick relays a merge-main).
   5. Mark the PR ready (if it is a draft); move the card In Progress -> Auto Review.
+  0. Not finished (dirty or unpushed) and the Claude's last message ends with a question:
+     the card moves In Progress -> Needs Input, once per question (Michal 2026-11-15).
   6. Codex already clean on the head: `swarm-advance --minbot N` (the MinBot check: CI
      green, mergeable, not a draft; a pass moves the card to Ready; a busy lock queues it
      for swarm-promoted). Else post "@codex review" once per head (the key is shared with
@@ -148,7 +150,70 @@ def minbot_check(n):
     return ([l for l in (r.stdout + r.stderr).splitlines() if l.strip()] or [f'rc={r.returncode}'])[-1]
 
 
-def run(cwd, g=None, dry=False, out=None, sh=None, sleep=time.sleep, merges=merges_onto_main, minbot=minbot_check):
+def last_question(transcript):
+    """The last assistant text of a Claude transcript (JSONL) when it ends in a question
+    (its last non-empty line ends with "?"), else None."""
+    try:
+        lines = Path(transcript).read_text(errors='replace').splitlines()[-400:]
+    except (OSError, TypeError):
+        return None
+    for raw in reversed(lines):
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            continue
+        msg = d.get('message') or {}
+        if d.get('type') != 'assistant' or msg.get('role', 'assistant') != 'assistant':
+            continue
+        content = msg.get('content')
+        texts = [c.get('text') or '' for c in content if isinstance(c, dict) and c.get('type') == 'text'] \
+            if isinstance(content, list) else [content or '']
+        text = '\n'.join(t for t in texts if t).strip()
+        if not text:
+            continue  # a tool call: look further back
+        last = [l for l in text.splitlines() if l.strip()][-1].strip().rstrip('*_` ')
+        return text if last.endswith('?') else None
+    return None
+
+
+def move_card(g, item, col, sh):
+    """Move a card by option id (hr-gate's move() knows only its own column names)."""
+    if col in (g.get('OPT') or {}):
+        g['move'](item, col)
+        return
+    sh(['gh', 'project', 'item-edit', '--id', item, '--project-id', g['project_id'](),
+        '--field-id', g['STATUS_FIELD'], '--single-select-option-id', board.OPTION[col]])
+    from . import boardcache
+    boardcache.invalidate()
+
+
+def needs_input(cwd, branch, transcript, g=None, dry=False, out=None, sh=None):
+    """Michal 2026-11-15 1:32 AM ET: a Claude that stops with a question (not a finished,
+    pushed head) moves its card In Progress -> Needs Input, once per question."""
+    import hashlib
+    q = last_question(transcript)
+    if not q:
+        return None
+    key = f"q:{branch}:{hashlib.sha1(q.encode()).hexdigest()[:12]}"
+    if seen(key):
+        return None
+    g = g if g is not None else hr_gate()
+    found = find_pr(g, branch)
+    if not found:
+        return None
+    n, item, col, _ = found
+    if col != board.IN_PROGRESS:
+        return None
+    if not dry:
+        move_card(g, item, board.NEEDS_INPUT, sh)
+        _mark_seen(key)
+    short = ' '.join(q.split())[-160:]
+    return say(f"#{n} the Claude stopped with a question: ...{short} Moved the card to Needs Input."
+               + (' (dry run)' if dry else ''), out)
+
+
+def run(cwd, g=None, dry=False, out=None, sh=None, sleep=time.sleep, merges=merges_onto_main, minbot=minbot_check,
+        transcript=None):
     """The handoff for one worktree. Returns the logged line, or None when nothing was due."""
     from . import slots, tick
     sh = sh or (lambda argv: tick.sh(argv, check=True))
@@ -157,6 +222,10 @@ def run(cwd, g=None, dry=False, out=None, sh=None, sleep=time.sleep, merges=merg
         return None
     branch, head = pushed_head(cwd)
     if branch is None or len(head) != 40:
+        if branch and transcript:
+            asked = needs_input(cwd, branch, transcript, g=g, dry=dry, out=out, sh=sh)
+            if asked:
+                return asked
         return say(f"{cwd.name}: not finished: {head}", out) if branch else None
     key = f"{branch}@{head}"
     if seen(key):
@@ -268,8 +337,9 @@ def hook(stdin=sys.stdin, spawn=subprocess.Popen):
     try:
         LOG.parent.mkdir(parents=True, exist_ok=True)
         with open(LOG, 'a') as log:
-            spawn([hook_command(), 'run', cwd], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                  start_new_session=True)
+            spawn([hook_command(), 'run', cwd] + (['--transcript', event['transcript_path']]
+                                                  if event.get('transcript_path') else []),
+                  stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
     except OSError:
         pass
     return 0
@@ -284,13 +354,14 @@ def main(argv=None):
     r = sub.add_parser('run')
     r.add_argument('cwd')
     r.add_argument('--dry-run', action='store_true')
+    r.add_argument('--transcript', help='the Claude transcript (JSONL): a final question moves the card to Needs Input')
     i = sub.add_parser('install')
     i.add_argument('worktrees', nargs='*')
     i.add_argument('--all', action='store_true')
     a = ap.parse_args(argv)
     if a.cmd == 'run':
         try:
-            line = run(a.cwd, dry=a.dry_run, out=print)
+            line = run(a.cwd, dry=a.dry_run, out=print, transcript=a.transcript)
         except Exception as e:  # never a traceback into a Claude session
             say(f"{Path(a.cwd).name}: stop hook failed: {type(e).__name__}: {str(e)[:200]}", print)
             return 2
