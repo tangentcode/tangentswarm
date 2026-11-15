@@ -12,6 +12,8 @@ grows) and, for the platform repo:
       -> start mn-workflow.service now (no-block). A pass already running: start it again
          once that pass ends, so the event is never lost. mn-workflow's own flock prevents
          overlap; its 5-minute timer stays as a slow backstop.
+  pull_request edited (a body edit, such as added screenshots) on a PR whose pull waits or
+  is held -> a cascade pass now (re-runs its gate), and the MinBot check.
   a Codex review, or a Codex comment on a PR (a review summary, a receipt)
       -> queue `swarm-advance --minbot N` for the daemon's drain: a PR in Auto Review that
          Codex just cleared gets the MinBot check at once (it does nothing for a PR outside
@@ -114,6 +116,10 @@ def actions(rec):
         n = rec['pr']
         why = f"pull_request_review on platform#{n} by {rec.get('reviewer')}"
         return [('mn', n, why)] + ([('minbot', n, why)] if is_codex(rec.get('reviewer')) else [])
+    if ev == 'pull_request' and rec.get('action') == 'edited' and rec.get('pr'):
+        n = rec['pr']
+        why = f"pull_request edited on platform#{n} (a body edit: screenshots?)"
+        return [('gate', n, why), ('minbot', n, why)]
     if ev == 'issue_comment' and rec.get('is_pr') and is_codex(rec.get('commenter')) and rec.get('issue'):
         n = rec['issue']
         why = f"Codex comment on platform#{n}"
@@ -124,8 +130,9 @@ def actions(rec):
 class Events:
     """The daemon's event reader. poll() returns the lines to log."""
 
-    def __init__(self, dry=False, run=subprocess.run, enqueue=None, events=None, offset=None):
+    def __init__(self, dry=False, run=subprocess.run, enqueue=None, events=None, offset=None, cascade=None):
         self.dry, self.run = dry, run
+        self.cascade = cascade
         self.enqueue = enqueue
         self.events, self.offset = events, offset
         self.mn_pending = None  # why: an mn-workflow pass is wanted once the running one ends
@@ -159,11 +166,13 @@ class Events:
 
     def poll(self):
         lines = []
-        mn, minbot = None, {}
+        mn, minbot, gate = None, {}, {}
         for rec in new_records(self.events, self.offset, save=not self.dry):
             for kind, n, why in actions(rec):
                 if kind == 'mn':
                     mn = mn or why
+                elif kind == 'gate':
+                    gate.setdefault(n, why)
                 else:
                     minbot.setdefault(n, why)
         if mn or self.mn_pending:
@@ -172,4 +181,20 @@ class Events:
                 lines.append(line)
         for n, why in minbot.items():
             lines.append(self.queue_minbot(n, why))
+        for n, why in gate.items():
+            line = self.queue_gate(n, why)
+            if line:
+                lines.append(line)
         return lines
+
+    def queue_gate(self, n, why):
+        """A body edit on a PR whose pull waits (SCREENSHOTS_NEEDED) or is held (NEEDS_WORKER):
+        a cascade pass re-runs its gate now (MethBot 2026-11-15: #519 got its images at 2:48
+        AM ET, and nothing re-ran the gate for 35 min)."""
+        from . import advance, flow
+        if n not in flow.pulled_prs() and n not in flow.held():
+            return None
+        if self.dry:
+            return f"{why}: would queue a cascade pass"
+        advance.flag_rerun(by=f"event: {why}")
+        return f"{why}: cascade {(self.cascade or advance.queue_cascade)()}"

@@ -84,3 +84,19 @@ def test_the_first_check_saves_the_offset_so_later_events_are_seen():
     append(REVIEW)
     assert E.pending() is True
     assert E.new_records() == [REVIEW]
+
+
+def test_a_body_edit_on_a_waiting_pull_re_runs_its_gate():
+    """MethBot 2026-11-15: #519's worker added images at 2:48 AM ET; a body edit is not a
+    review event, so nothing re-ran the gate for 35 min."""
+    from tangentswarm import flow
+    flow.save_pull(dict(pr=519, head='5' * 40, work='w' * 40, started=0))
+    E.new_records()
+    append({'event': 'pull_request', 'action': 'edited', 'repo': E.REPO, 'pr': 519},
+           {'event': 'pull_request', 'action': 'edited', 'repo': E.REPO, 'pr': 600})  # no pull: no cascade
+    queued, cascades = [], []
+    ev = E.Events(run=Sys(), enqueue=lambda argv, by='': queued.append(argv[1:]),
+                  cascade=lambda: cascades.append(1) or 'queued for swarm-promoted')
+    lines = ev.poll()
+    assert cascades == [1] and queued == [['--minbot', '519'], ['--minbot', '600']]
+    assert any(l.endswith('cascade queued for swarm-promoted') and 'platform#519' in l for l in lines)
