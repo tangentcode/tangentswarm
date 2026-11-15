@@ -173,6 +173,31 @@ def test_codex_open_thread_is_findings():
     assert st == 'findings' and '1 open' in why
 
 
+def summary(head='a' * 40, any_findings=False, unresolved=False):
+    state = {'code_review': {'commit_sha': head, 'status': 'completed', 'has_any_findings': any_findings,
+                             'has_unresolved_findings': unresolved}}
+    return {'author': CODEX, 'createdAt': 'x',
+            'body': '<!-- codex-pull-request-review-summary -->\n**Codex Review** summary\n'
+                    f'<!-- codex-review-state:v1 {__import__("json").dumps(state)} -->'}
+
+
+def test_a_codex_review_summary_without_findings_is_clean():
+    """Michal 2026-11-15 12:53 AM ET: #518/#520/#521 went back to In Progress 9 s after the
+    handoff because a reader took this summary comment as findings."""
+    assert tick.codex_status(pr(comments=[summary()])) == ('clean', 'review-state clean on head')
+    assert tick.codex_status(pr(comments=[summary(head='b' * 40)]))[0] == 'pending'  # another head
+    assert tick.codex_status(pr(comments=[summary(any_findings=True)]))[0] == 'pending'
+
+
+def test_a_codex_review_of_the_head_with_no_open_inline_thread_is_clean():
+    review = {'author': CODEX, 'commit': {'oid': 'a' * 40}, 'comments': {'totalCount': 2}}
+    done = [{'isResolved': True, 'isOutdated': False, 'comments': {'nodes': [{'author': CODEX}]}},
+            {'isResolved': False, 'isOutdated': True, 'comments': {'nodes': [{'author': CODEX}]}}]
+    assert tick.codex_status(pr(reviews=[review], threads=done))[0] == 'clean'  # resolved or outdated
+    still = [{'isResolved': False, 'isOutdated': False, 'comments': {'nodes': [{'author': CODEX}]}}]
+    assert tick.codex_status(pr(reviews=[review], threads=still))[0] == 'findings'
+
+
 def test_codex_requested_only_after_head():
     before = {'author': {'login': 'tangentstorm'}, 'body': '@codex review', 'createdAt': '2026-11-11T09:00:00Z'}
     after = dict(before, createdAt='2026-11-11T11:00:00Z')

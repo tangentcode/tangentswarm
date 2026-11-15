@@ -248,16 +248,23 @@ def menu_line(screen):
 
 
 def codex_status(pr):
-    """('clean' | 'findings' | 'pending', detail) for a PR from hr-gate's fetch()."""
+    """('clean' | 'findings' | 'pending', detail) for a PR from hr-gate's fetch().
+
+    Findings only while an inline Codex thread is open (not resolved, not outdated).
+    Clean (Michal 2026-11-15: #518/#520/#521 were sent back to In Progress at 12:53 AM ET
+    because a reader took Codex's review-summary comment as findings):
+      - a codex-review-state summary for the head with has_any_findings=false (and no
+        unresolved findings), or
+      - the "Didn't find any major issues" receipt for the head, or
+      - a Codex review of the head with no open inline thread.
+    Else pending."""
     head = pr['headRefOid']
     def is_codex(node):
         return ((node.get('author') or {}).get('login') or '').startswith(CODEX)
     open_thr = [t for t in pr['reviewThreads']['nodes'] if not t['isResolved'] and not t['isOutdated']
                 and t['comments']['nodes'] and is_codex(t['comments']['nodes'][0])]
-    on_head = [r for r in pr['reviews']['nodes'] if is_codex(r) and r.get('commit')
-               and r['commit']['oid'] == head and r['comments']['totalCount'] > 0]
-    if open_thr or on_head:
-        return 'findings', f"{len(open_thr)} open Codex thread(s)" + (f", {len(on_head)} finding review(s) on head" if on_head else '')
+    if open_thr:
+        return 'findings', f"{len(open_thr)} open Codex thread(s)"
     for c in pr['comments']['nodes']:
         if not is_codex(c):
             continue
@@ -272,6 +279,8 @@ def codex_status(pr):
                 continue
             if st.get('commit_sha') == head and not st.get('has_any_findings') and not st.get('has_unresolved_findings'):
                 return 'clean', 'review-state clean on head'
+    if any(is_codex(r) and (r.get('commit') or {}).get('oid') == head for r in pr['reviews']['nodes']):
+        return 'clean', 'Codex reviewed the head; no open inline thread'
     return 'pending', 'no Codex result on head'
 
 

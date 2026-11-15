@@ -201,3 +201,18 @@ def test_the_hook_passes_the_transcript(wt):
     stophook.hook(io.StringIO(json.dumps({'cwd': str(wt), 'transcript_path': '/t.jsonl'})),
                   spawn=lambda argv, **k: spawned.append(argv))
     assert spawned == [[stophook.hook_command(), 'run', str(wt), '--transcript', '/t.jsonl']]
+
+
+def test_a_summary_comment_without_findings_counts_as_clean_in_the_handoff(wt):
+    """The 12:53 AM ET bug: Codex's review-summary comment (codex-review-state,
+    has_any_findings=false) is CLEAN, so the handoff runs the MinBot check."""
+    head = run(wt, 'rev-parse', 'HEAD')
+    g = G(head)
+    state = {'code_review': {'commit_sha': head, 'status': 'completed', 'has_any_findings': False}}
+    g['fetch'](7)['comments']['nodes'].append(
+        {'author': {'login': 'chatgpt-codex-connector'},
+         'body': f'<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {json.dumps(state)} -->'})
+    ran = []
+    line = stophook.run(wt, g=g, sh=lambda argv: None, merges=lambda c, h: True, sleep=lambda s: None,
+                        minbot=lambda n: ran.append(n) or 'ok')
+    assert ran == [7] and 'is already Codex-clean' in line
