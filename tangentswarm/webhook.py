@@ -31,6 +31,9 @@ Every delivery and every decision is one JSON line in LOG. classify() is a pure 
   card     a new PR or issue: Project 4 card with the right Status
   wake     an exception (EXCEPTIONS): one deduped, rate-limited POST to swarmbot's wake URL
 
+`swarm-webhook replay --pr N [--pr M ...] [--dry]` runs the same handlers on a PR from its
+current state (the Codex result and CI on the head), for events that were missed.
+
 A worker's push to a PR in In Progress is left to the Stop hook: a worker often pushes and
 goes on working, so a push alone is not a handoff.
 """
@@ -587,6 +590,44 @@ def first_time(delivery, keep=5000):
         return True
 
 
+# -- replay --------------------------------------------------------------------------------
+
+def replay_plan(n, full, ci):
+    """[Action] for PR n from its current state (pure). full: hr-gate's fetch(); ci: the
+    advance.ci_problem() text for the head, or None when CI is green. The actions are the
+    ones a live delivery would give: the Codex result on the head (codex) and a completed CI
+    run on the head (ci). Red CI goes back to the worker and a clean Codex then gives no MinBot
+    check (it would refuse on red CI). The handlers re-read the PR, so a replay is safe to run twice."""
+    from . import tick
+    head = full.get('headRefOid') or ''
+    if (full.get('state') or 'OPEN') != 'OPEN':
+        return [Action('skip', n, f"#{n} is {full.get('state', '').lower()}")]
+    status, detail = tick.codex_status(full)
+    acts = []
+    if ci and not ci.startswith('CI is still running'):
+        acts.append(Action('ci', n, f'replay: {ci}', dict(sha=head)))
+    if status == 'findings' or (status == 'clean' and not acts):  # red CI: no MinBot check
+        acts.append(Action('codex', n, f'replay: Codex {status} on {head[:8]} ({detail})', dict(commit=head)))
+    elif not acts:
+        acts.append(Action('skip', n, f'replay: {detail}' + (f'; {ci}' if ci else '')))
+    return acts
+
+
+def replay(n, ex=None):
+    """Run the live handlers on PR n from its current state. Returns (actions, notes)."""
+    from . import advance
+    ex = ex or Executor()
+    full = ex.g['fetch'](n, refresh=True)
+    ci = advance.ci_problem(advance.check_runs(full['headRefOid']))
+    acts = replay_plan(n, full, ci)
+    for a in acts:
+        ex.run(a)
+    if ci and ci.startswith('CI is still running'):
+        ex.note(f"#{n}: {ci}")
+    log(delivery=f'replay-{n}', event='replay', pr=n, decisions=[a.as_dict() for a in acts], done=ex.done)
+    return acts, ex.done
+
+
 # -- processing ----------------------------------------------------------------------------
 
 def handle(event, payload, delivery='', ex=None):
@@ -678,7 +719,22 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog='swarm-webhook', description=__doc__.split('\n', 1)[0])
     ap.add_argument('--port', type=int, default=PORT)
     ap.add_argument('--classify', metavar='FILE', help='print the actions for a recorded {event, payload} file')
+    ap.add_argument('--dry', action='store_true', help='with replay: print what would be done')
+    ap.add_argument('cmd', nargs='?', choices=['replay'], help='replay: run the handlers on --pr N from its current state')
+    ap.add_argument('--pr', type=int, action='append', default=[], help='PR number for replay (repeat for more)')
     a = ap.parse_args(argv)
+    if a.cmd == 'replay':
+        if not a.pr:
+            ap.error('replay needs --pr N')
+        rc = 0
+        for n in a.pr:
+            try:
+                acts, done = replay(n, Executor(dry=a.dry))
+                print(f"REPLAY #{n}: " + ('; '.join(done) or 'nothing done'))
+            except Exception as e:
+                rc = 1
+                print(f"REPLAY #{n}: failed: {type(e).__name__}: {str(e)[:200]}")
+        return rc
     if a.classify:
         d = json.loads(Path(a.classify).read_text())
         for act in classify(d['event'], d['payload']):

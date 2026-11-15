@@ -220,3 +220,31 @@ def test_the_server_checks_the_signature_queues_once_and_logs(tmp_path, monkeypa
     assert lines[0]['decision'] == 'rejected: bad signature'
     assert lines[-1]['event'] == 'pull_request' and lines[-1]['decisions'][0]['kind'] == 'card'
     assert list(W.INBOX.glob('*.json')) == []
+
+
+# -- replay: the handlers on a PR's current state ----------------------------------------------
+
+def test_replay_plan_gives_the_live_actions_for_the_head():
+    head = 'e' * 40
+    plan = lambda full, ci=None: [(a.kind, a.args.get('commit') or a.args.get('sha')) for a in W.replay_plan(5, full, ci)]
+    assert plan(codex_pr(head, clean=True)) == [('codex', head)]
+    assert plan(codex_pr(head, findings=True)) == [('codex', head)]
+    assert plan(codex_pr(head), 'CI is not green: "x" failure on this head') == [('ci', head)]
+    assert plan(codex_pr(head, findings=True), 'CI is not green: "x" failure') == [('ci', head), ('codex', head)]
+    assert plan(codex_pr(head, clean=True), 'CI is still running: "x"') == [('codex', head)]
+    assert plan(codex_pr(head, clean=True), 'CI is not green: "x" failure') == [('ci', head)]
+    assert plan(codex_pr(head)) == [('skip', None)]
+    assert plan(dict(codex_pr(head, clean=True), state='MERGED')) == [('skip', None)]
+
+
+def test_replay_runs_the_handlers(monkeypatch, tmp_path):
+    from tangentswarm import advance
+    monkeypatch.setattr(W, 'LOG', tmp_path / 'log')
+    monkeypatch.setattr(advance, 'check_runs', lambda sha: [{'name': 'x', 'status': 'completed', 'conclusion': 'success'}])
+    ex = Fake(col=board.AUTO_REVIEW, full=codex_pr(clean=True))
+    acts, done = W.replay(541, ex)
+    assert ex.queued == [['--minbot', '541']] and ex.cascades == [1]
+    ex = Fake(col=board.AUTO_REVIEW, full=codex_pr(findings=True))
+    W.replay(541, ex)
+    assert 'ROOT-CAUSE RULE' in ex.relays[0][1] and ex.calls[0][-1] == board.OPTION[board.IN_PROGRESS]
+    assert '"event": "replay"' in (tmp_path / 'log').read_text()
