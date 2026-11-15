@@ -737,3 +737,39 @@ def test_api_only_and_docs_only_prs_get_no_screenshot_job(board_read, monkeypatc
     g['fetch'] = lambda n, refresh=False: {'number': n, 'body': '', 'files': {'nodes': [{'path': p} for p in paths]}}
     run(g)
     assert g.moves == [('I7', board.READY)] and sent == []
+
+
+def test_codex_clean_on_the_head_outweighs_an_open_thread_from_an_older_head():
+    """MethBot 2026-11-15: the worker pushed the fix but did not resolve the thread."""
+    head, old = 'a' * 40, 'b' * 40
+
+    def thread(commit, tid='T1'):
+        return {'id': tid, 'isResolved': False, 'isOutdated': False,
+                'comments': {'nodes': [{'author': {'login': 'chatgpt-codex-connector'},
+                                        'originalCommit': {'oid': commit} if commit else None}]}}
+    receipt = {'author': {'login': 'chatgpt-codex-connector'},
+               'body': f"Reviewed commit: {head[:8]} Didn't find any major issues."}
+    pr = {'headRefOid': head, 'comments': {'nodes': [receipt]}, 'reviews': {'nodes': []},
+          'reviewThreads': {'nodes': [thread(old)]}}
+    assert A.codex_clean(pr) and A.addressed_threads(pr) == ['T1']
+    pr['reviewThreads']['nodes'] = [thread(head)]
+    assert not A.codex_clean(pr) and A.addressed_threads(pr) == []  # a thread on the head blocks
+    pr['reviewThreads']['nodes'] = [thread(None)]
+    assert not A.codex_clean(pr)  # unknown commit: counts as on the head
+    pr['reviewThreads']['nodes'] = [thread(old)]
+    pr['comments']['nodes'] = []
+    assert not A.codex_clean(pr)  # no clean Codex result on the head yet
+
+
+def test_the_minbot_pass_resolves_the_addressed_threads(monkeypatch):
+    out, mutations = [], []
+    adv = A.Advance(g={'gql': lambda q, **v: mutations.append((q.split('(')[0], v['id']))}, out=out.append,
+                    minbot=lambda *a: None)
+    pr = {'headRefOid': 'a' * 40, 'reviews': {'nodes': [{'author': {'login': 'chatgpt-codex-connector'},
+                                                          'commit': {'oid': 'a' * 40}, 'comments': {'totalCount': 0}}]},
+          'comments': {'nodes': []},
+          'reviewThreads': {'nodes': [{'id': 'T9', 'isResolved': False, 'isOutdated': False,
+                                       'comments': {'nodes': [{'author': {'login': 'chatgpt-codex-connector'},
+                                                               'originalCommit': {'oid': 'b' * 40}}]}}]}}
+    adv.resolve_addressed(7, pr)
+    assert mutations == [('mutation', 'T9')] and out == ['#7 resolved 1 addressed Codex thread(s) from an older head']

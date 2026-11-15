@@ -62,20 +62,38 @@ DEPLOY_FALLBACK = int(os.environ.get('SWARM_DEPLOY_FALLBACK', '180'))  # then ac
 CODEX_FIELDS = """number isDraft headRefOid mergeable
  comments(last:40){nodes{author{login} body}}
  reviews(last:30){nodes{author{login} commit{oid} comments{totalCount}}}
- reviewThreads(last:60){nodes{isResolved isOutdated comments(first:1){nodes{author{login}}}}}"""
+ reviewThreads(last:60){nodes{id isResolved isOutdated comments(first:1){nodes{author{login} originalCommit{oid}}}}}"""
 
 
 def _codex(node):
     return ((node or {}).get('author') or {}).get('login', '').startswith(CODEX)
 
 
+def _thread_commit(t):
+    first = ((t.get('comments') or {}).get('nodes') or [{}])[0]
+    return (first.get('originalCommit') or {}).get('oid')
+
+
+def _open_codex_threads(pr):
+    return [t for t in (pr.get('reviewThreads') or {}).get('nodes') or []
+            if not t.get('isResolved') and not t.get('isOutdated')
+            and _codex(((t.get('comments') or {}).get('nodes') or [{}])[0])]
+
+
 def codex_clean(pr):
-    """hr-gate condition 3 on the exact head: a clean receipt (or review-state JSON) for the
-    head, no Codex review with findings on the head, and no open Codex thread."""
+    """hr-gate condition 3 on the exact head: a clean Codex result for the head (receipt,
+    review-state summary with no findings, or a Codex review of the head with no comment),
+    no Codex review with findings on the head, and no open Codex thread on the head. An
+    open thread from an OLDER head does not block once Codex is clean on the new head
+    (MethBot 2026-11-15: the worker pushed the fix but did not resolve the thread); the
+    MinBot pass resolves it (addressed_threads). A thread whose commit is unknown counts as
+    on the head."""
     head = pr.get('headRefOid') or ''
     if not head:
         return False
     clean = False
+    reviews = [r for r in (pr.get('reviews') or {}).get('nodes') or []
+               if _codex(r) and (r.get('commit') or {}).get('oid') == head]
     for c in (pr.get('comments') or {}).get('nodes') or []:
         if not _codex(c):
             continue
@@ -88,16 +106,21 @@ def codex_clean(pr):
                 st = json.loads(m.group(1)).get('code_review', {})
             except ValueError:
                 continue
-            if st.get('commit_sha') == head and not st.get('has_any_findings') \
-                    and not st.get('has_unresolved_findings'):
+            if st.get('commit_sha') == head and not st.get('has_any_findings'):
                 clean = True
-    findings = [r for r in (pr.get('reviews') or {}).get('nodes') or []
-                if _codex(r) and (r.get('commit') or {}).get('oid') == head
-                and ((r.get('comments') or {}).get('totalCount') or 0) > 0]
-    open_threads = [t for t in (pr.get('reviewThreads') or {}).get('nodes') or []
-                    if not t.get('isResolved') and not t.get('isOutdated')
-                    and _codex(((t.get('comments') or {}).get('nodes') or [{}])[0])]
-    return clean and not findings and not open_threads
+    if any(((r.get('comments') or {}).get('totalCount') or 0) == 0 for r in reviews):
+        clean = True
+    findings = [r for r in reviews if ((r.get('comments') or {}).get('totalCount') or 0) > 0]
+    on_head = [t for t in _open_codex_threads(pr) if _thread_commit(t) in (head, None)]
+    return clean and not findings and not on_head
+
+
+def addressed_threads(pr):
+    """The ids of open Codex threads from an older head, once Codex is clean on the head."""
+    if not codex_clean(pr):
+        return []
+    head = pr.get('headRefOid') or ''
+    return [t['id'] for t in _open_codex_threads(pr) if t.get('id') and _thread_commit(t) not in (head, None)]
 
 
 def minbot_order(prs, active=None):
@@ -238,6 +261,7 @@ class Advance:
                 self.ci_check_comment(p, ci)
                 continue
             self.apply_pass(p)
+            self.resolve_addressed(n, d)
             return True
         self.why.append('Auto Review: ' + ', '.join(skipped))
         return False
@@ -262,6 +286,25 @@ class Advance:
             rows, _ = self.g['evaluate'](full, hr_peers=self.g['list_hr_prs'](), scratch=scratch)
         bad = [f"{name.strip()}: {why[:80]}" for name, ok, why in rows if name.startswith(MINBOT_ROWS) and not ok]
         return '; '.join(bad) if bad else None
+
+    def resolve_addressed(self, n, d):
+        """After the pass: resolve the open Codex threads from older heads (the worker pushed
+        the fix; Codex is clean on the new head)."""
+        ids = addressed_threads(d)
+        if not ids:
+            return
+        if self.dry:
+            self.out(f"#{n} would resolve {len(ids)} addressed Codex thread(s) from an older head")
+            return
+        done = 0
+        for tid in ids:
+            try:
+                self.g['gql']('mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id isResolved}}}',
+                              id=tid)
+                done += 1
+            except Exception as e:
+                self.out(f"#{n} thread {tid} not resolved: {type(e).__name__}: {str(e)[:120]}")
+        self.out(f"#{n} resolved {done} addressed Codex thread(s) from an older head")
 
     def ci_check_comment(self, p, why):
         """Post the "MinBot check" comment once per head when a job failed (#30 mockup)."""

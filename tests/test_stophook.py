@@ -109,8 +109,10 @@ def test_an_unfinished_worktree_is_left_alone(wt, case, want):
 def test_open_codex_findings_and_a_main_conflict_are_left_to_the_tick(wt):
     head = run(wt, 'rev-parse', 'HEAD')
     g = G(head, findings=True)
+    g['fetch'](7)['reviews']['nodes'].append({'author': {'login': 'chatgpt-codex-connector'},
+                                              'commit': {'oid': head}, 'comments': {'totalCount': 1}})
     line, calls = handoff(wt, g)
-    assert 'Codex findings are open' in line and calls == [] and g.moves == []
+    assert 'Codex findings are open on this head' in line and calls == [] and g.moves == []
     (wt / 'c.txt').write_text('c\n')
     run(wt, 'add', '.')
     run(wt, 'commit', '-qm', 'next')
@@ -154,7 +156,7 @@ def test_install_adds_the_hook_once_and_keeps_other_keys(tmp_path):
     w = tmp_path / 'platform.x'
     (w / '.claude').mkdir(parents=True)
     (w / '.claude' / 'settings.local.json').write_text('{"disabledMcpjsonServers": ["j-mcp"]}')
-    assert stophook.install(w, command='/bin/swarm-stop-hook') == 'added'
+    assert stophook.install(w, command='/bin/swarm-stop-hook') == 'added stop hook'
     assert stophook.install(w, command='/bin/swarm-stop-hook') == 'present'
     d = json.loads((w / '.claude' / 'settings.local.json').read_text())
     assert d['disabledMcpjsonServers'] == ['j-mcp']
@@ -195,3 +197,41 @@ def test_no_question_means_no_needs_input(wt, tmp_path):
     assert stophook.run(wt, g=G('x' * 40), sh=calls.append, transcript=str(t)).endswith('uncommitted changes')
     assert calls == [] and stophook.last_question(str(t)) is None
     assert stophook.last_question(str(transcript(tmp_path, 'Which one do you want?**'))) is not None
+
+
+def test_a_push_after_codex_findings_is_handed_off_for_a_new_review(wt):
+    """MethBot 2026-11-15 3:05 AM ET: #518, #524 and #525 pushed a fix for a Codex finding but
+    did not resolve the thread; the hook said "left to mn-workflow", which planned nothing."""
+    head = run(wt, 'rev-parse', 'HEAD')
+    g = G(head, findings=True)  # an open Codex thread, and no Codex result on this head yet
+    calls = []
+    line = stophook.run(wt, g=g, sh=calls.append, merges=lambda c, h: True, sleep=lambda s: None)
+    assert calls == [['gh', 'pr', 'ready', '7', '-R', stophook.REPO],
+                     ['gh', 'pr', 'comment', '7', '-R', stophook.REPO, '--body', '@codex review']]
+    assert g.moves == [('ITEM7', 'Auto Review')] and 'Codex re-reviews this head' in line
+
+
+def test_findings_on_a_head_codex_already_reviewed_stay_with_mn_workflow(wt):
+    head = run(wt, 'rev-parse', 'HEAD')
+    g = G(head, findings=True)
+    g['fetch'](7)['reviews']['nodes'].append({'author': {'login': 'chatgpt-codex-connector'},
+                                              'commit': {'oid': head}, 'comments': {'totalCount': 1}})
+    calls = []
+    line = stophook.run(wt, g=g, sh=calls.append, merges=lambda c, h: True, sleep=lambda s: None)
+    assert calls == [] and g.moves == [] and 'left to mn-workflow' in line
+
+
+def test_install_allows_the_linked_node_modules(tmp_path):
+    """MethBot: workers stopped at a permission prompt for node_modules, a symlink to the
+    main checkout outside the worktree."""
+    main_nm = tmp_path / 'platform' / 'node_modules'
+    main_nm.mkdir(parents=True)
+    w = tmp_path / 'platform.x'
+    w.mkdir()
+    (w / 'node_modules').symlink_to(main_nm)
+    (w / 'inside').mkdir()
+    (w / 'local-link').symlink_to(w / 'inside')  # inside the worktree: not added
+    assert stophook.install(w, command='/bin/h').startswith('added stop hook; allowed ')
+    d = json.loads((w / '.claude' / 'settings.local.json').read_text())
+    assert d['permissions']['additionalDirectories'] == [str(main_nm.resolve())]
+    assert stophook.install(w, command='/bin/h') == 'present'

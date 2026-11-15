@@ -284,6 +284,30 @@ def codex_status(pr):
     return 'pending', 'no Codex result on head'
 
 
+def codex_reviewed_head(pr):
+    """True when Codex has given a result for the exact head: a review of the head, a
+    review-state summary or a receipt that names it."""
+    head = pr['headRefOid']
+    for r in pr['reviews']['nodes']:
+        if ((r.get('author') or {}).get('login') or '').startswith(CODEX) and \
+                (r.get('commit') or {}).get('oid') == head:
+            return True
+    for c in pr['comments']['nodes']:
+        if not ((c.get('author') or {}).get('login') or '').startswith(CODEX):
+            continue
+        body = c.get('body') or ''
+        if 'Reviewed commit' in body and head[:8] in body:
+            return True
+        m = re.search(r'codex-review-state:v1\s*(\{.*?\})\s*-->', body, re.S)
+        if m:
+            try:
+                if json.loads(m.group(1)).get('code_review', {}).get('commit_sha') == head:
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
 def codex_requested(pr):
     """True if someone (not a bot) already posted '@codex review' after the head commit."""
     nodes = pr['commits']['nodes']

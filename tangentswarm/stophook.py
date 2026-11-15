@@ -21,7 +21,10 @@ The handoff (run), only for a worker worktree ~/ver/platform.<slug>:
   2. Once per branch head: the same head on a later Stop does nothing.
   3. The open PR of the branch, from the board snapshot (column by option id). Only a card
      in In Progress or Auto Review is handled.
-  4. Codex findings open on the head: nothing (mn-workflow relays them). A head that does
+  4. Codex findings open AND Codex already reviewed this exact head: nothing (mn-workflow
+     relays them). Findings from an older head, with a new push Codex has not reviewed: the
+     handoff goes on, so Codex reviews the fix (MethBot 2026-11-15: #518, #524, #525 sat
+     61-75 min as idle drafts). A head that does
      not merge cleanly onto origin/main: nothing (the tick relays a merge-main).
   5. Mark the PR ready (if it is a draft); move the card In Progress -> Auto Review.
   0. Not finished (dirty or unpushed) and the Claude's last message ends with a question:
@@ -250,9 +253,11 @@ def run(cwd, g=None, dry=False, out=None, sh=None, sleep=time.sleep, merges=merg
         return say(f"#{n} head {head[:7]} pushed, but GitHub still shows {str(full.get('headRefOid'))[:7]}: "
                    "left to swarm-tick", out)
     status, detail = tick.codex_status(full)
-    if status == 'findings':
+    pushed_after = status == 'findings' and not tick.codex_reviewed_head(full)
+    if status == 'findings' and not pushed_after:
         mark_seen(key)
-        return say(f"#{n} head {head[:7]} pushed; Codex findings are open ({detail}): left to mn-workflow", out)
+        return say(f"#{n} head {head[:7]} pushed; Codex findings are open on this head ({detail}): "
+                   "left to mn-workflow", out)
     if not merges(cwd, head):
         mark_seen(key)
         return say(f"#{n} head {head[:7]} pushed, but it does not merge cleanly onto origin/main: "
@@ -284,7 +289,9 @@ def run(cwd, g=None, dry=False, out=None, sh=None, sleep=time.sleep, merges=merg
             mark_seen(key)
             return say(f"#{n} head {head[:7]} pushed; already ready, in Auto Review and asked for a Codex review", out)
         what = ', '.join(did[:-1]) + (', and ' if len(did) > 1 else '') + did[-1]
-        line = f"#{n} head {head[:7]} pushed. {what[0].upper() + what[1:]}."
+        line = f"#{n} head {head[:7]} pushed. {what[0].upper() + what[1:]}." + (
+            f" (Codex threads from an older head are open: {detail}; Codex re-reviews this head)"
+            if pushed_after else '')
     mark_seen(key)
     return say(line + (' (dry run)' if dry else ''), out)
 
@@ -295,9 +302,30 @@ def hook_command():
     return str(bin_dir() / 'swarm-stop-hook')
 
 
+def linked_dirs(worktree):
+    """The real paths of the top-level symlinks of a worktree that point outside it (such as
+    node_modules -> the main checkout's node_modules, from .swarm.yaml)."""
+    wt = Path(worktree).resolve()
+    out = []
+    try:
+        entries = sorted(Path(worktree).iterdir())
+    except OSError:
+        return out
+    for p in entries:
+        if not p.is_symlink():
+            continue
+        real = Path(os.path.realpath(p))
+        if real.is_dir() and wt not in real.parents and real != wt:
+            out.append(str(real))
+    return out
+
+
 def install(worktree, command=None):
-    """Add the Stop hook to WORKTREE/.claude/settings.local.json. Returns 'added', 'present'
-    or why not."""
+    """Write the worktree's .claude/settings.local.json (the file git ignores; other keys
+    are kept): the Stop hook, and permissions.additionalDirectories for each linked directory
+    outside the worktree (MethBot 2026-11-15 3:05 AM ET: the workers of ptw-521 and ptw-524
+    stopped at a permission prompt for node_modules, a symlink to the main checkout).
+    Returns 'added', 'present' or why not."""
     command = command or hook_command()
     path = Path(worktree) / '.claude' / 'settings.local.json'
     try:
@@ -306,15 +334,23 @@ def install(worktree, command=None):
         return f'not changed: {path} is not JSON ({e})'
     if not isinstance(d, dict):
         return f'not changed: {path} is not a JSON object'
+    changed = []
     stops = d.setdefault('hooks', {}).setdefault('Stop', [])
-    if any(h.get('command') == command for grp in stops for h in grp.get('hooks') or ()):
+    if not any(h.get('command') == command for grp in stops for h in grp.get('hooks') or ()):
+        stops.append({'hooks': [{'type': 'command', 'command': command}]})
+        changed.append('stop hook')
+    dirs = (d.get('permissions') or {}).get('additionalDirectories') or []
+    new = [x for x in linked_dirs(worktree) if x not in dirs]
+    if new:
+        d.setdefault('permissions', {})['additionalDirectories'] = dirs + new
+        changed.append('allowed ' + ', '.join(new))
+    if not changed:
         return 'present'
-    stops.append({'hooks': [{'type': 'command', 'command': command}]})
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f'.{path.name}.tmp')
     tmp.write_text(json.dumps(d, indent=2) + '\n')
     os.replace(tmp, path)
-    return 'added'
+    return 'added ' + '; '.join(changed)
 
 
 def worktrees():
