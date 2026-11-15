@@ -251,6 +251,11 @@ class Launcher:
         """Retry the worker start of a launched PR with no Claude; an unfinished setup is
         redone first."""
         from . import launches, slots
+        state = self.sh('gh', 'pr', 'view', str(pr), '-R', REPO, '--json', 'state', '--jq', '.state',
+                        check=False).strip()
+        if state and state != 'OPEN':  # Codex on PR #26: a closed launch must not start again
+            slots.unstarted_done(pr)
+            return f"PR #{pr} is {state.lower()}: its unstarted record is dropped, no worker start"
         if rec.get('brief_pane'):
             if self.pane_command(rec['brief_pane']) in ('claude', 'node'):
                 launches.send_brief(rec['brief_pane'], rec.get('unit'), rec['brief'])  # raises: retried later

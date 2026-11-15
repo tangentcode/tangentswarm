@@ -585,6 +585,9 @@ class Executor:
         item, col = self.card(a.pr)
         if item and col != board.CANCELED:
             self.move(a.pr, item, board.CANCELED)
+        if not self.dry:  # a canceled launch must not be started again by the start retry
+            from . import slots
+            slots.unstarted_done(a.pr)
 
     def do_card(self, a):
         """A new PR (draft -> In Progress, ready -> Auto Review) or issue (Triage) gets its card."""
@@ -771,15 +774,63 @@ def handle(event, payload, delivery='', ex=None):
     return acts
 
 
+def _inbox_name(delivery):
+    return re.sub(r'[^A-Za-z0-9-]', '', delivery)[:40]
+
+
+def enqueue(event, delivery, payload):
+    """Install one inbox file (atomic rename)."""
+    INBOX.mkdir(parents=True, exist_ok=True)
+    f = INBOX / f"{time.time_ns()}-{_inbox_name(delivery)}.json"
+    tmp = f.with_suffix('.tmp')
+    tmp.write_text(json.dumps(dict(event=event, delivery=delivery, payload=payload)))
+    os.replace(tmp, f)
+    return f
+
+
+def in_inbox(delivery):
+    name = _inbox_name(delivery)
+    return INBOX.is_dir() and any(f.name.split('-', 1)[-1] == f'{name}.json' for f in INBOX.glob('*.json'))
+
+
+def _handled(delivery):
+    try:
+        return eventdb.store().handled(delivery)
+    except Exception:
+        return False
+
+
+def recover_unqueued(now=None, min_age=60, max_age=2 * 86400):
+    """Queue again each delivery the event DB received (and acknowledged) that has no
+    'handled' row and no inbox file, older than min_age s (Codex on PR #26: a crash between
+    the receipt row and the inbox write lost it, and its redelivery was a "duplicate").
+    Returns the delivery ids queued."""
+    now = time.time() if now is None else now
+    out = []
+    for delivery, event, body in eventdb.store().unhandled(now - max_age, now - min_age):
+        if not delivery or in_inbox(delivery):
+            continue
+        try:
+            enqueue(event, delivery, json.loads(body))
+        except (OSError, ValueError, TypeError) as e:
+            log(delivery=delivery, error=f'recover failed: {type(e).__name__}: {e}')
+            continue
+        log(delivery=delivery, event=event, decision='recovered an unqueued delivery')
+        out.append(delivery)
+    return out
+
+
 def drain(ex_factory=Executor):
     """Handle the inbox files oldest first (one thread)."""
     for f in sorted(INBOX.glob('*.json')) if INBOX.is_dir() else []:
+        delivery = f.stem
         try:
             d = json.loads(f.read_text())
-            handle(d['event'], d['payload'], d.get('delivery', ''), ex_factory())
+            delivery = d.get('delivery') or delivery
+            handle(d['event'], d['payload'], delivery, ex_factory())
         except Exception as e:
-            log(delivery=f.stem, error=f'{type(e).__name__}: {e}')
-            _add('handled', f.stem, '', error=f'{type(e).__name__}: {str(e)[:500]}')
+            log(delivery=delivery, error=f'{type(e).__name__}: {e}')
+            _add('handled', delivery, '', error=f'{type(e).__name__}: {str(e)[:500]}')
         f.unlink(missing_ok=True)
 
 
@@ -844,14 +895,16 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             kinds = [f'classify failed: {type(e).__name__}']
         _, dup = self._received(delivery, event, payload, hdrs, raw, True, decisions=kinds)
-        if dup:
+        if dup and (in_inbox(delivery) or _handled(delivery)):
             log(delivery=delivery, event=event, decision='duplicate delivery: skip')
             return self._reply(200, 'duplicate\n')
-        INBOX.mkdir(parents=True, exist_ok=True)
-        f = INBOX / f"{time.time_ns()}-{re.sub(r'[^A-Za-z0-9-]', '', delivery)[:40]}.json"
-        tmp = f.with_suffix('.tmp')
-        tmp.write_text(json.dumps(dict(event=event, delivery=delivery, payload=payload)))
-        os.replace(tmp, f)
+        if dup:  # Codex on PR #26: received before but never queued (a crash or a failed write)
+            log(delivery=delivery, event=event, decision='redelivery of an unqueued delivery: queued')
+        try:
+            enqueue(event, delivery, payload)
+        except OSError as e:  # recover_unqueued() queues it from the event DB later
+            log(delivery=delivery, event=event, error=f'inbox write failed: {e}')
+            return self._reply(500, 'not queued\n')
         if self.wake:
             self.wake.set()
         self._reply(200, 'queued\n')
@@ -862,9 +915,16 @@ def serve(port=PORT, host='127.0.0.1'):
     Handler.wake = wake
 
     def worker():
+        last_recover = 0.0
         while True:
             wake.wait(5)
             wake.clear()
+            if time.time() - last_recover >= 60:  # also at start: deliveries lost in a crash
+                last_recover = time.time()
+                try:
+                    recover_unqueued()
+                except Exception as e:
+                    log(decision='recover failed', error=f'{type(e).__name__}: {e}')
             drain()
             try:
                 flush_wakes()

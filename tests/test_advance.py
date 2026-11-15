@@ -859,3 +859,17 @@ def test_no_minbot_pass_while_the_pr_has_an_open_question_for_michal():
         'issue #419 has an unanswered question for Michal'
     answered = {'number': 419, 'comments': {'nodes': [{'body': 'Use the new colors.'}]}}  # Michal replied last
     assert A.open_question({'body': 'Fixes #419', 'closingIssuesReferences': {'nodes': [answered]}}) is None
+
+
+def test_a_minbot_pass_from_green_ci_queues_a_cascade(board_read, monkeypatch):
+    """Codex on PR #26: a CI-driven pass moved the PR to Ready and nothing restocked Staging."""
+    cols = {board.HUMAN_REVIEW: [1, 2], board.STAGING: [],
+            board.AUTO_REVIEW: [dict(number=7, head=H, item='I7')]}
+    board_read(cols)
+    queued = []
+    monkeypatch.setattr(A, 'queue_cascade', lambda qdir=None: queued.append(1) or 'queued')
+    monkeypatch.setattr('tangentswarm.promoted.read_columns', lambda gql, max_age=0: cols)
+    out, calls = [], []
+    adv = A.Advance(g=Gate(cols, details={7: codex_pr()}), out=out.append, minbot=lambda *a: calls.append(a))
+    adv.minbot_one(7)
+    assert queued == [1] and A.RERUN.exists() and 'reached Ready: cascade queued' in out[-1]

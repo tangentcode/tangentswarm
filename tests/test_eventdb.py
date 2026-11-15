@@ -129,3 +129,32 @@ def test_the_wake_post_retries_with_backoff_and_stops_on_a_permanent_4xx(tmp_pat
     W.post_wake({'why': 'y'}, url_file=tmp_path / 'u', urlopen=urlopen, sleep=waits.append, background=False)
     assert codes == [200]
     assert eventdb.backoff(1) == 10 and eventdb.backoff(4) == 80 and eventdb.backoff(20) == 900
+
+
+def test_a_received_but_unqueued_delivery_is_recovered_and_its_redelivery_queued(tmp_path, monkeypatch):
+    """Codex on PR #26: a crash between the receipt row and the inbox write lost the event,
+    and GitHub's redelivery was dropped as a duplicate."""
+    import time as _t
+    (tmp_path / 'secret').write_text('s3cret\n')
+    monkeypatch.setattr(W, 'SECRET_FILES', [tmp_path / 'secret'])
+    p = {'action': 'opened', 'repository': REPO, 'pull_request': pr(9, draft=True)}
+    st = eventdb.store()
+    st.add_received('lost-1', 'pull_request', p, {}, json.dumps(p).encode(), True, decisions=['card'],
+                    now=_t.time() - 120)
+    assert W.recover_unqueued() == ['lost-1'] and W.in_inbox('lost-1')
+    assert W.recover_unqueued() == []  # already in the inbox
+    W.drain(lambda: Fake())
+    assert st.handled('lost-1') and W.recover_unqueued() == []
+    # a redelivery of a received-but-unqueued delivery is queued, not dropped
+    st.add_received('lost-2', 'pull_request', p, {}, json.dumps(p).encode(), True, decisions=['card'])
+    srv, url = serve()
+    body = json.dumps(p).encode()
+    req = urllib.request.Request(url, data=body, method='POST', headers={
+        'X-GitHub-Event': 'pull_request', 'X-GitHub-Delivery': 'lost-2',
+        'X-Hub-Signature-256': 'sha256=' + hmac.new(b's3cret', body, hashlib.sha256).hexdigest()})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            assert r.read() == b'queued\n'
+    finally:
+        srv.shutdown()
+    assert W.in_inbox('lost-2')

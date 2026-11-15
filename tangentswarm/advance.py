@@ -334,6 +334,10 @@ class Advance:
             return 0
         if not self.minbot_pass({board.AUTO_REVIEW: ar}):
             self.out(f"#{n} stays in Auto Review: " + (self.why[-1] if self.why else 'no MinBot pass'))
+            return 0
+        if not self.dry:  # Codex on PR #26: a new Ready PR may fill Staging now, not at the next tick
+            flag_rerun(by=f'MinBot pass #{n}')
+            self.out(f"#{n} reached Ready: cascade {queue_cascade()}")
         return 0
 
     def full_check(self, n):

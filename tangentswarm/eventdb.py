@@ -158,6 +158,23 @@ class EventStore:
             return self._insert(self._row(stage, delivery, event, payload, decisions=decisions,
                                           done=['error'] if error else [], notes=notes, error=error, pr=pr, now=now))
 
+    def handled(self, delivery):
+        """True when a 'handled' row exists for the delivery."""
+        with self._lock:
+            return self._db.execute("SELECT 1 FROM events WHERE delivery=? AND stage='handled' LIMIT 1",
+                                    (delivery,)).fetchone() is not None
+
+    def unhandled(self, since, before):
+        """[(delivery, event, body)] of good, queued 'received' rows with received in
+        [since, before) and no 'handled' row: deliveries that may have been lost between the
+        receipt and the inbox (Codex on PR #26)."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT delivery, event, body FROM events r WHERE stage='received' AND sig_ok=1 AND reason IS NULL "
+                "AND received >= ? AND received < ? AND NOT EXISTS (SELECT 1 FROM events h WHERE "
+                "h.delivery=r.delivery AND h.stage='handled') ORDER BY id", (since, before)).fetchall()
+        return [(r['delivery'], r['event'], r['body']) for r in rows]
+
     def body_of(self, delivery):
         """(event, payload) of the first good 'received' row of a delivery, or None (replay)."""
         with self._lock:

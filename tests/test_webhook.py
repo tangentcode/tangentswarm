@@ -371,3 +371,10 @@ def test_a_late_delivery_never_restarts_a_merged_or_done_pr():
     ex = Fake(col=board.CANCELED, full=codex_pr(findings=True))  # open PR, but its card is Canceled
     ex.run(W.Action('codex', 541))
     assert ex.relays == [] and ex.calls == []
+
+
+def test_a_closed_pr_drops_its_unstarted_launch():
+    from tangentswarm import slots
+    slots.unstarted_add(77, branch='b', brief='', issue=5)
+    Fake(col=board.IN_PROGRESS).run(W.Action('closed', 77))
+    assert '77' not in slots.load()['unstarted']

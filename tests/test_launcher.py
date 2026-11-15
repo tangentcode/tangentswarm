@@ -240,3 +240,12 @@ def test_a_pending_brief_is_retried_even_at_the_claude_cap(monkeypatch):
     reqs = sorted(json.loads(p.read_text())['pr'] for p in spool.SPOOL.glob('*.req.json'))
     assert reqs == [539]  # the brief line, not the new worker start of #537
     assert 'start: queued the brief line of #539 (c)' in out
+
+
+def test_a_closed_pr_is_never_started_again_by_the_retry():
+    """Codex on PR #26: a canceled launch's record restarted the worker."""
+    slots.unstarted_add(601, branch='b', brief='/b/601.txt', issue=412)
+    lz = L.Launcher(g=gate(), run=Run(), launch=lambda *a, **k: (_ for _ in ()).throw(AssertionError('started')))
+    lz.sh = lambda *a, check=True: 'CLOSED' if a[:3] == ('gh', 'pr', 'view') else ''
+    note = lz.start_existing(601, slots.load()['unstarted']['601'])
+    assert 'closed' in note and '601' not in slots.load()['unstarted']
