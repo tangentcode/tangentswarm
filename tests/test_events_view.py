@@ -131,3 +131,34 @@ def test_a_cascade_that_did_nothing_is_hidden_and_commands_read_plainly():
                received_at='2026-11-15T13:00:01-05:00', notes='["gh issue close 491 -R o/r"]')
     evs = V.events([idle, busy, cmd])
     assert [(e['event'], e['outcome']) for e in evs] == [('cascade', 'parked #547'), ('gh issue close 491', '')]
+
+
+def test_replays_stay_separate_and_a_request_without_a_delivery_id_shows(tmp_path):
+    """Codex on PR #36."""
+    st = eventdb.EventStore(tmp_path / 'e.sqlite')
+    st.add('replay', 'replay-537', 'replay', decisions=['codex'], pr=537, error='codex #537: RuntimeError: x', now=NOW)
+    st.add('replay', 'replay-537', 'replay', decisions=['codex'], pr=537, notes=['queued the MinBot check of #537'],
+           now=NOW + 60)
+    st.add_received('', 'pull_request', None, {}, None, None, reason='bad length', error='Content-Length 0', now=NOW + 61)
+    evs = V.events(st.rows())
+    assert [(e['event'], e['status']) for e in evs] == [('replay', 'failed'), ('replay', 'handled'),
+                                                         ('pull_request', 'failed')]
+    assert evs[1]['outcome'] == 'MinBot check #537' and not evs[1]['error']
+    assert 'Content-Length 0' in evs[2]['error']
+
+
+def test_a_verbose_pipe_reprints_only_the_changed_event(tmp_path):
+    """Codex on PR #36: by position, one handled row reprinted the rest of the day."""
+    st, path = make(tmp_path)
+    out, added = io.StringIO(), []
+    first = io.StringIO()
+    V.run(path, verbose=True, color=False, out=first, once=True, clock=lambda: NOW)
+
+    def sleep(s):
+        if not added:
+            added.append(st.add('handled', 'd5', 'pull_request_review', None, decisions=['codex'], pr=537,
+                                notes=['#537 -> In Progress'], now=NOW - 5))
+    V.run(path, verbose=True, color=False, out=out, sleep=sleep, polls=2, clock=lambda: NOW)
+    assert out.getvalue().startswith(first.getvalue())
+    tail = out.getvalue()[len(first.getvalue()):]
+    assert tail.count('\n') > 0 and '#513' not in tail and 'moved #537 to In Progress' in tail

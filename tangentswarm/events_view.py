@@ -112,18 +112,28 @@ def events(rows):
     repo, actor, outcome, sig_bad, error, rows}."""
     by_delivery, order = {}, []
     for r in rows:
-        if r.get('stage') in ('received', 'handled', 'replay') and r.get('delivery'):
+        if r.get('stage') in ('received', 'handled') and r.get('delivery'):
             key = r['delivery']
             if key not in by_delivery:
                 by_delivery[key] = []
                 order.append(('d', key))
             by_delivery[key].append(r)
+        elif r.get('stage') in ('received', 'handled', 'replay'):
+            # Codex on PR #36: each replay run is its own event (they share "replay-N"), and a
+            # request with no delivery id (a bad length) is still shown, on its own
+            order.append(('s', r))
         else:
             order.append(('r', r))
     out = []
     for kind, v in order:
-        e = _action(v) if kind == 'r' else _delivery(by_delivery[v])
+        if kind == 'd':
+            e = _delivery(by_delivery[v])
+            key = ('d', v)
+        else:
+            e = _delivery([v]) if kind == 's' else _action(v)
+            key = ('r', v.get('id'))
         if e:
+            e['key'] = key
             out.append(e)
     return out
 
@@ -131,9 +141,13 @@ def events(rows):
 def _delivery(rs):
     rec = [r for r in rs if r.get('stage') == 'received']
     first = rec[0] if rec else rs[0]
+    if first.get('stage') == 'replay':
+        rs, first = [first], dict(first, stage='replay')
     if first.get('reason') == 'duplicate':
         return None  # GitHub redelivered an event already queued
     done = [r for r in rs if r.get('stage') in ('handled', 'replay')]
+    if first.get('stage') == 'replay':
+        done = [first]
     sig_bad = first.get('sig_ok') == 0
     decisions = [d for r in rs for d in _list(r.get('decisions'))]
     if not sig_bad and (first.get('reason') == 'log-only' or (decisions and all(d in HIDDEN for d in decisions))):
@@ -233,13 +247,20 @@ def rows_after(db, last_id, since=''):
                                         (last_id, since))]
 
 
-def render(rows, now=None, color=True, verbose=False, height=None):
-    """The lines of one screen: the newest events that fit in height (all when None)."""
+def blocks(rows, now=None, color=True, verbose=False):
+    """[(event key, text)] in order: the event's line, and its rows as JSON with -v."""
     out = []
     for e in events(rows):
-        out.append(line(e, now, color))
+        text = line(e, now, color)
         if verbose:
-            out += [full(r) for r in e['rows']]
+            text += '\n' + '\n'.join(full(r) for r in e['rows'])
+        out.append((e['key'], text))
+    return out
+
+
+def render(rows, now=None, color=True, verbose=False, height=None):
+    """The lines of one screen: the newest events that fit in height (all when None)."""
+    out = [l for _, text in blocks(rows, now, color, verbose) for l in text.split('\n')]
     return out[-height:] if height else out
 
 
@@ -268,13 +289,13 @@ def run(path, since='today', verbose=False, once=False, color=None, out=sys.stdo
             last = got[-1]['id']
         now = clock()
         if once or not tty:
-            lines = render(rows, now, color, verbose)
-            # a queued event becomes handled later: print a line again only when it changed
+            # a queued event becomes handled later: print an event again only when it changed,
+            # tracked by its identity (Codex on PR #36: by position, one change reprinted the rest)
             shown = shown or {}
-            for i, l in enumerate(lines):
-                if shown.get(i) != l:
-                    print(l, file=out)
-                    shown[i] = l
+            for key, text in blocks(rows, now, color, verbose):
+                if shown.get(key) != text:
+                    print(text, file=out)
+                    shown[key] = text
         elif got or drawn is None or now - drawn >= redraw:
             height = shutil.get_terminal_size((120, 40)).lines - 1
             out.write(CLEAR + '\n'.join(render(rows, now, color, verbose, height)) + '\n')
