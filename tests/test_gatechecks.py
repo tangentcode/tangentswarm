@@ -134,3 +134,30 @@ def test_every_site_accepts_the_vn_tip_and_an_unreadable_site_fails_entry():
     assert not G.check_served_sites(web, True, [], never)[0]
     assert G.check_served_sites(web, True, sites, never, work_bad='origin/work has markers') == \
         (False, 'origin/work has markers')
+
+
+def pass_comment(body, login='tangentcode-minbot'):
+    return {'author': {'login': login}, 'body': body}
+
+
+def test_minbot_pass_comment_must_name_the_exact_head():
+    head = '39144fac99549b3b2e7e10db7d945da62d342648'
+    old = pass_comment('### MinBot pass\n\nCommit: `49cf308210a01c8161614d55485f12cf8ca9a5ff`\n\nCodex clean')
+    new = pass_comment(f'### MinBot pass\n\nCommit: `{head}`\n\nCodex clean on 39144fac99')
+    assert G.minbot_pass([old], [('head', head)]) == (False, 'no MinBot pass comment names head 39144fac')
+    assert G.minbot_pass([old, new], [('head', head)]) == (True, 'MinBot pass comment names head 39144fac')
+    short = pass_comment('### MinBot pass\n\nCommit: `b1849519fd`\n\nExact-head pass on b1849519fd')
+    assert G.minbot_pass([short], [('head', 'b1849519fd' + '0' * 30)])[0]
+    assert G.minbot_pass([pass_comment('### MinBot pass on 39144fac99')], [('head', head)])[0]
+
+
+def test_minbot_pass_accepts_the_vn_tip_but_not_other_authors_or_titles():
+    tip, head = '06347b83' + 'a' * 32, '0a8b0f7a' + 'b' * 32
+    c = pass_comment(f'### MinBot pass\n\nCommit: `{tip}`')
+    assert not G.minbot_pass([c], [('head', head)])[0]
+    assert G.minbot_pass([c], [('head', head), ('ptw/x-v2', tip)]) == (True, 'MinBot pass comment names ptw/x-v2 06347b83')
+    assert G.minbot_pass([pass_comment(f'### MinBot pass\n\nCommit: `{head}`', login='tangentcode-minbot[bot]')],
+                         [('head', head)])[0]
+    assert not G.minbot_pass([pass_comment(f'### MinBot pass\n\nCommit: `{head}`', login='someone')], [('head', head)])[0]
+    assert not G.minbot_pass([pass_comment(f'### Evidence\n\nCommit: `{head}`')], [('head', head)])[0]
+    assert not G.minbot_pass([pass_comment('### MinBot pass\n\nCommit: `0a8b0f7`')], [('head', head)])[0]  # 7 chars

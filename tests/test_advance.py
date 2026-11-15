@@ -121,10 +121,11 @@ def test_minbot_pass_labels_comments_and_moves_to_ready(board_read):
     board_read(cols)
     g = Gate(cols, details={7: codex_pr()})
     out, calls = run(g)
-    assert calls[0] == ('label', 'add', 7, 'MinBot-passed', '--repo', A.REPO)
-    assert calls[1][:2] == ('evidence', 7) and H in calls[1] and A.pass_text(H) in calls[1]
+    assert len(calls) == 1 and not any(c[0] == 'label' for c in calls)  # the label is retired
+    assert calls[0][:2] == ('evidence', 7) and H in calls[0] and A.pass_text(H) in calls[0]
+    assert calls[0][calls[0].index('--title') + 1] == 'MinBot pass'  # what hr-gate condition 4 reads
     assert g.moves == [('I7', board.READY)]
-    assert out == [f"MinBot-pass #7 at {H[:8]}: label, pass comment, Auto Review -> Ready"]
+    assert out == [f"MinBot-pass #7 at {H[:8]}: pass comment, Auto Review -> Ready"]
 
 
 def test_minbot_pass_dry_run_moves_nothing(board_read):
@@ -134,7 +135,7 @@ def test_minbot_pass_dry_run_moves_nothing(board_read):
     g = Gate(cols, details={7: codex_pr()})
     out, calls = run(g, dry=True)
     assert g.moves == [] and out[0].startswith('would MinBot-pass #7')
-    assert len(calls) == 2  # minbot without --apply is its own dry run
+    assert len(calls) == 1  # minbot without --apply is its own dry run
 
 
 def test_minbot_pass_refuses_a_failed_gate_row(board_read):

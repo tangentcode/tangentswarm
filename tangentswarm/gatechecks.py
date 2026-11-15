@@ -164,3 +164,27 @@ def check_served_sites(paths, entering, sites, has_head, tips=(), contains=None,
         why = f"{len(bad)} of {len(res)} staging sites do not serve it: " + '; '.join(bad)
         return (False, why) if entering else (True, lag + why)
     return True, f"all {len(res)} staging sites serve it: " + '; '.join(f"{h}: {w}" for h, _, w in res)
+
+
+# Condition 4 (Michal 2026-11-14 7:22 PM ET): the MinBot-passed label is retired. The pass is
+# a MinBot comment that names the commit it passed: "### MinBot pass" with "Commit: `<sha>`"
+# (minbot evidence --title "MinBot pass" --commit SHA), or "### MinBot pass on <sha>".
+MINBOT_LOGIN = 'tangentcode-minbot'
+_PASS_TITLE = re.compile(r'^\s*###\s*MinBot pass\b')
+_HEX = re.compile(r'\b[0-9a-f]{8,40}\b')
+
+
+def minbot_pass(comments, shas):
+    """(ok, why) for condition 4. shas: [(label, sha)] such as [('head', H)] or the -vN tip.
+    Passes when a MinBot pass comment names one of them (8 or more hex characters of it)."""
+    for c in reversed(list(comments or [])):
+        login = ((c.get('author') or {}).get('login') or '').replace('[bot]', '')
+        body = c.get('body') or ''
+        if login != MINBOT_LOGIN or not _PASS_TITLE.match(body):
+            continue
+        named = _HEX.findall(body)
+        for label, sha in shas:
+            if sha and any(sha.startswith(t) for t in named):
+                return True, f"MinBot pass comment names {label} {sha[:8]}"
+    want = ', '.join(f"{label} {sha[:8]}" for label, sha in shas if sha)
+    return False, f"no MinBot pass comment names {want}"

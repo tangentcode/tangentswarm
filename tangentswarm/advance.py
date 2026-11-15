@@ -12,8 +12,9 @@ the first useful step, nearest Human Review first:
                checks the image URLs and the static .deploy-sha) or its advance.
   3. minbot    an Auto Review PR is Codex-clean on its exact head (receipt, no findings,
                no open Codex threads), not a draft, merges onto main and has green Linux
-               CI (hr-gate conditions 1, 2, 3, 5): add MinBot-passed, post the pass
-               comment, and move the card to Ready.
+               CI (hr-gate conditions 1, 2, 3, 5): post the MinBot pass comment that
+               names the head (hr-gate condition 4 reads it; the MinBot-passed label
+               is retired), and move the card to Ready.
 
 Nothing to do: exit 0 with one summary line.
 
@@ -218,12 +219,11 @@ class Advance:
 
     def apply_pass(self, p):
         n, head = p['number'], p['head']
-        self.minbot('label', 'add', n, 'MinBot-passed', '--repo', REPO)
         self.minbot('evidence', n, '--repo', REPO, '--title', 'MinBot pass', '--commit', head,
                     '--body', pass_text(head))
         if not self.dry:
             self.g['move'](p['item'], board.READY)
-        self.out(f"{'would ' if self.dry else ''}MinBot-pass #{n} at {head[:8]}: label, pass comment, "
+        self.out(f"{'would ' if self.dry else ''}MinBot-pass #{n} at {head[:8]}: pass comment, "
                  "Auto Review -> Ready")
 
     # the step ----------------------------------------------------------------
