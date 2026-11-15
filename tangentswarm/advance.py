@@ -674,8 +674,9 @@ class Cascade(Advance):
             return
         moved = self.f.fail(p, f"conflicts with {where}"[:200], relay='merge-main', text=msg)
         self.flush()
-        if not moved:  # no worker could be started: the card stays, the relay waits for one
+        if not moved:  # no worker could be started: the card stays, and the next pass tries again
             self.out(f"RELAY: swarm-resume {n} {flow.RELAY_DIR / f'relay-{n}-merge-main.md'}")
+            return  # Codex on PR #26: never record a relay no worker took
         with slots.update() as st:
             st['relayed'][str(n)] = head
 

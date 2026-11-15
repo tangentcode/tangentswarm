@@ -487,6 +487,10 @@ def test_a_rework_with_no_worker_never_demotes_the_card(monkeypatch, tmp_path):
                for l in out)
     assert f'RELAY: swarm-resume 481 {tmp_path}/relay-481-merge-main.md' in out
     assert F.held()[481]['head'] == f'{481:040d}'  # not pulled again at this head
+    from tangentswarm import slots
+    assert '481' not in slots.load()['relayed']  # Codex on PR #26: no worker took it, so the next pass tries again
+    c.main_check(cols)
+    assert len(revived) == 2
 
 
 def test_empty_ready_stops_the_fill_and_starts_coders_on_active_issues(monkeypatch, tmp_path):

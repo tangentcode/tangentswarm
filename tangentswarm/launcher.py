@@ -35,6 +35,13 @@ STOP = {'a', 'an', 'the', 'on', 'of', 'to', 'in', 'for', 'and', 'or', 'with', 'i
         'must', 'can', 'it', 'its', 'as', 'at', 'by', 'from', 'into', 'when', 'that', 'this', 'not', 'non', 'show'}
 
 
+def closes(body, n):
+    """True when body has a closing reference to exactly issue n ("Fixes #50", not "#507").
+    Codex on PR #26: a substring test let issue #50 reuse the branch of a PR for #507."""
+    return re.search(rf'(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+(?:{re.escape(REPO)})?#{int(n)}(?!\d)',
+                     body or '') is not None
+
+
 def slug(title, n=None):
     """A short branch slug like the hand launches (avo-save-icon): three or four words of the
     title, at most 28 characters. The window becomes mn-<PR>-<slug>."""
@@ -101,7 +108,7 @@ class Launcher:
             return b
         body = self.sh('gh', 'pr', 'list', '-R', REPO, '--head', b, '--state', 'open', '--json', 'body',
                        '--jq', '.[0].body', check=False)
-        return b if f'#{n}' in body else f"{b}-{n}"
+        return b if closes(body, n) else f"{b}-{n}"
 
     def branch(self, n, branch):
         """Push the scaffold branch (one empty "Start #N" commit on origin/main), unless it exists."""

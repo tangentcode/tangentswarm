@@ -219,3 +219,10 @@ def test_a_failed_brief_send_keeps_the_record_and_the_retry_sends_only_the_brief
     note = lz.start_existing(601, rec)
     assert sent == [('%9', 'u.scope', rec['brief'])] and 'brief line sent' in note
     assert '601' not in slots.load()['unstarted']
+
+
+def test_a_branch_is_reused_only_for_an_exact_closing_reference():
+    """Codex on PR #26: issue #50 reused the branch of a PR whose body says "Fixes #507"."""
+    assert L.closes('Fixes #50', 50) and L.closes('closes tangentcode/platform#50.', 50)
+    assert L.closes('Some text\nResolves #50\n', 50)
+    assert not L.closes('Fixes #507', 50) and not L.closes('see #50', 50) and not L.closes('', 50)
