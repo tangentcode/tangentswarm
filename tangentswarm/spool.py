@@ -65,12 +65,33 @@ def submit(op, cwd, transcript=None, wait=0, spool=None, sleep=time.sleep, clock
     return {'ok': False, 'error': NO_DAEMON.format(wait=wait)}
 
 
+RUN_STALE = 900  # s: a claimed request older than this lost its serve process: queue it again
+
+
+def reclaim(spool=None, older_than=None, now=time.time):
+    """Put claimed requests back into the queue: all of them at daemon start (a restart kills
+    the whole service cgroup, serve processes included), else those older than older_than s.
+    A handoff is safe to repeat (once per head). Returns the request ids."""
+    spool = spool or SPOOL
+    back = []
+    for run in spool.glob('*.run.json') if spool.is_dir() else ():
+        try:
+            if older_than is not None and now() - run.stat().st_mtime < older_than:
+                continue
+            os.replace(run, run.with_name(run.name.replace('.run.json', '.req.json')))
+            back.append(run.name.split('.')[0])
+        except OSError:
+            continue
+    return back
+
+
 def dispatch(spool=None, spawn=subprocess.Popen, command=None, log=None, now=time.time):
     """Daemon side, every second: claim each request and serve it in its own process.
     Returns the claimed request ids."""
     spool = spool or SPOOL
     if not spool.is_dir():
         return []
+    reclaim(spool, older_than=RUN_STALE, now=now)
     started = []
     for req in sorted(spool.glob('*.req.json')):
         try:
@@ -85,6 +106,7 @@ def dispatch(spool=None, spawn=subprocess.Popen, command=None, log=None, now=tim
             os.replace(req, run)  # claim it (one daemon wins)
         except OSError:
             continue
+        os.utime(run)  # the claim time (RUN_STALE counts from here)
         cmd = list(command or [_hook_command(), 'serve']) + [str(run)]
         logf = open(log, 'a') if log else subprocess.DEVNULL
         try:

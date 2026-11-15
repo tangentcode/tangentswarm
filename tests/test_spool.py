@@ -92,3 +92,16 @@ def test_dispatch_claims_once_and_serves_a_stop_hook_without_an_answer(wt, monke
     assert len(got) == 1 and served == ['stophook']
     assert spool.dispatch(spawn=lambda cmd, **k: served.append('again'), command=['serve']) == []
     assert list(spool.SPOOL.iterdir()) == []  # no answer file for the Stop hook
+
+
+def test_requests_claimed_before_a_restart_are_served_again(wt):  # noqa: F811
+    """01:52 ET: a daemon restart (KillMode=control-group) killed four serve processes and
+    left their claimed files behind for good."""
+    spool.submit('stophook', wt)
+    spool.dispatch(spawn=lambda cmd, **k: None, command=['serve'])  # claimed, then the serve dies
+    assert len(list(spool.SPOOL.glob('*.run.json'))) == 1
+    assert len(spool.reclaim()) == 1 and len(list(spool.SPOOL.glob('*.req.json'))) == 1
+    spool.dispatch(spawn=lambda cmd, **k: None, command=['serve'])
+    t = time.time()
+    assert spool.reclaim(older_than=spool.RUN_STALE, now=lambda: t) == []  # fresh claim: kept
+    assert len(spool.reclaim(older_than=spool.RUN_STALE, now=lambda: t + spool.RUN_STALE + 1)) == 1

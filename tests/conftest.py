@@ -32,6 +32,9 @@ def isolated_state(tmp_path, monkeypatch):
     from tangentswarm import flow
     from tangentswarm import stophook
     from tangentswarm import spool
+    from tangentswarm import events as _events
+    monkeypatch.setattr(_events, 'EVENTS', tmp_path / 'github-events.jsonl')
+    monkeypatch.setattr(_events, 'OFFSET', tmp_path / 'events.offset')
     monkeypatch.setattr(spool, 'SPOOL', tmp_path / 'spool')
     monkeypatch.setattr(advance, 'check_runs', lambda head: [])  # no real GitHub read in a test
     from tangentswarm import tick as _tick

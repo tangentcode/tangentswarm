@@ -242,6 +242,7 @@ class Promoter:
         self.last_hr = None    # Human Review count at the last check
         self.cascade_at = 0.0  # when this daemon last queued a cascade for an empty Human Review
         self.last_deploy = None  # the staging .deploy-sha values at the last check
+        self.events = None       # tangentswarm.events reader (made on first use)
 
     def main_sha(self):
         """origin main's SHA via git ls-remote (no API quota), or None on an error."""
@@ -288,16 +289,26 @@ class Promoter:
         return f"a staging .deploy-sha changed ({new}) with pulls in flight ({names})"
 
     def each_second(self):
-        """Cheap work between polls: serve the worker spool (tangentswarm.spool: the Stop
-        hook and swarm-worker-mcp requests from inside swarm-workers.slice)."""
+        """Cheap work every second (its own thread): serve the worker spool
+        (tangentswarm.spool: the Stop hook and swarm-worker-mcp requests from inside
+        swarm-workers.slice), and act on new GitHub events (tangentswarm.events, #31)."""
         if self.dry:
             return
-        from . import spool
+        from . import events, spool
         try:
             for rid in spool.dispatch(log=str(STOP_LOG)):
                 say(f"spool: serving {rid}")
         except Exception as e:
             say(f"spool: {type(e).__name__}: {e}")
+        # tangentswarm #31: GitHub events instead of the mn-workflow timer and the Codex poll
+        try:
+            if self.events is None:
+                self.events = events.Events()
+            if events.pending() or self.events.mn_pending:
+                for line in self.events.poll():
+                    say(f"event: {line}")
+        except Exception as e:
+            say(f"events: {type(e).__name__}: {e}")
 
     def queue_cascade(self, why, now=None):
         from . import advance
@@ -529,6 +540,11 @@ def start_spool_thread(p, interval=1.0, stop=None):
     under the lock never delays a worker's Stop-hook or MCP request."""
     import threading
     stop = stop or threading.Event()
+    if not p.dry:
+        from . import spool
+        back = spool.reclaim()  # a restart killed every serve process of the old daemon
+        if back:
+            say(f"spool: {len(back)} request(s) claimed before the restart are queued again")
 
     def loop():
         while not stop.is_set():
