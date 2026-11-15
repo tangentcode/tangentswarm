@@ -390,27 +390,7 @@ class Executor:
         per WAKE_EVERY s for all keys together (Codex on PR #26: a burst of distinct failures
         woke the LLM once per delivery). Exceptions inside the interval wait in the pending
         list; the next POST carries them in "also"."""
-        key = key or why[:80]
-        t = now()
-        payload = {'source': 'swarm-webhook', 'kind': 'exception', 'pr': n or None, 'why': why,
-                   'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'log': str(LOG)}
-        with _lock:
-            st = _seen()
-            last = st.setdefault('wake', {})
-            if t - float(last.get(key, 0)) < WAKE_DEDUPE:
-                return self.note(f"exception already sent: {why[:120]}")
-            last[key] = t
-            if not self.dry:
-                st.setdefault('wake_pending', []).append(payload)
-                del st['wake_pending'][:-WAKE_PENDING_MAX]
-            _save_seen(st)
-        log(decision='wake', **payload)
-        if self.dry:
-            return self.note(f"would wake swarmbot: {why}")
-        if flush_wakes(self.wake_post or post_wake, now=now):
-            self.note(f"woke swarmbot: {why}")
-        else:
-            self.note(f"swarmbot wake queued (one POST per {WAKE_EVERY} s): {why}")
+        self.note(wake_exception(n, why, key=key, now=now, dry=self.dry, post=self.wake_post))
 
     # -- handlers -----------------------------------------------------------------------
     def run(self, a):
@@ -694,6 +674,32 @@ def flush_wakes(post=None, now=time.time):
         payload['also'] = [{k: p.get(k) for k in ('pr', 'why', 'at')} for p in pending[1:]]
     (post or post_wake)(payload)
     return True
+
+
+def wake_exception(n, why, key=None, now=time.time, dry=False, post=None, source='swarm-webhook'):
+    """An exception for swarmbot, from the webhook or any other swarm process (the daemon's
+    deploy-lag check): deduped by key for WAKE_DEDUPE s, at most one POST per WAKE_EVERY s
+    for all keys together. Returns a note line."""
+    key = key or why[:80]
+    t = now()
+    payload = {'source': source, 'kind': 'exception', 'pr': n or None, 'why': why,
+               'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'log': str(LOG)}
+    with _lock:
+        st = _seen()
+        last = st.setdefault('wake', {})
+        if t - float(last.get(key, 0)) < WAKE_DEDUPE:
+            return f"exception already sent: {why[:120]}"
+        last[key] = t
+        if not dry:
+            st.setdefault('wake_pending', []).append(payload)
+            del st['wake_pending'][:-WAKE_PENDING_MAX]
+        _save_seen(st)
+    log(decision='wake', **payload)
+    if dry:
+        return f"would wake swarmbot: {why}"
+    if flush_wakes(post or post_wake, now=now):
+        return f"woke swarmbot: {why}"
+    return f"swarmbot wake queued (one POST per {WAKE_EVERY} s): {why}"
 
 
 # -- dedupe state ------------------------------------------------------------------------
