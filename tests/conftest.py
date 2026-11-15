@@ -34,6 +34,11 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(flow, 'HELD', tmp_path / 'held.json')
     from tangentswarm import stophook
     from tangentswarm import spool
+    from tangentswarm import webhook as _wh
+    monkeypatch.setattr(_wh, 'LOG', tmp_path / 'webhook.log')
+    monkeypatch.setattr(_wh, 'INBOX', tmp_path / 'webhook-inbox')
+    monkeypatch.setattr(_wh, 'SEEN', tmp_path / 'webhook-seen.json')
+    monkeypatch.setattr(_wh, 'WAKE_URL_FILE', tmp_path / 'wake-url')
     from tangentswarm import events as _events
     monkeypatch.setattr(_events, 'EVENTS', tmp_path / 'github-events.jsonl')
     monkeypatch.setattr(_events, 'OFFSET', tmp_path / 'events.offset')
