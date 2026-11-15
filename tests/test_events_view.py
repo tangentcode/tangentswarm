@@ -66,3 +66,14 @@ def test_since(tmp_path):
     out = io.StringIO()
     V.run(path, since='2099-01-01', once=True, color=False, out=out)
     assert out.getvalue() == ''
+
+
+def test_the_bin_wrapper_runs_this_checkout(tmp_path):
+    import os
+    import subprocess
+    import sys
+    _, path = make(tmp_path)
+    wrapper = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'bin', 'swarm-events')
+    r = subprocess.run([wrapper, '--once', '--no-color', '--db', path], capture_output=True, text=True, timeout=30,
+                       env=dict(os.environ, TANGENTSWARM_PYTHON=sys.executable))
+    assert r.returncode == 0 and r.stdout.count('\n') == 4 and 'tangentcode/platform#537' in r.stdout, r.stderr

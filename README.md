@@ -929,6 +929,31 @@ swarm-hookgate wait                # return once the REST quota has a reserve; s
 
 The `SWARM_HOOK_*` variables override these limits. The state is in `~/.cache/swarm-hook`.
 
+## swarm-webhook and swarm-events
+
+`swarm-webhook` (`tangentswarm/webhook.py`) is the GitHub org webhook receiver. It runs the
+board rules with no LLM. It logs every inbound request in an append-only SQLite event log,
+`~/.local/state/swarm-flow/webhook-events.sqlite` (`tangentswarm/eventdb.py`).
+
+`swarm-events` is the console viewer of that log. It opens the DB read-only, prints today's
+rows (ET), then follows new rows every second. Errors are red. Duplicates, log-only rows and
+rejected requests are dim. `-v` prints each row as JSON. `--since all|YYYY-MM-DD` and
+`--once` are also available.
+
+Install it, in one of these ways:
+
+    pip install .                                          # the swarm-events entry point
+    ln -sf "$PWD/bin/swarm-events" ~/bin/swarm-events      # or: this checkout, no install
+
+The `bin/swarm-events` wrapper uses `$TANGENTSWARM_PYTHON` (default `python3`). To keep it
+open in tmux:
+
+    tmux new-session -d -s events -n webhook ~/bin/swarm-events
+    tmux attach -t events
+
+Private ids, hosts and secret paths are in `~/.config/tangentswarm/config.toml`, never in
+the repo. `tangentswarm/config.example.toml` shows the shape.
+
 ## License
 
 MIT
