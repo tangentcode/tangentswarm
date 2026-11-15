@@ -19,4 +19,6 @@ def isolated_state(tmp_path, monkeypatch):
     from tangentswarm import moves
     monkeypatch.setattr(moves, 'LOG', tmp_path / 'moves.log')
     monkeypatch.setattr(moves, 'SEEN', tmp_path / 'ready-seen.json')
+    from tangentswarm import conflictmap
+    monkeypatch.setattr(conflictmap, 'PATH', tmp_path / 'conflict-map.json')
     yield tmp_path

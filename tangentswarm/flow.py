@@ -194,6 +194,8 @@ class Flow:
         self.dry, self.out, self.now = dry_run, out, now
         self.did, self.notes = [], []
         self.tool_timeout = 1800  # one hr-gate / pending-promote run; the cascade sets less
+        from .conflictmap import ConflictMap
+        self.cmap = ConflictMap()  # merge-tree answers per SHA pair
         self.g = g if g is not None else runpy.run_path(str(BIN / 'hr-gate'), run_name='swarm_flow')
 
     def change(self, text):
@@ -237,7 +239,23 @@ class Flow:
         return True
 
     # -- 2. pull --------------------------------------------------------------
+    def clean(self, scratch, a, b):
+        """git merge-tree a b is clean? Kept per SHA pair in the conflict map."""
+        return self.cmap.clean(a, b, lambda: self.g['merge_tree_clean'](scratch.dir, a, b))
+
+    @staticmethod
+    def sha_of(scratch, ref):
+        r = git(scratch, 'rev-parse', '--verify', '--quiet', f'{ref}^{{commit}}', check=False)
+        sha = (r.stdout or '').strip()
+        return sha if r.returncode == 0 and len(sha) == 40 else ref
+
     def pull(self, prs, cols, scratch, limit=None, strict=False):
+        try:
+            return self._pull(prs, cols, scratch, limit, strict)
+        finally:
+            self.cmap.save()
+
+    def _pull(self, prs, cols, scratch, limit=None, strict=False):
         """Start one pull. Returns the pulled PR, or None. limit: pull only while Staging has
         fewer PRs than this (default STAGING_MIN).
         strict (the swarm-advance cascade): no rework to fill Staging. A Ready PR is pulled
@@ -252,25 +270,25 @@ class Flow:
             self.note(f"Staging {len(staging)}/{STAGING_MIN} and Ready is empty: refill needed")
             return
         scratch.ensure_main()
-        main = scratch.main
+        main = self.sha_of(scratch, scratch.main)  # a SHA, so the conflict map can key on it
         hr = cols.get(board.HUMAN_REVIEW, [])
         queue = self.staging_order(staging)
         bases = [(f"#{p['number']}", p['head']) for p in hr + queue]
         scratch.ensure(*[sha for _, sha in bases], *[p['head'] for p in ready])
         conflicts = {}
         for p in ready:
-            conflicts[p['number']] = sum(not self.g['merge_tree_clean'](scratch.dir, sha, p['head'])
+            conflicts[p['number']] = sum(not self.clean(scratch, sha, p['head'])
                                          for sha in [main] + [s for _, s in bases])
         work = self.fetch_work(scratch) if strict else None
         for p in ready_order(ready, conflicts):
             n = p['number']
             if strict:
                 bad = [label for label, sha in [('main', main), (WORK, work)] + bases
-                       if not self.g['merge_tree_clean'](scratch.dir, sha, p['head'])]
+                       if not self.clean(scratch, sha, p['head'])]
                 if bad:
                     self.note(f"#{n} skipped: does not merge cleanly with {', '.join(bad)} (no rework to fill Staging)")
                     continue
-            elif not self.g['merge_tree_clean'](scratch.dir, main, p['head']):
+            elif not self.clean(scratch, main, p['head']):
                 self.fail(p, 'does not merge cleanly onto main: merge origin/main into the branch (no rebase)',
                           relay='merge-main')
                 continue
@@ -278,7 +296,7 @@ class Flow:
             # Human Review only; the Staging PRs behind it are re-stacked at their own promotion.
             # Strict: no re-stack, so it must stack on every Staging PR too.
             mine = bases[:len(hr)] if p['rank'] == board.FAST_TRACK and not strict else bases
-            bad = stack_conflict(scratch, main, mine, p['head'])
+            bad = self.cmap.stack(main, mine, p['head'], lambda: stack_conflict(scratch, main, mine, p['head']))
             if bad:
                 self.note(f"#{n} skipped this step: conflicts with {bad} (Ready order kept)")
                 continue
