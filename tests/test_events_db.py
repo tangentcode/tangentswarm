@@ -88,3 +88,44 @@ def test_the_viewer_filters_by_source(tmp_path):
     out = io.StringIO()
     V.run(str(tmp_path / 'e.sqlite'), once=True, color=False, out=out)
     assert len(out.getvalue().splitlines()) == 2
+
+
+def _open(path, q):
+    try:
+        eventdb.EventStore(path)
+        q.put('ok')
+    except Exception as e:
+        q.put(f'{type(e).__name__}: {e}')
+
+
+def test_concurrent_first_opens_of_an_old_db_add_the_columns_once(tmp_path):
+    """Codex on PR #33: two processes raced the ALTER TABLE (duplicate column name)."""
+    import multiprocessing
+    path = str(tmp_path / 'old.sqlite')
+    db = sqlite3.connect(path)  # the pre-#32 schema, without source and actor
+    db.execute("CREATE TABLE events(id INTEGER PRIMARY KEY, delivery TEXT, event TEXT, action TEXT, lane TEXT, "
+               "headers TEXT, body BLOB, received REAL, received_at TEXT, reason TEXT, stage TEXT NOT NULL, "
+               "repo TEXT, pr INTEGER, sender TEXT, sig_ok INTEGER, decisions TEXT NOT NULL DEFAULT '[]', "
+               "done TEXT NOT NULL DEFAULT '[]', notes TEXT NOT NULL DEFAULT '[]', error TEXT)")
+    db.commit()
+    db.close()
+    ctx = multiprocessing.get_context('fork')
+    q = ctx.Queue()
+    procs = [ctx.Process(target=_open, args=(path, q)) for _ in range(6)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(30)
+    assert sorted(q.get() for _ in procs) == ['ok'] * 6
+
+
+def test_a_failed_card_move_is_logged_as_an_error():
+    """Codex on PR #33: a failed move looked like a done one."""
+    import pytest
+
+    def boom(argv):
+        raise RuntimeError('gh: rate limited')
+    with pytest.raises(RuntimeError):
+        board.move_card({'project_id': lambda: 'P', 'STATUS_FIELD': 'F'}, 'I7', board.READY, boom, n=7)
+    (r,) = rows(source='board')
+    assert 'rate limited' in r['error'] and r['pr'] == 7

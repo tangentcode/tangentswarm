@@ -136,8 +136,17 @@ def move_card(g, item, col, sh=None, n=None):
     2026-11-15 got their MinBot pass comment, then KeyError 'Ready', and stayed in Auto
     Review. Every mover goes through here."""
     from . import eventdb
+    try:
+        _move(g, item, col, sh)
+    except Exception as e:  # Codex on PR #33: the row says what happened, not what was tried
+        eventdb.log_event('move', source='board', action=col, pr=n, actor=eventdb.SOURCE or None,
+                          detail={'item': item, 'col': col}, error=f'{type(e).__name__}: {str(e)[:300]}')
+        raise
     eventdb.log_event('move', source='board', action=col, pr=n, actor=eventdb.SOURCE or None,
                       detail={'item': item, 'col': col})  # tangentswarm #32
+
+
+def _move(g, item, col, sh=None):
     if 'move' in g and col in (g.get('OPT') or HR_GATE_COLS):
         return g['move'](item, col)
     argv = ['gh', 'project', 'item-edit', '--id', item, '--project-id', g['project_id'](),

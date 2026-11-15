@@ -112,7 +112,7 @@ class EventStore:
         self._db = sqlite3.connect(path, timeout=30, isolation_level=None, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._lock = threading.Lock()
-        with self._lock:
+        with self._lock, _init_lock(path):  # Codex on PR #33: two processes opening a new DB raced the ALTERs
             if path != ":memory:":
                 self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=FULL")
@@ -244,6 +244,24 @@ def store():
         if _store is None:
             _store = EventStore()
         return _store
+
+
+class _init_lock:
+    """An interprocess lock around the schema setup of one DB file (none for :memory:)."""
+
+    def __init__(self, path):
+        self.path = None if path == ':memory:' else path + '.init.lock'
+
+    def __enter__(self):
+        if self.path:
+            import fcntl
+            self.f = open(self.path, 'a')
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        if self.path:
+            self.f.close()  # closing the fd releases the flock
 
 
 def migrate(old, new):
