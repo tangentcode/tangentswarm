@@ -203,6 +203,19 @@ class Advance:
         self.why.append('Auto Review: ' + ', '.join(skipped))
         return False
 
+    def minbot_one(self, n):
+        """swarm-advance --minbot N (the Stop hook, tangentswarm #28): the MinBot check of one
+        Auto Review PR. A pass posts the MinBot pass comment and moves the card to Ready."""
+        from .promoted import read_columns
+        cols = read_columns(self.g['gql'], max_age=0)
+        ar = [p for p in cols.get(board.AUTO_REVIEW, []) if p['number'] == n]
+        if not ar:
+            self.out(f"#{n} is not in Auto Review: no MinBot check")
+            return 0
+        if not self.minbot_pass({board.AUTO_REVIEW: ar}):
+            self.out(f"#{n} stays in Auto Review: " + (self.why[-1] if self.why else 'no MinBot pass'))
+        return 0
+
     def full_check(self, n):
         """None if hr-gate conditions 1, 2, 3 and 5 pass on the head, else the failed rows."""
         full = self.g['fetch'](n, refresh=True)
@@ -719,11 +732,11 @@ def watchdog(budget=None):
     signal.alarm(budget)
 
 
-def queue_self(qdir=None):
-    """Queue `swarm-advance` (the ~/bin wrapper) for the daemon. Returns a note."""
+def queue_self(args=(), qdir=None):
+    """Queue `swarm-advance [ARGS]` (the ~/bin wrapper) for the daemon. Returns a note."""
     from .promoted import BIN
     try:
-        gatelock.enqueue([str(BIN / 'swarm-advance')], by=f"pid {os.getpid()}", qdir=qdir)
+        gatelock.enqueue([str(BIN / 'swarm-advance'), *args], by=f"pid {os.getpid()}", qdir=qdir)
         return 'queued for swarm-promoted'
     except (OSError, ValueError) as e:
         return f'NOT queued ({e})'
@@ -755,12 +768,19 @@ def main(argv=None):
     ap.add_argument('--cascade', action='store_true',
                     help='the whole cascade (promote, keep one ready PR in Staging, START_CLAUDE) under the lock')
     ap.add_argument('--if-flagged', action='store_true', help='--cascade: run only if the rerun flag is set')
+    ap.add_argument('--minbot', type=int, metavar='N',
+                    help='the MinBot check of one Auto Review PR, under the lock (the Stop hook)')
     ap.add_argument('--floor', type=int, help=f'--cascade: Staging floor (default {FLOOR}, env SWARM_STAGING_FLOOR)')
     a = ap.parse_args(argv)
     if a.floor is not None:
         FLOOR = a.floor
         os.environ['SWARM_STAGING_FLOOR'] = str(a.floor)  # the move log records it
     try:
+        if a.minbot:
+            if a.dry_run:
+                return Advance(dry_run=True).minbot_one(a.minbot)
+            with gatelock.gate_lock(f'swarm-advance --minbot {a.minbot}'):
+                return Advance().minbot_one(a.minbot)
         if a.cascade:
             watchdog()
             if a.dry_run:  # no lock, no flag: a dry run changes nothing
@@ -772,7 +792,7 @@ def main(argv=None):
             return Advance().step()
     except gatelock.Busy as e:
         # No "busy, give up": the swarm-promoted daemon owns the queue and runs it under the lock.
-        print(f"busy: {e}; " + queue_self())
+        print(f"busy: {e}; " + queue_self(['--minbot', str(a.minbot)] if a.minbot else []))
         return gatelock.EXIT_BUSY
     except CascadeTimeout as e:  # a dry run (no lock, no flag)
         _say(f"stopped: {e}")

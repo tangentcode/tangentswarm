@@ -30,6 +30,9 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(advance, 'RERUN', tmp_path / 'swarm-serial.rerun')
     monkeypatch.setattr(advance, 'CASCADE_LOG', tmp_path / 'cascade.log')
     from tangentswarm import flow
+    from tangentswarm import stophook
+    monkeypatch.setattr(stophook, 'LOG', tmp_path / 'stop-hook.log')
+    monkeypatch.setattr(stophook, 'SEEN', tmp_path / 'stop-hook-seen.json')
     monkeypatch.setattr(flow, 'STATE', tmp_path / 'pull.json')
     monkeypatch.setattr(flow, 'LOG', tmp_path / 'flow.log')
     monkeypatch.setattr(advance, 'schedule', lambda reset, **kw: 'not scheduled (test)')
