@@ -48,7 +48,11 @@ _ATTACH = re.compile(r'https://github\.com/user-attachments/assets/[0-9a-fA-F-]{
 
 
 def image_urls(body):
-    """Image URLs in a PR body (markdown and <img>), in order, without repeats."""
+    """Image URLs in a PR body (markdown and <img>), in order, without repeats. The brief
+    section is not evidence: its SHOTS_RULE example `![x](shot.png)` made every launched UI
+    PR look screenshotted (Codex on PR #26), so it is stripped first, as hr-gate does."""
+    from .brief import strip_brief
+    body = strip_brief(body)
     found = sorted([(m.start(), m.group(1)) for m in _MD.finditer(body or '')] +
                    [(m.start(), m.group(1)) for m in _TAG.finditer(body or '')])
     out = []

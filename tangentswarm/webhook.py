@@ -69,6 +69,7 @@ MICHAL = 'tangentstorm'
 CODEX = 'chatgpt-codex-connector'
 WAKE_EVERY = 60          # s between two wakes
 WAKE_DEDUPE = 1800       # s: the same exception key wakes once
+WAKE_PENDING_MAX = 50    # exceptions kept for the next wake
 MAX_BODY = 2 * 1024 * 1024
 # Logged in the event DB only: one row each, no action, never queued (Michal 1:55 PM ET).
 LOG_ONLY = ('push', 'commit_comment', 'discussion', 'discussion_comment', 'pull_request_review_thread',
@@ -373,22 +374,31 @@ class Executor:
         self.note(f"#{n} relayed to its worker ({said})")
 
     def wake(self, n, why, key=None, now=time.time):
-        """An exception for swarmbot: deduped by key, at most one POST per WAKE_EVERY s."""
+        """An exception for swarmbot: deduped by key for WAKE_DEDUPE s, and at most one POST
+        per WAKE_EVERY s for all keys together (Codex on PR #26: a burst of distinct failures
+        woke the LLM once per delivery). Exceptions inside the interval wait in the pending
+        list; the next POST carries them in "also"."""
         key = key or why[:80]
-        st = _seen()
-        last = st.setdefault('wake', {})
         t = now()
-        if t - float(last.get(key, 0)) < WAKE_DEDUPE:
-            return self.note(f"exception already sent: {why[:120]}")
-        last[key] = t
-        _save_seen(st)
         payload = {'source': 'swarm-webhook', 'kind': 'exception', 'pr': n or None, 'why': why,
                    'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'log': str(LOG)}
+        with _lock:
+            st = _seen()
+            last = st.setdefault('wake', {})
+            if t - float(last.get(key, 0)) < WAKE_DEDUPE:
+                return self.note(f"exception already sent: {why[:120]}")
+            last[key] = t
+            if not self.dry:
+                st.setdefault('wake_pending', []).append(payload)
+                del st['wake_pending'][:-WAKE_PENDING_MAX]
+            _save_seen(st)
         log(decision='wake', **payload)
         if self.dry:
             return self.note(f"would wake swarmbot: {why}")
-        (self.wake_post or post_wake)(payload)
-        self.note(f"woke swarmbot: {why}")
+        if flush_wakes(self.wake_post or post_wake, now=now):
+            self.note(f"woke swarmbot: {why}")
+        else:
+            self.note(f"swarmbot wake queued (one POST per {WAKE_EVERY} s): {why}")
 
     # -- handlers -----------------------------------------------------------------------
     def run(self, a):
@@ -399,8 +409,11 @@ class Executor:
             fn(a)
         except Exception as e:  # one action failing never stops the rest
             self.errors.append(f"{a.kind} #{a.pr}: {type(e).__name__}: {str(e)[:300]}")
-            self.wake(a.pr, f"{a.kind} on #{a.pr} failed: {type(e).__name__}: {str(e)[:200]}",
-                      key=f'fail:{a.kind}:{a.pr}')
+            try:
+                self.wake(a.pr, f"{a.kind} on #{a.pr} failed: {type(e).__name__}: {str(e)[:200]}",
+                          key=f'fail:{a.kind}:{a.pr}')
+            except Exception as e2:  # the wake itself must never drop the delivery
+                self.errors.append(f"wake failed: {type(e2).__name__}: {str(e2)[:200]}")
 
     def do_skip(self, a):
         self.note(f"skip: {a.why}")
@@ -597,7 +610,7 @@ def post_wake(payload, url_file=None, key_file=None, urlopen=None, sleep=time.sl
     import urllib.request
     url = _read(url_file or WAKE_URL_FILE)
     if not url:
-        return log(decision='wake-not-sent', why='no wake URL configured', **payload)
+        return log(decision='wake-not-sent', reason='no wake URL configured', **payload)
     headers = {'Content-Type': 'application/json', 'User-Agent': 'swarm-webhook'}
     key = _read(key_file or WAKE_KEY_FILE)
     if key:
@@ -628,6 +641,25 @@ def post_wake(payload, url_file=None, key_file=None, urlopen=None, sleep=time.sl
         threading.Thread(target=run, name='wake-post', daemon=True).start()
     else:
         run()
+
+
+def flush_wakes(post=None, now=time.time):
+    """Send the pending exceptions as one POST when WAKE_EVERY s have passed since the last
+    one. Returns True when it sent. The server's worker thread calls it every few seconds,
+    so a held exception goes out without a new event."""
+    t = now()
+    with _lock:
+        st = _seen()
+        pending = st.get('wake_pending') or []
+        if not pending or t - float(st.get('wake_last', 0)) < WAKE_EVERY:
+            return False
+        st['wake_pending'], st['wake_last'] = [], t
+        _save_seen(st)
+    payload = dict(pending[0])
+    if len(pending) > 1:
+        payload['also'] = [{k: p.get(k) for k in ('pr', 'why', 'at')} for p in pending[1:]]
+    (post or post_wake)(payload)
+    return True
 
 
 # -- dedupe state ------------------------------------------------------------------------
@@ -807,6 +839,10 @@ def serve(port=PORT, host='127.0.0.1'):
             wake.wait(5)
             wake.clear()
             drain()
+            try:
+                flush_wakes()
+            except Exception as e:
+                log(decision='wake flush failed', error=f'{type(e).__name__}: {e}')
     threading.Thread(target=worker, name='webhook-worker', daemon=True).start()
     srv = ThreadingHTTPServer((host, port), Handler)
     log(decision=f'swarm-webhook listening on {host}:{port}')

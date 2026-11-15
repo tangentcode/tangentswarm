@@ -161,3 +161,12 @@ def test_minbot_pass_accepts_the_vn_tip_but_not_other_authors_or_titles():
     assert not G.minbot_pass([pass_comment(f'### MinBot pass\n\nCommit: `{head}`', login='someone')], [('head', head)])[0]
     assert not G.minbot_pass([pass_comment(f'### Evidence\n\nCommit: `{head}`')], [('head', head)])[0]
     assert not G.minbot_pass([pass_comment('### MinBot pass\n\nCommit: `0a8b0f7`')], [('head', head)])[0]  # 7 chars
+
+
+def test_the_brief_example_image_is_not_screenshot_evidence():
+    """Codex on PR #26: the brief's SHOTS_RULE example made every launched UI PR look done."""
+    from tangentswarm import brief, slots
+    from tangentswarm.gatechecks import SHOTS_RULE, image_urls
+    body = 'Fixes #5\n\n' + brief.section('Task #5\n' + SHOTS_RULE)
+    assert '](' in SHOTS_RULE and image_urls(body) == []
+    assert image_urls(body + '\n![after](https://example.test/a.png)') == ['https://example.test/a.png']

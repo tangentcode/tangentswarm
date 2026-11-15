@@ -320,3 +320,24 @@ def test_a_clean_review_of_the_fix_advances_despite_an_open_thread_from_an_older
     ex = Fake(col=board.AUTO_REVIEW, full=dict(codex_pr(head), reviewThreads={'nodes': [on_head]}))
     ex.run(W.Action('codex', 541, args={'commit': head}))
     assert ex.relays and ex.queued == []
+
+
+def test_wakes_are_one_post_per_interval_and_a_burst_waits_in_also():
+    """Codex on PR #26: distinct exceptions each woke swarmbot at once."""
+    ex = Fake()
+    t = [1_000_000.0]
+    ex.wake(1, 'a failed', key='a', now=lambda: t[0])
+    ex.wake(2, 'b failed', key='b', now=lambda: t[0] + 1)
+    ex.wake(3, 'c failed', key='c', now=lambda: t[0] + 2)
+    assert [w['why'] for w in ex.wakes] == ['a failed']
+    assert not W.flush_wakes(ex.wake_post, now=lambda: t[0] + 30)
+    assert W.flush_wakes(ex.wake_post, now=lambda: t[0] + W.WAKE_EVERY + 1)
+    assert ex.wakes[1]['why'] == 'b failed' and [x['why'] for x in ex.wakes[1]['also']] == ['c failed']
+    assert not W.flush_wakes(ex.wake_post, now=lambda: t[0] + 999)  # nothing pending
+
+
+def test_no_wake_url_is_logged_not_a_type_error(tmp_path):
+    """Codex on PR #26: post_wake passed `why` twice when no URL was configured."""
+    W.post_wake({'source': 'swarm-webhook', 'why': 'x', 'pr': 1}, url_file=tmp_path / 'none', background=False)
+    rec = json.loads(W.LOG.read_text().splitlines()[-1])
+    assert rec['decision'] == 'wake-not-sent' and rec['why'] == 'x' and rec['reason'] == 'no wake URL configured'

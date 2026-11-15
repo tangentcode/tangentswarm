@@ -100,7 +100,14 @@ def test_windows_to_close_skips_claude_node_dirty_and_open():
     prs = {**merged, 368: {'number': 368, 'state': 'MERGED', 'branch': 'ptw-attr-doc-tooltips'}, **open_pr}
     got = [(p['id'], pr['number']) for p, pr in tick.windows_to_close(
         [numbered, legacy, claude, node, dirty, open_legacy], prs)]
-    assert got == [('%107', 396), ('%101', 368)]
+    # Codex on PR #26: %107 shares its window with a live claude and node pane: kill-window
+    # would close them too, so that window stays.
+    assert got == [('%101', 368)]
+    alone = dict(numbered, widx='7')
+    others = dict(numbered, id='%108', widx='8', window_others=1)
+    two = [dict(numbered, id='%109', widx='9'), dict(numbered, id='%110', widx='9')]
+    got = [p['id'] for p, _ in tick.windows_to_close([alone, others, *two, dict(claude, widx='10')], prs)]
+    assert got == ['%107', '%109']  # one kill per window; never a window with an untracked pane
 
 
 def test_closable_closes_merged_shells_and_notes_finished_claude(monkeypatch):

@@ -217,19 +217,25 @@ def windows_to_close(panes, prs):
     closed = {n: pr for n, pr in prs.items() if (pr.get('state') or '').upper() in ('MERGED', 'CLOSED')}
     out = []
     seen = set()
-    for p in panes:
-        cmd = p.get('command') or ''
-        if p.get('claude') or cmd in ('claude', 'node'):
-            continue
+
+    def safe(p):
         wt = p.get('wt') or {}
-        if wt.get('dirty') or (wt.get('ahead') or 0) > 0:
+        return not (p.get('claude') or (p.get('command') or '') in ('claude', 'node')
+                    or wt.get('dirty') or (wt.get('ahead') or 0) > 0)
+
+    def wkey(p):
+        return p.get('widx') if p.get('widx') is not None else p.get('window')
+    # Codex on PR #26: kill-window closes the whole window, so every pane in it must be safe,
+    # and a window with a pane tick does not track (another directory) is never closed.
+    unsafe = {wkey(p) for p in panes if not safe(p) or p.get('window_others')}
+    for p in panes:
+        if wkey(p) in unsafe or ('w', wkey(p)) in seen:
             continue
         for pr in closed.values():
             if window_matches_pr(p.get('window'), p.get('path'), pr):
-                key = p.get('id') or p.get('window')
-                if key not in seen:
-                    seen.add(key)
-                    out.append((p, pr))
+                seen.add(('w', wkey(p)))  # one kill-window per window
+                out.append((p, pr))
+                break
                 break
     return out
 
@@ -538,15 +544,20 @@ def read_panes(state):
     parked = parked_windows()
     panes, seen = [], set()
     now = time.time()
+    others = {}  # window index -> live panes outside the platform worktrees (never closed)
+    rows = []
     for line in r.stdout.splitlines():
         pid, widx, window, cmd, path, dead = line.split('\t')
         if dead not in ('', '0'):
             continue
         wt = worktree_facts(path)
         if wt is None and not is_platform_worktree_path(path):
+            others[widx] = others.get(widx, 0) + 1
             continue
-        p = dict(id=pid, window=window, command=cmd, path=path, wt=wt, parked=window in parked,
-                 claude=is_claude(pid, cmd), cls=None, screen='')
+        rows.append((pid, widx, window, cmd, path, wt))
+    for pid, widx, window, cmd, path, wt in rows:
+        p = dict(id=pid, widx=widx, window=window, command=cmd, path=path, wt=wt, parked=window in parked,
+                 claude=is_claude(pid, cmd), cls=None, screen='', window_others=others.get(widx, 0))
         if p['claude']:
             screen, blank = capture(pid)
             cls = classify_screen(screen, blank)
