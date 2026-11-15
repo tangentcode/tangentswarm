@@ -359,3 +359,26 @@ def test_make_host_takes_the_tmux_modules_from_the_deployed_checkout(tmp_path, m
     monkeypatch.setattr(slots, 'TMUX_SRC', tmp_path / 'none')
     with pytest.raises(AssertionError):
         slots.make_host(SP)
+
+
+def test_idle_workers_in_staging_and_human_review_are_parked_too():
+    """MethBot 2026-11-15 4:13 AM ET: #531 and #532 were in Staging with idle Claudes since
+    about 3:00 and held two of the cap slots, because park looked only at Ready."""
+    cols = {board.STAGING: [dict(number=7)], board.HUMAN_REVIEW: [dict(number=8)], board.IN_PROGRESS: [dict(number=9)]}
+    cl = [dict(claude(1, '/w/b7', 'b7', 's7', '%7'), status='idle'), dict(claude(2, '/w/b8', 'b8', 's8', '%8'), status='busy'),
+          dict(claude(3, '/w/b9', 'b9', 's9', '%9'), status='idle')]
+    out = []
+    assert slots.park_ready(PRS, cols, out=out.append, claudes=cl, park=lambda c, say: None) == [7]
+    assert 'park: #7 parked; session s7 kept for swarm-revive 7' in out  # #8 is busy, #9 is still in work
+
+
+def test_the_cap_counts_workers_and_busy_claudes_but_not_idle_others(tmp_path, monkeypatch):
+    d = tmp_path / 'sessions'
+    d.mkdir()
+    rows = [(1, '/home/u/ver/platform.a', 'idle'), (2, '/home/u/ver/platform.b', 'busy'),
+            (3, '/home/u/ver/implish.rtl-eval', 'idle'), (4, '/home/u/ver/tangentswarm.x', 'busy'),
+            (5, '/home/u/ver/other', 'shell')]
+    for pid, cwd, st in rows:
+        (d / f'{pid}.json').write_text(json.dumps({'pid': pid, 'cwd': cwd, 'status': st}))
+    monkeypatch.setattr(slots, 'WORKTREE_PARENT', Path('/home/u/ver'))
+    assert slots.live_claudes(sessions=d, alive=lambda pid: True) == 4  # not the idle implish Claude

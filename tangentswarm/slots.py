@@ -270,15 +270,21 @@ def launch_done(n, path=None):
 
 
 def live_claudes(sessions=None, alive=None):
-    """How many Claude processes run on the host (any directory): the ~10 cap."""
+    """How many Claudes count against the MAX_CLAUDES cap. MethBot 2026-11-15 4:13 AM ET asked
+    whether non-swarm Claudes count: every platform worker counts (busy or idle), and any
+    other Claude counts while it is not idle (busy, or running a shell command). An idle
+    non-worker Claude (such as implish's imp-22, idle since 11 PM) uses no CPU, and
+    swarm-start-scoped's memory admission guards the RAM."""
     alive = alive or _alive
     n = 0
     for f in (sessions or SESSIONS).glob('*.json'):
         try:
-            pid = int(json.loads(f.read_text()).get('pid') or f.stem)
+            d = json.loads(f.read_text())
+            pid = int(d.get('pid') or f.stem)
         except (OSError, ValueError, TypeError):
             continue
-        n += bool(alive(pid))
+        if alive(pid) and (is_platform_worktree(d.get('cwd')) or (d.get('status') or 'idle') != 'idle'):
+            n += 1
     return n
 
 
@@ -401,11 +407,13 @@ def rework_open(rw, pr, head):
 
 
 def park_ready(prs, cols, dry=False, out=print, claudes=None, park=None, path=None):
-    """(a) Park the Claude of each PR in Ready: record its session id, then /exit it. The
-    tmux window, its shell, the branch and the worktree stay. A rework Claude in Ready keeps
-    running only while the reason it was revived for is open (rework_open). Returns the
-    parked PR numbers."""
-    ready = {p['number'] for p in cols.get(board.READY, [])}
+    """(a) Park the Claude of each PR in Ready, Staging or Human Review: record its session
+    id, then /exit it (swarm_parking.park_one parks only an idle Claude at an empty prompt).
+    MethBot 2026-11-15 4:13 AM ET: #531 and #532 sat in Staging with idle Claudes that held
+    two of the cap slots, because park looked only at Ready. The tmux window, its shell, the
+    branch and the worktree stay. A rework Claude keeps running only while the reason it was
+    revived for is open (rework_open). Returns the parked PR numbers."""
+    ready = {p['number']: col for col in DONE_COLS for p in cols.get(col, [])}
     claudes = attach_prs(running() if claudes is None else claudes, prs)
     st = load(path)
     gone = [k for k in st['rework'] if prs and (prs.get(int(k)) or {}).get('state', 'GONE') != 'OPEN']  # closed, merged
@@ -427,8 +435,11 @@ def park_ready(prs, cols, dry=False, out=print, claudes=None, park=None, path=No
         if not c.get('pane'):
             out(f"park: #{n} Claude pid {c['pid']} is not in the {TMUX_SESSION} tmux session: not parked")
             continue
+        col = 'Staging' if ready[n] == board.STAGING else ready[n]
+        if ready[n] != board.READY and c.get('status') not in (None, 'idle'):
+            continue  # MethBot 4:13 AM ET: past Ready, park only an idle Claude
         if dry:
-            out(f"park: would park #{n} (pane {c['pane']}, session {c['session'][:8]}): its PR is in Ready")
+            out(f"park: would park #{n} (pane {c['pane']}, session {c['session'][:8]}): its PR is in {col}")
             continue
         st = load(path)  # record the session first: the revive needs it even if the /exit fails
         st['parked'][str(n)] = dict(session=c['session'], pane=c['pane'], worktree=c['cwd'],
