@@ -116,3 +116,29 @@ def update_active(items, path=None):
 def is_active_fast_track(number, closes=(), active=None):
     """True if PR/issue `number`, or an issue it closes, is the active fast-track ticket."""
     return active is not None and (number == active or active in set(closes))
+
+
+HR_GATE_COLS = {IN_PROGRESS, AUTO_REVIEW, STAGING, HUMAN_REVIEW, DONE, BACKLOG}  # hr-gate's OPT names
+
+
+def move_card(g, item, col, sh=None):
+    """Move a Project 4 card to column col, by option id. hr-gate's move() knows only its own
+    OPT names (no Ready, Needs Input, Triage...): platform #537/#540/#542/#543 at 11:03 AM ET
+    2026-11-15 got their MinBot pass comment, then KeyError 'Ready', and stayed in Auto
+    Review. Every mover goes through here."""
+    if 'move' in g and col in (g.get('OPT') or HR_GATE_COLS):
+        return g['move'](item, col)
+    argv = ['gh', 'project', 'item-edit', '--id', item, '--project-id', g['project_id'](),
+            '--field-id', g['STATUS_FIELD'], '--single-select-option-id', OPTION[col]]
+    if sh:
+        sh(argv)
+    else:
+        from . import tick
+        tick.sh(argv, check=True)
+    for name in ('board',):
+        if g.get('cache_drop'):
+            g['cache_drop'](name)
+    if g.get('cache_drop_prefix'):
+        g['cache_drop_prefix']('pr:')
+    from . import boardcache
+    boardcache.invalidate()

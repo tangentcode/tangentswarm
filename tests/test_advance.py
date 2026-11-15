@@ -55,12 +55,30 @@ def test_minbot_order_puts_the_active_fast_track_first():
     assert [p['number'] for p in A.minbot_order(prs, None)] == [4, 9, 12]
 
 
+@pytest.fixture(autouse=True)
+def option_id_moves(monkeypatch):
+    """A move hr-gate's move() does not know (Ready) goes by option id through tick.sh: record
+    it on the last Gate, like hr-gate's move(), and never run gh."""
+    from tangentswarm import tick
+    by_id = {v: k for k, v in board.OPTION.items()}
+
+    def sh(argv, check=True, **kw):
+        assert argv[:3] == ['gh', 'project', 'item-edit'], argv
+        Gate.last.moves.append((argv[argv.index('--id') + 1], by_id[argv[-1]]))
+    monkeypatch.setattr(tick, 'sh', sh)
+
+
 class Gate(dict):
+    last = None
+
     def __init__(self, cols, details=None, rows=None):
         super().__init__()
+        Gate.last = self
         self.moves = []
         self.cols = cols
         self.update(gql=self.gql, move=lambda item, col: self.moves.append((item, col)),
+                    OPT={c: board.OPTION[c] for c in board.HR_GATE_COLS},
+                    project_id=lambda: 'P', STATUS_FIELD='F',
                     fetch=lambda n, refresh=False: {'number': n},
                     list_hr_prs=lambda refresh=False: [],
                     evaluate=lambda pr, hr_peers=None, scratch=None: (rows or GOOD_ROWS, {}),
@@ -146,6 +164,19 @@ def test_minbot_pass_labels_comments_and_moves_to_ready(board_read):
     assert calls[0][calls[0].index('--title') + 1] == 'MinBot pass'  # what hr-gate condition 4 reads
     assert g.moves == [('I7', board.READY)]
     assert out == [f"MinBot-pass #7 at {H[:8]}: pass comment, Auto Review -> Ready"]
+
+
+def test_a_retried_minbot_pass_moves_the_card_without_a_second_comment(board_read):
+    """platform #537 (2026-11-15 11:03 AM ET): the pass comment was posted, then the move to
+    Ready failed. The retry moves the card and posts no second comment."""
+    cols = {board.HUMAN_REVIEW: [1, 2], board.STAGING: [3, 4, 5],
+            board.AUTO_REVIEW: [dict(number=7, head=H, item='I7')]}
+    board_read(cols)
+    d = codex_pr()
+    d['comments']['nodes'].append({'author': {'login': 'tangentcode-minbot'}, 'body': '### MinBot pass\n' + A.pass_text(H)})
+    g = Gate(cols, details={7: d})
+    out, calls = run(g)
+    assert calls == [] and g.moves == [('I7', board.READY)]
 
 
 def test_minbot_pass_dry_run_moves_nothing(board_read):

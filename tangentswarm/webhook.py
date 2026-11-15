@@ -60,6 +60,7 @@ SEEN = Path(os.environ.get('SWARM_WEBHOOK_SEEN', str(STATE / 'webhook-seen.json'
 SECRET_FILES = [Path(p) for p in os.environ.get(
     'SWARM_WEBHOOK_SECRETS', f"{HOME}/.config/tangentswarm/webhook-secret:{HOME}/example/hook-secret").split(':') if p]
 WAKE_URL_FILE = Path(os.environ.get('SWARM_WAKE_URL_FILE', str(HOME / '.config' / 'tangentswarm' / 'swarmbot-wake-url')))
+WAKE_KEY_FILE = Path(os.environ.get('SWARM_WAKE_KEY_FILE', str(HOME / '.config' / 'tangentswarm' / 'swarmbot-wake-key')))
 PORT = int(os.environ.get('SWARM_WEBHOOK_PORT', '8772'))
 REPO = 'tangentcode/platform'
 MICHAL = 'tangentstorm'
@@ -298,10 +299,7 @@ class Executor:
     def move(self, n, item, col):
         if self.dry:
             return self.note(f"would move #{n} to {col}")
-        self._sh(['gh', 'project', 'item-edit', '--id', item, '--project-id', self.g['project_id'](),
-                  '--field-id', self.g['STATUS_FIELD'], '--single-select-option-id', board.OPTION[col]])
-        from . import boardcache
-        boardcache.invalidate()
+        board.move_card(self.g, item, col, self._sh)
         self.note(f"#{n} -> {col}")
 
     def minbot(self, n):
@@ -540,20 +538,29 @@ class Executor:
         self.wake(a.pr, a.why, key=a.args.get('key'))
 
 
-def post_wake(payload, url_file=None):
-    """POST the exception to swarmbot's wake URL (from WAKE_URL_FILE). No URL: logged only."""
-    import urllib.request
+def _read(path):
     try:
-        url = (url_file or WAKE_URL_FILE).read_text().strip()
+        return Path(path).read_text().strip()
     except OSError:
-        url = ''
+        return ''
+
+
+def post_wake(payload, url_file=None, key_file=None):
+    """POST the exception to swarmbot's wake URL (from WAKE_URL_FILE). No URL: logged only.
+    An optional key (WAKE_KEY_FILE, mode 600) goes as "Authorization: Bearer <key>"; the key
+    is never logged."""
+    import urllib.request
+    url = _read(url_file or WAKE_URL_FILE)
     if not url:
         return log(decision='wake-not-sent', why='no wake URL configured', **payload)
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), method='POST',
-                                 headers={'Content-Type': 'application/json'})
+    headers = {'Content-Type': 'application/json'}
+    key = _read(key_file or WAKE_KEY_FILE)
+    if key:
+        headers['Authorization'] = f'Bearer {key}'
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), method='POST', headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
-            log(decision='wake-sent', status=r.status, **payload)
+            log(decision='wake-sent', status=r.status, auth=bool(key), **payload)
     except Exception as e:
         log(decision='wake-failed', error=f'{type(e).__name__}: {e}', **payload)
 

@@ -282,7 +282,7 @@ class Advance:
                 skipped.append(f"#{n} {ci}")
                 self.ci_check_comment(p, ci)
                 continue
-            self.apply_pass(p)
+            self.apply_pass(p, d)
             self.resolve_addressed(n, d)
             return True
         self.why.append('Auto Review: ' + ', '.join(skipped))
@@ -342,12 +342,16 @@ class Advance:
         if not self.dry:
             state.mark(key)
 
-    def apply_pass(self, p):
+    def apply_pass(self, p, d=None):
+        """The pass comment (once per head: a pass whose move failed is not posted again on the
+        retry), then the card to Ready."""
         n, head = p['number'], p['head']
-        self.minbot('evidence', n, '--repo', REPO, '--title', 'MinBot pass', '--commit', head,
-                    '--body', pass_text(head))
+        mark = pass_text(head).split(' (')[0]
+        if not any(mark in (c.get('body') or '') for c in ((d or {}).get('comments') or {}).get('nodes') or []):
+            self.minbot('evidence', n, '--repo', REPO, '--title', 'MinBot pass', '--commit', head,
+                        '--body', pass_text(head))
         if not self.dry:
-            self.g['move'](p['item'], board.READY)
+            board.move_card(self.g, p['item'], board.READY)
             from . import moves
             moves.log_move(n, 'Auto Review', 'Ready', head, note='swarm-advance MinBot pass')
         self.out(f"{'would ' if self.dry else ''}MinBot-pass #{n} at {head[:8]}: pass comment, "

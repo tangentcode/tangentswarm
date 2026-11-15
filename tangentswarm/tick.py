@@ -767,7 +767,7 @@ class Tick:
                 sh(['gh', 'pr', 'ready', str(n), '-R', REPO], check=True)
             self.change(f"#{n} marked ready (Claude finished, head {head[:8]} pushed)")
         if not self.dry:
-            self.g['move'](pr['item'], 'Auto Review')
+            board.move_card(self.g, pr['item'], board.AUTO_REVIEW)
         self.change(f"#{n} card In Progress -> Auto Review")
         key = f"codex-request:{n}@{head}"
         if codex_clean or self.state.done(key) or codex_requested(full):

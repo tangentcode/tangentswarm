@@ -338,7 +338,7 @@ class Promoter:
             def clean(m, head):
                 scratch.ensure(m, head)
                 return flow.merge_commit(scratch, m, head, 'probe main') is not None
-            return mainmerge.recheck(staging, main, clean, self.g['move'], say, details=details, dry=self.dry)
+            return mainmerge.recheck(staging, main, clean, lambda item, col: board.move_card(self.g, item, col), say, details=details, dry=self.dry)
 
     def regate(self):
         """Leftover Staging heads with no gate pass: the only ones the slow path re-gates."""
@@ -433,7 +433,7 @@ class Promoter:
                 if self.dry:
                     say(f"would move #{n} Staging -> Human Review (cheap check passed at {head[:8]})")
                 else:
-                    self.g['move'](p['item'], board.HUMAN_REVIEW)
+                    board.move_card(self.g, p['item'], board.HUMAN_REVIEW)
                     self.g['log']('apply', n, head[:8], 'PASS', [])
                     from . import moves
                     moves.log_move(n, 'Staging', 'Human Review', head, note='cheap check')

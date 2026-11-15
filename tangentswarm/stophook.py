@@ -194,14 +194,7 @@ def last_question(transcript):
 
 
 def move_card(g, item, col, sh):
-    """Move a card by option id (hr-gate's move() knows only its own column names)."""
-    if col in (g.get('OPT') or {}):
-        g['move'](item, col)
-        return
-    sh(['gh', 'project', 'item-edit', '--id', item, '--project-id', g['project_id'](),
-        '--field-id', g['STATUS_FIELD'], '--single-select-option-id', board.OPTION[col]])
-    from . import boardcache
-    boardcache.invalidate()
+    board.move_card(g, item, col, sh)
 
 
 def needs_input(cwd, branch, transcript, g=None, dry=False, out=None, sh=None):
@@ -327,7 +320,7 @@ def _run(cwd, g, dry, out, sh, sleep, merges, minbot, transcript, procs, tell):
         did.append('marked the pull request ready')
     if status == 'clean':
         if col == board.IN_PROGRESS and not dry:
-            g['move'](item, 'Auto Review')
+            move_card(g, item, board.AUTO_REVIEW, sh)
         last = minbot(n) if not dry else f'would run swarm-advance --minbot {n}'
         what = (', '.join(did) + ', and ' if did else '') + 'ran the MinBot check'
         line = f"#{n} head {head[:7]} is already Codex-clean. {what[0].upper() + what[1:]}: {last}"
@@ -341,7 +334,7 @@ def _run(cwd, g, dry, out, sh, sleep, merges, minbot, transcript, procs, tell):
             did.append('posted "@codex review"')
         if col == board.IN_PROGRESS:
             if not dry:
-                g['move'](item, 'Auto Review')
+                move_card(g, item, board.AUTO_REVIEW, sh)
             did.append('moved the card to Auto Review')
         if not did:
             mark_seen(key)

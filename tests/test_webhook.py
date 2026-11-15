@@ -248,3 +248,39 @@ def test_replay_runs_the_handlers(monkeypatch, tmp_path):
     W.replay(541, ex)
     assert 'ROOT-CAUSE RULE' in ex.relays[0][1] and ex.calls[0][-1] == board.OPTION[board.IN_PROGRESS]
     assert '"event": "replay"' in (tmp_path / 'log').read_text()
+
+
+def test_the_wake_sends_the_bearer_key_when_the_key_file_exists(tmp_path, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    got = []
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            got.append((self.headers.get('Authorization'), json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+            self.send_response(200)
+            self.end_headers()
+    srv = ThreadingHTTPServer(('127.0.0.1', 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setattr(W, 'LOG', tmp_path / 'log')
+    url, key = tmp_path / 'url', tmp_path / 'key'
+    url.write_text(f'http://127.0.0.1:{srv.server_address[1]}/wake\n')
+    try:
+        W.post_wake({'why': 'a'}, url_file=url, key_file=tmp_path / 'missing')
+        key.write_text('k123\n')
+        W.post_wake({'why': 'b'}, url_file=url, key_file=key)
+    finally:
+        srv.shutdown()
+    assert got == [(None, {'why': 'a'}), ('Bearer k123', {'why': 'b'})]
+    assert 'k123' not in (tmp_path / 'log').read_text()
+
+
+def test_move_card_uses_the_option_id_for_columns_hr_gate_does_not_know():
+    calls, moved = [], []
+    g = {'OPT': {'In Progress': 'x'}, 'move': lambda item, col: moved.append(col),
+         'project_id': lambda: 'P', 'STATUS_FIELD': 'F'}
+    board.move_card(g, 'I', board.IN_PROGRESS, calls.append)
+    board.move_card(g, 'I', board.READY, calls.append)
+    assert moved == ['In Progress'] and calls[0][-1] == board.OPTION[board.READY]
