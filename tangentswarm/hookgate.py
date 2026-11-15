@@ -44,9 +44,9 @@ MAX_WAIT = int(os.environ.get('SWARM_HOOK_MAX_WAIT', '3900'))
 
 
 def pulled():
-    """The PR that swarm-flow is pulling into Staging (it sits in Ready until it passes)."""
+    """The PRs that swarm-flow is pulling into Staging (they sit in Ready until they pass)."""
     from . import flow
-    return flow.pulled_pr()
+    return flow.pulled_prs()
 
 
 class Stop(Exception):
@@ -130,7 +130,8 @@ def check(sha, now=None, fetch=fetch_board):
         raise Stop(f"#{n} is {p['state'].lower()}")
     if p['draft']:
         raise Stop(f"#{n} is a draft")
-    if p['col'] not in GATE_COLS and n != pulled():
+    pp = pulled()
+    if p['col'] not in GATE_COLS and n not in (pp if isinstance(pp, (set, list, tuple)) else {pp}):
         raise Stop(f"#{n} is in {p['col'] or 'no column'}, not {' or '.join(GATE_COLS)}")
     with locked_json(CACHE / 'state.json') as st:
         seen = st.setdefault('heads', {})

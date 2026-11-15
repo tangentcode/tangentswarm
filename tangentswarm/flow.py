@@ -62,28 +62,58 @@ CI_WAIT_WORDS = ('IN_PROGRESS', 'QUEUED', 'PENDING', 'WAITING', 'REQUESTED', 'no
 # ---------------------------------------------------------------------------
 # state of the one running pull
 
-def load_pull():
+def load_pulls():
+    """The pulls in flight: [{pr, head, branch, item, work, started, asked}], oldest first.
+    A batch (Cascade fill) shares one work commit. The old one-pull file is read too."""
     try:
         d = json.loads(STATE.read_text())
-        return d if isinstance(d, dict) and d.get('pr') else None
     except (OSError, ValueError):
-        return None
+        return []
+    if isinstance(d, dict) and isinstance(d.get('pulls'), list):
+        return [p for p in d['pulls'] if isinstance(p, dict) and p.get('pr')]
+    return [d] if isinstance(d, dict) and d.get('pr') else []
 
 
-def save_pull(d):
+def save_pulls(pulls):
     STATE.parent.mkdir(parents=True, exist_ok=True)
-    if d is None:
+    if not pulls:
         STATE.unlink(missing_ok=True)
         return
     tmp = STATE.with_suffix('.tmp')
-    tmp.write_text(json.dumps(d, indent=1))
+    tmp.write_text(json.dumps({'pulls': list(pulls)}, indent=1))
     os.replace(tmp, STATE)
 
 
+def load_pull():
+    """The oldest pull in flight, or None."""
+    pulls = load_pulls()
+    return pulls[0] if pulls else None
+
+
+def save_pull(d):
+    """Put pull d (replaces the pull of the same PR). None clears every pull."""
+    if d is None:
+        save_pulls([])
+        return
+    save_pulls([p for p in load_pulls() if p['pr'] != d['pr']] + [d])
+
+
+def drop_pull(n):
+    """Pull n ended (moved, failed, dropped)."""
+    pulls = load_pulls()
+    if any(p['pr'] == n for p in pulls):
+        save_pulls([p for p in pulls if p['pr'] != n])
+
+
 def pulled_pr():
-    """PR number of the running pull, or None (read by the hook gate)."""
+    """PR number of the oldest pull in flight, or None."""
     d = load_pull()
     return d['pr'] if d else None
+
+
+def pulled_prs():
+    """The PR numbers of every pull in flight (read by the hook gate)."""
+    return {d['pr'] for d in load_pulls()}
 
 
 def log(line):
@@ -361,6 +391,67 @@ class Flow:
         self.change(f"#{n} pulled: merged head {head[:8]} into {WORK} ({merged[:8]}); staging redeploys")
         return True
 
+    def pull_batch(self, prs, cols, scratch, room):
+        """Staging stocking (Michal 2026-11-15): pull EVERY clean Ready PR, up to room, in ONE
+        work push, so one staging redeploy (one PTW request) covers all of them. A PR enters
+        the batch only if it merges cleanly with main, work and each Human Review and Staging
+        head, stacks on them, and merges cleanly onto the batch so far (one merge commit per
+        PR on top of work). Nothing is reworked to fill Staging. Returns the pulled PRs."""
+        try:
+            return self._pull_batch(prs, cols, scratch, room)
+        finally:
+            self.cmap.save()
+
+    def _pull_batch(self, prs, cols, scratch, room):
+        staging, hr = cols.get(board.STAGING, []), cols.get(board.HUMAN_REVIEW, [])
+        ready = [p for p in cols.get(board.READY, []) if not p['draft']]
+        if not ready or room < 1:
+            return []
+        scratch.ensure_main()
+        main = self.sha_of(scratch, scratch.main)
+        bases = [(f"#{p['number']}", p['head']) for p in hr + self.staging_order(staging)]
+        scratch.ensure(*[sha for _, sha in bases], *[p['head'] for p in ready])
+        conflicts = {p['number']: sum(not self.clean(scratch, sha, p['head']) for sha in [main] + [s for _, s in bases])
+                     for p in ready}
+        work = self.fetch_work(scratch)
+        tip, batch = work, []
+        for p in ready_order(ready, conflicts):
+            if len(batch) >= room:
+                break
+            n, head = p['number'], p['head']
+            bad = [label for label, sha in [('main', main), (WORK, work)] + bases if not self.clean(scratch, sha, head)]
+            if bad:
+                self.note(f"#{n} skipped: does not merge cleanly with {', '.join(bad)} (no rework to fill Staging)")
+                continue
+            bad = self.cmap.stack(main, bases, head, lambda: stack_conflict(scratch, main, bases, head))
+            if bad:
+                self.note(f"#{n} skipped this step: conflicts with {bad} (Ready order kept)")
+                continue
+            if git(scratch, 'merge-base', '--is-ancestor', head, tip, check=False).returncode != 0:
+                why = []
+                merged = merge_commit(scratch, tip, head, f"Merge #{n} ({p['branch']}) into {WORK} for Staging\n\n"
+                                                          f"swarm-flow batch, head {head}.", why=why)
+                if merged is None:
+                    self.note(f"#{n} skipped: does not merge cleanly onto the batch "
+                              f"({', '.join('#' + str(q['number']) for q in batch)}): {why[0]}")
+                    continue
+                tip = merged
+            batch.append(p)
+        if not batch:
+            self.note('no Ready PR merges cleanly with main, work and every Human Review and Staging PR')
+            return []
+        if tip != work and not self.dry:
+            git(scratch, 'push', '--quiet', self.g['origin_url'](), f'{tip}:refs/heads/{WORK}')
+        self.last_work = tip
+        if not self.dry:
+            now = self.now()
+            save_pulls(load_pulls() + [dict(pr=p['number'], head=p['head'], branch=p['branch'], item=p['item'],
+                                            work=tip, started=now) for p in batch])
+        names = ', '.join(f"#{p['number']} {p['head'][:8]}" for p in batch)
+        self.change(f"{names} pulled: {len(batch)} head(s) merged into {WORK} ({tip[:8]}) in one push; "
+                    "staging redeploys once")
+        return batch
+
     def merge_work(self, n, tip, label):
         """swarm-flow merge-work: the one safe staging merge for a hand step (a -vN tip)."""
         with self.g['ScratchRepo']() as scratch:
@@ -382,12 +473,12 @@ class Flow:
         if p is None or p['state'] != 'OPEN':
             self.change(f"#{n} pull dropped: the PR is no longer open on the board")
             if not self.dry:
-                save_pull(None)
+                drop_pull(n)
             return
         if p['col'] in (board.STAGING, board.HUMAN_REVIEW):
             self.change(f"#{n} pull finished: the card is in {p['col']}")
             if not self.dry:
-                save_pull(None)
+                drop_pull(n)
             return
         if p['head'] != d['head']:
             self.fail(p, f"head moved during the pull ({d['head'][:8]} -> {p['head'][:8]}): needs Codex and MinBot again")
@@ -416,7 +507,7 @@ class Flow:
             to = 'Human Review' if 'Human Review' in moved[-1] else 'Staging'
             moves.log_move(n, p['col'] if p['col'] != board.STAGING else 'Staging', to, d['head'], note='hr-gate --apply')
         if rc == 0 or moved:
-            save_pull(None)
+            drop_pull(n)
 
     def fail(self, p, reason, relay=None):
         n = p['number']
@@ -427,9 +518,7 @@ class Flow:
             path = Path(f"/tmp/relay-{n}-{relay or 'gate'}.md")
             path.write_text(f"Coordinator: #{n} left the Staging pull: {reason}. Fix the root cause, push, and "
                             "report the head commit and test counts.\n")
-            running = load_pull()
-            if running and running.get('pr') == n:
-                save_pull(None)
+            drop_pull(n)
         self.change(f"#{n} -> In Progress: {reason[:200]}")
 
     # -- the step ---------------------------------------------------------------
@@ -461,9 +550,12 @@ class Flow:
             ps = cols.get(key, [])
             label = 'Staging' if key == board.STAGING else key
             self.out(f"{label} {len(ps)}: " + (', '.join(f"#{p['number']}" for p in ps) or '-'))
-        d = load_pull()
-        self.out(f"pull: #{d['pr']} head {d['head'][:8]} since {int((self.now() - d['started']) // 60)} min"
-                 if d else 'pull: none')
+        pulls = load_pulls()
+        for d in pulls:
+            self.out(f"pull: #{d['pr']} head {d['head'][:8]} in work {str(d.get('work'))[:8]} "
+                     f"since {int((self.now() - d['started']) // 60)} min" + (' (cornerbot asked)' if d.get('asked') else ''))
+        if not pulls:
+            self.out('pull: none')
         return 0
 
 

@@ -48,12 +48,8 @@ MINBOT_ROWS = ('1 ', '2 ', '3 ', '5 ')  # not draft, mergeable, Codex clean, Lin
 # --cascade (Michal 2026-11-14)
 FLOOR = int(os.environ.get('SWARM_STAGING_FLOOR', '2'))  # pull while Staging has fewer (--floor; compare 1 and 2)
 READY_TARGET = int(os.environ.get("SWARM_READY_TARGET", "6"))      # Ready short: one more new-work slot (slots.NEW_SLOTS_SHORT)
-DEPLOY_WAIT = int(os.environ.get('SWARM_DEPLOY_WAIT', '600'))      # seconds to wait for staging to serve a pull
-PTW_WAIT = int(os.environ.get('SWARM_PTW_WAIT', '1800'))           # seconds to wait for a cornerbot redeploy
-DEPLOY_POLL = 15
 BUDGET = int(os.environ.get('SWARM_CASCADE_BUDGET', '780'))   # whole run; the tick kills it at 900 s
 STEP_TIMEOUT = int(os.environ.get('SWARM_CASCADE_STEP_TIMEOUT', '300'))  # one hr-gate --apply run
-GATE_RESERVE = STEP_TIMEOUT + 30  # budget kept for the gate after a redeploy wait
 EXIT_TIMEOUT = 124
 DEADLINE = None  # time.monotonic() deadline of this process (watchdog)
 CASCADE_LOG = Path(os.environ.get('SWARM_CASCADE_LOG', str(Path.home() / '.local' / 'state' / 'swarm-flow' / 'cascade.log')))
@@ -241,20 +237,21 @@ class Cascade(Advance):
     """swarm-advance --cascade: the whole just-in-time cascade in one serial run.
 
       1. promote   Human Review has a free slot: the fast path moves the next Staging PR.
-      2. fill      (Michal 2026-11-14 7:16 PM ET) no fixed cap. Any Ready PR that merges
-                   cleanly (git merge-tree) with main, work and every Human Review and
-                   Staging PR may enter Staging (Flow.pull strict). A pull happens only
-                   while Staging has fewer than FLOOR PRs (default 2; --floor or
-                   SWARM_STAGING_FLOOR, to compare 1 and 2). Nothing is rebased, reworked
-                   or sent back just to fill Staging. The expensive steps run only at pull
-                   time: work merge (refused on a conflict or a marker), staging redeploy
-                   (ptw: CORNERBOT_REQUEST, also in CORNERBOT_FILE), a poll until the
-                   .deploy-sha of EVERY staging site contains it, then hr-gate --apply.
-                   A pull that still waits after the timeout (or for CI) stops the fill;
-                   the next cascade continues it. Each move goes to the move log
-                   (tangentswarm.moves). A fast-track PR (the active fast-track ticket, the
-                   PR Michal marks urgent) is the next pull: Flow.pull tries it first, and
-                   it is pulled also when Staging is at the floor (Michal 2026-11-14 8:43 PM).
+      2. fill      Staging stocking (Michal 2026-11-15; before: 2026-11-14 7:16 PM ET).
+                   (A) Each pull in flight gets ONE served check, never a wait: when EVERY
+                   staging site's .deploy-sha contains its head, hr-gate --apply moves it
+                   into Staging. The serial lock is never held for a redeploy, so a promote
+                   never waits on one. The swarm-promoted daemon queues the next cascade
+                   when a staging .deploy-sha changes. (B) While Staging + pulls in flight
+                   is below FLOOR (the target, default 2; --floor or SWARM_STAGING_FLOOR),
+                   EVERY Ready PR that merges cleanly (git merge-tree) with main, work, each
+                   Human Review and Staging PR and the batch so far is merged into work in
+                   ONE push (Flow.pull_batch, up to flow.STAGING_MAX in Staging), so one
+                   redeploy (one CORNERBOT_REQUEST for ptw) covers all of them. Nothing is
+                   rebased, reworked or sent back just to fill Staging. The promote ran
+                   first in the pass, so a promote frees a slot and the next pull starts in
+                   the same pass. A fast-track PR is pulled also at the target (Michal
+                   2026-11-14 8:43 PM). Each move goes to the move log (tangentswarm.moves).
       park         (tangentswarm.slots) the Claude of each PR in Ready exits; its tmux
                    window, branch and worktree stay, and its session id is kept so that
                    swarm-revive PR FEEDBACK can resume it in a rework slot.
@@ -288,8 +285,8 @@ class Cascade(Advance):
         return any(gatechecks.SERVED_RE.search(f.get('path') or '')
                    for f in ((full.get('files') or {}).get('nodes') or []))
 
-    def cornerbot_request(self, n, branch, head, work, host):
-        line = request_line(n, branch, head, work, host, self.dry)
+    def cornerbot_request(self, n, branch, head, work, host, also=()):
+        line = request_line(n, branch, head, work, host, self.dry, also)
         if not self.dry:  # for swarmbot while this run still waits (stdout may be read only at exit)
             try:
                 CORNERBOT_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -301,64 +298,65 @@ class Cascade(Advance):
     def lagging(self, d):
         return lagging(self.g, d)
 
-    def served(self, d):
-        """True once EVERY staging site serves the pulled head. Polls each .deploy-sha up to
-        DEPLOY_WAIT s, or PTW_WAIT s while a cornerbot site (ptw) lags; that site gets one
-        CORNERBOT_REQUEST per pull."""
+    # -- the pulls in flight: one check, never a wait (Michal 2026-11-15) ---------------------
+    def gate_pulls(self, prs, scratch, only=None):
+        """ONE served check for each pull in flight, no wait: the serial lock is never held for
+        a redeploy, so a promote never waits on one (Human Review sat empty about 15 min twice on
+        2026-11-14 while pulls of #495 and #514 waited on a PTW redeploy). A pull whose head
+        every staging site serves gets hr-gate --apply. A batch (one work commit) gets ONE
+        CORNERBOT_REQUEST. The swarm-promoted daemon queues the next cascade when a staging
+        .deploy-sha changes. Returns the PRs whose pull ended (moved or failed)."""
         from . import flow
-        start, asked, said = self.clock(), bool(d.get('asked')), self.clock()
-        self.out(f"redeploy: polling every staging .deploy-sha for #{d['pr']} {d['head'][:8]}"
-                 + (" (cornerbot was asked before: one check, no wait)" if asked else ''))
-        while True:
-            lag = self.lagging(d)
-            if not lag:
-                self.out(f"served: every staging site serves #{d['pr']} {d['head'][:8]}")
-                if asked and not self.dry and CORNERBOT_FILE.exists():
+        every = flow.load_pulls()
+        pulls = [d for d in every if only is None or d['pr'] in only]
+        ended, asked = [], {d.get('work') for d in every if d.get('asked')}
+        for d in pulls:
+            n, head = d['pr'], d['head']
+            if self.touches_served(n):
+                lag = self.lagging(d)
+                if lag:
+                    corner = [h for k, h, _, _ in lag if k in CORNERBOT_SITES]
+                    if corner and d.get('work') not in asked:
+                        group = [q for q in flow.load_pulls() if q.get('work') == d.get('work')]
+                        also = [q['pr'] for q in group if q['pr'] != n]
+                        for host in corner:
+                            self.out(self.cornerbot_request(n, d.get('branch', ''), head, d.get('work'), host, also))
+                        asked.add(d.get('work'))
+                        if not self.dry:
+                            for q in group:
+                                flow.save_pull(dict(q, asked=True))
+                    age = int(max(0, time.time() - float(d.get('started') or 0)))
+                    self.out(f"waiting: #{n} {head[:8]} is not served yet by "
+                             + '; '.join(f"{h} ({x[:8] if x else (e or 'empty')[:60]})" for _, h, x, e in lag)
+                             + f"; pulled {_age(age)} ago; no wait: the pull stays open, and a .deploy-sha "
+                               "change queues the next cascade")
+                    continue
+                self.out(f"served: every staging site serves #{n} {head[:8]}")
+                if d.get('work') in asked and not self.dry and CORNERBOT_FILE.exists():
                     CORNERBOT_FILE.unlink(missing_ok=True)
-                    self.out(f"CORNERBOT_DONE: every cornerbot site serves #{d['pr']} {d['head'][:8]}; request cleared")
-                return True
-            corner = [(k, h) for k, h, _, _ in lag if k in CORNERBOT_SITES]
-            if corner and not asked:
-                for _, host in corner:
-                    self.out(self.cornerbot_request(d['pr'], d.get('branch', ''), d['head'], d.get('work'), host))
-                asked = True
-                if not self.dry:
-                    flow.save_pull(dict(d, asked=True))
-            # the wait limit, cut so the gate still fits in the run budget. A cornerbot site that
-            # was asked in an EARLIER run or pass gets one check only: waiting again would hold the
-            # serial lock for nothing (7:32 PM ET: #480 held it pass after pass).
-            limit = min(PTW_WAIT if corner else DEPLOY_WAIT, self.deadline - start - GATE_RESERVE)
-            if corner and d.get('asked'):
-                limit = 0
-            waited = self.clock() - start
-            if waited >= limit:
-                self.out(f"waiting: #{d['pr']} {d['head'][:8]} is not served yet by "
-                         + '; '.join(f"{h} ({s[:8] if s else (e or 'empty')[:60]})" for _, h, s, e in lag)
-                         + f" after {int(waited)}s; the pull stays open for the next cascade")
-                return False
-            if self.clock() - said >= 60:
-                said = self.clock()
-                self.out(f"redeploy: still waiting for {', '.join(h for _, h, _, _ in lag)} "
-                         f"({int(waited)}s of {int(limit)}s)")
-            self.sleep(DEPLOY_POLL)
+                    self.out(f"CORNERBOT_DONE: every cornerbot site serves #{n} {head[:8]}; request cleared")
+            before = len(self.f.did)
+            self.out(f"gate: hr-gate on #{n} {head[:8]} (timeout {STEP_TIMEOUT}s)")
+            self.f.advance(d, prs, scratch)
+            self.flush()
+            if (len(self.f.did) > before) if self.dry else n not in flow.pulled_prs():
+                ended.append(n)
+        return ended
 
-    def finish(self, d, prs, scratch):
-        """Bring the running pull d into Staging: wait until every staging site serves it, then
-        hr-gate --apply. True when the pull ended (moved or failed), False when it still waits
-        (redeploy timeout, CI): the fill stops there and the next cascade continues it."""
-        from . import flow
-        if self.touches_served(d['pr']) and not self.served(d):
-            return False
-        before = len(self.f.did)
-        self.out(f"gate: hr-gate on #{d['pr']} {d['head'][:8]} (timeout {STEP_TIMEOUT}s)")
-        self.f.advance(d, prs, scratch)
-        self.flush()
-        if self.dry:  # nothing is saved: a would-line means the pull ends, a note means it waits
-            return len(self.f.did) > before
-        return flow.load_pull() is None
+    def _staged(self, cols, nums):
+        """Dry run: count the PRs a gate would move (from Ready) into Staging."""
+        done = [q for q in cols.get(board.READY, []) if q['number'] in nums]
+        return dict(cols, **{board.READY: [q for q in cols.get(board.READY, []) if q not in done],
+                             board.STAGING: cols.get(board.STAGING, []) + done})
 
     # -- 2. fill ------------------------------------------------------------------
     def fill(self):
+        """Staging stocking (Michal 2026-11-15). (A) gate the pulls in flight that staging
+        serves (no wait). (B) While Staging + pulls in flight < FLOOR (the target, default 2),
+        pull EVERY clean Ready PR (up to flow.STAGING_MAX in Staging) in ONE work push, so one
+        redeploy covers them. A fast-track PR is pulled also at the target. The promote ran
+        first in this pass, so a promote frees a slot and the next pull starts in the same
+        pass; the pull's redeploy never holds the lock."""
         from . import flow
         prs, cols = self.columns()
         cols = self.main_check(cols)
@@ -367,65 +365,62 @@ class Cascade(Advance):
             cols[board.STAGING] = [p for p in cols.get(board.STAGING, []) if p not in up]
             cols[board.HUMAN_REVIEW] = cols.get(board.HUMAN_REVIEW, []) + up
         with self.g['ScratchRepo']() as scratch:
-            ended = None  # dry run: the running pull that would end (pull.json is not changed)
-            for _ in range(len(cols.get(board.READY, [])) + 2):  # each turn ends the pull, adds one PR, or stops
-                d = flow.load_pull()
-                if d and d.get('pr') != ended:
-                    if not self.finish(d, prs, scratch):
-                        return cols
-                    if self.dry:  # count it where the live run would see it: out of Ready, into Staging
-                        ended = d.get('pr')
-                        if any(f"#{ended} hr-gate --apply" in line for line in self.f.did):
-                            done = [q for q in cols.get(board.READY, []) if q['number'] == ended]
-                            cols = dict(cols, **{board.READY: [q for q in cols.get(board.READY, []) if q not in done],
-                                                 board.STAGING: cols.get(board.STAGING, []) + done})
-                    else:
-                        prs, cols = self.columns()
-                    continue
-                st = cols.get(board.STAGING, [])
-                ready = [p for p in cols.get(board.READY, []) if not p.get('draft')]
-                if not ready:
-                    self.out(f"fill: Staging {len(st)}, Ready 0: Ready is empty")
-                    return cols
-                # (d) Michal 2026-11-14 8:43 PM ET: a PR Michal marks urgent (the active fast-track)
-                # is the next Staging pull, also when Staging is at the floor. Flow.pull tries
-                # it first (ready_order: rank first); strict still needs a clean merge.
-                urgent = [p for p in ready if p.get('rank') == board.FAST_TRACK]
-                limit, pick = FLOOR, cols
-                if len(st) >= FLOOR:
-                    if not urgent:
-                        self.out(f"fill: Staging {len(st)}, floor {FLOOR}: no pull needed")
-                        return cols
-                    limit = len(st) + 1
-                    pick = dict(cols, **{board.READY: urgent})
-                    self.out(f"fill: Staging {len(st)}, floor {FLOOR}: fast-track "
-                             f"{', '.join('#' + str(p['number']) for p in urgent)} is pulled past the floor")
-                p = self.f.pull(prs, pick, scratch, limit=limit, strict=True)
-                self.flush()
-                if p is None:
-                    self.out(f"fill: Staging {len(st)}: no {'extra ' if st else ''}Ready PR to pull without rework")
-                    return cols
-                getattr(self, 'pulled', []).append(p['number'])
-                ft = ' (fast-track)' if p.get('rank') == board.FAST_TRACK else ''
-                self.out(f"fill: #{p['number']} is the {'extra' if st else 'first'} Staging pull{ft}")
-                if self.dry:  # nothing was pushed: show the rest of the chain, then count it in Staging
-                    if self.touches_served(p['number']):
-                        d = dict(pr=p['number'], head=p['head'], work=getattr(self.f, 'last_work', None))
-                        lag = self.lagging(d)
-                        for k, host, _, _ in lag:
-                            if k in CORNERBOT_SITES:
-                                self.out(self.cornerbot_request(p['number'], p.get('branch', ''), p['head'],
-                                                                d['work'], host))
-                        corner = any(k in CORNERBOT_SITES for k, *_ in lag)
-                        self.out(f"would wait up to {PTW_WAIT if corner else DEPLOY_WAIT}s until every staging "
-                                 f"site serves {p['head'][:8]}"
-                                 + (f" (now lagging: {', '.join(h for _, h, _, _ in lag)})" if lag else ''))
-                    self.out(f"would run hr-gate --apply {p['number']} (Ready -> Staging when it passes)")
-                    cols = dict(cols, **{board.READY: [q for q in cols.get(board.READY, []) if q is not p],
-                                         board.STAGING: st + [p]})
-                    continue
-                if not self.finish(flow.load_pull(), prs, scratch):
-                    return cols
+            ended = self.gate_pulls(prs, scratch) if flow.load_pulls() else []
+            if ended and self.dry:
+                gated = [n for n in ended if any(f"#{n} hr-gate --apply" in line for line in self.f.did)]
+                cols = self._staged(cols, gated)
+            elif ended:
+                prs, cols = self.columns()
+            st = cols.get(board.STAGING, [])
+            flying = ({d['pr'] for d in flow.load_pulls()} - (set(ended) if self.dry else set())
+                      - {p['number'] for p in st})
+            fl = f" + {len(flying)} in flight ({', '.join('#' + str(n) for n in sorted(flying))})" if flying else ''
+            ready = [p for p in cols.get(board.READY, []) if not p.get('draft') and p['number'] not in flying]
+            have = len(st) + len(flying)
+            # (d) Michal 2026-11-14 8:43 PM ET: a PR Michal marks urgent (the active fast-track)
+            # is pulled also when Staging is at the target; strict still needs a clean merge.
+            urgent = [p for p in ready if p.get('rank') == board.FAST_TRACK]
+            if have >= FLOOR and not urgent:
+                self.out(f"fill: Staging {len(st)}{fl}, target {FLOOR}: no pull needed")
+                return cols
+            if not ready:
+                self.out(f"fill: Staging {len(st)}{fl}, Ready 0: Ready is empty")
+                return cols
+            if have >= FLOOR:
+                pick, room = dict(cols, **{board.READY: urgent}), len(urgent)
+                self.out(f"fill: Staging {len(st)}{fl}, target {FLOOR}: fast-track "
+                         f"{', '.join('#' + str(p['number']) for p in urgent)} is pulled past the target")
+            else:
+                pick, room = dict(cols, **{board.READY: ready}), max(1, flow.STAGING_MAX - have)
+            batch = self.f.pull_batch(prs, pick, scratch, room)
+            self.flush()
+            if not batch:
+                self.out(f"fill: Staging {len(st)}{fl}: no {'extra ' if have else ''}Ready PR to pull without rework")
+                return cols
+            nums = [p['number'] for p in batch]
+            getattr(self, 'pulled', []).extend(nums)
+            ft = ' (fast-track)' if any(p.get('rank') == board.FAST_TRACK for p in batch) else ''
+            self.out(f"fill: {', '.join('#' + str(n) for n in nums)} pulled in one work merge{ft}: "
+                     f"Staging {len(st)}{fl} + {len(batch)}, target {FLOOR}")
+            if self.dry:  # nothing was pushed: show the rest of the chain, then count them in Staging
+                work = getattr(self.f, 'last_work', None)
+                served = [p for p in batch if self.touches_served(p['number'])]
+                if served:
+                    p = served[0]
+                    lag = self.lagging(dict(pr=p['number'], head=p['head'], work=work))
+                    for k, host, _, _ in lag:
+                        if k in CORNERBOT_SITES:
+                            self.out(self.cornerbot_request(p['number'], p.get('branch', ''), p['head'], work, host,
+                                                            [q['number'] for q in batch if q is not p]))
+                    self.out("would gate each one when every staging site serves the batch (no wait; the "
+                             "daemon queues a cascade on a .deploy-sha change)"
+                             + (f" (now lagging: {', '.join(h for _, h, _, _ in lag)})" if lag else ''))
+                for n in nums:
+                    self.out(f"would run hr-gate --apply {n} (Ready -> Staging when it passes)")
+                return dict(cols, **{board.READY: [q for q in cols.get(board.READY, []) if q not in batch],
+                                     board.STAGING: st + batch})
+            # one check now, no wait: the PTW request goes out at once
+            if self.gate_pulls(prs, scratch, only=set(nums)):
                 prs, cols = self.columns()
         return cols
 
@@ -459,7 +454,7 @@ class Cascade(Advance):
         from . import flow
         hr, st = cols.get(board.HUMAN_REVIEW, []), cols.get(board.STAGING, [])
         ready = [p for p in cols.get(board.READY, []) if not p.get('draft')]
-        if pulled or flow.load_pull() or (hr and st) or len(st) >= FLOOR:  # at the floor: no pull was wanted
+        if pulled or flow.load_pulls() or (hr and st) or len(st) >= FLOOR:  # at the floor: no pull was wanted
             return
         if not ready:
             self.out(f"STALLED: Human Review {len(hr)}, Staging {len(st)}, Ready empty: new work must reach Ready")
@@ -596,9 +591,10 @@ def hr_gate():
     return runpy.run_path(str(BIN / 'hr-gate'), run_name='swarm_advance')
 
 
-def request_line(n, branch, head, work, host, dry=False):
+def request_line(n, branch, head, work, host, dry=False, also=()):
     return (f"CORNERBOT_REQUEST{' (dry run)' if dry else ''}: redeploy {host} from platform work "
-            f"{work[:8] if work else '(after the merge)'} (#{n} {branch} {head[:8]} is in work)")
+            f"{work[:8] if work else '(after the merge)'} (#{n} {branch} {head[:8]} is in work)"
+            + (f" with {', '.join('#' + str(x) for x in also)}" if also else ''))
 
 
 def lagging(g, d):
@@ -639,14 +635,15 @@ def cornerbot_reminder(g, out=print, dry=False, now=time.time):
     except OSError:
         return None
     m = re.search(r'\(#(\d+) ', text)
-    d = flow.load_pull()
+    pulls = flow.load_pulls()
+    d = next((q for q in pulls if m and q['pr'] == int(m.group(1))), None) if m else (pulls[0] if pulls else None)
 
     def clear(line):
         if not dry:
             CORNERBOT_FILE.unlink(missing_ok=True)
         out(line + ('' if not dry else ' (dry run: file kept)'))
         return line
-    if not d or (m and int(m.group(1)) != d['pr']):
+    if not d:
         return clear(f"CORNERBOT_REQUEST cleared: no running pull waits on it ({text[:160]})")
     try:
         corner = [(k, h) for k, h, _, _ in lagging(g, d) if k in CORNERBOT_SITES]
@@ -656,7 +653,8 @@ def cornerbot_reminder(g, out=print, dry=False, now=time.time):
         return clear(f"CORNERBOT_DONE: every cornerbot site serves #{d['pr']} {d['head'][:8]} "
                      f"{_age(now() - at)} after the request; request cleared")
     hosts = [h for _, h in corner] if corner else re.findall(r'redeploy (\S+) from', text)[:1] or ['?']
-    line = '; '.join(request_line(d['pr'], d.get('branch', ''), d['head'], d.get('work'), h) for h in hosts)
+    also = [q['pr'] for q in pulls if q.get('work') == d.get('work') and q['pr'] != d['pr']]
+    line = '; '.join(request_line(d['pr'], d.get('branch', ''), d['head'], d.get('work'), h, also=also) for h in hosts)
     line += (f"; open {_age(now() - at)} (asked {_et(at)} ET)"
              + ('; not served yet' if corner else f'; served check failed ({why})'))
     out(line)

@@ -372,3 +372,42 @@ def test_an_empty_human_review_queues_the_cascade_at_once_then_after_a_backoff(t
     assert p.cascade_due({}, False, now=10 + P.CASCADE_EMPTY_HR) == 'Human Review is empty'
     p.last_main = 'a' * 40
     assert p.cascade_due(hr1, True, now=30) == 'main moved'
+
+
+def test_a_deploy_sha_change_with_pulls_in_flight_queues_the_cascade(tmp_path):
+    """Michal 2026-11-15: the cascade checks a redeploy once and never waits, so the daemon
+    starts the next cascade when a staging .deploy-sha changes. File reads only."""
+    from tangentswarm import flow
+    sites = {'work': 'a' * 40, 'ptw': 'o' * 40}
+    p = P.Promoter(g={'served_all': lambda: [(k, f'{k}.example', v, None) for k, v in sites.items()]})
+    assert p.deploy_due() is None  # no pull in flight
+    flow.save_pull(dict(pr=9, head='9' * 40, work='a' * 40, started=0))
+    assert p.deploy_due() is None  # the same .deploy-sha values as last time
+    sites['ptw'] = 'a' * 40
+    assert p.deploy_due() == 'a staging .deploy-sha changed (ptw aaaaaaaa) with pulls in flight (#9)'
+    assert p.deploy_due() is None
+    fresh = P.Promoter(g=p.g)  # a daemon restart: one look at once
+    assert fresh.deploy_due() == 'pulls in flight (#9): first .deploy-sha check'
+
+
+def test_a_daemon_promote_queues_a_cascade_to_restock_staging(tmp_path, monkeypatch):
+    """(2) A promote frees a Staging slot: the next pull starts at once, in the drain that
+    follows under the same lock."""
+    from tangentswarm import advance
+    g = G(tmp_path)
+    g['gql'] = lambda q, **v: page(item(1, HR, 'a'), item(5, ST, H5))
+    p = P.Promoter(g=g)
+    order = []
+    monkeypatch.setattr(p, 'fast_path', lambda cols: [5])
+    monkeypatch.setattr(p, 'queue_cascade', lambda why, now=None: order.append(why))
+    monkeypatch.setattr(p, 'drain', lambda: order.append('drain') or [])
+
+    class L:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+    monkeypatch.setattr(P.gatelock, 'gate_lock', lambda name: L())
+    assert p.once() == 'promoted'
+    assert order[-2:] == ['promoted #5: restock Staging', 'drain']

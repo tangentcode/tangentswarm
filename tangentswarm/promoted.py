@@ -240,6 +240,7 @@ class Promoter:
         self.last_main = None  # main SHA the last main-merge recheck ran for
         self.last_hr = None    # Human Review count at the last check
         self.cascade_at = 0.0  # when this daemon last queued a cascade for an empty Human Review
+        self.last_deploy = None  # the staging .deploy-sha values at the last check
 
     def main_sha(self):
         """origin main's SHA via git ls-remote (no API quota), or None on an error."""
@@ -264,6 +265,26 @@ class Promoter:
         if main_moved and self.last_main is not None:
             return "main moved"
         return None
+
+    def deploy_due(self):
+        """Why to queue a cascade for the pulls in flight, or None (Michal 2026-11-15). The
+        cascade never waits on a redeploy; it checks once and exits. So when a staging
+        .deploy-sha changes while a pull is in flight (or at the first look after a start),
+        the next cascade must gate it. Local file reads only: no GraphQL, no git fetch."""
+        from . import flow
+        try:
+            key = tuple((k, sha) for k, _, sha, _ in self.g['served_all']())
+        except Exception:
+            return None
+        prev, self.last_deploy = self.last_deploy, key
+        pulls = flow.load_pulls()
+        if not pulls or key == prev:
+            return None
+        names = ', '.join(f"#{d['pr']}" for d in pulls)
+        if prev is None:
+            return f"pulls in flight ({names}): first .deploy-sha check"
+        new = ', '.join(f"{k} {sha[:8] if sha else '-'}" for k, sha in key if (k, sha) not in prev)
+        return f"a staging .deploy-sha changed ({new}) with pulls in flight ({names})"
 
     def queue_cascade(self, why, now=None):
         from . import advance
@@ -427,7 +448,7 @@ class Promoter:
         waiting = gatelock.queued()
         if not retry:
             cols = read_columns(self.g['gql'], max_age=IDLE_AGE)
-            why = self.cascade_due(cols, main_moved)
+            why = self.cascade_due(cols, main_moved) or self.deploy_due()
             if why:
                 self.queue_cascade(why)
                 waiting = gatelock.queued()
@@ -446,6 +467,8 @@ class Promoter:
             with (gatelock.gate_lock('swarm-promoted') if not self.dry else _null()):
                 cols = read_columns(self.g['gql'], max_age=0)  # fresh, under the lock
                 moved = self.fast_path(cols) if needs_promotion(cols) else []
+                if moved:  # a free Staging slot: restock it now (the drain below runs it under our lock)
+                    self.queue_cascade(f"promoted {', '.join('#' + str(n) for n in moved)}: restock Staging")
                 drained = self.drain()
                 if drained:  # a queued run may have moved cards: read again before the rest
                     cols, moved = read_columns(self.g['gql'], max_age=0), []  # the new read already has our moves

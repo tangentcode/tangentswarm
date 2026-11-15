@@ -282,17 +282,13 @@ def cascade(monkeypatch, tmp_path, cols, g, dry=True, **kw):
     merge_fakes(monkeypatch, kw.get('dirty', ()), kw.get('main_dirty', ()))
     pulled = []
 
-    def pull(self, prs, c, scratch, limit=None, strict=False):
-        st = len(c.get(board.STAGING, []))
-        assert strict and limit == (A.FLOOR if st < A.FLOOR else st + 1)  # past the floor: fast-track only
-        fits = [q for q in c.get(board.READY, []) if q['number'] not in kw.get('dirty', ())]
-        if not fits:
-            return None
-        p = fits[0]
-        pulled.append(p['number'])
-        self.change(f"#{p['number']} pulled")
-        return p
-    monkeypatch.setattr(F.Flow, 'pull', pull)
+    def pull_batch(self, prs, c, scratch, room):
+        fits = [q for q in c.get(board.READY, []) if q['number'] not in kw.get('dirty', ())][:room]
+        pulled.extend(q['number'] for q in fits)
+        if fits:
+            self.change(f"{', '.join('#' + str(q['number']) for q in fits)} pulled")
+        return fits
+    monkeypatch.setattr(F.Flow, 'pull_batch', pull_batch)
     monkeypatch.setattr(F.Flow, 'columns', lambda self: ({}, {k: list(v) for k, v in cols.items()}))
     out = []
     c = A.Cascade(g=g, dry_run=dry, out=out.append, sleep=lambda s: None)
@@ -308,9 +304,9 @@ def test_empty_staging_gets_one_pull_then_only_clean_extras(monkeypatch, tmp_pat
             board.IN_PROGRESS: [pr(8, board.IN_PROGRESS)]}
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(), dirty={5, 7})
     assert pulled == [4, 6]  # #5 and #7 do not merge cleanly: skipped, not reworked
-    assert 'fill: #4 is the first Staging pull' in out and 'fill: #6 is the extra Staging pull' in out
-    assert 'fill: Staging 2, floor 2: no pull needed' in out  # floor 2 reached; #7 is never tried
+    assert 'fill: #4, #6 pulled in one work merge: Staging 0 + 2, target 2' in out  # one batch, one push
     assert out.count('would run hr-gate --apply 4 (Ready -> Staging when it passes)') == 1
+    assert out.count('would run hr-gate --apply 6 (Ready -> Staging when it passes)') == 1
     assert out[-1] == 'signal: no Active issue without a PR (new=0/4 rework=0/3 ready=2/6 active_without_pr=0): no START_CLAUDE'
 
 
@@ -329,17 +325,28 @@ def test_staging_at_the_floor_pulls_nothing(monkeypatch, tmp_path):
     cols = {board.STAGING: [pr(n, board.STAGING) for n in range(1, A.FLOOR + 1)],
             board.READY: [pr(n, board.READY) for n in range(10, 16)]}
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate())
-    assert pulled == [] and out == [f'fill: Staging {A.FLOOR}, floor {A.FLOOR}: no pull needed',
+    assert pulled == [] and out == [f'fill: Staging {A.FLOOR}, target {A.FLOOR}: no pull needed',
                                     'signal: no Active issue without a PR (new=0/3 rework=0/3 ready=6/6 active_without_pr=0): no START_CLAUDE']
 
 
-@pytest.mark.parametrize('floor, want', [(1, [10]), (2, [10, 12]), (4, [10, 12, 14, 15])])
-def test_the_floor_sets_how_many_clean_prs_staging_gets(monkeypatch, tmp_path, floor, want):
-    """No fixed cap: pull clean Ready PRs only while Staging is below the floor."""
-    monkeypatch.setattr(A, 'FLOOR', floor)
-    cols = {board.READY: [pr(n, board.READY) for n in range(10, 16)]}
+@pytest.mark.parametrize('staging, want', [(0, [10, 12, 14, 15, 16]), (1, [10, 12, 14, 15, 16]), (2, [])])
+def test_below_the_target_one_batch_takes_every_clean_ready_pr(monkeypatch, tmp_path, staging, want):
+    """Michal 2026-11-15: one work merge for all clean Ready PRs, so one redeploy covers them.
+    The target (FLOOR) says WHEN to pull; the batch is capped by flow.STAGING_MAX."""
+    cols = {board.STAGING: [pr(n, board.STAGING) for n in range(1, staging + 1)],
+            board.READY: [pr(n, board.READY) for n in range(10, 17)]}
     _, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False), dirty={11, 13})
-    assert pulled == want
+    assert pulled == want[:flow.STAGING_MAX - staging]
+
+
+def test_pulls_in_flight_count_toward_the_target(monkeypatch, tmp_path):
+    from tangentswarm import flow as F
+    cols = {board.STAGING: [pr(1, board.STAGING)], board.READY: [pr(3, board.READY), pr(9, board.READY)]}
+    monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
+    F.save_pull(dict(pr=3, head='3' * 40, branch='b', item='I', work='w' * 40, started=0))
+    monkeypatch.setattr(F.Flow, 'advance', lambda self, d, prs, s: self.note(f"#{d['pr']} pull waiting (1 min): CI"))
+    out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False))
+    assert pulled == [] and 'fill: Staging 1 + 1 in flight (#3), target 2: no pull needed' in out
 
 
 def test_a_fast_track_pr_is_pulled_past_the_floor(monkeypatch, tmp_path):
@@ -348,9 +355,8 @@ def test_a_fast_track_pr_is_pulled_past_the_floor(monkeypatch, tmp_path):
             board.READY: [pr(10, board.READY), pr(12, board.READY, rank=board.FAST_TRACK), pr(13, board.READY)]}
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False))
     assert pulled == [12]  # only the fast-track PR; #10 and #13 wait for the floor
-    assert f'fill: Staging {A.FLOOR}, floor {A.FLOOR}: fast-track #12 is pulled past the floor' in out
-    assert 'fill: #12 is the extra Staging pull (fast-track)' in out
-    assert f'fill: Staging {A.FLOOR + 1}, floor {A.FLOOR}: no pull needed' in out
+    assert f'fill: Staging {A.FLOOR}, target {A.FLOOR}: fast-track #12 is pulled past the target' in out
+    assert f'fill: #12 pulled in one work merge (fast-track): Staging {A.FLOOR} + 1, target {A.FLOOR}' in out
 
 
 def test_a_fast_track_pr_that_does_not_merge_cleanly_is_not_pulled_past_the_floor(monkeypatch, tmp_path):
@@ -425,80 +431,97 @@ def test_a_dry_run_shows_the_cornerbot_request_and_the_wait_for_every_site(monke
     out, pulled = cascade(monkeypatch, tmp_path, cols, g)
     assert pulled == [9]
     assert any(l.startswith('CORNERBOT_REQUEST (dry run): redeploy ptw.example') and '#9 b9' in l for l in out)
-    assert f'would wait up to {A.PTW_WAIT}s until every staging site serves 00000000 (now lagging: ptw.example)' in out
+    assert ('would gate each one when every staging site serves the batch (no wait; the daemon queues a cascade '
+            'on a .deploy-sha change) (now lagging: ptw.example)') in out
     assert 'would run hr-gate --apply 9 (Ready -> Staging when it passes)' in out
 
 
-def live(monkeypatch, tmp_path, g, polls, advance=None, ready=(9,)):
-    """A live fill: Flow.pull merges into work ('w'*40). polls: list of {site: sha} per poll."""
+def live(monkeypatch, tmp_path, g, advance=None, ready=(9,), staging=(1,), hr=()):
+    """A live fill: Flow.pull_batch merges the clean Ready PRs into work ('w'*40) in one push.
+    Returns (out, gated PRs, seconds slept, board)."""
     from tangentswarm import flow as F
-    seq = iter(polls)
+    gated = []
 
-    def served_all():
-        g.served = next(seq, g.served) if polls else g.served
-        return [(k, f'{k}.example', sha, None) for k, sha in g.served.items()]
-    g['served_all'] = served_all
-    advanced = []
-
-    def start(self, prs, c, scratch, limit=None, strict=False):
-        p = c[board.READY].pop(0)
-        F.save_pull(dict(pr=p['number'], head=p['head'], branch='b', item='I', work='w' * 40, started=0))
-        return p
+    def batch(self, prs, c, scratch, room):
+        got = c[board.READY][:room]
+        F.save_pulls(F.load_pulls() + [dict(pr=p['number'], head=p['head'], branch=f"b{p['number']}", item='I',
+                                            work='w' * 40, started=0) for p in got])
+        return got
 
     def adv(self, d, prs, scratch):
-        advanced.append(d['pr'])
-        F.save_pull(None)  # hr-gate --apply moved it
+        gated.append(d['pr'])
+        F.drop_pull(d['pr'])  # hr-gate --apply moved it
+        c[board.READY] = [q for q in c[board.READY] if q['number'] != d['pr']]
         c[board.STAGING].append(pr(d['pr'], board.STAGING))
-    c = {board.STAGING: [pr(1, board.STAGING)], board.READY: [pr(n, board.READY) for n in ready]}
+        self.change(f"#{d['pr']} hr-gate --apply: moved")
+    c = {board.STAGING: [pr(n, board.STAGING) for n in staging], board.READY: [pr(n, board.READY) for n in ready],
+         board.HUMAN_REVIEW: [pr(n, board.HUMAN_REVIEW) for n in hr]}
     monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
     merge_fakes(monkeypatch)
     monkeypatch.setattr(A, 'CORNERBOT_FILE', tmp_path / 'cornerbot')
-    monkeypatch.setattr(F.Flow, 'pull', start)
+    monkeypatch.setattr(F.Flow, 'pull_batch', batch)
     monkeypatch.setattr(F.Flow, 'advance', advance or adv)
     monkeypatch.setattr(F.Flow, 'columns', lambda self: ({}, c))
-    out, now = [], [0]
-
-    def sleep(s):
-        now[0] += s
-    A.Cascade(g=g, dry_run=False, out=out.append, sleep=sleep, clock=lambda: now[0]).fill()
-    return out, advanced, now[0]
+    out, slept = [], []
+    A.Cascade(g=g, dry_run=False, out=out.append, sleep=slept.append).fill()
+    return out, gated, sum(slept), c
 
 
-def test_a_live_pull_gates_only_when_every_site_serves_the_head(monkeypatch, tmp_path):
-    """platform #493: work and minavo served the head first; ptw served it two polls later."""
-    W, O = 'w' * 40, 'o' * 40
-    polls = [{'work': O, 'minavo': O, 'ptw': O}, {'work': W, 'minavo': W, 'ptw': O},
-             {'work': W, 'minavo': W, 'ptw': O}, {'work': W, 'minavo': W, 'ptw': W}]
-    out, advanced, waited = live(monkeypatch, tmp_path, CascadeGate(), polls)
-    assert advanced == [9] and waited == 3 * A.DEPLOY_POLL
-    reqs = [l for l in out if l.startswith('CORNERBOT_REQUEST')]
-    assert len(reqs) == 1 and reqs[0].startswith('CORNERBOT_REQUEST: redeploy ptw.example from platform work wwwwwwww')
-    assert "served: every staging site serves #9 00000000" in out
-    # the request file was written, then cleared once ptw served the head
-    assert "CORNERBOT_DONE: every cornerbot site serves #9 00000000; request cleared" in out
-    assert not (tmp_path / 'cornerbot').exists()
+W, O = 'w' * 40, 'o' * 40
+PTW_LAGS = {'work': W, 'minavo': W, 'ptw': O}
+ALL_SERVE = {'work': W, 'minavo': W, 'ptw': W}
 
 
-def test_a_live_pull_times_out_on_a_lagging_ptw_and_stops_the_fill(monkeypatch, tmp_path):
-    monkeypatch.setattr(A, 'BUDGET', 100_000)  # the plain wait limits, not the budget cut
+def test_a_batch_waits_on_no_redeploy_and_asks_cornerbot_once(monkeypatch, tmp_path):
+    """Michal 2026-11-15: Human Review sat empty about 15 min twice while single pulls of #495 and
+    #514 each waited about 10 min on a PTW redeploy, holding the serial lock."""
     from tangentswarm import flow as F
-    W, O = 'w' * 40, 'o' * 40
-    g = CascadeGate(served={'work': W, 'minavo': W, 'ptw': O})
-    out, advanced, waited = live(monkeypatch, tmp_path, g, [],
-                                 advance=lambda *a: pytest.fail('ptw does not serve it: no gate'), ready=(9, 10))
-    assert advanced == [] and waited >= A.PTW_WAIT
-    assert out[-1] == (f"waiting: #9 00000000 is not served yet by ptw.example (oooooooo) after {A.PTW_WAIT}s; "
-                       "the pull stays open for the next cascade")
-    assert F.load_pull()['asked'] is True  # the next cascade waits again but does not ask again
-    assert 'CORNERBOT_REQUEST: redeploy ptw.example' in (tmp_path / 'cornerbot').read_text()  # kept: not served
+    out, gated, slept, _ = live(monkeypatch, tmp_path, CascadeGate(served=PTW_LAGS), ready=(9, 10), staging=())
+    assert slept == 0 and gated == []  # no sleep, no gate: the lock is free for a promote at once
+    assert 'fill: #9, #10 pulled in one work merge: Staging 0 + 2, target 2' in out
+    reqs = [l for l in out if l.startswith('CORNERBOT_REQUEST')]
+    assert reqs == ['CORNERBOT_REQUEST: redeploy ptw.example from platform work wwwwwwww (#9 b9 00000000 is in work) '
+                    'with #10']  # ONE request for the whole batch
+    assert [d['asked'] for d in F.load_pulls()] == [True, True]
+    assert any(l.startswith('waiting: #10 00000000 is not served yet by ptw.example (oooooooo); pulled ') for l in out)
 
 
-def test_a_web_site_that_never_serves_times_out_after_deploy_wait(monkeypatch, tmp_path):
-    monkeypatch.setattr(A, 'BUDGET', 100_000)  # the plain wait limits, not the budget cut
-    W, O = 'w' * 40, 'o' * 40
+def test_the_next_cascade_gates_the_whole_batch_once_ptw_serves_it(monkeypatch, tmp_path):
+    from tangentswarm import flow as F
+    monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
+    F.save_pulls([dict(pr=n, head=f'{n}' * 40, branch='b', item='I', work=W, started=0, asked=True) for n in (9, 10)])
+    (tmp_path / 'cornerbot').write_text('x CORNERBOT_REQUEST: redeploy ptw.example ...\n')
+    g = CascadeGate(served=ALL_SERVE, has={W})
+    out, gated, slept, c = live(monkeypatch, tmp_path, g, ready=(9, 10), staging=())
+    assert gated == [9, 10] and slept == 0 and F.load_pulls() == []
+    assert 'CORNERBOT_DONE: every cornerbot site serves #9 99999999; request cleared' in out
+    assert not (tmp_path / 'cornerbot').exists()
+    assert 'fill: Staging 2, target 2: no pull needed' in out
+
+
+def test_a_promote_starts_the_next_pull_while_a_batch_still_waits(monkeypatch, tmp_path):
+    """(2) A promote frees a Staging slot: the next Ready pull starts in the same pass, and the
+    waiting batch (asked before) gets one check and no second request."""
+    from tangentswarm import flow as F
+    monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
+    F.save_pull(dict(pr=9, head='9' * 40, branch='b', item='I', work=W, started=0, asked=True))
+    out, gated, slept, _ = live(monkeypatch, tmp_path, CascadeGate(served=PTW_LAGS), ready=(9, 11), staging=())
+    assert slept == 0 and gated == []
+    assert 'fill: #11 pulled in one work merge: Staging 0 + 1 in flight (#9) + 1, target 2' in out
+    assert [d['pr'] for d in F.load_pulls()] == [9, 11]
+    assert not any(l.startswith('CORNERBOT_REQUEST') and '#9' in l for l in out)  # asked before
+
+
+def test_a_pull_without_served_files_is_gated_at_once(monkeypatch, tmp_path):
+    out, gated, _, _ = live(monkeypatch, tmp_path, CascadeGate(served_files=False, served=PTW_LAGS), ready=(9,),
+                            staging=())
+    assert gated == [9] and not any(l.startswith(('CORNERBOT', 'waiting')) for l in out)
+
+
+def test_a_web_site_that_never_serves_never_holds_the_lock(monkeypatch, tmp_path):
     g = CascadeGate(served={'work': O, 'minavo': W, 'ptw': W})
-    out, advanced, waited = live(monkeypatch, tmp_path, g, [], advance=lambda *a: pytest.fail('no gate'))
-    assert advanced == [] and A.DEPLOY_WAIT <= waited < A.PTW_WAIT
+    out, gated, slept, _ = live(monkeypatch, tmp_path, g, advance=lambda *a: pytest.fail('no gate'))
+    assert gated == [] and slept == 0
     assert not any(l.startswith('CORNERBOT_REQUEST') for l in out)
 
 
@@ -520,7 +543,8 @@ def test_a_dry_run_stops_at_a_waiting_pull(monkeypatch, tmp_path):
     F.save_pull(dict(pr=3, head='3' * 40, branch='b', item='I', work='w' * 40, started=0))
     monkeypatch.setattr(F.Flow, 'advance', lambda self, d, prs, s: self.note(f"#{d['pr']} pull waiting (1 min): CI"))
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False))
-    assert pulled == [] and 'note: #3 pull waiting (1 min): CI' in out
+    # a waiting pull no longer blocks the fill: Staging 0 + 1 in flight is below the target
+    assert pulled == [9] and 'note: #3 pull waiting (1 min): CI' in out
 
 
 def test_a_dry_run_counts_a_gated_running_pull_in_staging(monkeypatch, tmp_path):
@@ -532,20 +556,10 @@ def test_a_dry_run_counts_a_gated_running_pull_in_staging(monkeypatch, tmp_path)
     F.save_pull(dict(pr=3, head='3' * 40, branch='b', item='I', work='w' * 40, started=0))
     monkeypatch.setattr(F.Flow, 'advance', lambda self, d, prs, s: self.change(f"#{d['pr']} hr-gate --apply {d['pr']}"))
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False))
-    assert pulled == [9] and 'fill: #9 is the extra Staging pull' in out
+    assert pulled == [9] and 'fill: #9 pulled in one work merge: Staging 1 + 1, target 2' in out
 
 
 # --- --cascade: run budget, timeouts, clean stop (7:02 PM ET tick ran past 600 s, no output) ---
-
-def test_the_redeploy_wait_is_cut_to_fit_the_run_budget(monkeypatch, tmp_path):
-    W, O = 'w' * 40, 'o' * 40
-    g = CascadeGate(served={'work': W, 'minavo': W, 'ptw': O})
-    out, advanced, waited = live(monkeypatch, tmp_path, g, [], advance=lambda *a: pytest.fail('no gate'))
-    limit = A.BUDGET - A.GATE_RESERVE
-    assert advanced == [] and limit <= waited < limit + A.DEPLOY_POLL
-    assert out[-1].endswith(f"after {waited}s; the pull stays open for the next cascade")
-    assert any(l.startswith('redeploy: still waiting for ptw.example (') for l in out)  # a line each minute
-
 
 def test_a_timeout_keeps_the_rerun_flag_and_releases_the_lock(tmp_path):
     flag, lock, out = tmp_path / 'rerun', tmp_path / 'lock', []
@@ -604,8 +618,7 @@ def test_a_cornerbot_site_asked_before_gets_one_check_and_no_wait(monkeypatch, t
     g = CascadeGate(served={'work': 'w' * 40, 'minavo': 'w' * 40, 'ptw': 'o' * 40})
     A.Cascade(g=g, out=out.append, sleep=lambda s: now.__setitem__(0, now[0] + s), clock=lambda: now[0]).fill()
     assert now[0] == 0 and not any(l.startswith('CORNERBOT_REQUEST') for l in out)
-    assert out[0].endswith('(cornerbot was asked before: one check, no wait)')
-    assert out[1].startswith('waiting: #480 5f6e09a4 is not served yet by ptw.example (oooooooo) after 0s')
+    assert out[0].startswith('waiting: #480 5f6e09a4 is not served yet by ptw.example (oooooooo); pulled ')
 
 
 def test_the_deadline_is_per_process_not_per_pass(monkeypatch):

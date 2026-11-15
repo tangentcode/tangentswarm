@@ -368,3 +368,61 @@ def test_strict_pull_skips_without_rework_and_needs_every_pair_clean(monkeypatch
     assert '#7 skipped: does not merge cleanly with work' in notes
     assert '#8 skipped: does not merge cleanly with #3' in notes
     assert notes.endswith('no Ready PR merges cleanly with main, work and every Human Review and Staging PR')
+
+
+def test_pull_batch_merges_every_clean_ready_pr_into_work_in_one_push(repo, tmp_path):
+    """Staging stocking (Michal 2026-11-15): one work push for the whole batch, so one staging
+    redeploy covers it. x and y each merge cleanly with work but not with each other: x enters
+    the batch, y is skipped with a note, z enters too."""
+    s, h = repo
+    origin = tmp_path / 'origin.git'
+    run(tmp_path, 'init', '-q', '--bare', str(origin))
+    run(s.dir, 'push', '-q', str(origin), f"{h['hr1']}:refs/heads/work")
+    s.main = h['main']
+    s.ensure_main = s.ensure = lambda *a: None
+
+    def mt_clean(d, a, b):
+        return subprocess.run(['git', '--git-dir', d, 'merge-tree', '--write-tree', a, b],
+                              capture_output=True).returncode == 0
+    g = {'origin_url': lambda: str(origin), 'merge_tree_clean': mt_clean, 'queue_from_board_or_file': lambda: []}
+    f = flow.Flow(out=lambda line: None, g=g, now=lambda: 10_000)
+    prs = {n: card(n, RD, head=h[k]) for n, k in ((7, 'x'), (8, 'y'), (9, 'z'))}
+    cols = {HR: [card(1, HR, head=h['hr1'])], RD: [prs[7], prs[8], prs[9]]}
+    batch = f.pull_batch(prs, cols, s, room=5)
+    assert [p['number'] for p in batch] == [7, 9]
+    assert any(n.startswith('#8 skipped: does not merge cleanly onto the batch (#7)') for n in f.notes)
+    tip = run(s.dir, 'ls-remote', str(origin), 'refs/heads/work').split()[0]
+    assert tip == f.last_work
+    for head in (h['x'], h['z'], h['hr1']):
+        assert subprocess.run(['git', '--git-dir', s.dir, 'merge-base', '--is-ancestor', head, tip]).returncode == 0
+    assert run(s.dir, 'rev-list', '--count', f"{h['hr1']}..{tip}", '--merges') == '2'  # one merge commit per PR
+    assert [(d['pr'], d['work']) for d in flow.load_pulls()] == [(7, tip), (9, tip)]
+    assert f.did[-1].startswith(f"did: #7 {h['x'][:8]}, #9 {h['z'][:8]} pulled: 2 head(s) merged into work") \
+        and 'in one push' in f.did[-1]
+
+
+def test_pull_batch_dry_run_pushes_nothing_and_saves_nothing(repo, tmp_path):
+    s, h = repo
+    origin = tmp_path / 'origin.git'
+    run(tmp_path, 'init', '-q', '--bare', str(origin))
+    run(s.dir, 'push', '-q', str(origin), f"{h['hr1']}:refs/heads/work")
+    s.main = h['main']
+    s.ensure_main = s.ensure = lambda *a: None
+    g = {'origin_url': lambda: str(origin), 'merge_tree_clean': lambda d, a, b: True,
+         'queue_from_board_or_file': lambda: []}
+    f = flow.Flow(dry_run=True, out=lambda line: None, g=g, now=lambda: 10_000)
+    prs = {9: card(9, RD, head=h['z'])}
+    assert [p['number'] for p in f.pull_batch(prs, {RD: [prs[9]]}, s, room=5)] == [9]
+    assert run(s.dir, 'ls-remote', str(origin), 'refs/heads/work').split()[0] == h['hr1']
+    assert flow.load_pulls() == []
+
+
+def test_pulls_state_reads_the_old_single_pull_file_and_drops_one_pr(tmp_path):
+    flow.STATE.write_text('{"pr": 495, "head": "4e", "work": "5b", "asked": true}')
+    assert [d['pr'] for d in flow.load_pulls()] == [495] and flow.pulled_prs() == {495}
+    flow.save_pull(dict(pr=514, head='f0', work='5b'))
+    assert flow.pulled_prs() == {495, 514} and flow.load_pull()['pr'] == 495
+    flow.drop_pull(495)
+    assert flow.pulled_prs() == {514}
+    flow.drop_pull(514)
+    assert not flow.STATE.exists()
