@@ -31,7 +31,6 @@ def pr(n=7, draft=False, base='main', head='a' * 40, merged=False):
                       'pull_request': pr()}, 'not tangentcode/platform'),
     ('check_run', {'action': 'completed', 'repository': REPO}, 'check_run'),
     ('workflow_job', {'action': 'queued', 'repository': REPO}, 'workflow_job'),
-    ('pull_request_review_comment', {'action': 'created', 'repository': REPO}, 'pull_request_review_comment'),
     ('pull_request', {'action': 'labeled', 'repository': REPO, 'pull_request': pr()}, 'labeled'),
     ('pull_request', {'action': 'synchronize', 'repository': REPO, 'pull_request': pr(draft=True)}, 'draft'),
     ('issue_comment', {'action': 'created', 'repository': REPO, 'issue': {'number': 7, 'pull_request': {}},
@@ -268,9 +267,9 @@ def test_the_wake_sends_the_bearer_key_when_the_key_file_exists(tmp_path, monkey
     url, key = tmp_path / 'url', tmp_path / 'key'
     url.write_text(f'http://127.0.0.1:{srv.server_address[1]}/wake\n')
     try:
-        W.post_wake({'why': 'a'}, url_file=url, key_file=tmp_path / 'missing')
+        W.post_wake({'why': 'a'}, url_file=url, key_file=tmp_path / 'missing', background=False)
         key.write_text('k123\n')
-        W.post_wake({'why': 'b'}, url_file=url, key_file=key)
+        W.post_wake({'why': 'b'}, url_file=url, key_file=key, background=False)
     finally:
         srv.shutdown()
     assert got == [(None, {'why': 'a'}), ('Bearer k123', {'why': 'b'})]

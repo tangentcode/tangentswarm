@@ -10,7 +10,8 @@ it cannot handle.
                    200 at once; one worker thread handles the inbox in order.
   GET  /health     "ok"
 
-Every delivery and every decision is one JSON line in LOG. classify() is a pure function of
+Every delivery and every decision is one JSON line in LOG, and rows in the append-only
+SQLite event log (eventdb: a 'received' row before the reply, a 'handled' row after). classify() is a pure function of
 (event, payload) -> [Action]; Executor runs the actions with the swarm's own tools:
 
   minbot   queue `swarm-advance --minbot N` (CI green, mergeable, Codex clean on the head,
@@ -33,6 +34,7 @@ Every delivery and every decision is one JSON line in LOG. classify() is a pure 
 
 `swarm-webhook replay --pr N [--pr M ...] [--dry]` runs the same handlers on a PR from its
 current state (the Codex result and CI on the head), for events that were missed.
+`swarm-webhook replay --delivery ID` runs them again on a delivery stored in the event DB.
 
 A worker's push to a PR in In Progress is left to the Stop hook: a worker often pushes and
 goes on working, so a push alone is not a handoff.
@@ -50,7 +52,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import board
+from . import board, eventdb
 
 HOME = Path.home()
 STATE = HOME / '.local' / 'state' / 'swarm-flow'
@@ -68,6 +70,17 @@ CODEX = 'chatgpt-codex-connector'
 WAKE_EVERY = 60          # s between two wakes
 WAKE_DEDUPE = 1800       # s: the same exception key wakes once
 MAX_BODY = 2 * 1024 * 1024
+# Logged in the event DB only: one row each, no action, never queued (Michal 1:55 PM ET).
+LOG_ONLY = ('push', 'commit_comment', 'discussion', 'discussion_comment', 'pull_request_review_thread',
+            'pull_request_review_comment')
+# The event types classify() has rules for (a skip is a rule). Any other type is log-only too:
+# a 2xx answer and one row, never an error (Michal 1:58 PM ET).
+HANDLED = ('ping', 'projects_v2_item', 'issue_comment', 'pull_request_review', 'check_suite', 'workflow_run',
+           'pull_request', 'issues', 'check_run', 'status', 'workflow_job', 'create', 'delete')
+
+
+def log_only(event):
+    return event in LOG_ONLY or event not in HANDLED
 OUR_MARKS = ('<!-- swarm-needs-input -->', '### MinBot', 'MinBot pass', 'MinBot check',
              '<!-- swarm-brief', 'Coordinator: #')
 
@@ -151,7 +164,9 @@ def classify(event, p):
         return project_move(p)
     if repo != REPO:
         return [Action('skip', why=f'not {REPO} ({repo or "no repo"})')]
-    if event in ('check_run', 'status', 'workflow_job', 'pull_request_review_comment', 'push', 'create', 'delete'):
+    if log_only(event):
+        return [Action('log-only', why=f'{event}: logged only (Michal 2026-11-15 1:55 PM ET)')]
+    if event in ('check_run', 'status', 'workflow_job', 'create', 'delete'):
         return [Action('skip', why=f'{event}: not handled (STEP 0)')]
 
     if event == 'issue_comment':
@@ -233,7 +248,7 @@ def classify(event, p):
             return [Action('card', i.get('number'), f"issue #{i.get('number')} opened", dict(what='issue'))]
         return [Action('skip', pr=i.get('number'), why=f'issues {action}')]
 
-    return [Action('skip', why=f'{event} {action}: no rule')]
+    return [Action('skip', why=f'{event} {action}: no rule for this action')]
 
 
 def project_move(p):
@@ -270,6 +285,7 @@ class Executor:
         self.give = give
         self.wake_post = wake_post
         self.done = []
+        self.errors = []
 
     @property
     def g(self):
@@ -364,6 +380,7 @@ class Executor:
         try:
             fn(a)
         except Exception as e:  # one action failing never stops the rest
+            self.errors.append(f"{a.kind} #{a.pr}: {type(e).__name__}: {str(e)[:300]}")
             self.wake(a.pr, f"{a.kind} on #{a.pr} failed: {type(e).__name__}: {str(e)[:200]}",
                       key=f'fail:{a.kind}:{a.pr}')
 
@@ -545,24 +562,54 @@ def _read(path):
         return ''
 
 
-def post_wake(payload, url_file=None, key_file=None):
+def _retry_after(e):
+    try:
+        return int(e.headers.get('Retry-After') or 0) or None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def post_wake(payload, url_file=None, key_file=None, urlopen=None, sleep=time.sleep, background=True):
     """POST the exception to swarmbot's wake URL (from WAKE_URL_FILE). No URL: logged only.
     An optional key (WAKE_KEY_FILE, mode 600) goes as "Authorization: Bearer <key>"; the key
-    is never logged."""
+    is never logged. A failed POST is retried with board-sync's backoff() (Retry-After
+    honored) up to eventdb.WAKE_MAX_ATTEMPTS; a 4xx other than 408/429 is not retried. The
+    retries run in their own thread, so the handler never waits for them."""
+    import urllib.error
     import urllib.request
     url = _read(url_file or WAKE_URL_FILE)
     if not url:
         return log(decision='wake-not-sent', why='no wake URL configured', **payload)
-    headers = {'Content-Type': 'application/json'}
+    headers = {'Content-Type': 'application/json', 'User-Agent': 'swarm-webhook'}
     key = _read(key_file or WAKE_KEY_FILE)
     if key:
         headers['Authorization'] = f'Bearer {key}'
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), method='POST', headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            log(decision='wake-sent', status=r.status, auth=bool(key), **payload)
-    except Exception as e:
-        log(decision='wake-failed', error=f'{type(e).__name__}: {e}', **payload)
+    data = json.dumps(payload).encode()
+    urlopen = urlopen or urllib.request.urlopen
+
+    def attempt():
+        req = urllib.request.Request(url, data=data, method='POST', headers=headers)
+        try:
+            with urlopen(req, timeout=20) as r:
+                return getattr(r, 'status', 200) or 200, None, None
+        except urllib.error.HTTPError as e:
+            return e.code, _retry_after(e), f'HTTP {e.code}'
+        except Exception as e:
+            return None, None, f'{type(e).__name__}: {e}'
+
+    def run():
+        for attempts in range(1, eventdb.WAKE_MAX_ATTEMPTS + 1):
+            code, wait, err = attempt()
+            if code is not None and 200 <= code < 300:
+                return log(decision='wake-sent', status=code, attempts=attempts, auth=bool(key), **payload)
+            permanent = code is not None and 400 <= code < 500 and code not in (408, 429)
+            if permanent or attempts >= eventdb.WAKE_MAX_ATTEMPTS:
+                return log(decision='wake-failed', status=code, attempts=attempts, error=err, **payload)
+            sleep(eventdb.backoff(attempts, wait))
+    if background:
+        threading.Thread(target=run, name='wake-post', daemon=True).start()
+    else:
+        run()
 
 
 # -- dedupe state ------------------------------------------------------------------------
@@ -582,19 +629,6 @@ def _save_seen(d):
     tmp = SEEN.with_suffix('.tmp')
     tmp.write_text(json.dumps(d))
     os.replace(tmp, SEEN)
-
-
-def first_time(delivery, keep=5000):
-    """True the first time a delivery id is seen (GitHub redelivers on a timeout)."""
-    with _lock:
-        d = _seen()
-        ids = d.setdefault('deliveries', [])
-        if delivery in ids:
-            return False
-        ids.append(delivery)
-        del ids[:-keep]
-        _save_seen(d)
-        return True
 
 
 # -- replay --------------------------------------------------------------------------------
@@ -632,10 +666,19 @@ def replay(n, ex=None):
     if ci and ci.startswith('CI is still running'):
         ex.note(f"#{n}: {ci}")
     log(delivery=f'replay-{n}', event='replay', pr=n, decisions=[a.as_dict() for a in acts], done=ex.done)
+    _add('replay', f'replay-{n}', 'replay', decisions=[a.kind for a in acts], notes=ex.done, pr=n,
+         error='; '.join(ex.errors) or None)
     return acts, ex.done
 
 
 # -- processing ----------------------------------------------------------------------------
+
+def _add(*a, **kw):
+    try:
+        return eventdb.store().add(*a, **kw)
+    except Exception as e:
+        log(decision='eventdb failed', error=f'{type(e).__name__}: {e}')
+
 
 def handle(event, payload, delivery='', ex=None):
     """Classify and run one delivery; log the decision. Returns the actions."""
@@ -646,6 +689,8 @@ def handle(event, payload, delivery='', ex=None):
     pr = next((a.pr for a in acts if a.pr), None)
     log(delivery=delivery, event=event, action=payload.get('action'), pr=pr,
         decisions=[a.as_dict() for a in acts], done=ex.done)
+    _add('handled', delivery, event, payload, decisions=[a.kind for a in acts], notes=ex.done,
+         error='; '.join(ex.errors) or None, pr=pr)
     return acts
 
 
@@ -657,12 +702,14 @@ def drain(ex_factory=Executor):
             handle(d['event'], d['payload'], d.get('delivery', ''), ex_factory())
         except Exception as e:
             log(delivery=f.stem, error=f'{type(e).__name__}: {e}')
+            _add('handled', f.stem, '', error=f'{type(e).__name__}: {str(e)[:500]}')
         f.unlink(missing_ok=True)
 
 
 class Handler(BaseHTTPRequestHandler):
     keys = None
     wake = None
+    store = None
 
     def log_message(self, *a):
         pass
@@ -678,25 +725,51 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self._reply(200, 'ok\n') if self.path == '/health' else self._reply(404, 'not found\n')
 
+    def _received(self, *a, **kw):
+        """The 'received' row, before the reply. A DB failure is logged and the delivery is
+        still handled (webhook.log has it). Returns (row id, duplicate)."""
+        try:
+            return (self.store or eventdb.store()).add_received(*a, **kw)
+        except Exception as e:
+            log(decision='eventdb failed', error=f'{type(e).__name__}: {e}')
+            return None, False
+
     def do_POST(self):
         if self.path.split('?')[0] != '/github':
             return self._reply(404, 'not found\n')
-        n = int(self.headers.get('Content-Length') or 0)
+        event = self.headers.get('X-GitHub-Event', '')
+        hdrs = dict(self.headers.items())
+        try:
+            n = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            n = -1
         if n <= 0 or n > MAX_BODY:
+            self._received(self.headers.get('X-GitHub-Delivery', ''), event, None, hdrs, None, None,
+                           reason='bad length', error=f'Content-Length {n}')
             return self._reply(400, 'bad length\n')
         raw = self.rfile.read(n)
-        event = self.headers.get('X-GitHub-Event', '')
         delivery = self.headers.get('X-GitHub-Delivery', '') or hashlib.sha1(raw).hexdigest()
         if not signed(raw, self.headers.get('X-Hub-Signature-256', ''), self.keys or secrets()):
             log(delivery=delivery, event=event, decision='rejected: bad signature')
+            # an unsigned body is not trusted: it is kept raw, but no field is read from it
+            self._received(delivery, event, None, hdrs, raw, False, reason='bad signature')
             return self._reply(401, 'bad signature\n')
-        if not first_time(delivery):
-            log(delivery=delivery, event=event, decision='duplicate delivery: skip')
-            return self._reply(200, 'duplicate\n')
         try:
             payload = json.loads(raw)
         except ValueError:
+            self._received(delivery, event, None, hdrs, raw, True, reason='bad json', error='bad json')
             return self._reply(400, 'bad json\n')
+        if log_only(event):
+            self._received(delivery, event, payload, hdrs, raw, True, reason='log-only', decisions=['log-only'])
+            return self._reply(200, 'logged\n')
+        try:
+            kinds = [a.kind for a in classify(event, payload)]
+        except Exception as e:
+            kinds = [f'classify failed: {type(e).__name__}']
+        _, dup = self._received(delivery, event, payload, hdrs, raw, True, decisions=kinds)
+        if dup:
+            log(delivery=delivery, event=event, decision='duplicate delivery: skip')
+            return self._reply(200, 'duplicate\n')
         INBOX.mkdir(parents=True, exist_ok=True)
         f = INBOX / f"{time.time_ns()}-{re.sub(r'[^A-Za-z0-9-]', '', delivery)[:40]}.json"
         tmp = f.with_suffix('.tmp')
@@ -729,11 +802,22 @@ def main(argv=None):
     ap.add_argument('--dry', action='store_true', help='with replay: print what would be done')
     ap.add_argument('cmd', nargs='?', choices=['replay'], help='replay: run the handlers on --pr N from its current state')
     ap.add_argument('--pr', type=int, action='append', default=[], help='PR number for replay (repeat for more)')
+    ap.add_argument('--delivery', action='append', default=[],
+                    help='replay a stored delivery from the event DB (its raw body), by delivery id')
     a = ap.parse_args(argv)
     if a.cmd == 'replay':
-        if not a.pr:
-            ap.error('replay needs --pr N')
+        if not a.pr and not a.delivery:
+            ap.error('replay needs --pr N or --delivery ID')
         rc = 0
+        for d in a.delivery:
+            got = eventdb.store().body_of(d)
+            if not got:
+                rc = 1
+                print(f"REPLAY {d}: not in the event DB (or not a good delivery)")
+                continue
+            ex = Executor(dry=a.dry)
+            acts = handle(got[0], got[1], f'replay:{d}', ex)
+            print(f"REPLAY {d} ({got[0]}): " + ('; '.join(ex.done) or 'nothing done'))
         for n in a.pr:
             try:
                 acts, done = replay(n, Executor(dry=a.dry))

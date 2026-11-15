@@ -39,6 +39,10 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(_wh, 'INBOX', tmp_path / 'webhook-inbox')
     monkeypatch.setattr(_wh, 'SEEN', tmp_path / 'webhook-seen.json')
     monkeypatch.setattr(_wh, 'WAKE_URL_FILE', tmp_path / 'wake-url')
+    monkeypatch.setattr(_wh, 'WAKE_KEY_FILE', tmp_path / 'wake-key')
+    from tangentswarm import eventdb
+    monkeypatch.setattr(eventdb, 'PATH', str(tmp_path / 'webhook-events.sqlite'))
+    monkeypatch.setattr(eventdb, '_store', None)
     from tangentswarm import events as _events
     monkeypatch.setattr(_events, 'EVENTS', tmp_path / 'github-events.jsonl')
     monkeypatch.setattr(_events, 'OFFSET', tmp_path / 'events.offset')
