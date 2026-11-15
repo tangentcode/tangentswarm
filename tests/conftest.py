@@ -43,6 +43,7 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(_tick, 'STATE_DIR', tmp_path / 'tick-state')
     monkeypatch.setattr(stophook, 'LOG', tmp_path / 'stop-hook.log')
     monkeypatch.setattr(stophook, 'SEEN', tmp_path / 'stop-hook-seen.json')
+    monkeypatch.setattr(stophook, 'LOCKS', tmp_path / 'stop-hook-locks')
     monkeypatch.setattr(flow, 'STATE', tmp_path / 'pull.json')
     monkeypatch.setattr(flow, 'LOG', tmp_path / 'flow.log')
     monkeypatch.setattr(advance, 'schedule', lambda reset, **kw: 'not scheduled (test)')

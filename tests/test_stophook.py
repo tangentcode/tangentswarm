@@ -183,11 +183,12 @@ def test_a_question_moves_an_unfinished_card_to_needs_input(wt, tmp_path):
     calls = []
     t = transcript(tmp_path, 'Two options here.\n\nShould the badge use the old colors or the new ones?')
     line = stophook.run(wt, g=g, sh=calls.append, transcript=str(t))
-    assert calls == [['gh', 'project', 'item-edit', '--id', 'ITEM7', '--project-id', 'PROJ', '--field-id', 'FIELD',
-                      '--single-select-option-id', board.OPTION[board.NEEDS_INPUT]]]
-    assert 'stopped with a question' in line and line.endswith('Moved the card to Needs Input.')
-    assert stophook.run(wt, g=g, sh=calls.append, transcript=str(t)).endswith('uncommitted changes')  # once
-    assert len(calls) == 1
+    assert calls[0] == ['gh', 'project', 'item-edit', '--id', 'ITEM7', '--project-id', 'PROJ', '--field-id', 'FIELD',
+                        '--single-select-option-id', board.OPTION[board.NEEDS_INPUT]]
+    assert calls[1][:4] == ['gh', 'issue', 'comment', '7'] and stophook.QUESTION_MARK in calls[1][-1]
+    assert 'stopped with a question' in line and line.endswith('not marked ready.')
+    again = stophook.run(wt, g=g, sh=calls.append, transcript=str(t))
+    assert 'already handed to Michal' in again and len(calls) == 2  # once per question
 
 
 def test_no_question_means_no_needs_input(wt, tmp_path):
@@ -250,3 +251,39 @@ def test_no_handoff_while_a_dev_server_runs_in_the_worktree(wt):
     line = stophook.run(wt, g=g, sh=calls.append, merges=lambda c, h: True, sleep=lambda s: None,
                         procs=lambda cwd: left[0], tell=lambda n, text: told.append((n, text)))
     assert 'moved the card to Auto Review' in line and len(told) == 1
+
+
+def test_a_question_with_a_clean_pushed_head_goes_to_needs_input_never_ready(wt, tmp_path):
+    """platform #541 (2026-11-15): step 1 done, clean pushed head, a question for Michal. The
+    hook marked it ready, asked Codex, and the MinBot pass moved it to Ready."""
+    head = run(wt, 'rev-parse', 'HEAD')
+    g = G(head, codex=True)  # even Codex-clean
+    g['OPT'] = {'In Progress': 'x'}
+    g['project_id'], g['STATUS_FIELD'] = (lambda: 'PROJ'), 'FIELD'
+    calls, ran = [], []
+    t = transcript(tmp_path, 'Step 1 is done and pushed (partial scope). Step 2 waits for your decision.')
+    line = stophook.run(wt, g=g, sh=calls.append, merges=lambda c, h: True, sleep=lambda s: None,
+                        minbot=lambda n: ran.append(n), transcript=str(t))
+    assert 'Moved the card to Needs Input' in line and ran == []
+    assert not any(c[:3] == ['gh', 'pr', 'ready'] or '@codex review' in c for c in calls)
+    assert calls[0][-1] == board.OPTION[board.NEEDS_INPUT]
+
+
+def test_two_hook_runs_for_one_worktree_never_overlap(wt, monkeypatch):
+    import threading
+    import time as T
+    inside, overlap = [], []
+
+    def slow(*a, **k):
+        if inside:
+            overlap.append(1)
+        inside.append(1)
+        T.sleep(0.2)
+        inside.pop()
+    monkeypatch.setattr(stophook, '_run', slow)
+    ts = [threading.Thread(target=stophook.run, args=(wt,)) for _ in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(5)
+    assert overlap == []

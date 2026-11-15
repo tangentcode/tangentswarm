@@ -29,8 +29,10 @@ The handoff (run), only for a worker worktree ~/ver/platform.<slug>:
   4b. A dev server or other background process still runs in the worktree: no handoff; the
      worker is asked to stop it (workerprocs), and its next Stop runs the handoff.
   5. Mark the PR ready (if it is a draft); move the card In Progress -> Auto Review.
-  0. Not finished (dirty or unpushed) and the Claude's last message ends with a question:
-     the card moves In Progress -> Needs Input, once per question (Michal 2026-11-15).
+  0. One run at a time per worktree (a lock). FIRST, whatever the head: the Claude's last
+     message ends with a question, or says partial scope or that it waits for a decision:
+     the card moves to Needs Input, the question goes on the issue, and nothing else runs
+     (platform #541, 2026-11-15). It is never marked ready.
   6. Codex already clean on the head: `swarm-advance --minbot N` (the MinBot check: CI
      green, mergeable, not a draft; a pass moves the card to Ready; a busy lock queues it
      for swarm-promoted). Else post "@codex review" once per head (the key is shared with
@@ -53,6 +55,7 @@ HOME = Path.home()
 STATE_DIR = Path(os.environ.get('SWARM_FLOW_STATE', str(HOME / '.local' / 'state' / 'swarm-flow' / 'pull.json'))).parent
 LOG = Path(os.environ.get('SWARM_STOP_HOOK_LOG', str(STATE_DIR / 'stop-hook.log')))
 SEEN = Path(os.environ.get('SWARM_STOP_HOOK_SEEN', str(STATE_DIR / 'stop-hook-seen.json')))
+LOCKS = Path(os.environ.get('SWARM_STOP_HOOK_LOCKS', str(Path.home() / '.cache' / 'swarm-stop-hook-locks')))
 REPO = 'tangentcode/platform'
 HEAD_TRIES, HEAD_WAIT = 4, 5  # GitHub may show the new head a few seconds after the push
 
@@ -127,14 +130,16 @@ def pushed_head(cwd):
     return branch, head
 
 
-def find_pr(g, branch, max_age=None):
-    """(number, item id, column, draft) of the open platform PR whose head branch is branch."""
+def find_pr(g, branch, max_age=None, issues=False):
+    """(number, item id, column, draft[, closed issue numbers]) of the open platform PR whose
+    head branch is branch."""
     from . import boardcache
     for age in ((max_age,) if max_age is not None else (None, 0)):  # a stale snapshot: read once more
         snap = boardcache.snapshot(g['gql'], max_age=age)
         for it, c in boardcache.open_prs(snap):
             if c.get('headRefName') == branch:
-                return c['number'], it['id'], boardcache.col(it), bool(c.get('isDraft'))
+                row = (c['number'], it['id'], boardcache.col(it), bool(c.get('isDraft')))
+                return row + ([i['number'] for i in boardcache.closes(c)],) if issues else row
     return None
 
 
@@ -154,6 +159,12 @@ def minbot_check(n):
     r = subprocess.run([str(bin_dir() / 'swarm-advance'), '--minbot', str(n)],
                        capture_output=True, text=True, timeout=900)
     return ([l for l in (r.stdout + r.stderr).splitlines() if l.strip()] or [f'rc={r.returncode}'])[-1]
+
+
+WAITING_RE = __import__('re').compile(
+    r'partial scope|waiting (?:for|on) (?:a |your |michal.s )?decision|needs? (?:a |your |michal.s )?decision|'
+    r'question for michal|before i (?:go on|continue)', __import__('re').I)
+QUESTION_MARK = '<!-- swarm-needs-input -->'
 
 
 def last_question(transcript):
@@ -178,7 +189,7 @@ def last_question(transcript):
         if not text:
             continue  # a tool call: look further back
         last = [l for l in text.splitlines() if l.strip()][-1].strip().rstrip('*_` ')
-        return text if last.endswith('?') else None
+        return text if last.endswith('?') or WAITING_RE.search(text[-600:]) else None
     return None
 
 
@@ -194,28 +205,37 @@ def move_card(g, item, col, sh):
 
 
 def needs_input(cwd, branch, transcript, g=None, dry=False, out=None, sh=None):
-    """Michal 2026-11-15 1:32 AM ET: a Claude that stops with a question (not a finished,
-    pushed head) moves its card In Progress -> Needs Input, once per question."""
+    """A Claude that stops with a question for Michal (a final "?", or partial scope, or
+    waiting for a decision) goes to Needs Input, ALWAYS before any handoff, even with a clean,
+    pushed head (platform #541, 2026-11-15: the hook marked it ready, asked Codex, the MinBot
+    pass moved it to Ready, and only a racing later run moved it to Needs Input). The card
+    moves from In Progress or Auto Review to Needs Input; the question is posted on the
+    issue (with QUESTION_MARK, which the MinBot pass reads); once per question. Never ready."""
     import hashlib
     q = last_question(transcript)
     if not q:
         return None
     key = f"q:{branch}:{hashlib.sha1(q.encode()).hexdigest()[:12]}"
     if seen(key):
-        return None
+        return say(f"{branch}: the question was already handed to Michal: no handoff", out)
     g = g if g is not None else hr_gate()
-    found = find_pr(g, branch)
+    found = find_pr(g, branch, issues=True)
     if not found:
         return None
-    n, item, col, _ = found
-    if col != board.IN_PROGRESS:
-        return None
+    n, item, col, _, issues = found
+    if col not in (board.IN_PROGRESS, board.AUTO_REVIEW):
+        return say(f"#{n}: the Claude asks a question, but the card is in {col}: not moved", out)
+    body = (f"{QUESTION_MARK}\nQuestion from the worker on #{n} (the card is in Needs Input):\n\n"
+            + '\n'.join('> ' + l for l in q.strip()[-1500:].splitlines()))
     if not dry:
         move_card(g, item, board.NEEDS_INPUT, sh)
+        for i in (issues or [n])[:1]:
+            sh(['gh', 'issue', 'comment', str(i), '-R', REPO, '--body', body])
         _mark_seen(key)
     short = ' '.join(q.split())[-160:]
-    return say(f"#{n} the Claude stopped with a question: ...{short} Moved the card to Needs Input."
-               + (' (dry run)' if dry else ''), out)
+    where = f"issue #{issues[0]}" if issues else f"#{n}"
+    return say(f"#{n} the Claude stopped with a question: ...{short} Moved the card to Needs Input and posted "
+               f"the question on {where}; not marked ready." + (' (dry run)' if dry else ''), out)
 
 
 def tell_worker(n, text):
@@ -233,12 +253,35 @@ def run(cwd, g=None, dry=False, out=None, sh=None, sleep=time.sleep, merges=merg
     cwd = Path(cwd)
     if not slots.is_platform_worktree(cwd):
         return None
+    with branch_lock(cwd):  # platform #541: two hook runs for one PR must never race
+        return _run(cwd, g, dry, out, sh, sleep, merges, minbot, transcript, procs, tell)
+
+
+def branch_lock(cwd):
+    """An exclusive lock per worktree (one PR): a second hook run waits for the first."""
+    import contextlib
+    import fcntl
+
+    @contextlib.contextmanager
+    def held():
+        LOCKS.mkdir(parents=True, exist_ok=True)
+        with open(LOCKS / f"{Path(cwd).name}.lock", 'w') as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    return held()
+
+
+def _run(cwd, g, dry, out, sh, sleep, merges, minbot, transcript, procs, tell):
+    from . import tick, workerprocs
     branch, head = pushed_head(cwd)
+    if branch and transcript:  # a question for Michal goes first, whatever the head
+        asked = needs_input(cwd, branch, transcript, g=g, dry=dry, out=out, sh=sh)
+        if asked:
+            return asked
     if branch is None or len(head) != 40:
-        if branch and transcript:
-            asked = needs_input(cwd, branch, transcript, g=g, dry=dry, out=out, sh=sh)
-            if asked:
-                return asked
         return say(f"{cwd.name}: not finished: {head}", out) if branch else None
     key = f"{branch}@{head}"
     if seen(key):

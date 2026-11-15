@@ -799,3 +799,16 @@ def test_a_live_signal_queues_the_launches_and_respects_the_claude_cap(monkeypat
     out.clear()
     c.signal({})
     assert out[0].startswith('signal: 4 new-work slot(s) free, but 10 Claudes run (cap 10): no launch')
+
+
+def test_no_minbot_pass_while_the_pr_has_an_open_question_for_michal():
+    """platform #541 (2026-11-15): the MinBot pass moved a PR to Ready while its worker waited
+    for Michal's decision."""
+    from tangentswarm.stophook import QUESTION_MARK
+    assert A.open_question({'body': '## Question for Michal\nOld or new colors?'}) == \
+        'the PR body has an open question for Michal'
+    issue = {'number': 419, 'comments': {'nodes': [{'body': QUESTION_MARK + '\nQuestion from the worker'}]}}
+    assert A.open_question({'body': '', 'closingIssuesReferences': {'nodes': [issue]}}) == \
+        'issue #419 has an unanswered question for Michal'
+    answered = {'number': 419, 'comments': {'nodes': [{'body': 'Use the new colors.'}]}}  # Michal replied last
+    assert A.open_question({'body': 'Fixes #419', 'closingIssuesReferences': {'nodes': [answered]}}) is None

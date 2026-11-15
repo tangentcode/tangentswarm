@@ -59,7 +59,8 @@ RERUN = Path(os.environ.get('SWARM_CASCADE_RERUN', str(gatelock.LOCK.with_name('
 REDEPLOY_LATE = int(os.environ.get('SWARM_REDEPLOY_LATE', '600'))  # lag warning only after this (Michal 2026-11-15)
 DEPLOY_FALLBACK = int(os.environ.get('SWARM_DEPLOY_FALLBACK', '180'))  # then accept a .deploy-sha that contains the head
 
-CODEX_FIELDS = """number isDraft headRefOid mergeable
+CODEX_FIELDS = """number isDraft headRefOid mergeable body
+ closingIssuesReferences(first:3){nodes{number comments(last:1){nodes{body}}}}
  comments(last:40){nodes{author{login} body}}
  reviews(last:30){nodes{author{login} commit{oid} comments{totalCount}}}
  reviewThreads(last:60){nodes{id isResolved isOutdated comments(first:1){nodes{author{login} originalCommit{oid}}}}}"""
@@ -121,6 +122,23 @@ def addressed_threads(pr):
         return []
     head = pr.get('headRefOid') or ''
     return [t['id'] for t in _open_codex_threads(pr) if t.get('id') and _thread_commit(t) not in (head, None)]
+
+
+OPEN_QUESTION_RE = re.compile(r'(?im)^\s*(?:#+\s*|\*\*)?(?:open\s+)?questions?\s+for\s+michal')
+
+
+def open_question(pr):
+    """platform #541 (2026-11-15): no MinBot pass while the PR has an open question for Michal:
+    a "Question(s) for Michal" heading or line in the PR body, or a linked issue whose
+    latest comment is the Stop hook's Needs Input question (nobody answered after it)."""
+    from .stophook import QUESTION_MARK
+    if OPEN_QUESTION_RE.search(pr.get('body') or ''):
+        return 'the PR body has an open question for Michal'
+    for i in ((pr.get('closingIssuesReferences') or {}).get('nodes') or []):
+        last = ((i.get('comments') or {}).get('nodes') or [{}])[-1]
+        if QUESTION_MARK in (last.get('body') or ''):
+            return f"issue #{i.get('number')} has an unanswered question for Michal"
+    return None
 
 
 def minbot_order(prs, active=None):
@@ -244,6 +262,10 @@ class Advance:
                 continue
             if d.get('isDraft'):
                 skipped.append(f"#{n} draft")
+                continue
+            q = open_question(d)
+            if q:
+                skipped.append(f"#{n} {q}")
                 continue
             if d.get('mergeable') == 'CONFLICTING':  # cheap: no full hr-gate read for it
                 skipped.append(f"#{n} conflicts with main (GitHub mergeable)")
