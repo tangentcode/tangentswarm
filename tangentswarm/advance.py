@@ -56,6 +56,7 @@ BUDGET = int(os.environ.get('SWARM_CASCADE_BUDGET', '780'))   # whole run; the t
 STEP_TIMEOUT = int(os.environ.get('SWARM_CASCADE_STEP_TIMEOUT', '300'))  # one hr-gate --apply run
 GATE_RESERVE = STEP_TIMEOUT + 30  # budget kept for the gate after a redeploy wait
 EXIT_TIMEOUT = 124
+DEADLINE = None  # time.monotonic() deadline of this process (watchdog)
 CASCADE_LOG = Path(os.environ.get('SWARM_CASCADE_LOG', str(Path.home() / '.local' / 'state' / 'swarm-flow' / 'cascade.log')))
 CORNERBOT_FILE = Path(os.environ.get('SWARM_CORNERBOT_REQUEST', str(Path.home() / '.cache' / 'swarm-cornerbot-request')))
 MAX_PASSES = int(os.environ.get('SWARM_CASCADE_MAX_PASSES', '10'))  # cascade passes per lock hold
@@ -265,7 +266,8 @@ class Cascade(Advance):
         self.f = flow.Flow(dry_run=dry_run, out=lambda line: None, g=self.g)
         self.f.tool_timeout = STEP_TIMEOUT
         self._seen = [0, 0]
-        self.deadline = self.clock() + BUDGET
+        # one deadline per PROCESS (watchdog sets it): a rerun pass must not start a fresh budget
+        self.deadline = DEADLINE if DEADLINE is not None and clock is time.monotonic else self.clock() + BUDGET
 
     def flush(self):
         """Print the Flow lines (did/would, then notes) not printed yet."""
@@ -308,7 +310,8 @@ class Cascade(Advance):
         CORNERBOT_REQUEST per pull."""
         from . import flow
         start, asked, said = self.clock(), bool(d.get('asked')), self.clock()
-        self.out(f"redeploy: polling every staging .deploy-sha for #{d['pr']} {d['head'][:8]}")
+        self.out(f"redeploy: polling every staging .deploy-sha for #{d['pr']} {d['head'][:8]}"
+                 + (" (cornerbot was asked before: one check, no wait)" if asked else ''))
         while True:
             lag = self.lagging(d)
             if not lag:
@@ -321,8 +324,12 @@ class Cascade(Advance):
                 asked = True
                 if not self.dry:
                     flow.save_pull(dict(d, asked=True))
-            # the wait limit, cut so the gate still fits in the run budget
+            # the wait limit, cut so the gate still fits in the run budget. A cornerbot site that
+            # was asked in an EARLIER run or pass gets one check only: waiting again would hold the
+            # serial lock for nothing (7:32 PM ET: #480 held it pass after pass).
             limit = min(PTW_WAIT if corner else DEPLOY_WAIT, self.deadline - start - GATE_RESERVE)
+            if corner and d.get('asked'):
+                limit = 0
             waited = self.clock() - start
             if waited >= limit:
                 self.out(f"waiting: #{d['pr']} {d['head'][:8]} is not served yet by "
@@ -509,9 +516,12 @@ def watchdog(budget=None):
 
     def stop(signum, frame):
         raise CascadeTimeout('run budget used up' if signum == signal.SIGALRM else f'signal {signum}')
+    global DEADLINE
+    budget = BUDGET if budget is None else budget
     signal.signal(signal.SIGALRM, stop)
     signal.signal(signal.SIGTERM, stop)
-    signal.alarm(BUDGET if budget is None else budget)
+    DEADLINE = time.monotonic() + budget
+    signal.alarm(budget)
 
 
 def queue_self(qdir=None):

@@ -477,3 +477,34 @@ def test_progress_lines_carry_a_time_and_go_to_the_log(monkeypatch, tmp_path, ca
     import re
     assert re.fullmatch(r'\d\d:\d\d:\d\d gate: hr-gate on #9\n', printed)
     assert (tmp_path / 'cascade.log').read_text().endswith(printed)
+
+
+def test_a_cornerbot_site_asked_before_gets_one_check_and_no_wait(monkeypatch, tmp_path):
+    """7:32 PM ET: pass after pass waited 430 s for the same ptw redeploy of #480, holding the lock."""
+    from tangentswarm import flow as F
+    monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
+    F.save_pull(dict(pr=480, head='5f6e09a4' + '0' * 32, branch='b', item='I', work='w' * 40, started=0, asked=True))
+    monkeypatch.setattr(F.Flow, 'advance', lambda *a: pytest.fail('not served: no gate'))
+    monkeypatch.setattr(F.Flow, 'columns', lambda self: ({}, {}))
+    out, now = [], [0]
+    g = CascadeGate(served={'work': 'w' * 40, 'minavo': 'w' * 40, 'ptw': 'o' * 40})
+    A.Cascade(g=g, out=out.append, sleep=lambda s: now.__setitem__(0, now[0] + s), clock=lambda: now[0]).fill()
+    assert now[0] == 0 and not any(l.startswith('CORNERBOT_REQUEST') for l in out)
+    assert out[0].endswith('(cornerbot was asked before: one check, no wait)')
+    assert out[1].startswith('waiting: #480 5f6e09a4 is not served yet by ptw.example (oooooooo) after 0s')
+
+
+def test_the_deadline_is_per_process_not_per_pass(monkeypatch):
+    import signal
+    import time
+    old = signal.getsignal(signal.SIGALRM), signal.getsignal(signal.SIGTERM)
+    try:
+        A.watchdog(budget=500)
+        first = A.Cascade(g=CascadeGate()).deadline
+        assert abs(first - (time.monotonic() + 500)) < 5
+        assert A.Cascade(g=CascadeGate()).deadline == first  # a rerun pass keeps the same deadline
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old[0])
+        signal.signal(signal.SIGTERM, old[1])
+        monkeypatch.setattr(A, 'DEADLINE', None)
