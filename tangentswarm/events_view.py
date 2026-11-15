@@ -112,15 +112,17 @@ def events(rows):
     repo, actor, outcome, sig_bad, error, rows}."""
     by_delivery, order = {}, []
     for r in rows:
-        if r.get('stage') in ('received', 'handled') and r.get('delivery'):
+        rejected = r.get('stage') == 'received' and (r.get('sig_ok') == 0 or r.get('reason') not in (None, 'duplicate'))
+        if r.get('stage') in ('received', 'handled') and r.get('delivery') and not rejected:
             key = r['delivery']
             if key not in by_delivery:
                 by_delivery[key] = []
                 order.append(('d', key))
             by_delivery[key].append(r)
         elif r.get('stage') in ('received', 'handled', 'replay'):
-            # Codex on PR #36: each replay run is its own event (they share "replay-N"), and a
-            # request with no delivery id (a bad length) is still shown, on its own
+            # Codex on PR #36: each replay run is its own event (they share "replay-N"); a
+            # request with no delivery id (a bad length) and a rejected attempt (bad signature,
+            # bad JSON, log-only) are shown on their own, never merged with an accepted one
             order.append(('s', r))
         else:
             order.append(('r', r))
@@ -248,19 +250,18 @@ def rows_after(db, last_id, since=''):
 
 
 def blocks(rows, now=None, color=True, verbose=False):
-    """[(event key, text)] in order: the event's line, and its rows as JSON with -v."""
+    """[(event key, stable text, text)] in order: the event's line, and its rows as JSON with
+    -v. The stable text has no color, so the age shading alone is never a change."""
     out = []
     for e in events(rows):
-        text = line(e, now, color)
-        if verbose:
-            text += '\n' + '\n'.join(full(r) for r in e['rows'])
-        out.append((e['key'], text))
+        rows_json = ('\n' + '\n'.join(full(r) for r in e['rows'])) if verbose else ''
+        out.append((e['key'], line(e, now, False) + rows_json, line(e, now, color) + rows_json))
     return out
 
 
 def render(rows, now=None, color=True, verbose=False, height=None):
     """The lines of one screen: the newest events that fit in height (all when None)."""
-    out = [l for _, text in blocks(rows, now, color, verbose) for l in text.split('\n')]
+    out = [l for _, _, text in blocks(rows, now, color, verbose) for l in text.split('\n')]
     return out[-height:] if height else out
 
 
@@ -292,10 +293,10 @@ def run(path, since='today', verbose=False, once=False, color=None, out=sys.stdo
             # a queued event becomes handled later: print an event again only when it changed,
             # tracked by its identity (Codex on PR #36: by position, one change reprinted the rest)
             shown = shown or {}
-            for key, text in blocks(rows, now, color, verbose):
-                if shown.get(key) != text:
+            for key, stable, text in blocks(rows, now, color, verbose):
+                if shown.get(key) != stable:  # Codex on PR #36: a new shade is not a change
                     print(text, file=out)
-                    shown[key] = text
+                    shown[key] = stable
         elif got or drawn is None or now - drawn >= redraw:
             height = shutil.get_terminal_size((120, 40)).lines - 1
             out.write(CLEAR + '\n'.join(render(rows, now, color, verbose, height)) + '\n')

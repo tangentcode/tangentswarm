@@ -162,3 +162,26 @@ def test_a_verbose_pipe_reprints_only_the_changed_event(tmp_path):
     assert out.getvalue().startswith(first.getvalue())
     tail = out.getvalue()[len(first.getvalue()):]
     assert tail.count('\n') > 0 and '#513' not in tail and 'moved #537 to In Progress' in tail
+
+
+def test_a_rejected_attempt_stays_apart_from_the_accepted_redelivery(tmp_path):
+    """Codex on PR #36: the accepted redelivery was shown as a signature failure."""
+    st = eventdb.EventStore(tmp_path / 'e.sqlite')
+    p = {'action': 'opened', 'repository': REPO, 'issue': {'number': 9}, 'sender': {'login': 'tangentstorm'}}
+    st.add_received('d9', 'issues', None, {}, b'x', False, reason='bad signature', now=NOW)
+    st.add_received('d9', 'issues', p, {}, b'{}', True, decisions=['card'], now=NOW + 5)
+    st.add('handled', 'd9', 'issues', p, decisions=['card'], notes=['#9 -> Triage'], now=NOW + 6)
+    evs = V.events(st.rows())
+    assert [(e['status'], e['sig_bad']) for e in evs] == [('failed', True), ('handled', False)]
+    assert evs[1]['actor'] == 'tangentstorm' and evs[1]['outcome'] == 'moved #9 to Triage'
+
+
+def test_a_colored_pipe_does_not_reprint_for_a_new_shade(tmp_path):
+    """Codex on PR #36: the gray level changed with age and reprinted unchanged events."""
+    st, path = make(tmp_path)
+    out, t = io.StringIO(), [NOW]
+
+    def sleep(s):
+        t[0] += 120
+    V.run(path, color=True, out=out, sleep=sleep, polls=3, clock=lambda: t[0])
+    assert len(out.getvalue().splitlines()) == 3
