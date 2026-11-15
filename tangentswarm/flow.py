@@ -125,11 +125,27 @@ def held():
         return {}
 
 
-def hold(n, head, why):
+def hold(n, head, why, relay=None, tried=None):
     d = held()
-    d[n] = {'head': head, 'why': why[:200]}
+    d[n] = {'head': head, 'why': why[:200], 'relay': str(relay) if relay else None,
+            'tried': time.time() if tried is None else tried}
+    _save_held(d)
+
+
+def unhold(n):
+    d = held()
+    if d.pop(n, None) is not None:
+        _save_held(d)
+
+
+def _save_held(d):
     HELD.parent.mkdir(parents=True, exist_ok=True)
-    HELD.write_text(json.dumps({str(k): v for k, v in d.items()}))
+    tmp = HELD.with_name(f'{HELD.name}.{os.getpid()}.tmp')
+    tmp.write_text(json.dumps({str(k): v for k, v in d.items()}))
+    os.replace(tmp, HELD)
+
+
+HELD_RETRY = int(os.environ.get('SWARM_HELD_RETRY', '300'))  # s between handoff retries of a held head
 
 
 def pulled_pr():
@@ -576,6 +592,36 @@ class Flow:
         rc, said = self.give_worker(n, text)
         return rc == 0, said
 
+    def retry_held(self, cols, now=None):
+        """Codex on PR #26: a held head (its failed pull found no worker) was never handed off
+        again when capacity freed. Every HELD_RETRY s, each Ready PR held at its current head
+        with a saved relay goes to its worker again; on success the card moves to In Progress
+        and the hold ends. Staging holds are retried by the daemon's merge-main retry."""
+        now = time.time() if now is None else now
+        hd = held()
+        for p in cols.get(board.READY, []):
+            h = hd.get(p['number'])
+            if not h or h.get('head') != p.get('head') or not h.get('relay') or now - float(h.get('tried') or 0) < HELD_RETRY:
+                continue
+            n = p['number']
+            try:
+                text = Path(h['relay']).read_text().strip()
+            except OSError:
+                continue
+            if self.dry:
+                self.change(f"would retry the held handoff of #{n} ({h.get('why', '')[:80]})")
+                continue
+            rc, said = self.give_worker(n, text)
+            if rc != 0:
+                hold(n, h['head'], h.get('why', ''), relay=h['relay'], tried=now)
+                self.note(f"NEEDS_WORKER #{n}: retried the held handoff; still no worker ({said})")
+                continue
+            unhold(n)
+            board.move_card(self.g, p['item'], board.IN_PROGRESS)
+            from . import moves
+            moves.log_move(n, board.READY, 'In Progress', p.get('head', ''), note=('held: ' + h.get('why', ''))[:120])
+            self.change(f"#{n} -> In Progress: the held handoff reached its worker ({said})")
+
     def give_worker(self, n, text):
         """(rc, last line) of slots.revive: 0 = its Claude runs and got the text."""
         from . import slots
@@ -598,13 +644,14 @@ class Flow:
             self.change(f"#{n} -> In Progress (with its worker): {reason[:200]}")
             return False
         drop_pull(n)
+        relay_path = RELAY_DIR / f"relay-{n}-{relay or 'gate'}.md"
         try:
-            (RELAY_DIR / f"relay-{n}-{relay or 'gate'}.md").write_text(text + '\n')
+            relay_path.write_text(text + '\n')
         except OSError:
             pass
         rc, said = self.give_worker(n, text)
         if rc != 0:
-            hold(n, p.get('head', ''), reason)
+            hold(n, p.get('head', ''), reason, relay=relay_path)
             self.note(f"NEEDS_WORKER #{n}: {reason[:160]}; the card stays in {p.get('col') or '?'} because no "
                       f"worker could be started ({said}); its head is held from new pulls")
             return False

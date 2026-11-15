@@ -457,3 +457,22 @@ def test_needs_screenshots_exempts_api_docs_and_tooling():
     assert not ns(['docs/a.md', 'AGENTS.md'])
     assert not ns(['.github/workflows/ci.yml', 'scripts/x.ts', 'tests/a.test.ts'])
     assert ns(['web/src/a.tsx'], body='This is code-only.')  # web/ files still need shots
+
+
+def test_a_held_ready_head_is_handed_off_again_when_a_worker_can_take_it(tmp_path, monkeypatch):
+    """Codex on PR #26: a gate failure that found no worker held the head for good."""
+    from tangentswarm import board, flow as F
+    rel = tmp_path / 'relay-7-gate.md'
+    rel.write_text('Coordinator: #7 fix the gate\n')
+    F.hold(7, 'h' * 40, 'a human comment after the head', relay=rel, tried=0)
+    moves, rcs = [], [3, 0]
+    f = F.Flow(dry_run=False, out=lambda l: None, g={'OPT': {}, 'project_id': lambda: 'P', 'STATUS_FIELD': 'S'})
+    f.give_worker = lambda n, text: (rcs.pop(0), 'x')
+    monkeypatch.setattr(board, 'move_card', lambda g, item, col, sh=None: moves.append((item, col)))
+    cols = {board.READY: [dict(number=7, head='h' * 40, item='I7')]}
+    f.retry_held(cols, now=10_000)
+    assert moves == [] and F.held()[7]['tried'] == 10_000
+    f.retry_held(cols, now=10_100)  # inside HELD_RETRY: not tried
+    assert rcs == [0]
+    f.retry_held(cols, now=10_000 + F.HELD_RETRY)
+    assert moves == [('I7', board.IN_PROGRESS)] and 7 not in F.held()

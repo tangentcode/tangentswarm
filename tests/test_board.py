@@ -86,3 +86,15 @@ def test_next_fast_track_when_the_active_enters_human_review_or_loses_the_label(
 def test_closed_or_canceled_tickets_are_not_candidates():
     assert board.ft_candidates([ft_item(1, board.READY, ['fast-track'], state='CLOSED'),
                                 ft_item(2, board.CANCELED, ['fast-track'])]) == {}
+
+
+def test_a_fast_track_issue_is_released_when_its_pr_reaches_human_review(tmp_path):
+    """Codex on PR #26: the issue card stays Active while its PR moves on, so the issue kept
+    the fast-track after its PR entered Human Review."""
+    p = tmp_path / 'ft.json'
+    issue = ft_item(488, board.ACTIVE, ['fast-track'], kind='Issue')
+    other = ft_item(490, board.BACKLOG, ['fast-track'], kind='Issue')
+    pr_ready = ft_item(530, board.READY, closes=[488])
+    assert board.update_active([issue, other, pr_ready], p)[0] == 488
+    pr_hr = dict(pr_ready, col=board.HUMAN_REVIEW)
+    assert board.update_active([issue, other, pr_hr], p)[0] == 490

@@ -127,7 +127,7 @@ def recheck(staging, main, clean, move, say, details=None, dry=False, cache_path
             ok = how == 'sent'
         if not ok:
             from . import flow
-            flow.hold(n, p['head'], f'conflicts with main {main[:8]}')
+            flow.hold(n, p['head'], f'conflicts with main {main[:8]}', relay=path)
             say(f"NEEDS_WORKER #{n}: conflicts with main {main[:8]}; no worker took the merge-main relay "
                 f"{path.name} ({how}); the card stays in Staging, its head is held from new pulls")
             continue

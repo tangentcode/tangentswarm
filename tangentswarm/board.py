@@ -70,6 +70,14 @@ def ft_candidates(items):
     """{ticket number: stage index} for fast-track tickets that may be active.
     items: [{number, kind ('Issue'|'PullRequest'), state, col, labels, closes: [{number, labels}]}]."""
     out = {}
+    # Codex on PR #26: an issue card stays in Active while its PR moves on, so the issue was
+    # still a candidate after its PR reached Human Review. A ticket whose PR is past Staging
+    # (Human Review) is released, with the issues that PR closes.
+    released = set()
+    for it in items:
+        if it.get('state') == 'OPEN' and it.get('kind') == 'PullRequest' and it.get('col') == HUMAN_REVIEW:
+            released.add(it['number'])
+            released.update(c['number'] for c in it.get('closes') or ())
     for it in items:
         if it.get('state') != 'OPEN' or it.get('col') not in FT_STAGES:
             continue
@@ -77,7 +85,8 @@ def ft_candidates(items):
         tickets = [it['number']] if is_fast_track(it.get('labels') or ()) else []
         tickets += [c['number'] for c in it.get('closes') or () if is_fast_track(c.get('labels') or ())]
         for t in tickets:
-            out[t] = max(out.get(t, -1), stage)
+            if t not in released:
+                out[t] = max(out.get(t, -1), stage)
     return out
 
 

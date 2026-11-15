@@ -820,6 +820,8 @@ class Cascade(Advance):
         cols = self.fill()
         self.unblock(cols, self.pulled)
         self.park(cols)
+        self.f.retry_held(cols)  # after park: a parked worker may have freed a rework slot
+        self.flush()
         self.signal(cols)
         self.out(f"cascade: done in {int(self.clock() - t0)}s")
         return 0
