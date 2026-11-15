@@ -21,4 +21,13 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(moves, 'SEEN', tmp_path / 'ready-seen.json')
     from tangentswarm import conflictmap
     monkeypatch.setattr(conflictmap, 'PATH', tmp_path / 'conflict-map.json')
+    from tangentswarm import boardcache
+    monkeypatch.setattr(boardcache, 'PATH', tmp_path / 'board-snapshot.json')
+    monkeypatch.setattr(boardcache, 'DETAILS', tmp_path / 'pr-details.json')
+    from tangentswarm import gqlmeter
+    monkeypatch.setattr(gqlmeter, 'LOG', tmp_path / 'gql.log')
+    from tangentswarm import slots
+    monkeypatch.setattr(slots, 'STATE', tmp_path / 'slots.json')
+    monkeypatch.setattr(slots, 'SESSIONS', tmp_path / 'claude-sessions')
+    monkeypatch.setattr(slots, 'PROJECTS', tmp_path / 'claude-projects')
     yield tmp_path

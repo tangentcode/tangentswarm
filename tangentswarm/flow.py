@@ -42,7 +42,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import board, gatelock, proc
+from . import board, gatelock, gqlmeter, proc
 
 HOME = Path.home()
 BIN = Path(os.environ.get('SWARM_TICK_BIN', str(HOME / 'bin')))
@@ -211,12 +211,14 @@ class Flow:
         r = subprocess.run([str(a) for a in argv], capture_output=True, text=True, timeout=self.tool_timeout, env=env)
         out = (r.stdout or '') + (r.stderr or '')
         log(f"tool\t{' '.join(str(a) for a in argv)}\trc={r.returncode}\n{out.rstrip()}")
+        if r.returncode and gqlmeter.is_rate_limit(out):  # not a gate verdict: stop, do not fail the PR
+            raise gqlmeter.RateLimited(f"{Path(str(argv[0])).name}: GitHub rate limit", gqlmeter.reset_time())
         return r.returncode, out
 
     # -- board ----------------------------------------------------------------
     def columns(self):
         from . import tick
-        prs = tick.board_prs({'gql': self.g['gql'], 'PARKED': self.g.get('PARKED', set())})
+        prs = tick.board_prs_open({'gql': self.g['gql'], 'PARKED': self.g.get('PARKED', set())})
         cols = {}
         for n, p in prs.items():
             if p['state'] == 'OPEN' and not p['parked']:

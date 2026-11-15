@@ -392,6 +392,28 @@ BOARD_Q = """query($c:String){organization(login:"tangentcode"){projectV2(number
      closingIssuesReferences(first:10){nodes{number milestone{title} labels(first:20){nodes{name}}}}}}}}}}}"""
 
 
+def board_prs_open(g, max_age=None):
+    """board_prs for the OPEN PRs only, from the shared board snapshot (boardcache): one
+    batched query per pass instead of a 4-page scan of the whole board."""
+    from . import boardcache
+    snap = boardcache.snapshot(g['gql'], max_age)
+    active = board.active_fast_track()
+    out = {}
+    for it, c in boardcache.open_prs(snap):
+        cl = boardcache.closes(c)
+        miles = [(c.get('milestone') or {}).get('title')] + [(i.get('milestone') or {}).get('title') for i in cl]
+        labels = {l['name'] for l in ((c.get('labels') or {}).get('nodes') or [])}
+        nums = [i.get('number') for i in cl]
+        out[c['number']] = dict(number=c['number'], state=c['state'], draft=c['isDraft'],
+                                branch=c['headRefName'], head=c['headRefOid'], title=c['title'],
+                                body=c.get('body') or '', updated=c.get('updatedAt'),
+                                col=boardcache.col(it), item=it['id'], closes=nums,
+                                rank=board.priority_rank(board.is_active_fast_track(c['number'], nums, active),
+                                                         milestone_rank(miles) == 0),
+                                parked=c['number'] in g['PARKED'] | EXTRA_PARKED or 'parked' in labels)
+    return out
+
+
 def board_prs(g):
     out, cursor = {}, None
     active = board.active_fast_track()  # the ONE active fast-track ticket (kept by swarm-promoted)
@@ -411,6 +433,7 @@ def board_prs(g):
                                     branch=c['headRefName'], head=c['headRefOid'], title=c['title'],
                                     body=c.get('body') or '',
                                     col=col, item=it['id'],
+                                    closes=[i.get('number') for i in c['closingIssuesReferences']['nodes']],
                                     rank=board.priority_rank(
                                         board.is_active_fast_track(
                                             c['number'], [i.get('number') for i in c['closingIssuesReferences']['nodes']],

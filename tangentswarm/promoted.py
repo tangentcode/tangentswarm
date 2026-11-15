@@ -53,17 +53,15 @@ HOME = Path.home()
 BIN = Path(os.environ.get('SWARM_TICK_BIN', str(HOME / 'bin')))
 POLL = int(os.environ.get('SWARM_PROMOTE_POLL', '30'))
 RETRY = int(os.environ.get('SWARM_PROMOTE_RETRY', '5'))
+# The idle check reads the shared board snapshot when it is younger than this (a GraphQL
+# budget: a full read every 30 s used more than the hourly quota). SIGUSR1 (a webhook event)
+# makes the next check read the board now.
+IDLE_AGE = int(os.environ.get('SWARM_PROMOTE_IDLE_AGE', '120'))
 PULL = os.environ.get('SWARM_PROMOTE_PULL') == '1'  # also run the Staging pull
 REPO = 'tangentcode/platform'
 BACKSTOP = int(os.environ.get('SWARM_PROMOTE_BACKSTOP', '900'))  # retry a leftover head at most this often
 HR_TARGET = int(os.environ.get('SWARM_PROMOTE_HR_TARGET', '2'))  # only raise it for a dry-run proof
 
-LEAN_Q = """query($c:String){organization(login:"tangentcode"){projectV2(number:4){items(first:100, after:$c){
- pageInfo{hasNextPage endCursor}
- nodes{id fieldValueByName(name:"Status"){...on ProjectV2ItemFieldSingleSelectValue{name optionId}}
-  content{__typename ...on PullRequest{number state headRefOid repository{nameWithOwner}
-   labels(first:20){nodes{name}} closingIssuesReferences(first:10){nodes{number labels(first:20){nodes{name}}}}}
-   ...on Issue{number state repository{nameWithOwner} labels(first:20){nodes{name}}}}}}}}}"""
 
 
 def say(line):
@@ -74,33 +72,28 @@ def _names(node):
     return [l['name'] for l in ((node or {}).get('labels') or {}).get('nodes') or []]
 
 
-def read_board(gql):
-    """({column key: [{number, head, item}]} for OPEN platform PRs by option id,
-    [fast-track items for board.update_active])."""
-    cols, ft, cursor = {}, [], None
-    while True:
-        data = gql(LEAN_Q, c=cursor)['organization']['projectV2']['items']
-        for it in data['nodes']:
-            c = it.get('content') or {}
-            kind = c.get('__typename')
-            if kind not in ('PullRequest', 'Issue') or (c.get('repository') or {}).get('nameWithOwner') != REPO:
-                continue
-            col = board.column(it.get('fieldValueByName'))
-            closes = [dict(number=i['number'], labels=_names(i))
-                      for i in ((c.get('closingIssuesReferences') or {}).get('nodes') or [])]
-            ft.append(dict(number=c['number'], kind=kind, state=c.get('state'), col=col,
-                           labels=_names(c), closes=closes))
-            if kind == 'PullRequest' and c.get('state') == 'OPEN':
-                cols.setdefault(col, []).append(dict(number=c['number'], head=c['headRefOid'], item=it['id'],
-                                                     closes=[i['number'] for i in closes]))
-        if not data['pageInfo']['hasNextPage']:
-            return cols, ft
-        cursor = data['pageInfo']['endCursor']
+def read_board(gql, max_age=None):
+    """({column key: [{number, head, item, closes}]} for OPEN platform PRs by option id,
+    [fast-track items for board.update_active]), from the shared board snapshot (boardcache;
+    max_age 0 reads the board now)."""
+    from . import boardcache
+    snap = boardcache.snapshot(gql, max_age)
+    cols, ft = {}, []
+    for it, c in boardcache.open_prs(snap):
+        col = boardcache.col(it)
+        closes = [dict(number=i['number'], labels=_names(i)) for i in boardcache.closes(c)]
+        ft.append(dict(number=c['number'], kind='PullRequest', state='OPEN', col=col, labels=_names(c), closes=closes))
+        cols.setdefault(col, []).append(dict(number=c['number'], head=c['headRefOid'], item=it['id'],
+                                             closes=[i['number'] for i in closes]))
+    for it, c in boardcache.open_issues(snap):
+        ft.append(dict(number=c['number'], kind='Issue', state='OPEN', col=boardcache.col(it),
+                       labels=_names(c), closes=[]))
+    return cols, ft
 
 
-def read_columns(gql, ft_state=None):
+def read_columns(gql, ft_state=None, max_age=None):
     """Columns as read_board, and keep the ONE active fast-track ticket current (board.FT_STATE)."""
-    cols, ft = read_board(gql)
+    cols, ft = read_board(gql, max_age)
     try:  # the Ready entry time, for the Ready -> Human Review wait in the move log
         from . import moves
         moves.note_ready([p['number'] for p in cols.get(board.READY, [])])
@@ -157,13 +150,32 @@ DETAIL_FIELDS = """number state headRefOid headRefName isDraft baseRefName body 
 
 
 def read_details(gql, numbers):
-    """{n: PR fields} for a few PRs in ONE GraphQL query (no REST)."""
+    """{n: PR fields} for a few PRs in ONE GraphQL query (no REST). A PR whose head SHA and
+    updatedAt in the board snapshot are unchanged is not read again (boardcache.detail_get)."""
     if not numbers:
         return {}
-    owner, name = REPO.split('/')
-    parts = ' '.join(f'p{n}: pullRequest(number:{int(n)}){{{DETAIL_FIELDS}}}' for n in numbers)
-    data = gql(f'query{{repository(owner:"{owner}",name:"{name}"){{{parts}}}}}')['repository']
-    return {int(k[1:]): v for k, v in data.items() if v}
+    from . import boardcache
+    try:
+        keys = boardcache.keys(boardcache.snapshot(gql))
+    except Exception:
+        keys = {}
+    out = {}
+    for n in numbers:
+        hit = boardcache.detail_get(int(n), *keys.get(int(n), (None, None)))
+        if hit is not None and hit.get('headRefOid') == keys[int(n)][0]:
+            out[int(n)] = hit
+    miss = [n for n in numbers if int(n) not in out]
+    if miss:
+        owner, name = REPO.split('/')
+        parts = ' '.join(f'p{n}: pullRequest(number:{int(n)}){{{DETAIL_FIELDS}}}' for n in miss)
+        data = gql(f'query{{repository(owner:"{owner}",name:"{name}"){{{parts}}}}}')['repository']
+        for k, v in data.items():
+            if v:
+                out[int(k[1:])] = v
+                head, upd = keys.get(int(k[1:]), (None, None))
+                if v.get('headRefOid') == head:
+                    boardcache.detail_put(int(k[1:]), head, upd, v)
+    return out
 
 
 def human_after(pr, since):
@@ -385,7 +397,7 @@ class Promoter:
         main_moved = main is not None and main != self.last_main
         waiting = gatelock.queued()
         if not retry:
-            cols = read_columns(self.g['gql'])
+            cols = read_columns(self.g['gql'], max_age=IDLE_AGE)
             from . import flow
             pull_due = needs_pull(cols, flow.load_pull())
             if not needs_promotion(cols) and not main_moved and not waiting and not pull_due:
@@ -399,11 +411,11 @@ class Promoter:
                 say(f"main is at {main[:8]} (was {(self.last_main or 'unknown')[:8]}): Staging merge recheck")
         try:
             with (gatelock.gate_lock('swarm-promoted') if not self.dry else _null()):
-                cols = read_columns(self.g['gql'])  # fresh, under the lock
+                cols = read_columns(self.g['gql'], max_age=0)  # fresh, under the lock
                 moved = self.fast_path(cols) if needs_promotion(cols) else []
                 drained = self.drain()
                 if drained:  # a queued run may have moved cards: read again before the rest
-                    cols, moved = read_columns(self.g['gql']), []  # the new read already has our moves
+                    cols, moved = read_columns(self.g['gql'], max_age=0), []  # the new read already has our moves
                 if main_moved:
                     self.main_pass(cols, moved, main)
                     self.last_main = main
@@ -432,23 +444,39 @@ class _null:
         return False
 
 
+def limit_pause(e, now=time.time):
+    """Seconds to sleep after a GitHub rate-limit error (until the reset + 30 s), or None for
+    any other error. No busy retries: each would fail again and the quota stays at 0."""
+    from . import gqlmeter
+    if not gqlmeter.limited(e):
+        return None
+    reset = getattr(e, 'reset', None)
+    say(f"GitHub rate limit; it resets at {gqlmeter.when(reset)}; sleeping until then (SIGUSR1 ignored)")
+    return int(max(60, (reset or now() + 600) - now() + 30))
+
+
 def run(p, poll=POLL, retry=RETRY, sleep=time.sleep):
     wake = {'now': False}
     signal.signal(signal.SIGUSR1, lambda *a: wake.update(now=True))
     say(f"swarm-promoted: polling every {poll}s (SIGUSR1 wakes it)")
     what = 'idle'
     while True:
+        limited = None
         try:
             what = p.once(retry=what == 'busy')
         except Exception as e:  # keep the daemon alive; report and retry
             say(f"error: {type(e).__name__}: {e}")
-            what = 'busy'
-        pause = retry if what == 'busy' else poll
+            limited = limit_pause(e)
+            what = 'idle' if limited else 'busy'
+        pause = limited or (retry if what == 'busy' else poll)
         for _ in range(pause):
-            if wake['now']:
+            if wake['now'] and not limited:
                 wake['now'] = False
+                from . import boardcache
+                boardcache.invalidate()  # an event: read the board now
                 break
             sleep(1)
+        wake['now'] = wake['now'] and not limited
 
 
 def main(argv=None):

@@ -41,44 +41,24 @@ CACHE = Path(os.environ.get('SWARM_FLOW_STATUS_CACHE',
 REPO = 'tangentcode/platform'
 COLUMNS = ('Human Review', 'Pending', 'In Progress', 'Auto Review')  # hr-gate's internal names
 
-PR_FIELDS = """number state title isDraft headRefName headRefOid body repository{nameWithOwner}
- milestone{title} labels(first:20){nodes{name}}
- closingIssuesReferences(first:10){nodes{number milestone{title} labels(first:20){nodes{name}}}}
- timelineItems(last:30,itemTypes:[PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]){nodes{__typename
-   ...on ProjectV2ItemStatusChangedEvent{createdAt status}}}"""
-
-# items(query:) filters on the server: only the ~30 open PRs, not ~330 items in 4 pages
-# (0.8 s, not 11 s). Columns are still matched by option id here, never by name in the query.
-BOARD_FILTER = 'is:pr is:open'
-BOARD_Q = """query($c:String,$f:String!){organization(login:"tangentcode"){projectV2(number:4){
- items(first:100, after:$c, query:$f){
- pageInfo{hasNextPage endCursor}
- nodes{fieldValueByName(name:"Status"){...on ProjectV2ItemFieldSingleSelectValue{name optionId}}
-  content{__typename ...on PullRequest{%s}}}}}}}""" % PR_FIELDS
+# The board comes from the shared snapshot (boardcache): open items only, filtered on the
+# server; columns are still matched by option id, never by name.
 
 
-def read_board(gql):
-    """(items, prs). items: hr-gate list_board_items rows for every board item. prs: {n: PR
-    dict in hr-gate's fetch() shape} for the OPEN platform PRs in COLUMNS. gql must
-    normalize status names by option id (hr-gate's gql does: Staging -> Pending)."""
-    items, prs, cursor = [], {}, None  # status by option id: hr-gate's gql canon_status
-    while True:
-        data = gql(BOARD_Q, c=cursor, f=BOARD_FILTER)['organization']['projectV2']['items']
-        for node in data['nodes']:
-            fv = node.get('fieldValueByName') or {}
-            st = {'Staging': 'Pending'}.get(fv.get('name'), fv.get('name'))
-            ct = node.get('content') or {}
-            kind = ct.get('__typename')
-            if kind == 'PullRequest' and (ct.get('repository') or {}).get('nameWithOwner') != REPO:
-                continue
-            items.append({'status': st, 'number': ct.get('number'), 'state': ct.get('state'), 'typename': kind})
-            if kind == 'PullRequest' and ct.get('state') == 'OPEN' and st in COLUMNS:
-                pr = dict(ct)
-                pr.pop('repository', None)
-                prs[ct['number']] = pr
-        if not data['pageInfo']['hasNextPage']:
-            return items, prs
-        cursor = data['pageInfo']['endCursor']
+def read_board(gql, max_age=None):
+    """(items, prs). items: hr-gate list_board_items rows for the open board items. prs: {n:
+    PR dict in hr-gate's fetch() shape} for the OPEN platform PRs in COLUMNS. From the shared
+    board snapshot (boardcache), which has the status-change timeline of each open PR."""
+    from . import boardcache
+    snap = boardcache.snapshot(gql, max_age)
+    items, prs = boardcache.item_rows(snap), {}
+    for it, c in boardcache.open_prs(snap):
+        st = 'Pending' if boardcache.col(it) == 'Pending' else boardcache.col(it)
+        if st in COLUMNS:
+            pr = dict(c)
+            pr.pop('repository', None)
+            prs[c['number']] = pr
+    return items, prs
 
 
 def ls_heads(url, run=subprocess.run):
@@ -245,6 +225,11 @@ def main(argv=None):
         g = runpy.run_path(GATE, run_name='flow_status')
         print('\n'.join(run(g, fresh=a.fresh)))
     except (RuntimeError, subprocess.TimeoutExpired) as e:
+        from . import gqlmeter
+        if gqlmeter.limited(e):  # no retry, no other token: say when it comes back
+            reset = getattr(e, 'reset', None)
+            print(f"flow-status: GitHub GraphQL rate limit; it resets at {gqlmeter.when(reset)}", file=sys.stderr)
+            return 75
         print(f"flow-status error: {e}", file=sys.stderr)
         return 2
     return 0

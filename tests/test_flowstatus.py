@@ -15,19 +15,17 @@ def pr(n, branch, head, draft=False, body=''):
 
 
 def node(status, content):
-    return {'fieldValueByName': {'name': status}, 'content': content}
+    from tangentswarm import board
+    key = {'Staging': board.STAGING}.get(status, status)
+    return {'id': f"I{content.get('number')}", 'content': content,
+            'fieldValueByName': {'name': key, 'optionId': board.OPTION[key]}}
 
 
 def pages(*page_nodes):
+    """One batched snapshot answer with every node (boardcache reads open items only)."""
+    import boardfake
     calls = []
-
-    def gql(q, c=None, f=None):
-        calls.append((c, f))
-        i = 0 if c is None else int(c)
-        last = i == len(page_nodes) - 1
-        return {'organization': {'projectV2': {'items': {
-            'pageInfo': {'hasNextPage': not last, 'endCursor': str(i + 1)}, 'nodes': page_nodes[i]}}}}
-    return gql, calls
+    return boardfake.gql([n for nodes in page_nodes for n in nodes], calls), calls
 
 
 def test_read_board_keeps_open_platform_prs_in_report_columns():
@@ -35,13 +33,14 @@ def test_read_board_keeps_open_platform_prs_in_report_columns():
     gql, calls = pages(
         [node('Human Review', pr(1, 'a', 'h1')), node('Staging', pr(2, 'b', 'h2')), node('Ready', pr(3, 'c', 'h3'))],
         [node('In Progress', dict(pr(4, 'd', 'h4'), state='CLOSED')), node('Human Review', other),
-         node('Inbox', {'__typename': 'Issue', 'number': 5, 'state': 'OPEN'})])
+         node('Inbox', {'__typename': 'Issue', 'number': 5, 'state': 'OPEN',
+                       'repository': {'nameWithOwner': F.REPO}})])
     items, prs = F.read_board(gql)
-    assert calls == [(None, F.BOARD_FILTER), ('1', F.BOARD_FILTER)]
+    assert len(calls) == 1 and 'is:pr is:open' in calls[0] and 'is:issue is:open' in calls[0]  # one request
     assert sorted(prs) == [1, 2]                      # Ready is not a report column; 4 is closed
     assert 'repository' not in prs[1]
     assert {(i['number'], i['status']) for i in items} == {(1, 'Human Review'), (2, 'Pending'), (3, 'Ready'),
-                                                           (4, 'In Progress'), (5, 'Inbox')}
+                                                           (5, 'Inbox')}  # open items only
 
 
 def test_ls_heads_parses_one_call_and_raises_on_failure():

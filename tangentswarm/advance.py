@@ -27,7 +27,7 @@ The merge or reject event runs this: the whole just-in-time cascade (see Cascade
 serial run under ~/.cache/swarm-serial.lock. A caller that finds the lock busy writes the
 rerun flag (~/.cache/swarm-serial.rerun), queues `swarm-advance --cascade --if-flagged` for
 the daemon, and exits 0. The holder runs the cascade again until no flag is left, then
-releases the lock. Lines for swarmbot: START_CLAUDE n=K ... and CORNERBOT_REQUEST: ...
+releases the lock. Lines for swarmbot: START_CLAUDE n=K issues=#A,#B ... and CORNERBOT_REQUEST: ...
 """
 import argparse
 import json
@@ -38,7 +38,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import board, gatelock, proc
+from . import board, gatelock, gqlmeter, proc
 
 REPO = 'tangentcode/platform'
 CODEX = 'chatgpt-codex-connector'
@@ -47,8 +47,7 @@ MINBOT_ROWS = ('1 ', '2 ', '3 ', '5 ')  # not draft, mergeable, Codex clean, Lin
 
 # --cascade (Michal 2026-11-14)
 FLOOR = int(os.environ.get('SWARM_STAGING_FLOOR', '2'))  # pull while Staging has fewer (--floor; compare 1 and 2)
-READY_TARGET = int(os.environ.get('SWARM_READY_TARGET', '6'))      # START_CLAUDE while Ready is below this
-WORKING_TARGET = int(os.environ.get('SWARM_WORKING_TARGET', '2'))  # aim: about this many coders working
+READY_TARGET = int(os.environ.get("SWARM_READY_TARGET", "6"))      # Ready short: one more new-work slot (slots.NEW_SLOTS_SHORT)
 DEPLOY_WAIT = int(os.environ.get('SWARM_DEPLOY_WAIT', '600'))      # seconds to wait for staging to serve a pull
 PTW_WAIT = int(os.environ.get('SWARM_PTW_WAIT', '1800'))           # seconds to wait for a cornerbot redeploy
 DEPLOY_POLL = 15
@@ -258,8 +257,12 @@ class Cascade(Advance):
                    (tangentswarm.moves). A fast-track PR (the active fast-track ticket, the
                    PR Michal marks urgent) is the next pull: Flow.pull tries it first, and
                    it is pulled also when Staging is at the floor (Michal 2026-11-14 8:43 PM).
-      3. signal    Ready has fewer than READY_TARGET PRs: print one START_CLAUDE line for
-                   swarmbot, so that about WORKING_TARGET coders work.
+      park         (tangentswarm.slots) the Claude of each PR in Ready exits; its tmux
+                   window, branch and worktree stay, and its session id is kept so that
+                   swarm-revive PR FEEDBACK can resume it in a rework slot.
+      3. signal    (tangentswarm.slots) fewer than NEW_SLOTS new-work Claudes run and Active
+                   issues without a PR exist: print one START_CLAUDE line for swarmbot that
+                   names the issues to start, in Ready order.
     """
 
     def __init__(self, g=None, dry_run=False, out=print, sleep=time.sleep, clock=time.monotonic, **kw):
@@ -363,7 +366,7 @@ class Cascade(Advance):
     # -- 2. fill ------------------------------------------------------------------
     def fill(self):
         from . import flow
-        prs, cols = self.f.columns()
+        prs, cols = self.columns()
         if self.dry and self.moved:  # the promote step only said "would move"
             up = [p for p in cols.get(board.STAGING, []) if p['number'] in self.moved]
             cols[board.STAGING] = [p for p in cols.get(board.STAGING, []) if p not in up]
@@ -382,7 +385,7 @@ class Cascade(Advance):
                             cols = dict(cols, **{board.READY: [q for q in cols.get(board.READY, []) if q not in done],
                                                  board.STAGING: cols.get(board.STAGING, []) + done})
                     else:
-                        prs, cols = self.f.columns()
+                        prs, cols = self.columns()
                     continue
                 st = cols.get(board.STAGING, [])
                 ready = [p for p in cols.get(board.READY, []) if not p.get('draft')]
@@ -427,32 +430,69 @@ class Cascade(Advance):
                     continue
                 if not self.finish(flow.load_pull(), prs, scratch):
                     return cols
-                prs, cols = self.f.columns()
+                prs, cols = self.columns()
         return cols
+
+    def columns(self):
+        """Flow.columns, and keep the PRs for the park and signal steps."""
+        self.prs, cols = self.f.columns()
+        return self.prs, cols
+
+    # -- park --------------------------------------------------------------------
+    def park(self, cols):
+        """(a) Michal 2026-11-14 8:43 PM ET: the Claude of a PR in Ready exits (its window,
+        branch and worktree stay; its session id is kept for swarm-revive)."""
+        from . import slots
+        try:
+            slots.park_ready(getattr(self, 'prs', None) or {}, cols, dry=self.dry, out=self.out)
+        except Exception as e:  # parking must not stop the signal step
+            self.out(f"park: skipped: {type(e).__name__}: {str(e)[:200]}")
 
     # -- 3. signal ----------------------------------------------------------------
     def signal(self, cols):
+        """(c) Michal 2026-11-14 8:43 PM ET: START_CLAUDE whenever fewer than slots.NEW_SLOTS
+        new-work Claudes run and Active issues without a PR exist (slots.NEW_SLOTS_SHORT while
+        Ready is short). The line names the issues to start, in Ready order."""
+        from . import slots
+        prs = getattr(self, 'prs', None) or {}
         ready = len([p for p in cols.get(board.READY, []) if not p.get('draft')])
-        working = len(cols.get(board.IN_PROGRESS, []))
-        if ready >= READY_TARGET:
-            self.out(f"signal: Ready {ready}/{READY_TARGET}: no new coder")
-            return
-        start = max(0, WORKING_TARGET - working)
-        if start:
-            self.out(f"START_CLAUDE n={start} ready={ready}/{READY_TARGET} working={working}/{WORKING_TARGET}")
+        k = slots.kinds(slots.attach_prs(slots.running(), prs), slots.load())
+        from . import boardcache
+        issues = slots.active_issues(boardcache.snapshot(self.g['gql']), board.active_fast_track(), prs)
+        n, target = slots.start_plan(len(k['new']), issues, ready, READY_TARGET)
+        facts = (f"new={len(k['new'])}/{target} rework={len(k['rework'])}/{slots.REWORK_SLOTS} "
+                 f"ready={ready}/{READY_TARGET} active_without_pr={len(issues)}")
+        if n:
+            self.out(f"START_CLAUDE n={n} issues={','.join('#' + str(i['number']) for i in issues[:n])} {facts}")
+        elif not issues:
+            self.out(f"signal: no Active issue without a PR ({facts}): no START_CLAUDE")
         else:
-            self.out(f"signal: Ready {ready}/{READY_TARGET}, {working} PR(s) In Progress "
-                     f"(aim {WORKING_TARGET}): no START_CLAUDE")
+            self.out(f"signal: the new-work slots are full ({facts}): no START_CLAUDE")
 
     def run(self):
         from .promoted import read_columns
         t0 = self.clock()
-        self.out(f"cascade: start{' (dry run)' if self.dry else ''}; budget {BUDGET}s")
+        os.environ[gqlmeter.PASS_ENV] = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"  # hr-gate children log it too
+        mark = dict(gqlmeter.TALLY)
+        self.out(f"cascade: start{' (dry run)' if self.dry else ''}; budget {BUDGET}s; "
+                 f"pass {os.environ[gqlmeter.PASS_ENV]}")
+        try:
+            return self._run(t0)
+        finally:
+            calls, pts = gqlmeter.since_mark(mark)
+            self.out(f"graphql: {pts} points in {calls} queries in this process "
+                     f"(remaining {gqlmeter.TALLY['remaining']}); per pass with hr-gate: "
+                     f"python -m tangentswarm.gqlmeter --passes")
+
+    def _run(self, t0):
+        from .promoted import read_columns
         self.out("promote: reading the board")
-        if not self.promote(read_columns(self.g['gql'])):
+        if not self.promote(read_columns(self.g['gql'], max_age=0)):  # the one board read of this pass
             self.out('promote: ' + self.why[-1])
         self.out("fill: reading the board")
-        self.signal(self.fill())
+        cols = self.fill()
+        self.park(cols)
+        self.signal(cols)
         self.out(f"cascade: done in {int(self.clock() - t0)}s")
         return 0
 
@@ -509,6 +549,10 @@ def run_locked(body, flag=None, lock=None, out=print, if_flagged=False, max_pass
                         body()
                     except BaseException as e:  # timeout, SIGTERM, error: keep the rerun; the with releases the lock
                         flag_rerun(flag, by='kept after ' + type(e).__name__)
+                        if rate_limited(e):  # no busy retry: one rerun after the reset
+                            out(f"stopped: GraphQL rate limit; it resets at {gqlmeter.when(getattr(e, 'reset', None))}; "
+                                f"lock released, rerun flag kept; {schedule(e.reset)}")
+                            return EXIT_RATELIMIT
                         out(f"stopped: {type(e).__name__}: {str(e)[:200]}; lock released, rerun flag kept")
                         if isinstance(e, CascadeTimeout):
                             return EXIT_TIMEOUT
@@ -517,6 +561,34 @@ def run_locked(body, flag=None, lock=None, out=print, if_flagged=False, max_pass
             out(f"busy: {e}; rerun flag set, the lock holder runs the cascade again; {enqueue()}")
             return 0
     return 0
+
+
+EXIT_RATELIMIT = 75  # EX_TEMPFAIL: the rerun is scheduled
+RERUN_UNIT = 'swarm-cascade-after-ratelimit'
+RERUN_SLACK = 60  # seconds after the reset
+
+
+def rate_limited(e):
+    return isinstance(e, Exception) and gqlmeter.limited(e)
+
+
+def schedule(reset, run=subprocess.run, now=time.time):
+    """One `swarm-advance --cascade --if-flagged` after the reset (systemd-run --on-active). A
+    timer that is already waiting is kept: one rerun, not one per caller."""
+    from .promoted import BIN
+    delay = int(max(0, (reset or now() + 3600) - now())) + RERUN_SLACK
+    try:
+        if run(['systemctl', '--user', 'is-active', '--quiet', RERUN_UNIT + '.timer'],
+               capture_output=True, timeout=30).returncode == 0:
+            return f"a rerun is already scheduled ({RERUN_UNIT}.timer)"
+        r = run(['systemd-run', '--user', '--collect', f'--unit={RERUN_UNIT}', f'--on-active={delay}s',
+                 str(BIN / 'swarm-advance'), '--cascade', '--if-flagged'],
+                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"rerun NOT scheduled ({e})"
+    if r.returncode:
+        return f"rerun NOT scheduled ({(r.stderr or r.stdout).strip()[:160]})"
+    return f"one rerun scheduled in {delay}s ({RERUN_UNIT}.timer)"
 
 
 class CascadeTimeout(Exception):
@@ -598,6 +670,10 @@ def main(argv=None):
         _say(f"stopped: {e}")
         return EXIT_TIMEOUT
     except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as e:
+        if rate_limited(e):  # a dry run or a plain step: no lock to keep, no rerun to schedule
+            print(f"swarm-advance: GraphQL rate limit; it resets at {gqlmeter.when(getattr(e, 'reset', None))}; no retry",
+                  file=sys.stderr)
+            return EXIT_RATELIMIT
         print(f"swarm-advance error: {e}", file=sys.stderr)
         return 2
 

@@ -7,8 +7,8 @@ H5, H6 = '5' * 40, '6' * 40
 
 
 def page(*items):
-    return {'organization': {'projectV2': {'items': {'nodes': list(items),
-                                                     'pageInfo': {'hasNextPage': False, 'endCursor': None}}}}}
+    from boardfake import answer
+    return answer(list(items))
 
 
 def item(n, opt, head, state='OPEN', repo=P.REPO):
@@ -27,7 +27,7 @@ def own_queue(tmp_path, monkeypatch):
 
 
 def test_read_columns_counts_open_prs_by_option_id_only():
-    cols = P.read_columns(lambda q, c=None: page(item(1, HR, 'a'), item(2, HR, 'b', state='MERGED'),
+    cols = P.read_columns(lambda q, **v: page(item(1, HR, 'a'), item(2, HR, 'b', state='MERGED'),
                                                  item(5, ST, H5), item(9, ST, 'z', repo='other/repo')))
     assert [p['number'] for p in cols[board.HUMAN_REVIEW]] == [1]
     assert [p['number'] for p in cols[board.STAGING]] == [5]
@@ -71,7 +71,7 @@ def test_read_columns_keeps_the_active_fast_track_current(tmp_path):
     issue = {'id': 'X', 'fieldValueByName': {'optionId': B.OPTION[B.ACTIVE]},
              'content': {'__typename': 'Issue', 'number': 488, 'state': 'OPEN',
                          'repository': {'nameWithOwner': P.REPO}, 'labels': {'nodes': [{'name': 'fast-track'}]}}}
-    P.read_columns(lambda q, c=None: page(item(5, ST, H5), issue))
+    P.read_columns(lambda q, **v: page(item(5, ST, H5), issue))
     assert B.active_fast_track() == 488
 
 
@@ -130,7 +130,7 @@ class G(dict):
         self.moves, self.logs = [], []
         details = details if details is not None else {5: detail(5, H5)}
         self.update(LOG=str(tmp_path / 'hr.log'), read_queue_file=lambda: list(queue),
-                    gql=lambda q, c=None: {'repository': {f'p{n}': d for n, d in details.items()}},
+                    gql=lambda q, **v: {'repository': {f'p{n}': d for n, d in details.items()}},
                     ScratchRepo=Scratch, stacked_base=lambda b: 3 if b.startswith('# STACKED') else None,
                     move=lambda i, c: self.moves.append((i, c)), log=lambda *a: self.logs.append(a))
 
@@ -181,7 +181,7 @@ def test_fast_path_dry_run_moves_nothing(tmp_path, clean):
 def test_once_runs_fast_then_slow_under_the_lock(tmp_path, monkeypatch):
     order = []
     g = G(tmp_path)
-    g['gql'] = lambda q, c=None: page(item(1, HR, 'a'), item(5, ST, H5))
+    g['gql'] = lambda q, **v: page(item(1, HR, 'a'), item(5, ST, H5))
     p = P.Promoter(g=g)
     moved = []
 
@@ -208,7 +208,7 @@ def test_once_runs_fast_then_slow_under_the_lock(tmp_path, monkeypatch):
 def test_once_busy_then_retry_skips_the_outer_read(tmp_path, monkeypatch):
     reads = []
     g = G(tmp_path)
-    g['gql'] = lambda q, c=None: reads.append(1) or page(item(1, HR, 'a'), item(5, ST, H5))
+    g['gql'] = lambda q, **v: reads.append(1) or page(item(1, HR, 'a'), item(5, ST, H5))
     p = P.Promoter(g=g)
 
     class Busy:
@@ -224,7 +224,7 @@ def test_once_busy_then_retry_skips_the_outer_read(tmp_path, monkeypatch):
 
 def test_once_idle_when_human_review_full(tmp_path):
     g = G(tmp_path)
-    g['gql'] = lambda q, c=None: page(item(1, HR, 'a'), item(2, HR, 'b'), item(5, ST, H5))
+    g['gql'] = lambda q, **v: page(item(1, HR, 'a'), item(2, HR, 'b'), item(5, ST, H5))
     assert P.Promoter(g=g).once() == 'idle'
 
 
@@ -272,7 +272,7 @@ def test_slow_path_runs_once_per_leftover_head_then_waits_for_the_backstop(tmp_p
 
 def test_once_does_not_rerun_the_slow_path_for_the_same_blocked_head(tmp_path, monkeypatch):
     g = G(tmp_path)
-    g['gql'] = lambda q, c=None: page(item(1, HR, 'a'), item(5, ST, H5))
+    g['gql'] = lambda q, **v: page(item(1, HR, 'a'), item(5, ST, H5))
     p = P.Promoter(g=g)
     slow = []
 
@@ -289,7 +289,7 @@ def test_once_does_not_rerun_the_slow_path_for_the_same_blocked_head(tmp_path, m
 
 def test_once_rechecks_staging_only_when_main_moves(tmp_path, monkeypatch):
     g = G(tmp_path)
-    g['gql'] = lambda q, c=None: page(item(1, HR, 'a'), item(2, HR, 'b'), item(5, ST, H5))
+    g['gql'] = lambda q, **v: page(item(1, HR, 'a'), item(2, HR, 'b'), item(5, ST, H5))
     p = P.Promoter(g=g)
     mains, passes = ['1' * 40], []
     monkeypatch.setattr(p, 'main_sha', lambda: mains[0])
@@ -313,7 +313,7 @@ def test_main_sha_reads_ls_remote_and_survives_errors(tmp_path):
 
 def test_once_drains_queued_requests_under_its_lock(tmp_path, monkeypatch, own_queue):
     g = G(tmp_path)
-    g['gql'] = lambda q, c=None: page(item(1, HR, 'a'), item(2, HR, 'b'))  # nothing else to do
+    g['gql'] = lambda q, **v: page(item(1, HR, 'a'), item(2, HR, 'b'))  # nothing else to do
     p = P.Promoter(g=g)
     monkeypatch.setattr(p, 'main_sha', lambda: None)
     order = []
