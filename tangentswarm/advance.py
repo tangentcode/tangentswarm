@@ -633,6 +633,10 @@ class Cascade(Advance):
             slots.park_ready(getattr(self, 'prs', None) or {}, cols, dry=self.dry, out=self.out)
         except Exception as e:  # parking must not stop the signal step
             self.out(f"park: skipped: {type(e).__name__}: {str(e)[:200]}")
+        try:  # Michal 2026-11-15 4:40 AM ET: idle non-PR workers too (/exit, the window stays)
+            slots.park_idle_others(dry=self.dry, out=self.out)
+        except Exception as e:
+            self.out(f"park: idle workers skipped: {type(e).__name__}: {str(e)[:200]}")
 
     # -- 3. signal ----------------------------------------------------------------
     def signal(self, cols):

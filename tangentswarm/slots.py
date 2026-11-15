@@ -387,6 +387,71 @@ def _park(c, out):
     return None
 
 
+IDLE_PARK = int(os.environ.get('SWARM_IDLE_PARK', '1800'))  # s idle before a non-PR worker is parked
+WORKER_WINDOW = re.compile(r'^[a-z]+-\d+-')                    # code-nnn-branch
+NO_PARK_PREFIXES = tuple(os.environ.get('SWARM_NO_PARK', 'meth-').split(','))  # coordinator sessions
+
+
+def idle_others(sessions=None, alive=None, now=None, windows=None):
+    """Michal 2026-11-15 4:40 AM ET: idle agents are closed with /exit, keeping the window. The
+    Claudes that no PR card governs: a live Claude outside the platform worktrees, in a
+    worker window (code-nnn-branch, such as imp-22-rtl-eval) of the agents tmux session,
+    idle for IDLE_PARK s or more (statusUpdatedAt). Coordinator windows (NO_PARK_PREFIXES)
+    are never parked. Returns [{pid, session, cwd, pane, window, idle_s}]."""
+    alive = alive or _alive
+    now = time.time() if now is None else now
+    windows = windows if windows is not None else _pane_windows()
+    out = []
+    for f in sorted((sessions or SESSIONS).glob('*.json')):
+        try:
+            d = json.loads(f.read_text())
+            pid = int(d.get('pid') or f.stem)
+        except (OSError, ValueError, TypeError):
+            continue
+        if not alive(pid) or is_platform_worktree(d.get('cwd')) or d.get('status') != 'idle':
+            continue
+        tm = d.get('tmux') or ''
+        if not tm.startswith(TMUX_SESSION + ':'):
+            continue
+        pane = tm.rsplit('.', 1)[-1]
+        window = windows.get(pane, '')
+        if not WORKER_WINDOW.match(window) or window.startswith(NO_PARK_PREFIXES):
+            continue
+        idle = now - float(d.get('statusUpdatedAt') or d.get('updatedAt') or now * 1000) / 1000
+        if idle >= IDLE_PARK:
+            out.append(dict(pid=pid, session=d.get('sessionId') or '', cwd=d.get('cwd') or '', pane=pane,
+                            window=window, idle_s=int(idle)))
+    return out
+
+
+def _pane_windows():
+    r = subprocess.run(['tmux', 'list-panes', '-s', '-t', TMUX_SESSION, '-F', '#{pane_id} #{window_name}'],
+                       capture_output=True, text=True, timeout=30)
+    return dict(line.split(' ', 1) for line in (r.stdout or '').splitlines() if ' ' in line)
+
+
+def park_idle_others(dry=False, out=print, found=None, park=None):
+    """/exit each idle non-PR worker (idle_others), keeping its window and session record.
+    Returns the parked windows."""
+    done = []
+    for c in (idle_others() if found is None else found):
+        mins = c['idle_s'] // 60
+        if dry:
+            out(f"park: would park {c['window']} ({c['pane']}): idle {mins} min, no PR card")
+            continue
+        why = (park or _park)(c, out)
+        if why:
+            out(f"park: {c['window']} not parked: {why}")
+            continue
+        st = load()
+        st['parked'][c['window']] = dict(session=c['session'], pane=c['pane'], worktree=c['cwd'],
+                                         window=c['window'], parked_at=et_now())
+        save(st)
+        done.append(c['window'])
+        out(f"park: {c['window']} parked after {mins} min idle; session {c['session']} kept; its window stays")
+    return done
+
+
 def revive_reason(text):
     """Why a Claude was revived, from its feedback: 'shots' for the screenshot job."""
     return 'shots' if 'needs screenshots before Human Review' in (text or '') else 'rework'
@@ -621,8 +686,9 @@ def report(out=print, path=None):
     nr = sum(1 for c in claudes if c['cwd'] in rw)
     out(f"running: {len(claudes) - nr} not rework (new work, or done and waiting to be parked; "
         f"keep {NEW_SLOTS} new), {nr}/{REWORK_SLOTS} rework")
-    for k, r in sorted(st['parked'].items(), key=lambda kv: int(kv[0])):
-        out(f"parked #{k} {r.get('window') or r.get('pane')} session {r.get('session')} since {r.get('parked_at')}")
+    for k, r in sorted(st['parked'].items(), key=lambda kv: (not kv[0].isdigit(), int(kv[0]) if kv[0].isdigit() else kv[0])):
+        label = f"#{k}" if k.isdigit() else k
+        out(f"parked {label} {r.get('window') or r.get('pane')} session {r.get('session')} since {r.get('parked_at')}")
     return 0
 
 

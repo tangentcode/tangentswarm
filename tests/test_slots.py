@@ -396,3 +396,31 @@ def test_a_refused_park_names_the_leftover_process_to_the_worker_once():
     slots.relay_leftovers(532, '/w/b532', out=out.append, find=lambda cwd: left,
                           tell=lambda n, text: told.append((n, text)))
     assert len(told) == 2  # a new set of pids is told again
+
+
+def test_idle_non_pr_workers_are_parked_but_never_a_coordinator(tmp_path, monkeypatch):
+    """Michal 2026-11-15 4:40 AM ET: idle agents get /exit; the window stays (imp-22-rtl-eval)."""
+    d = tmp_path / 'sessions'
+    d.mkdir()
+    now = 100_000.0
+    rows = [(1, '/home/u/ver/implish.rtl-eval', 'idle', '%151', now - 3 * 3600),   # imp-22: parked
+            (2, '/home/u/ver/tangentswarm.auto', 'idle', '%9', now - 3 * 3600),    # meth-26: coordinator
+            (3, '/home/u/ver/implish.other', 'idle', '%7', now - 60),             # idle 1 min: kept
+            (4, '/home/u/ver/platform.x', 'idle', '%5', now - 3 * 3600),          # PR worker: by its card
+            (5, '/home/u/ver/implish.busy', 'busy', '%4', now - 3 * 3600)]
+    for pid, cwd, st, pane, at in rows:
+        (d / f'{pid}.json').write_text(json.dumps({'pid': pid, 'cwd': cwd, 'status': st, 'sessionId': f's{pid}',
+                                                   'tmux': f'agents:@1.{pane}', 'statusUpdatedAt': at * 1000}))
+    monkeypatch.setattr(slots, 'WORKTREE_PARENT', Path('/home/u/ver'))
+    windows = {'%151': 'imp-22-rtl-eval', '%9': 'meth-26-auto-coordinator-1', '%7': 'imp-23-other',
+               '%5': 'mn-5-x', '%4': 'imp-24-busy'}
+    found = slots.idle_others(sessions=d, alive=lambda pid: True, now=now, windows=windows)
+    assert [c['window'] for c in found] == ['imp-22-rtl-eval'] and found[0]['idle_s'] == 3 * 3600
+    out, exited = [], []
+    assert slots.park_idle_others(out=out.append, found=found, park=lambda c, say: exited.append(c['pane'])) == \
+        ['imp-22-rtl-eval']
+    assert exited == ['%151'] and slots.load()['parked']['imp-22-rtl-eval']['session'] == 's1'
+    assert out == ['park: imp-22-rtl-eval parked after 180 min idle; session s1 kept; its window stays']
+    lines = []
+    slots.report(out=lines.append)  # a window-keyed entry does not break the report
+    assert any(l.startswith('parked imp-22-rtl-eval') for l in lines)
