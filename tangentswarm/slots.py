@@ -205,11 +205,44 @@ def parking():
     return swarm_parking
 
 
+# swarm_parking.Host drives tmux with the deployed tangentswarm checkout (agents, registry,
+# tmux: the bash-shell launch rules). A caller that puts another checkout first on sys.path
+# (the swarm-advance and swarm-revive wrappers) would give it older modules, so the Host gets
+# them from TMUX_SRC under their own package name.
+TMUX_SRC = Path(os.environ.get('SWARM_TMUX_SRC', str(HOME / 'srv' / 'swarm-tmux')))
+TMUX_PKG = 'swarm_tmux_live'
+
+
+def _tmux_modules(src=None):
+    import importlib
+    import importlib.util
+    if TMUX_PKG not in sys.modules:
+        init = (src or TMUX_SRC) / 'tangentswarm' / '__init__.py'
+        spec = importlib.util.spec_from_file_location(TMUX_PKG, init, submodule_search_locations=[str(init.parent)])
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[TMUX_PKG] = mod
+        spec.loader.exec_module(mod)
+    return [importlib.import_module(f'{TMUX_PKG}.{m}') for m in ('agents', 'registry', 'tmux')]
+
+
+def make_host(sp):
+    """swarm_parking.Host with the deployed tmux modules (see TMUX_SRC); sp.Host() when that
+    checkout is missing."""
+    if not (TMUX_SRC / 'tangentswarm' / 'registry.py').exists():
+        return sp.Host()
+    agents, registry, tmux = _tmux_modules()
+    h = sp.Host.__new__(sp.Host)
+    h.agents, h.tmux, h.registry = agents, tmux, registry
+    h.tmux_run = tmux.run_checked
+    h.env = dict(os.environ, XDG_RUNTIME_DIR=sp.RUNTIME_DIR)
+    return h
+
+
 def _park(c, out):
     """/exit the Claude in pane c['pane'] through swarm_parking.park_one. Sets c['window'].
     Returns None when parked, else why not."""
     sp = parking()
-    host = sp.Host()
+    host = make_host(sp)
     with sp.flocked('park.lock', timeout=120) as got:
         if not got:
             return 'another swarm-park holds the park lock'
@@ -295,7 +328,7 @@ def revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, path
         return 1
     sp = sp or parking()
     try:
-        host = host or sp.Host()
+        host = host or make_host(sp)
         window, wt, branch, entry = sp.resolve(host, str(n))
         wt = str(wt)
         st = load(path)

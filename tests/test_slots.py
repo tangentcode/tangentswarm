@@ -283,3 +283,26 @@ def test_revive_is_held_without_memory(wt):
     out = []
     assert slots.revive(7, 'go', out=out.append, sp=FakeSP(wt, room=100), host=FakeHost(), claudes=[]) == 3
     assert out[-1].startswith('held: mn-7-b7 needs 400 MB')
+
+
+def test_make_host_takes_the_tmux_modules_from_the_deployed_checkout(tmp_path, monkeypatch):
+    pkg = tmp_path / 'srv' / 'tangentswarm'
+    pkg.mkdir(parents=True)
+    (pkg / '__init__.py').write_text('')
+    (pkg / 'tmux.py').write_text('WHERE = "srv"\ndef run_checked(*a): pass\n')
+    (pkg / 'registry.py').write_text('from . import tmux\ndef shell_problem(*a): return tmux.WHERE\n')
+    (pkg / 'agents.py').write_text('from . import registry, tmux\n')
+    monkeypatch.setattr(slots, 'TMUX_SRC', tmp_path / 'srv')
+    monkeypatch.setattr(slots, 'TMUX_PKG', 'swarm_tmux_test')
+
+    class SP:
+        RUNTIME_DIR = '/run/user/1'
+
+        class Host:
+            def __init__(self):
+                raise AssertionError('the default Host would import the caller checkout')
+    h = slots.make_host(SP)
+    assert h.registry.shell_problem() == 'srv' and h.env['XDG_RUNTIME_DIR'] == '/run/user/1'
+    monkeypatch.setattr(slots, 'TMUX_SRC', tmp_path / 'none')
+    with pytest.raises(AssertionError):
+        slots.make_host(SP)
