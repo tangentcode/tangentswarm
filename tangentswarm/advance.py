@@ -46,7 +46,7 @@ MINBOT = os.environ.get('SWARM_MINBOT', 'minbot')
 MINBOT_ROWS = ('1 ', '2 ', '3 ', '5 ')  # not draft, mergeable, Codex clean, Linux CI
 
 # --cascade (Michal 2026-11-14)
-STAGING_CAP = int(os.environ.get('SWARM_CASCADE_STAGING_CAP', '5'))  # safety bound only: never more in Staging
+FLOOR = int(os.environ.get('SWARM_STAGING_FLOOR', '2'))  # pull while Staging has fewer (--floor; compare 1 and 2)
 READY_TARGET = int(os.environ.get('SWARM_READY_TARGET', '6'))      # START_CLAUDE while Ready is below this
 WORKING_TARGET = int(os.environ.get('SWARM_WORKING_TARGET', '2'))  # aim: about this many coders working
 DEPLOY_WAIT = int(os.environ.get('SWARM_DEPLOY_WAIT', '600'))      # seconds to wait for staging to serve a pull
@@ -224,6 +224,8 @@ class Advance:
                     '--body', pass_text(head))
         if not self.dry:
             self.g['move'](p['item'], board.READY)
+            from . import moves
+            moves.log_move(n, 'Auto Review', 'Ready', head, note='swarm-advance MinBot pass')
         self.out(f"{'would ' if self.dry else ''}MinBot-pass #{n} at {head[:8]}: pass comment, "
                  "Auto Review -> Ready")
 
@@ -242,19 +244,18 @@ class Cascade(Advance):
     """swarm-advance --cascade: the whole just-in-time cascade in one serial run.
 
       1. promote   Human Review has a free slot: the fast path moves the next Staging PR.
-      2. fill      the target is ONE fully ready PR in Staging at all times (Michal
-                   2026-11-14 6:44 PM ET: bulk pre-merging made every main merge conflict
-                   the speculative branches). Staging empty: pull ONE Ready PR (milestone,
-                   fewest conflicts, oldest). Then pull extra Ready PRs, but only ones that
-                   merge cleanly with main, work and every Human Review and Staging PR
-                   (Flow.pull strict). Nothing is rebased, reworked or sent back just to fill
-                   Staging. Each pull: work merge (refused on a conflict or a marker),
-                   staging redeploy (ptw: print the cornerbot request, and write it to
-                   CORNERBOT_FILE), then poll until the .deploy-sha of EVERY staging site
-                   contains it (PTW_WAIT for ptw, DEPLOY_WAIT otherwise), then hr-gate
-                   --apply. A pull that still waits after the timeout (or for CI) stops
-                   the fill; the next cascade continues it. STAGING_CAP is only a safety
-                   bound.
+      2. fill      (Michal 2026-11-14 7:16 PM ET) no fixed cap. Any Ready PR that merges
+                   cleanly (git merge-tree) with main, work and every Human Review and
+                   Staging PR may enter Staging (Flow.pull strict). A pull happens only
+                   while Staging has fewer than FLOOR PRs (default 2; --floor or
+                   SWARM_STAGING_FLOOR, to compare 1 and 2). Nothing is rebased, reworked
+                   or sent back just to fill Staging. The expensive steps run only at pull
+                   time: work merge (refused on a conflict or a marker), staging redeploy
+                   (ptw: CORNERBOT_REQUEST, also in CORNERBOT_FILE), a poll until the
+                   .deploy-sha of EVERY staging site contains it, then hr-gate --apply.
+                   A pull that still waits after the timeout (or for CI) stops the fill;
+                   the next cascade continues it. Each move goes to the move log
+                   (tangentswarm.moves).
       3. signal    Ready has fewer than READY_TARGET PRs: print one START_CLAUDE line for
                    swarmbot, so that about WORKING_TARGET coders work.
     """
@@ -367,7 +368,7 @@ class Cascade(Advance):
             cols[board.HUMAN_REVIEW] = cols.get(board.HUMAN_REVIEW, []) + up
         with self.g['ScratchRepo']() as scratch:
             ended = None  # dry run: the running pull that would end (pull.json is not changed)
-            for _ in range(STAGING_CAP + 2):  # each turn ends the running pull, adds one PR, or stops
+            for _ in range(len(cols.get(board.READY, [])) + 2):  # each turn ends the pull, adds one PR, or stops
                 d = flow.load_pull()
                 if d and d.get('pr') != ended:
                     if not self.finish(d, prs, scratch):
@@ -386,10 +387,10 @@ class Cascade(Advance):
                 if not ready:
                     self.out(f"fill: Staging {len(st)}, Ready 0: Ready is empty")
                     return cols
-                if len(st) >= STAGING_CAP:
-                    self.out(f"fill: Staging {len(st)}: at the safety cap {STAGING_CAP}")
+                if len(st) >= FLOOR:
+                    self.out(f"fill: Staging {len(st)}, floor {FLOOR}: no pull needed")
                     return cols
-                p = self.f.pull(prs, cols, scratch, limit=STAGING_CAP, strict=True)
+                p = self.f.pull(prs, cols, scratch, limit=FLOOR, strict=True)
                 self.flush()
                 if p is None:
                     self.out(f"fill: Staging {len(st)}: no {'extra ' if st else ''}Ready PR to pull without rework")
@@ -554,12 +555,17 @@ def _say(line):
 
 
 def main(argv=None):
+    global FLOOR
     ap = argparse.ArgumentParser(prog='swarm-advance', description=__doc__.split('\n', 1)[0])
     ap.add_argument('--dry-run', action='store_true', help='print what it would do; change nothing')
     ap.add_argument('--cascade', action='store_true',
                     help='the whole cascade (promote, keep one ready PR in Staging, START_CLAUDE) under the lock')
     ap.add_argument('--if-flagged', action='store_true', help='--cascade: run only if the rerun flag is set')
+    ap.add_argument('--floor', type=int, help=f'--cascade: Staging floor (default {FLOOR}, env SWARM_STAGING_FLOOR)')
     a = ap.parse_args(argv)
+    if a.floor is not None:
+        FLOOR = a.floor
+        os.environ['SWARM_STAGING_FLOOR'] = str(a.floor)  # the move log records it
     try:
         if a.cascade:
             if a.dry_run:  # no lock, no flag: a dry run changes nothing

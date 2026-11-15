@@ -377,13 +377,20 @@ class Flow:
         rc, out = self.tool([BIN / 'hr-gate', '--apply', str(n)])
         msg = [l.strip() for l in out.splitlines() if l.strip().startswith(('moved', 'refused', 'stayed', 'stays'))]
         self.change(f"#{n} hr-gate --apply: " + (msg[-1] if msg else f'rc={rc}'))
-        if rc == 0 or any(m.startswith('moved') for m in msg):
+        moved = [m for m in msg if m.startswith('moved')]
+        if moved:
+            from . import moves
+            to = 'Human Review' if 'Human Review' in moved[-1] else 'Staging'
+            moves.log_move(n, p['col'] if p['col'] != board.STAGING else 'Staging', to, d['head'], note='hr-gate --apply')
+        if rc == 0 or moved:
             save_pull(None)
 
     def fail(self, p, reason, relay=None):
         n = p['number']
         if not self.dry:
             self.g['move'](p['item'], board.IN_PROGRESS)
+            from . import moves
+            moves.log_move(n, p.get('col') or '?', 'In Progress', p.get('head', ''), note=reason[:120])
             path = Path(f"/tmp/relay-{n}-{relay or 'gate'}.md")
             path.write_text(f"Coordinator: #{n} left the Staging pull: {reason}. Fix the root cause, push, and "
                             "report the head commit and test counts.\n")

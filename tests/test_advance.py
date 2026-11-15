@@ -254,7 +254,7 @@ def cascade(monkeypatch, tmp_path, cols, g, dry=True, **kw):
     pulled = []
 
     def pull(self, prs, c, scratch, limit=None, strict=False):
-        assert limit == A.STAGING_CAP and strict  # the cascade never reworks to fill Staging
+        assert limit == A.FLOOR and strict  # the cascade never reworks to fill Staging
         fits = [q for q in c.get(board.READY, []) if q['number'] not in kw.get('dirty', ())]
         if not fits:
             return None
@@ -276,7 +276,7 @@ def test_empty_staging_gets_one_pull_then_only_clean_extras(monkeypatch, tmp_pat
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(), dirty={5, 7})
     assert pulled == [4, 6]  # #5 and #7 do not merge cleanly: skipped, not reworked
     assert 'fill: #4 is the first Staging pull' in out and 'fill: #6 is the extra Staging pull' in out
-    assert 'fill: Staging 2: no extra Ready PR to pull without rework' in out
+    assert 'fill: Staging 2, floor 2: no pull needed' in out  # floor 2 reached; #7 is never tried
     assert out.count('would run hr-gate --apply 4 (Ready -> Staging when it passes)') == 1
     assert out[-1] == 'START_CLAUDE n=1 ready=2/6 working=1/2'
 
@@ -288,12 +288,21 @@ def test_staging_empty_and_nothing_clean_pulls_nothing(monkeypatch, tmp_path):
                                     'signal: Ready 6/6: no new coder']
 
 
-def test_the_safety_cap_bounds_staging(monkeypatch, tmp_path):
-    cols = {board.STAGING: [pr(n, board.STAGING) for n in range(1, A.STAGING_CAP + 1)],
+def test_staging_at_the_floor_pulls_nothing(monkeypatch, tmp_path):
+    cols = {board.STAGING: [pr(n, board.STAGING) for n in range(1, A.FLOOR + 1)],
             board.READY: [pr(n, board.READY) for n in range(10, 16)]}
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate())
-    assert pulled == [] and out == [f'fill: Staging {A.STAGING_CAP}: at the safety cap {A.STAGING_CAP}',
+    assert pulled == [] and out == [f'fill: Staging {A.FLOOR}, floor {A.FLOOR}: no pull needed',
                                     'signal: Ready 6/6: no new coder']
+
+
+@pytest.mark.parametrize('floor, want', [(1, [10]), (2, [10, 12]), (4, [10, 12, 14, 15])])
+def test_the_floor_sets_how_many_clean_prs_staging_gets(monkeypatch, tmp_path, floor, want):
+    """No fixed cap: pull clean Ready PRs only while Staging is below the floor."""
+    monkeypatch.setattr(A, 'FLOOR', floor)
+    cols = {board.READY: [pr(n, board.READY) for n in range(10, 16)]}
+    _, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False), dirty={11, 13})
+    assert pulled == want
 
 
 def test_empty_ready_stops_the_fill_and_asks_for_two_coders(monkeypatch, tmp_path):
@@ -339,7 +348,7 @@ def live(monkeypatch, tmp_path, g, polls, advance=None, ready=(9,)):
         advanced.append(d['pr'])
         F.save_pull(None)  # hr-gate --apply moved it
         c[board.STAGING].append(pr(d['pr'], board.STAGING))
-    c = {board.STAGING: [pr(n, board.STAGING) for n in range(1, 5)], board.READY: [pr(n, board.READY) for n in ready]}
+    c = {board.STAGING: [pr(1, board.STAGING)], board.READY: [pr(n, board.READY) for n in ready]}
     monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
     monkeypatch.setattr(A, 'CORNERBOT_FILE', tmp_path / 'cornerbot')
     monkeypatch.setattr(F.Flow, 'pull', start)
@@ -390,7 +399,7 @@ def test_a_web_site_that_never_serves_times_out_after_deploy_wait(monkeypatch, t
 
 def test_a_dry_run_goes_on_after_a_running_pull_would_end(monkeypatch, tmp_path):
     from tangentswarm import flow as F
-    cols = {board.STAGING: [pr(n, board.STAGING) for n in range(1, 5)], board.READY: [pr(9, board.READY)]}
+    cols = {board.READY: [pr(9, board.READY)]}
     monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
     F.save_pull(dict(pr=3, head='3' * 40, branch='b', item='I', work='w' * 40, started=0))
     monkeypatch.setattr(F.Flow, 'advance', lambda self, d, prs, s: self.change(f"#{d['pr']} pull finished"))

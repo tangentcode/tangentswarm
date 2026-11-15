@@ -16,4 +16,7 @@ def isolated_state(tmp_path, monkeypatch):
             monkeypatch.delenv(var, raising=False)
     from tangentswarm import board
     monkeypatch.setattr(board, 'FT_STATE', tmp_path / 'swarm-fasttrack.json')
+    from tangentswarm import moves
+    monkeypatch.setattr(moves, 'LOG', tmp_path / 'moves.log')
+    monkeypatch.setattr(moves, 'SEEN', tmp_path / 'ready-seen.json')
     yield tmp_path

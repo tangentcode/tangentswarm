@@ -101,6 +101,11 @@ def read_board(gql):
 def read_columns(gql, ft_state=None):
     """Columns as read_board, and keep the ONE active fast-track ticket current (board.FT_STATE)."""
     cols, ft = read_board(gql)
+    try:  # the Ready entry time, for the Ready -> Human Review wait in the move log
+        from . import moves
+        moves.note_ready([p['number'] for p in cols.get(board.READY, [])])
+    except OSError as e:
+        say(f"ready-seen not saved: {e}")
     try:
         act, prev = board.update_active(ft, ft_state)
         if act != prev:
@@ -344,6 +349,8 @@ class Promoter:
                 else:
                     self.g['move'](p['item'], board.HUMAN_REVIEW)
                     self.g['log']('apply', n, head[:8], 'PASS', [])
+                    from . import moves
+                    moves.log_move(n, 'Staging', 'Human Review', head, note='cheap check')
                     say(f"moved #{n} Staging -> Human Review (cheap check passed at {head[:8]})")
                 hr.append(p)
                 moved.append(n)
