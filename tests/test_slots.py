@@ -186,17 +186,29 @@ def test_a_refused_park_keeps_the_claude_and_the_session_record():
     assert slots.load()['parked']['7']['session'] == 's7'
 
 
-def test_a_rework_claude_is_parked_only_after_it_pushes_a_new_head():
-    slots.save({'parked': {}, 'rework': {'7': dict(worktree='/w/b7', session='s7', head='7' * 40),
+def test_a_rework_claude_back_in_ready_is_parked_even_without_a_new_head():
+    """MethBot 2026-11-15 3:35 AM ET: a rework Claude kept its slot because it pushed no new
+    head, and rework=3/3 held #516 with NEEDS_WORKER."""
+    slots.save({'parked': {}, 'rework': {'7': dict(worktree='/w/b7', session='s7', head='7' * 40,
+                                                   feedback='Coordinator: #7 conflicts with work'),
                                          '5': dict(worktree='/w/b5', head='5' * 40)}})
     out, cl = [], [claude(1, '/w/b7', 'b7', 's7')]
-    assert slots.park_ready(PRS, COLS, out=out.append, claudes=cl, park=lambda c, say: None) == []
-    assert out == ['park: #7 is in rework and has pushed no new head since 77777777: it keeps running']
-    assert set(slots.load()['rework']) == {'7'}  # #5 is no longer open: forgotten
-    prs = {**PRS, 7: dict(PRS[7], head='a' * 40)}
-    assert slots.park_ready(prs, COLS, out=out.append, claudes=cl, park=lambda c, say: None) == [7]
+    assert slots.park_ready(PRS, COLS, out=out.append, claudes=cl, park=lambda c, say: None) == [7]
     st = slots.load()
-    assert st['rework'] == {} and st['parked']['7']['head'] == 'a' * 40
+    assert st['rework'] == {} and st['parked']['7']['head'] == '7' * 40  # #5 is no longer open: forgotten
+
+
+def test_a_screenshot_job_keeps_its_claude_until_the_body_has_an_image():
+    """#519: revived for screenshots while its card stayed in Ready; it is parked once the
+    body has an image (the reason is gone), not before."""
+    text = 'Coordinator: #7 needs screenshots before Human Review. Take them from staging.'
+    slots.save({'parked': {}, 'rework': {'7': dict(worktree='/w/b7', session='s7', head='7' * 40,
+                                                   feedback=text, reason=slots.revive_reason(text))}})
+    out, cl = [], [claude(1, '/w/b7', 'b7', 's7')]
+    assert slots.park_ready(PRS, COLS, out=out.append, claudes=cl, park=lambda c, say: None) == []
+    assert out == ['park: #7 is in rework and its PR body has no screenshot yet: it keeps running']
+    prs = {**PRS, 7: dict(PRS[7], body='![shot](https://github.com/user-attachments/assets/0123456789abcdef0123)')}
+    assert slots.park_ready(prs, COLS, out=out.append, claudes=cl, park=lambda c, say: None) == [7]
 
 
 # -- (b) revive ------------------------------------------------------------------------

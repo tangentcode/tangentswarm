@@ -302,10 +302,31 @@ def _park(c, out):
     return None
 
 
+def revive_reason(text):
+    """Why a Claude was revived, from its feedback: 'shots' for the screenshot job."""
+    return 'shots' if 'needs screenshots before Human Review' in (text or '') else 'rework'
+
+
+def rework_open(rw, pr, head):
+    """Why a rework Claude whose PR is in Ready must keep running, or None (park it).
+    MethBot 2026-11-15 3:35 AM ET: #519's worker added the screenshots to the body (no new
+    head) and stayed in a rework slot, so rework=3/3 held #516 with NEEDS_WORKER.
+      - revived for the screenshot job: it runs until the body has an image;
+      - revived for anything else: the card is back in Ready, so the reason is gone."""
+    if not rw:
+        return None
+    if (rw.get('reason') or revive_reason(rw.get('feedback'))) == 'shots':
+        from .gatechecks import image_urls
+        if not image_urls(pr.get('body') or ''):
+            return 'its PR body has no screenshot yet'
+    return None
+
+
 def park_ready(prs, cols, dry=False, out=print, claudes=None, park=None, path=None):
     """(a) Park the Claude of each PR in Ready: record its session id, then /exit it. The
-    tmux window, its shell, the branch and the worktree stay. A rework Claude is kept until
-    it pushes a new head. Returns the parked PR numbers."""
+    tmux window, its shell, the branch and the worktree stay. A rework Claude in Ready keeps
+    running only while the reason it was revived for is open (rework_open). Returns the
+    parked PR numbers."""
     ready = {p['number'] for p in cols.get(board.READY, [])}
     claudes = attach_prs(running() if claudes is None else claudes, prs)
     st = load(path)
@@ -321,8 +342,9 @@ def park_ready(prs, cols, dry=False, out=print, claudes=None, park=None, path=No
             continue
         head = (prs.get(n) or {}).get('head') or ''
         rw = st['rework'].get(str(n))
-        if rw and rw.get('head') and rw['head'] == head:
-            out(f"park: #{n} is in rework and has pushed no new head since {head[:8]}: it keeps running")
+        keep = rework_open(rw, prs.get(n) or {}, head)
+        if keep:
+            out(f"park: #{n} is in rework and {keep}: it keeps running")
             continue
         if not c.get('pane'):
             out(f"park: #{n} Claude pid {c['pid']} is not in the {TMUX_SESSION} tmux session: not parked")
@@ -395,7 +417,8 @@ def revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, path
                 return
             d = load(path)
             d['rework'][str(n)] = dict(session=sid or '', window=window, pane=pane, worktree=wt, branch=branch,
-                                       head=_git(wt, 'rev-parse', 'HEAD'), started=et_now(), feedback=text[:200])
+                                       head=_git(wt, 'rev-parse', 'HEAD'), started=et_now(), feedback=text[:200],
+                                       reason=revive_reason(text))
             d['parked'].pop(str(n), None)
             save(d, path)
 
