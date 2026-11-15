@@ -403,3 +403,15 @@ def test_a_dry_run_stops_at_a_waiting_pull(monkeypatch, tmp_path):
     monkeypatch.setattr(F.Flow, 'advance', lambda self, d, prs, s: self.note(f"#{d['pr']} pull waiting (1 min): CI"))
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False))
     assert pulled == [] and 'note: #3 pull waiting (1 min): CI' in out
+
+
+def test_a_dry_run_counts_a_gated_running_pull_in_staging(monkeypatch, tmp_path):
+    """Live dry run 2026-11-15: #476 (the running pull) would pass hr-gate --apply, and the
+    fill then pulled #476 again because it was still in the Ready list."""
+    from tangentswarm import flow as F
+    cols = {board.READY: [pr(3, board.READY), pr(9, board.READY)]}
+    monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
+    F.save_pull(dict(pr=3, head='3' * 40, branch='b', item='I', work='w' * 40, started=0))
+    monkeypatch.setattr(F.Flow, 'advance', lambda self, d, prs, s: self.change(f"#{d['pr']} hr-gate --apply {d['pr']}"))
+    out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False))
+    assert pulled == [9] and 'fill: #9 is the extra Staging pull' in out

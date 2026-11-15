@@ -348,8 +348,12 @@ class Cascade(Advance):
                 if d and d.get('pr') != ended:
                     if not self.finish(d, prs, scratch):
                         return cols
-                    if self.dry:
+                    if self.dry:  # count it where the live run would see it: out of Ready, into Staging
                         ended = d.get('pr')
+                        if any(f"#{ended} hr-gate --apply" in line for line in self.f.did):
+                            done = [q for q in cols.get(board.READY, []) if q['number'] == ended]
+                            cols = dict(cols, **{board.READY: [q for q in cols.get(board.READY, []) if q not in done],
+                                                 board.STAGING: cols.get(board.STAGING, []) + done})
                     else:
                         prs, cols = self.f.columns()
                     continue
