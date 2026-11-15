@@ -385,3 +385,16 @@ def test_a_closed_pr_drops_its_held_launch():
     launches.hold('b', pr=78)
     Fake(col=board.IN_PROGRESS).run(W.Action('closed', 78))
     assert launches.read_queue() == []
+
+
+def test_a_reopened_pr_leaves_canceled_for_its_working_column():
+    """Codex on PR #26: a reopened PR stayed in Canceled."""
+    opened = {'action': 'reopened', 'repository': REPO, 'pull_request': pr(9, draft=True)}
+    (a,) = W.classify('pull_request', opened)
+    assert a.kind == 'card' and a.args['reopened']
+    ex = Fake(col=board.CANCELED)
+    ex.run(a)
+    assert ex.calls[0][-1] == board.OPTION[board.IN_PROGRESS]
+    ex = Fake(col=board.AUTO_REVIEW)  # a plain "opened" never moves an existing card
+    ex.run(W.Action('card', 9, args=dict(draft=True, what='pr', reopened=False)))
+    assert ex.calls == [] and 'already has a card' in ex.done[0]

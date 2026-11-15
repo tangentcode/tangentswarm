@@ -231,7 +231,8 @@ def classify(event, p):
         if action in ('opened', 'reopened'):
             if base not in ('main', 'deploy'):
                 return [Action('wake', n, f"#{n} targets {base}, not main", dict(key=f'base:{n}'))]
-            return [Action('card', n, f"PR #{n} {action}", dict(draft=bool(pr.get('draft')), what='pr'))]
+            return [Action('card', n, f"PR #{n} {action}", dict(draft=bool(pr.get('draft')), what='pr',
+                                                               reopened=action == 'reopened'))]
         if pr.get('draft') and action not in ('ready_for_review',):
             return [Action('skip', pr=n, why=f'draft PR: {action}')]
         if action == 'ready_for_review':
@@ -591,7 +592,8 @@ class Executor:
             launches.drop_pr(a.pr)
 
     def do_card(self, a):
-        """A new PR (draft -> In Progress, ready -> Auto Review) or issue (Triage) gets its card."""
+        """A new PR (draft -> In Progress, ready -> Auto Review) or issue (Triage) gets its card.
+        A reopened PR whose card is in Canceled or Done goes back to that working column."""
         if a.args.get('what') == 'issue':
             col = board.TRIAGE
             url = f'https://github.com/{REPO}/issues/{a.pr}'
@@ -599,8 +601,9 @@ class Executor:
             col = board.IN_PROGRESS if a.args.get('draft') else board.AUTO_REVIEW
             url = f'https://github.com/{REPO}/pull/{a.pr}'
         item, cur = self.card(a.pr)
-        if item and cur:
+        if item and cur and not (a.args.get('reopened') and cur in (board.CANCELED, board.DONE)):
             return self.note(f"#{a.pr} already has a card in {cur}")
+        # Codex on PR #26: a reopened PR left its card in Canceled, where nothing works on it
         if self.dry:
             return self.note(f"would put #{a.pr} on Project 4 in {col}")
         item = item or json.loads(self._sh(['gh', 'project', 'item-add', '4', '--owner', 'tangentcode', '--url', url,
