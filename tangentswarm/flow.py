@@ -185,10 +185,12 @@ def gate_verdict(rows):
     return ('fail', hard) if hard else ('wait', wait)
 
 
-def ready_order(ready, conflicts):
-    """Ready PRs in pull order: milestone rank, fewest conflicts, then oldest (entry time when
-    known, else the lower PR number)."""
-    return sorted(ready, key=lambda p: (p['rank'], conflicts.get(p['number'], 0), p.get('entered') or 0, p['number']))
+def ready_order(ready, conflicts=None, active=None):
+    """Ready PRs in pull order: the shared pick order (board.pick_key: fast-track, the soonest
+    milestone due date, the lowest number; tangentswarm #35, Michal 2026-11-15 6:09 PM ET: MVP
+    PRs due Dec 1 went ahead of ptw 15 PRs due Nov 15). The pull still takes the first one in
+    this order that merges cleanly; conflicts no longer reorder them."""
+    return sorted(ready, key=lambda p: board.pick_key(p, active))
 
 
 def event_wants_step(name, payload):
@@ -394,12 +396,8 @@ class Flow:
                   'no Ready PR stacks cleanly on main + Human Review + Staging: one speculative rebase needed')
 
     def staging_order(self, staging):
-        try:
-            order = [r['pr'] for r in self.g['queue_from_board_or_file']()]
-        except Exception:
-            order = []
-        pos = {n: i for i, n in enumerate(order)}
-        return sorted(staging, key=lambda p: (pos.get(p['number'], len(pos)), p['number']))
+        """Staging in the shared pick order (board.pick_key; tangentswarm #35)."""
+        return sorted(staging, key=lambda p: board.pick_key(p, board.active_fast_track()))
 
     def fetch_work(self, scratch):
         """Fetch origin work into the scratch repo; return its commit."""
