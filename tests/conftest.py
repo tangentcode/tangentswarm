@@ -31,6 +31,9 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(advance, 'CASCADE_LOG', tmp_path / 'cascade.log')
     from tangentswarm import flow
     from tangentswarm import stophook
+    monkeypatch.setattr(advance, 'check_runs', lambda head: [])  # no real GitHub read in a test
+    from tangentswarm import tick as _tick
+    monkeypatch.setattr(_tick, 'STATE_DIR', tmp_path / 'tick-state')
     monkeypatch.setattr(stophook, 'LOG', tmp_path / 'stop-hook.log')
     monkeypatch.setattr(stophook, 'SEEN', tmp_path / 'stop-hook-seen.json')
     monkeypatch.setattr(flow, 'STATE', tmp_path / 'pull.json')

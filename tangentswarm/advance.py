@@ -108,6 +108,39 @@ def minbot_order(prs, active=None):
     return sorted(prs, key=key)
 
 
+CI_BAD = ('failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale')
+
+
+def check_runs(head):
+    """[{name, status, conclusion}] of the latest check runs on the exact head (REST, the
+    minbot App quota through the gh shim)."""
+    r = proc.sh('gh', 'api', '--paginate', '--slurp',
+                f'repos/{REPO}/commits/{head}/check-runs?per_page=100&filter=latest',
+                check=False, who='swarm-advance')
+    if r.returncode:
+        raise RuntimeError(f"check runs of {head[:8]}: {(r.stderr or r.stdout).strip()[:160]}")
+    return [c for page in json.loads(r.stdout or '[]') for c in page.get('check_runs', [])]
+
+
+def ci_problem(runs):
+    """tangentswarm #30: why CI on the head is not green, or None. A failed, cancelled or
+    timed-out job is never green (platform #516: "Linux mna tests" failed at 10:17 PM ET and
+    a MinBot pass at 10:20 PM ET still said "CI green (5 checks)"); a job still running is
+    not green yet. Skipped and neutral jobs are fine."""
+    bad = [f'"{c.get("name")}" {c.get("conclusion")}' for c in runs
+           if c.get('status') == 'completed' and c.get('conclusion') in CI_BAD]
+    if bad:
+        return 'CI is not green: ' + ', '.join(bad) + ' on this head'
+    running = [c.get('name') for c in runs if c.get('status') != 'completed']
+    if running:
+        return 'CI is still running: ' + ', '.join(f'"{n}"' for n in running)
+    return None
+
+
+def check_text(head, why):
+    return f"{why}.\nThe card stays out of Ready (swarm-advance, mechanical)."
+
+
 def pass_text(head):
     return (f"Exact-head pass on {head[:10]} (swarm-advance, mechanical): not a draft; merges cleanly "
             "onto main; Codex clean on this head with no open Codex threads; Linux CI green.")
@@ -199,6 +232,11 @@ class Advance:
             if why:
                 skipped.append(f"#{n} {why}")
                 continue
+            ci = ci_problem(check_runs(p['head']))  # every job on the exact head, not only Linux
+            if ci:
+                skipped.append(f"#{n} {ci}")
+                self.ci_check_comment(p, ci)
+                continue
             self.apply_pass(p)
             return True
         self.why.append('Auto Review: ' + ', '.join(skipped))
@@ -224,6 +262,20 @@ class Advance:
             rows, _ = self.g['evaluate'](full, hr_peers=self.g['list_hr_prs'](), scratch=scratch)
         bad = [f"{name.strip()}: {why[:80]}" for name, ok, why in rows if name.startswith(MINBOT_ROWS) and not ok]
         return '; '.join(bad) if bad else None
+
+    def ci_check_comment(self, p, why):
+        """Post the "MinBot check" comment once per head when a job failed (#30 mockup)."""
+        from . import tick
+        if not why.startswith('CI is not green'):
+            return
+        state = tick.State(tick.STATE_DIR / 'state.json')
+        key = f"minbot-check:{p['number']}@{p['head']}"
+        if state.done(key):
+            return
+        self.minbot('evidence', p['number'], '--repo', REPO, '--title', 'MinBot check', '--commit', p['head'],
+                    '--body', check_text(p['head'], why))
+        if not self.dry:
+            state.mark(key)
 
     def apply_pass(self, p):
         n, head = p['number'], p['head']

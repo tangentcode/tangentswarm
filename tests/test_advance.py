@@ -160,6 +160,34 @@ def test_minbot_pass_refuses_a_failed_gate_row(board_read):
     assert out[0].startswith('nothing to do: Human Review 2/2') and '#7 5 CI green (Linux): FAILURE' in out[0]
 
 
+def test_a_failed_job_on_the_head_blocks_the_minbot_pass_and_says_why(board_read, monkeypatch):
+    """tangentswarm #30, platform #516: "Linux mna tests" failed at 10:17 PM ET, and a MinBot
+    pass at 10:20 PM ET still claimed "CI green (5 checks)"."""
+    cols = {board.HUMAN_REVIEW: [1, 2], board.STAGING: [3, 4, 5],
+            board.AUTO_REVIEW: [dict(number=7, head=H, item='I7')]}
+    board_read(cols)
+    runs = [{'name': 'Linux mna tests', 'status': 'completed', 'conclusion': 'failure'},
+            {'name': 'Linux rs tests', 'status': 'completed', 'conclusion': 'success'},
+            {'name': 'docs', 'status': 'completed', 'conclusion': 'skipped'}]
+    monkeypatch.setattr(A, 'check_runs', lambda head: runs)
+    g = Gate(cols, details={7: codex_pr()})
+    out, calls = run(g)
+    assert g.moves == [] and len(calls) == 1
+    assert calls[0][calls[0].index('--title') + 1] == 'MinBot check'  # not "MinBot pass"
+    body = calls[0][calls[0].index('--body') + 1]
+    assert body.startswith('CI is not green: "Linux mna tests" failure on this head.') and 'stays out of Ready' in body
+    assert '#7 CI is not green' in out[0]
+    _, again = run(g)
+    assert again == []  # the check comment is posted once per head
+
+
+def test_ci_problem_reads_every_job():
+    ok = {'status': 'completed', 'conclusion': 'success', 'name': 'a'}
+    assert A.ci_problem([ok, dict(ok, conclusion='skipped'), dict(ok, conclusion='neutral')]) is None
+    assert A.ci_problem([ok, dict(ok, conclusion='cancelled', name='b')]) == 'CI is not green: "b" cancelled on this head'
+    assert A.ci_problem([ok, {'status': 'in_progress', 'name': 'c'}]) == 'CI is still running: "c"'
+
+
 def test_nothing_to_do_is_one_line(board_read):
     cols = {board.HUMAN_REVIEW: [1, 2], board.STAGING: [3, 4, 5],
             board.AUTO_REVIEW: [dict(number=7, head=H, item='I7'), dict(number=8, head=H, item='I8')]}
