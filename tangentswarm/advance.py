@@ -646,8 +646,14 @@ class Cascade(Advance):
         ready = len([p for p in cols.get(board.READY, []) if not p.get('draft')])
         k = slots.kinds(slots.attach_prs(slots.running(), prs), slots.load())
         from . import boardcache
+        snap = boardcache.snapshot(self.g['gql'])
+        if not self.dry:
+            dropped = slots.prune_named(slots.taken_issues(snap, prs))
+            if dropped:
+                self.out(f"signal: dropped stale named entries (no draft PR): "
+                         f"{', '.join('#' + str(x) for x in dropped)}")
         st = slots.load()
-        issues = slots.backlog_issues(boardcache.snapshot(self.g['gql']), board.active_fast_track(), prs,
+        issues = slots.backlog_issues(snap, board.active_fast_track(), prs,
                                       named=st['named'], launching=st['launching'])
         n, target = slots.start_plan(len(k['new']), issues, ready, READY_TARGET)
         live = slots.live_claudes()

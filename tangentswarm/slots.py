@@ -198,6 +198,13 @@ def key_text(issue):
     return f"#{n}=(ft:{'yes' if ft == 0 else 'no'},due:{when},n:{n})"
 
 
+def taken_issues(snap, prs=None):
+    """The issues an open PR closes (board snapshot and board PRs)."""
+    from . import boardcache
+    taken = {i['number'] for _, c in boardcache.open_prs(snap) for i in boardcache.closes(c)}
+    return taken | {i for p in (prs or {}).values() if p.get('state', 'OPEN') == 'OPEN' for i in p.get('closes') or ()}
+
+
 def backlog_issues(snap, active_ft=None, prs=None, named=None, now=None, launching=None):
     """The launch picker (Michal 2026-11-15 12:16 AM ET: START_CLAUDE named Parked #344 while
     Backlog held the approved issues). Open platform issues in the BACKLOG column (by option
@@ -207,8 +214,7 @@ def backlog_issues(snap, active_ft=None, prs=None, named=None, now=None, launchi
     snap: the board snapshot (boardcache); prs: board PRs ({n: {closes}})."""
     from . import boardcache
     now = time.time() if now is None else now
-    taken = {i['number'] for _, c in boardcache.open_prs(snap) for i in boardcache.closes(c)}
-    taken |= {i for p in (prs or {}).values() if p.get('state', 'OPEN') == 'OPEN' for i in p.get('closes') or ()}
+    taken = taken_issues(snap, prs)
     recent = {int(k) for k, t in (named or {}).items() if now - float(t) < LAUNCH_GRACE}
     recent |= {int(k) for k, t in (launching or {}).items() if now - float(t) < LAUNCHING_TTL}
     out = []
@@ -252,6 +258,23 @@ def live_claudes(sessions=None, alive=None):
             continue
         n += bool(alive(pid))
     return n
+
+
+def prune_named(taken, path=None, now=None):
+    """Drop stale 'named' entries: an issue named by a pass that never launched it (before
+    the launcher) has no open PR, and its entry hid it from the picker for 45 minutes
+    (2026-11-15: #399-#431, #502, #503). Named means "its draft PR exists", so an entry
+    whose issue no open PR closes (and older than 10 minutes: a new PR can lag in the board
+    snapshot) is dropped. Returns the dropped issue numbers."""
+    now = time.time() if now is None else now
+    d = load(path)
+    drop = [k for k, t in d['named'].items()
+            if int(k) not in taken and now - float(t) > 600]  # a new PR may lag in the snapshot
+    if drop:
+        for k in drop:
+            d['named'].pop(k)
+        save(d, path)
+    return sorted(int(k) for k in drop)
 
 
 def mark_named(numbers, path=None, now=None):

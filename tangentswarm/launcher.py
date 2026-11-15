@@ -10,7 +10,7 @@ while nothing launched. Now the cascade launches the issues it names, through th
      (pushed; an existing branch is reused)
   2. a draft PR (base main, body "Fixes #N"), put on Project 4 in In Progress; an open PR
      for the branch is reused
-  3. the issue card moves Backlog -> Active (option ids)
+  3. the issue's milestone is copied to the PR; the issue card moves Backlog -> Active
   4. the brief file (tangentswarm.brief) and its section in the PR body
   5. launches.launch: swarm-start-scoped (worktree, window <code>-<PR>-<branch>, the Stop
      hook, memory admission; a memory hold queues it for swarm-tick) and the brief line
@@ -107,6 +107,17 @@ class Launcher:
             raise RuntimeError(f"gh pr create gave no PR URL: {url[:200]}")
         return int(m.group(1)), f"opened draft PR #{m.group(1)}"
 
+    def milestone(self, n, pr):
+        """Copy the issue's milestone to the PR (REST; swarm-label-sync cannot write
+        milestones, and `gh pr edit` fails on the Projects classic deprecation)."""
+        ms = self.sh('gh', 'api', f'repos/{REPO}/issues/{n}', '--jq', '.milestone.number // empty', check=False)
+        if not ms.strip().isdigit():
+            return f"issue #{n} has no milestone"
+        if self.dry:
+            return f"would set milestone {ms.strip()} on PR #{pr}"
+        self.sh('gh', 'api', '-X', 'PATCH', f'repos/{REPO}/issues/{pr}', '-F', f'milestone={ms.strip()}')
+        return f"milestone {ms.strip()} set on PR #{pr}"
+
     def set_status(self, item, col):
         self.sh('gh', 'project', 'item-edit', '--id', item, '--project-id', self.g['project_id'](),
                 '--field-id', self.g['STATUS_FIELD'], '--single-select-option-id', board.OPTION[col])
@@ -162,6 +173,7 @@ class Launcher:
         if not self.dry:
             slots.mark_named([n])  # the draft PR exists: now it counts as named
             slots.launch_done(n)
+        steps.append(self.milestone(n, pr))
         steps.append(self.board(n, pr))
         path, note = self.brief(n, title, branch, pr)
         steps.append(note)

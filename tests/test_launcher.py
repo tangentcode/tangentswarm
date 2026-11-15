@@ -98,3 +98,26 @@ def test_the_picker_skips_a_queued_launch(tmp_path):
     assert [i['number'] for i in got] == [413]
     got = slots.backlog_issues(snap, launching={'412': 1000.0}, now=1000 + slots.LAUNCHING_TTL)
     assert [i['number'] for i in got] == [412, 413]
+
+
+def test_the_launch_copies_the_issue_milestone_to_the_pr(tmp_path, monkeypatch):
+    from tangentswarm import brief
+    monkeypatch.setattr(brief, 'BRIEF_DIR', tmp_path / 'briefs')
+    monkeypatch.setattr(brief, 'write_brief', lambda n: None)
+    run = Run()
+    real = run.__call__
+
+    def answer(argv, **k):
+        r = real(argv, **k)
+        if argv[:3] == ['gh', 'api', 'repos/tangentcode/platform/issues/412']:
+            r.stdout = '7'
+        return r
+    L.Launcher(g=gate(), run=answer, git_dir=tmp_path, launch=lambda *a, **k: ('held', {})).launch(412, 't')
+    assert ['gh', 'api', '-X', 'PATCH', 'repos/tangentcode/platform/issues/601', '-F', 'milestone=7'] in run.calls
+
+
+def test_stale_named_entries_without_a_draft_pr_are_dropped():
+    """2026-11-15: #399-#431, #502, #503 stayed "named" from passes that never launched."""
+    slots.save(dict(slots.load(), named={'399': 1000.0, '412': 1000.0, '502': 5000.0}))
+    assert slots.prune_named(taken={412}, now=5300.0) == [399]  # #502 is fresh: its PR may lag
+    assert set(slots.load()['named']) == {'412', '502'}
