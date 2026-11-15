@@ -517,21 +517,27 @@ class Cascade(Advance):
     # -- 3. signal ----------------------------------------------------------------
     def signal(self, cols):
         """(c) Michal 2026-11-14 8:43 PM ET: START_CLAUDE whenever fewer than slots.NEW_SLOTS
-        new-work Claudes run and Active issues without a PR exist (slots.NEW_SLOTS_SHORT while
-        Ready is short). The line names the issues to start, in Ready order."""
+        new-work Claudes run and Backlog issues without a PR exist (slots.NEW_SLOTS_SHORT while
+        Ready is short). The line names the issues to start, from slots.backlog_issues (Michal
+        2026-11-15: never Parked, Triage or #377). A named issue is kept for
+        slots.LAUNCH_GRACE s, so the next pass does not name it again before its PR exists."""
         from . import slots
         prs = getattr(self, 'prs', None) or {}
         ready = len([p for p in cols.get(board.READY, []) if not p.get('draft')])
         k = slots.kinds(slots.attach_prs(slots.running(), prs), slots.load())
         from . import boardcache
-        issues = slots.active_issues(boardcache.snapshot(self.g['gql']), board.active_fast_track(), prs)
+        issues = slots.backlog_issues(boardcache.snapshot(self.g['gql']), board.active_fast_track(), prs,
+                                      named=slots.load()['named'])
         n, target = slots.start_plan(len(k['new']), issues, ready, READY_TARGET)
         facts = (f"new={len(k['new'])}/{target} rework={len(k['rework'])}/{slots.REWORK_SLOTS} "
-                 f"ready={ready}/{READY_TARGET} active_without_pr={len(issues)}")
+                 f"ready={ready}/{READY_TARGET} backlog_without_pr={len(issues)}")
         if n:
-            self.out(f"START_CLAUDE n={n} issues={','.join('#' + str(i['number']) for i in issues[:n])} {facts}")
+            pick = [i['number'] for i in issues[:n]]
+            self.out(f"START_CLAUDE n={n} issues={','.join('#' + str(x) for x in pick)} {facts}")
+            if not self.dry:
+                slots.mark_named(pick)
         elif not issues:
-            self.out(f"signal: no Active issue without a PR ({facts}): no START_CLAUDE")
+            self.out(f"signal: no Backlog issue without a PR ({facts}): no START_CLAUDE")
         else:
             self.out(f"signal: the new-work slots are full ({facts}): no START_CLAUDE")
 

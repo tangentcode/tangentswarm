@@ -1,7 +1,7 @@
 """Claude slots: new-work and rework (Michal 2026-11-14 8:43 PM ET).
 
 Of the usual 5 to 8 running Claudes:
-  new work  3 to 4 slots. First implementations of Active issues, each on its own branch.
+  new work  3 to 4 slots. First implementations of Backlog issues, each on its own branch.
             Never stopped. Finished PRs pile up in Ready, which is the buffer.
   rework    2 to 3 slots. A parked Claude is revived with `claude --resume SESSION` plus
             feedback (swarm-revive).
@@ -12,10 +12,11 @@ Of the usual 5 to 8 running Claudes:
                session id is recorded first, so that swarm-revive can resume it.
   (b) revive   swarm-revive PR FEEDBACK: resume that session in the PR's window in a rework
                slot, then send the feedback as one line.
-  (c) signal   START_CLAUDE while fewer than NEW_SLOTS new-work Claudes run and Active issues
-               without a PR exist (up to NEW_SLOTS_SHORT while Ready is short). The issues
-               are picked in Ready order: the active fast-track first, then a priority
-               milestone, then the oldest (lowest number).
+  (c) signal   START_CLAUDE while fewer than NEW_SLOTS new-work Claudes run and Backlog issues
+               without a PR exist (up to NEW_SLOTS_SHORT while Ready is short). The picker
+               (backlog_issues) takes only the Backlog column, never Parked, Triage or the
+               NEVER_START list (#377 is held): the active fast-track first, then a
+               milestone (the priority milestone first), then the lowest number.
 
 A running Claude is found from ~/.claude/sessions/<pid>.json (pid, sessionId, cwd, tmux
 pane); only live Claudes in platform worktrees (~/ver/platform.*) count. A rework Claude is
@@ -50,6 +51,12 @@ WORKTREE_PARENT = Path(os.environ.get('SWARM_WORKTREE_PARENT', str(HOME / 'ver')
 NEW_SLOTS = int(os.environ.get('SWARM_NEW_SLOTS', '3'))              # new-work Claudes to keep running
 NEW_SLOTS_SHORT = int(os.environ.get('SWARM_NEW_SLOTS_SHORT', '4'))  # ... while Ready is short
 REWORK_SLOTS = int(os.environ.get('SWARM_REWORK_SLOTS', '3'))
+# The launch picker never names these (the swarmbot handoff: parked items and held #377).
+# Parked cards are also skipped by column (Parked) and by the label "parked".
+NEVER_START = {int(x) for x in os.environ.get(
+    'SWARM_NEVER_START', '21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,'
+    '110,116,117,120,125,202,203,204,344,350,377').split(',') if x.strip().isdigit()}
+LAUNCH_GRACE = int(os.environ.get('SWARM_LAUNCH_GRACE', '2700'))  # s: a named issue is not named again
 TMUX_SESSION = 'agents'
 FEEDBACK_MAX = 4000
 
@@ -63,7 +70,7 @@ def load(path=None):
         d = {}
     d = d if isinstance(d, dict) else {}
     return {'parked': dict(d.get('parked') or {}), 'rework': dict(d.get('rework') or {}),
-            'relayed': dict(d.get('relayed') or {})}
+            'relayed': dict(d.get('relayed') or {}), 'named': dict(d.get('named') or {})}
 
 
 def save(d, path=None):
@@ -165,27 +172,44 @@ def latest_session(worktree, projects=None):
     return files[-1].stem if files else None
 
 
-# -- (c) Active issues without a PR ----------------------------------------------------
+# -- (c) Backlog issues without a PR: the launch picker ----------------------------------------------------
 
-def active_issues(snap, active_ft=None, prs=None):
-    """Open platform issues in the Active column (by option id) that no open PR closes, in
-    Ready order: the active fast-track first, then a priority milestone, then the lowest
-    number. snap: the board snapshot (boardcache); prs: board PRs ({n: {closes}}), a second
-    source of 'has a PR'."""
+def backlog_issues(snap, active_ft=None, prs=None, named=None, now=None):
+    """The launch picker (Michal 2026-11-15 12:16 AM ET: START_CLAUDE named Parked #344 while
+    Backlog held 16 approved issues). Open platform issues in the BACKLOG column (by option id;
+    so never Triage, Inbox, Discuss, Active or Parked) that no open PR closes, without the label
+    "parked" or "triage", not in NEVER_START, and not named by START_CLAUDE in the last
+    LAUNCH_GRACE s (named: {number: time}; its Claude has no PR yet). Order: the active
+    fast-track, then a priority milestone, then any other milestone, then none; then the
+    lowest number. snap: the board snapshot (boardcache); prs: board PRs ({n: {closes}})."""
     from . import boardcache
     from .tick import milestone_rank
+    now = time.time() if now is None else now
     taken = {i['number'] for _, c in boardcache.open_prs(snap) for i in boardcache.closes(c)}
     taken |= {i for p in (prs or {}).values() if p.get('state', 'OPEN') == 'OPEN' for i in p.get('closes') or ()}
+    recent = {int(k) for k, t in (named or {}).items() if now - float(t) < LAUNCH_GRACE}
     out = []
     for it, c in boardcache.open_issues(snap):
-        if boardcache.col(it) != board.ACTIVE or c['number'] in taken:
+        n = c['number']
+        if boardcache.col(it) != board.BACKLOG or n in taken or n in NEVER_START or n in recent:
             continue
-        if 'parked' in [l['name'] for l in (c.get('labels') or {}).get('nodes') or []]:
+        if {'parked', 'triage'} & {l['name'].lower() for l in (c.get('labels') or {}).get('nodes') or []}:
             continue
-        rank = board.priority_rank(board.is_active_fast_track(c['number'], (), active_ft),
-                                   milestone_rank([(c.get('milestone') or {}).get('title')]) == 0)
-        out.append(dict(number=c['number'], title=c.get('title') or '', rank=rank))
+        ms = (c.get('milestone') or {}).get('title')
+        ft = board.is_active_fast_track(n, (), active_ft)
+        rank = (0 if ft else 1, milestone_rank([ms]), 0 if ms else 1)
+        out.append(dict(number=n, title=c.get('title') or '', rank=rank, milestone=ms))
     return sorted(out, key=lambda i: (i['rank'], i['number']))
+
+
+def mark_named(numbers, path=None, now=None):
+    """Keep the issues START_CLAUDE named, so the next pass does not name them again while
+    their Claude has no PR yet. Entries older than LAUNCH_GRACE are dropped."""
+    now = time.time() if now is None else now
+    d = load(path)
+    d['named'] = {k: t for k, t in d['named'].items() if now - float(t) < LAUNCH_GRACE}
+    d['named'].update({str(n): now for n in numbers})
+    save(d, path)
 
 
 def start_plan(new_running, issues, ready, ready_target):

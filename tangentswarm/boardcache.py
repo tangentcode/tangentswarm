@@ -12,7 +12,7 @@ is kept in PATH and reused by every process while it is younger than MAX_AGE sec
 
   promoted.read_board    columns of open PRs, fast-track candidates
   Flow.columns           tick.board_prs shape (the cascade)
-  slots.active_issues    Active issues without an open PR
+  slots.backlog_issues   Backlog issues without an open PR (the launch picker)
   flow-status            open PRs with their status-change timeline
   hr-gate                list_board_items rows
 

@@ -33,20 +33,40 @@ def pr_node(n, closes, col=board.IN_PROGRESS):
                         'closingIssuesReferences': {'nodes': [{'number': i} for i in closes]}}}
 
 
-# -- (c) Active issues without a PR, in Ready order -------------------------------------
+# -- (c) the launch picker: Backlog issues without a PR ---------------------------------
 
-def test_active_issues_without_a_pr_in_ready_order():
+def test_the_picker_takes_only_backlog_issues_in_milestone_then_number_order():
+    """Michal 2026-11-15 12:16 AM ET: START_CLAUDE named Parked #344 (active_without_pr=1)
+    while Backlog held 16 approved issues, so the tick launched nothing."""
     snap = {'issues': issue_nodes([
-        (30, board.ACTIVE), (21, board.ACTIVE), (25, board.ACTIVE, {'milestone': 'ptw 15'}),
-        (27, board.ACTIVE),                                    # open PR #90 on the board closes it
-        (29, board.ACTIVE, {'labels': ['parked']}),
-        (31, board.BACKLOG), (32, board.ACTIVE, {'repo': 'tangentcode/other'}),
-        (33, board.ACTIVE, {'state': 'CLOSED'}),
-        (34, board.ACTIVE),                                    # a PR from prs closes it
-        (28, board.ACTIVE), (40, board.ACTIVE)]),
-        'prs': [pr_node(90, [27])]}
-    got = slots.active_issues(snap, active_ft=40, prs={95: {'closes': [34]}})
-    assert [i['number'] for i in got] == [40, 25, 21, 28, 30]  # fast-track, priority milestone, oldest
+        (344, board.ACTIVE),                                   # Active: not the launch queue
+        (499, board.BACKLOG), (412, board.BACKLOG),
+        (505, board.BACKLOG, {'milestone': 'ptw 15'}), (490, board.BACKLOG, {'milestone': 'MVP'}),
+        (501, board.BACKLOG, {'milestone': 'MVP'}),
+        (377, board.BACKLOG),                                  # held
+        (350, board.BACKLOG),                                  # parked by the handoff list
+        (420, board.BACKLOG, {'labels': ['parked']}),
+        (421, board.BACKLOG, {'labels': ['Triage']}),
+        (430, board.TRIAGE), (431, board.PARKED), (432, board.INBOX), (433, board.DISCUSS),
+        (434, board.BACKLOG),                                  # an open PR closes it
+        (435, board.BACKLOG, {'repo': 'tangentcode/other'}), (436, board.BACKLOG, {'state': 'CLOSED'}),
+        (507, board.BACKLOG, {'milestone': 'ptw 15'})]),
+        'prs': [pr_node(90, [434])]}
+    got = slots.backlog_issues(snap, active_ft=None, prs={}, now=0)
+    assert [i['number'] for i in got] == [505, 507, 490, 501, 412, 499]  # priority ms, other ms, none
+    ft = slots.backlog_issues(snap, active_ft=499, prs={}, now=0)
+    assert ft[0]['number'] == 499  # the active fast-track first
+
+
+def test_a_named_issue_is_not_named_again_until_the_grace_ends(tmp_path):
+    snap = {'issues': issue_nodes([(412, board.BACKLOG), (413, board.BACKLOG)]), 'prs': []}
+    path = tmp_path / 'slots.json'
+    slots.mark_named([412], path=path, now=1000)
+    named = slots.load(path)['named']
+    assert [i['number'] for i in slots.backlog_issues(snap, named=named, now=1000 + 60)] == [413]
+    assert [i['number'] for i in slots.backlog_issues(snap, named=named, now=1000 + slots.LAUNCH_GRACE)] == [412, 413]
+    slots.mark_named([413], path=path, now=1000 + slots.LAUNCH_GRACE)  # drops the old entry
+    assert set(slots.load(path)['named']) == {'413'}
 
 
 @pytest.mark.parametrize('new, issues, ready, want', [
