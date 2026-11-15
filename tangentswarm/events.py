@@ -59,8 +59,12 @@ def _offset(path, events):
 
 
 def pending(events=None, offset=None):
-    """True when the events file has grown past the saved offset (a stat, no read)."""
+    """True when the events file has grown past the saved offset (a stat, no read). The
+    first call saves the current end as the offset, so later events are seen."""
     events, offset = events or EVENTS, offset or OFFSET
+    if not offset.exists():
+        _save(offset, f"{_inode(events)}:{_size(events)}")
+        return False
     return _size(events) > _offset(offset, events)
 
 

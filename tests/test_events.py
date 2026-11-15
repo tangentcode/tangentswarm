@@ -75,3 +75,12 @@ def test_a_half_written_line_waits_and_a_rotated_file_is_read_from_the_start():
     E.EVENTS.rename(E.EVENTS.with_name('old.jsonl'))  # rotated: a new file (another inode)
     E.EVENTS.write_text(json.dumps(COMMENT) + '\n' + json.dumps(REVIEW) + '\n')
     assert E.new_records() == [COMMENT, REVIEW]
+
+
+def test_the_first_check_saves_the_offset_so_later_events_are_seen():
+    """Live 01:55 ET: with no offset file, pending() compared the size with itself forever."""
+    append({'event': 'pull_request', 'repo': E.REPO, 'pr': 1})
+    assert not E.OFFSET.exists() and E.pending() is False and E.OFFSET.exists()
+    append(REVIEW)
+    assert E.pending() is True
+    assert E.new_records() == [REVIEW]
