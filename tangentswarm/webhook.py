@@ -412,11 +412,11 @@ class Executor:
         self.minbot(a.pr)
 
     def do_codex(self, a):
-        from . import tick
-        full = self.g['fetch'](a.pr, refresh=True)
+        from . import advance
+        full = advance.codex_details(self.g['gql'], a.pr)
         if a.args.get('commit') and a.args['commit'] != full.get('headRefOid'):
             return self.note(f"#{a.pr}: Codex reviewed an older head: skip")
-        status, detail = tick.codex_status(full)
+        status, detail = advance.codex_decision(full)  # exact head, like the MinBot pass
         if status == 'findings':
             text = (f"Coordinator: #{a.pr}: Codex found issues on your head {full['headRefOid'][:8]} ({detail}). "
                     f"Read them with: gh pr view {a.pr} --comments (and the review threads). {ROOT_CAUSE}")
@@ -652,16 +652,16 @@ def _save_seen(d):
 # -- replay --------------------------------------------------------------------------------
 
 def replay_plan(n, full, ci):
-    """[Action] for PR n from its current state (pure). full: hr-gate's fetch(); ci: the
+    """[Action] for PR n from its current state (pure). full: advance.codex_details(); ci: the
     advance.ci_problem() text for the head, or None when CI is green. The actions are the
     ones a live delivery would give: the Codex result on the head (codex) and a completed CI
     run on the head (ci). Red CI goes back to the worker and a clean Codex then gives no MinBot
     check (it would refuse on red CI). The handlers re-read the PR, so a replay is safe to run twice."""
-    from . import tick
+    from . import advance
     head = full.get('headRefOid') or ''
     if (full.get('state') or 'OPEN') != 'OPEN':
         return [Action('skip', n, f"#{n} is {full.get('state', '').lower()}")]
-    status, detail = tick.codex_status(full)
+    status, detail = advance.codex_decision(full)
     acts = []
     if ci and not ci.startswith('CI is still running'):
         acts.append(Action('ci', n, f'replay: {ci}', dict(sha=head)))
@@ -676,7 +676,7 @@ def replay(n, ex=None):
     """Run the live handlers on PR n from its current state. Returns (actions, notes)."""
     from . import advance
     ex = ex or Executor()
-    full = ex.g['fetch'](n, refresh=True)
+    full = advance.codex_details(ex.g['gql'], n)
     ci = advance.ci_problem(advance.check_runs(full['headRefOid']))
     acts = replay_plan(n, full, ci)
     for a in acts:

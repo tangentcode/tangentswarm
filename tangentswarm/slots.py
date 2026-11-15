@@ -270,6 +270,18 @@ def unstarted_add(pr, path=None, now=None, **rec):
         d['unstarted'][str(pr)] = dict(rec, at=time.time() if now is None else now, queued=0)
 
 
+def brief_pending(pr, pane, unit, brief, branch='', issue=None, path=None, now=None):
+    """Its Claude runs, but the brief line was not sent (Codex on PR #26: the launch counted
+    as done and the Claude had no task). The unstarted record keeps the pane, so the start
+    retry (retry_starts -> start_existing) sends only the brief line."""
+    with update(path) as d:
+        rec = d['unstarted'].setdefault(str(pr), {})
+        rec.update(branch=branch or rec.get('branch', ''), brief=str(brief), setup='done', brief_pane=pane,
+                   unit=unit, at=time.time() if now is None else now, queued=0)
+        if issue is not None:
+            rec['issue'] = issue
+
+
 def unstarted_done(pr, path=None):
     with update(path) as d:
         d['unstarted'].pop(str(pr), None)

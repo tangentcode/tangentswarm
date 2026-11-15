@@ -93,6 +93,7 @@ class Fake(W.Executor):
         self.calls, self.queued, self.cascades, self.relays, self.wakes = [], [], [], [], []
         self.col, self.full = col, full or {}
         self._g['fetch'] = lambda n, refresh=False: self.full
+        self._g['gql'] = lambda q, **v: {'repository': {'p': self.full}}  # advance.codex_details
 
     def card(self, n):
         return ('ITEM', self.col)
@@ -180,7 +181,7 @@ def test_a_merge_runs_the_cascade_and_closes_the_issues():
 
 def test_a_failing_action_wakes_swarmbot_with_the_error():
     ex = Fake()
-    ex._g['fetch'] = lambda n, refresh=False: (_ for _ in ()).throw(RuntimeError('rate limit'))
+    ex._g['gql'] = lambda q, **v: (_ for _ in ()).throw(RuntimeError('rate limit'))
     ex.run(W.Action('codex', 7))
     assert ex.wakes[0]['why'] == 'codex on #7 failed: RuntimeError: rate limit'
 
@@ -303,3 +304,19 @@ def test_a_merged_or_closed_pr_card_is_found_outside_the_open_snapshot(monkeypat
     assert ex.card(9) == ('IT9', board.READY)
     ex.run(W.Action('closed', 9))
     assert calls and calls[0][-1] == board.OPTION[board.CANCELED] and calls[0][calls[0].index('--id') + 1] == 'IT9'
+
+
+def test_a_clean_review_of_the_fix_advances_despite_an_open_thread_from_an_older_head():
+    """Codex on PR #26: an open thread from an older head made the webhook relay fixed
+    findings and demote the PR; the MinBot pass (which resolves those threads) must run."""
+    head = 'f' * 40
+    old = {'isResolved': False, 'isOutdated': False, 'id': 'T1',
+           'comments': {'nodes': [{'author': {'login': 'chatgpt-codex-connector'}, 'originalCommit': {'oid': 'e' * 40}}]}}
+    full = dict(codex_pr(head, clean=True), reviewThreads={'nodes': [old]})
+    ex = Fake(col=board.AUTO_REVIEW, full=full)
+    ex.run(W.Action('codex', 541, args={'commit': head}))
+    assert ex.queued == [['--minbot', '541']] and ex.relays == []
+    on_head = dict(old, comments={'nodes': [{'author': {'login': 'chatgpt-codex-connector'}, 'originalCommit': {'oid': head}}]})
+    ex = Fake(col=board.AUTO_REVIEW, full=dict(codex_pr(head), reviewThreads={'nodes': [on_head]}))
+    ex.run(W.Action('codex', 541, args={'commit': head}))
+    assert ex.relays and ex.queued == []

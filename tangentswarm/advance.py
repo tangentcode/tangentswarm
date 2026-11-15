@@ -59,7 +59,7 @@ RERUN = Path(os.environ.get('SWARM_CASCADE_RERUN', str(gatelock.LOCK.with_name('
 REDEPLOY_LATE = int(os.environ.get('SWARM_REDEPLOY_LATE', '600'))  # lag warning only after this (Michal 2026-11-15)
 DEPLOY_FALLBACK = int(os.environ.get('SWARM_DEPLOY_FALLBACK', '180'))  # then accept a .deploy-sha that contains the head
 
-CODEX_FIELDS = """number isDraft headRefOid mergeable body
+CODEX_FIELDS = """number state isDraft headRefOid mergeable body
  closingIssuesReferences(first:3){nodes{number comments(last:1){nodes{body}}}}
  comments(last:40){nodes{author{login} body}}
  reviews(last:30){nodes{author{login} commit{oid} comments{totalCount}}}
@@ -114,6 +114,41 @@ def codex_clean(pr):
     findings = [r for r in reviews if ((r.get('comments') or {}).get('totalCount') or 0) > 0]
     on_head = [t for t in _open_codex_threads(pr) if _thread_commit(t) in (head, None)]
     return clean and not findings and not on_head
+
+
+def codex_decision(pr):
+    """('clean' | 'findings' | 'pending', detail) on the exact head, for every reader that acts
+    on a Codex result (the MinBot pass, swarm-webhook, its replay). Clean is codex_clean(): an
+    open thread from an older head does not count once Codex is clean on the head (Codex on
+    PR #26: the webhook relayed already-fixed findings from an older head and demoted the
+    PR). Findings are only on the head: an open thread on it (or of unknown commit), a Codex
+    review of the head with comments, or a review-state summary of the head with findings."""
+    head = pr.get('headRefOid') or ''
+    if codex_clean(pr):
+        return 'clean', f'Codex clean on {head[:8]}'
+    on_head = [t for t in _open_codex_threads(pr) if _thread_commit(t) in (head, None)]
+    if on_head:
+        return 'findings', f'{len(on_head)} open Codex thread(s) on {head[:8]}'
+    if any(_codex(r) and (r.get('commit') or {}).get('oid') == head and ((r.get('comments') or {}).get('totalCount') or 0)
+           for r in (pr.get('reviews') or {}).get('nodes') or []):
+        return 'findings', f'a Codex review of {head[:8]} has comments'
+    for c in (pr.get('comments') or {}).get('nodes') or []:
+        m = re.search(r'codex-review-state:v1\s*(\{.*?\})\s*-->', c.get('body') or '', re.S) if _codex(c) else None
+        if m:
+            try:
+                st = json.loads(m.group(1)).get('code_review', {})
+            except ValueError:
+                continue
+            if st.get('commit_sha') == head and st.get('has_any_findings'):
+                return 'findings', f'the Codex summary of {head[:8]} has findings'
+    return 'pending', f'no Codex result on {head[:8]}'
+
+
+def codex_details(gql, n, repo=REPO):
+    """The CODEX_FIELDS of PR n (one GraphQL read), or {}."""
+    owner, name = repo.split('/')
+    d = gql(f'query{{repository(owner:"{owner}",name:"{name}"){{p: pullRequest(number:{int(n)}){{{CODEX_FIELDS}}}}}}}')
+    return ((d or {}).get('repository') or {}).get('p') or {}
 
 
 def addressed_threads(pr):

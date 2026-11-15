@@ -250,7 +250,9 @@ def menu_line(screen):
 def codex_status(pr):
     """('clean' | 'findings' | 'pending', detail) for a PR from hr-gate's fetch().
 
-    Findings only while an inline Codex thread is open (not resolved, not outdated).
+    Findings only while an inline Codex thread is open (not resolved, not outdated) on the
+    head: a thread whose originalCommit is an older head does not count (the MinBot pass
+    resolves it once Codex is clean on the head).
     Clean (Michal 2026-11-15: #518/#520/#521 were sent back to In Progress at 12:53 AM ET
     because a reader took Codex's review-summary comment as findings):
       - a codex-review-state summary for the head with has_any_findings=false (and no
@@ -261,8 +263,12 @@ def codex_status(pr):
     head = pr['headRefOid']
     def is_codex(node):
         return ((node.get('author') or {}).get('login') or '').startswith(CODEX)
+
+    def on_head(t):  # Codex on PR #26: a thread from an older head is not a finding on this head
+        oid = ((t['comments']['nodes'][0].get('originalCommit') or {}).get('oid'))
+        return oid in (head, None)  # unknown commit: counts, as before
     open_thr = [t for t in pr['reviewThreads']['nodes'] if not t['isResolved'] and not t['isOutdated']
-                and t['comments']['nodes'] and is_codex(t['comments']['nodes'][0])]
+                and t['comments']['nodes'] and is_codex(t['comments']['nodes'][0]) and on_head(t)]
     if open_thr:
         return 'findings', f"{len(open_thr)} open Codex thread(s)"
     for c in pr['comments']['nodes']:
@@ -856,7 +862,12 @@ class Tick:
         if what == 'launched':
             self.change(f"{name} started held launch in {out.get('window')} ({out.get('pane')})")
             if out.get('brief_error'):
-                self.note(first['pr'], None, f"started, but the brief line was not sent: {out['brief_error']}")
+                from . import slots
+                if first.get('pr') and first.get('brief'):
+                    slots.brief_pending(first['pr'], out.get('pane'), out.get('unit'), first['brief'],
+                                        branch=first['branch'])
+                self.note(first['pr'], None, f"started, but the brief line was not sent: {out['brief_error']}"
+                                             "; the cascade's start retry sends it")
         elif what == 'refused':
             self.note(first['pr'], None, f"held launch {first['branch']} refused and dropped from the queue: "
                                          f"{out.get('refused', out)}")

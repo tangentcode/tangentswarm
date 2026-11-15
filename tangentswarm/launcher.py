@@ -176,15 +176,18 @@ class Launcher:
             return path, f"brief {path} (PR body section not written: {str(e)[:120]})"
         return path, f"brief {path}"
 
-    def start(self, branch, pr, path):
+    def start(self, branch, pr, path, issue=None):
         """Start the worker. Done only when a claude process runs in its pane (MethBot
-        2026-11-15 3:55 AM ET: #537-#542 got a window with only a bash prompt). A memory hold
-        is queued for swarm-tick. Raises otherwise."""
+        2026-11-15 3:55 AM ET: #537-#542 got a window with only a bash prompt) and has the
+        brief line; then the unstarted record goes. A memory hold is queued for swarm-tick
+        (the held queue holds its capacity). A Claude that runs without the brief line keeps
+        the record (slots.brief_pending) for the retry. Raises otherwise."""
         if self.dry:
             return f"would start the worker: swarm-start-scoped {branch}, then send the brief line"
-        from . import launches
+        from . import launches, slots
         what, detail = (self._launch or launches.launch)(branch, pr=pr, brief=str(path))
         if what == 'held':
+            slots.unstarted_done(pr)
             return f"worker held (memory): queued for swarm-tick ({detail.get('window') if isinstance(detail, dict) else ''})"
         if what == 'refused':
             raise RuntimeError(f"swarm-start-scoped refused: {str(detail)[-300:]}")
@@ -192,8 +195,12 @@ class Launcher:
         cmd = self.pane_command(pane) if pane else None
         if cmd not in ('claude', 'node'):
             raise RuntimeError(f"no claude runs in {pane or 'the window'} after the start (it runs {cmd or 'nothing'})")
-        return f"worker launched in {detail.get('window')} ({pane}, claude runs)" + (
-            f"; brief not sent: {detail['brief_error'][:120]}" if detail.get('brief_error') else '')
+        if detail.get('brief_error'):
+            slots.brief_pending(pr, pane, detail.get('unit'), path, branch=branch, issue=issue)
+            return (f"worker launched in {detail.get('window')} ({pane}, claude runs); brief not sent: "
+                    f"{detail['brief_error'][:120]}; the start retry sends it")
+        slots.unstarted_done(pr)
+        return f"worker launched in {detail.get('window')} ({pane}, claude runs)"
 
     def pane_command(self, pane):
         return self.sh('tmux', 'display-message', '-p', '-t', pane, '#{pane_current_command}', check=False)
@@ -217,9 +224,7 @@ class Launcher:
             slots.launch_done(n)
         path, notes = self.setup(n, title, branch, pr)
         steps += notes
-        steps.append(self.start(branch, pr, path))
-        if not self.dry:
-            slots.unstarted_done(pr)
+        steps.append(self.start(branch, pr, path, issue=n))
         return steps
 
     def setup(self, n, title, branch, pr):
@@ -238,13 +243,18 @@ class Launcher:
     def start_existing(self, pr, rec):
         """Retry the worker start of a launched PR with no Claude; an unfinished setup is
         redone first."""
-        from . import slots
+        from . import launches, slots
+        if rec.get('brief_pane'):
+            if self.pane_command(rec['brief_pane']) in ('claude', 'node'):
+                launches.send_brief(rec['brief_pane'], rec.get('unit'), rec['brief'])  # raises: retried later
+                slots.unstarted_done(pr)
+                return f"brief line sent to the running Claude in {rec['brief_pane']}"
+            with slots.update() as d:  # its Claude is gone: start a worker again
+                d['unstarted'].get(str(pr), {}).pop('brief_pane', None)
         path = rec.get('brief')
         if rec.get('setup', 'done') != 'done' or not path:
             path, _ = self.setup(int(rec['issue']), rec.get('title') or f"Issue #{rec['issue']}", rec['branch'], pr)
-        note = self.start(rec['branch'], pr, path)
-        slots.unstarted_done(pr)
-        return note
+        return self.start(rec['branch'], pr, path, issue=rec.get('issue'))
 
 
 def execute_start(req):

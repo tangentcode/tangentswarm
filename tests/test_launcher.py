@@ -198,3 +198,24 @@ def test_a_setup_failure_after_the_draft_pr_is_recovered_by_the_start_retry(tmp_
     note = lz.start_existing(601, rec)
     assert started == [601] and 'claude runs' in note and '601' not in slots.load()['unstarted']
     assert (tmp_path / 'briefs' / '601.txt').exists()
+
+
+def test_a_failed_brief_send_keeps_the_record_and_the_retry_sends_only_the_brief(tmp_path, monkeypatch):
+    """Codex on PR #26: a Claude that ran without its brief line counted as launched, and
+    nothing sent the brief again."""
+    from tangentswarm import brief, launches
+    monkeypatch.setattr(brief, 'BRIEF_DIR', tmp_path / 'briefs')
+    monkeypatch.setattr(brief, 'write_brief', lambda n: None)
+    lz = L.Launcher(g=gate(), run=Run(), git_dir=tmp_path,
+                    launch=lambda branch, pr, brief: ('launched', {'window': 'w', 'pane': '%9', 'unit': 'u.scope',
+                                                                   'brief_error': 'prompt not ready'}))
+    steps = lz.launch(412, 'Board marks right and wrong')
+    assert 'the start retry sends it' in steps[-1]
+    rec = slots.load()['unstarted']['601']
+    assert rec['brief_pane'] == '%9' and rec['unit'] == 'u.scope' and rec['brief'].endswith('601.txt')
+    sent = []
+    monkeypatch.setattr(launches, 'send_brief', lambda pane, unit, path: sent.append((pane, unit, path)))
+    lz._launch = lambda *a, **k: (_ for _ in ()).throw(AssertionError('no second worker start'))
+    note = lz.start_existing(601, rec)
+    assert sent == [('%9', 'u.scope', rec['brief'])] and 'brief line sent' in note
+    assert '601' not in slots.load()['unstarted']

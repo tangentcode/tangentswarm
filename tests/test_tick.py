@@ -173,6 +173,18 @@ def test_codex_open_thread_is_findings():
     assert st == 'findings' and '1 open' in why
 
 
+def test_an_open_thread_from_an_older_head_is_not_a_finding_on_this_head():
+    """Codex on PR #26: a clean review of the fix must advance, not restart rework."""
+    old = {'isResolved': False, 'isOutdated': False,
+           'comments': {'nodes': [{'author': CODEX, 'originalCommit': {'oid': 'b' * 40}}]}}
+    body = "**Reviewed commit:** `aaaaaaaa`\nDidn't find any major issues"
+    assert tick.codex_status(pr(threads=[old], comments=[{'author': CODEX, 'body': body, 'createdAt': 'x'}]))[0] == 'clean'
+    assert tick.codex_status(pr(threads=[old]))[0] == 'pending'  # no result on the head yet
+    here = {'isResolved': False, 'isOutdated': False,
+            'comments': {'nodes': [{'author': CODEX, 'originalCommit': {'oid': 'a' * 40}}]}}
+    assert tick.codex_status(pr(threads=[old, here]))[0] == 'findings'
+
+
 def summary(head='a' * 40, any_findings=False, unresolved=False):
     state = {'code_review': {'commit_sha': head, 'status': 'completed', 'has_any_findings': any_findings,
                              'has_unresolved_findings': unresolved}}
