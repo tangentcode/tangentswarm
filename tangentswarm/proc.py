@@ -26,13 +26,21 @@ def sh(*a, check=True, timeout=None, env=None, who='hr-gate', run=subprocess.run
         r = run(a, capture_output=True, text=True, timeout=t, env=env)
     except subprocess.TimeoutExpired:
         msg = f"{who}: timed out after {t}s: {' '.join(a[:6])}"
+        _log(a, TIMED_OUT, who, msg)
         print(msg, file=sys.stderr, flush=True)
         if check:
             raise RuntimeError(msg)
         return subprocess.CompletedProcess(a, TIMED_OUT, '', msg)
+    _log(a, r.returncode, who, r.stderr or r.stdout)
     if check and r.returncode:
         raise RuntimeError(f"{' '.join(a[:3])}...: {(r.stderr or '').strip()[:200]}")
     return r
+
+
+def _log(argv, rc, who, output):
+    """tangentswarm #32: every minbot call and gh write goes to the events DB."""
+    from . import eventdb
+    eventdb.log_command(argv, rc, who, output)
 
 
 def commit_env(name='hr-gate'):

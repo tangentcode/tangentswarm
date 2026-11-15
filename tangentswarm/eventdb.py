@@ -1,4 +1,14 @@
-"""swarm-webhook event log in SQLite (Michal 2026-11-15 1:54 PM ET).
+"""The swarm events DB: one append-only SQLite table for everything that happens in the swarm
+(tangentswarm #32, Michal 2026-11-15 2:43 PM ET). It started as the swarm-webhook event log
+(1:54 PM ET); every other part now writes to it through log_event():
+
+  source     webhook | mcp | stop-hook | launcher | slots | relay | minbot | gh | board |
+             cascade | hr-gate   (the column `source`; webhook rows have 'webhook')
+  actor      who acted: a worktree, a PR, the daemon, a tool name
+  event      what happened (a GitHub event type, or 'move', 'launch', 'park', 'resume', ...)
+
+The DB is ~/.local/state/swarm-flow/events.sqlite ($SWARM_EVENTS_DB). The old
+webhook-events.sqlite is renamed to it once, with its rows.
 
 Adapted from board-sync's ForwardStore (Michal 1:55 PM ET: copy it, do not write it from
 scratch). Taken: the connection setup (makedirs, timeout=30, isolation_level=None,
@@ -25,8 +35,10 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-PATH = os.environ.get('SWARM_WEBHOOK_DB', str(Path.home() / '.local' / 'state' / 'swarm-flow' /
-                                              'webhook-events.sqlite'))
+_DIR = Path.home() / '.local' / 'state' / 'swarm-flow'
+PATH = os.environ.get('SWARM_EVENTS_DB') or os.environ.get('SWARM_WEBHOOK_DB') or str(_DIR / 'events.sqlite')
+OLD_PATH = str(_DIR / 'webhook-events.sqlite')  # before tangentswarm #32
+SOURCE = os.environ.get('SWARM_EVENT_SOURCE', '')  # this process's default source (set_source)
 ET = ZoneInfo('America/New_York')
 KEEP_HEADERS = ('X-GitHub-Event', 'X-GitHub-Delivery', 'X-GitHub-Hook-ID', 'X-GitHub-Hook-Installation-Target-ID',
                 'X-GitHub-Hook-Installation-Target-Type', 'X-Hub-Signature-256', 'Content-Type', 'User-Agent')
@@ -92,10 +104,11 @@ def meta(event, payload):
 class EventStore:
     """Append-only SQLite log of hook deliveries and what was done with them."""
 
-    def __init__(self, path=None):
+    def __init__(self, path=None, old=None):
         path = str(path or PATH)
         if path != ":memory:":
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            migrate(old or (OLD_PATH if path == str(_DIR / 'events.sqlite') else None), path)
         self._db = sqlite3.connect(path, timeout=30, isolation_level=None, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._lock = threading.Lock()
@@ -109,6 +122,12 @@ class EventStore:
                 stage TEXT NOT NULL, repo TEXT, pr INTEGER, sender TEXT, sig_ok INTEGER,
                 decisions TEXT NOT NULL DEFAULT '[]', done TEXT NOT NULL DEFAULT '[]',
                 notes TEXT NOT NULL DEFAULT '[]', error TEXT)""")
+            have = {r[1] for r in self._db.execute("PRAGMA table_info(events)")}
+            if 'source' not in have:  # tangentswarm #32: the old rows are all webhook rows
+                self._db.execute("ALTER TABLE events ADD COLUMN source TEXT NOT NULL DEFAULT 'webhook'")
+            if 'actor' not in have:
+                self._db.execute("ALTER TABLE events ADD COLUMN actor TEXT")
+            self._db.execute("CREATE INDEX IF NOT EXISTS ev_source ON events(source, id)")
             self._db.execute("CREATE INDEX IF NOT EXISTS ev_delivery ON events(delivery)")
             self._db.execute("CREATE INDEX IF NOT EXISTS ev_lane ON events(lane, id)")
             self._db.execute("CREATE INDEX IF NOT EXISTS ev_pr ON events(pr, id)")
@@ -157,6 +176,19 @@ class EventStore:
         with self._lock:
             return self._insert(self._row(stage, delivery, event, payload, decisions=decisions,
                                           done=['error'] if error else [], notes=notes, error=error, pr=pr, now=now))
+
+    def add_event(self, source, event, action=None, pr=None, actor=None, decisions=(), notes=(), error=None,
+                  detail=None, repo=None, now=None):
+        """One row of any source (stage 'event'): detail is a JSON-able dict kept in body."""
+        now = time.time() if now is None else now
+        row = dict(delivery=None, event=event, action=action, lane=None, headers=None,
+                   body=None if detail is None else json.dumps(detail, default=str)[:20000],
+                   received=now, received_at=datetime.fromtimestamp(now, ET).isoformat(timespec='seconds'),
+                   reason=None, stage='event', repo=repo, pr=pr, sender=None, sig_ok=None,
+                   decisions=json.dumps(list(decisions)), done=json.dumps((['error'] if error else []) + tags(notes)),
+                   notes=json.dumps([str(x)[:2000] for x in notes]), error=error, source=source, actor=actor)
+        with self._lock:
+            return self._insert(row)
 
     def handled(self, delivery):
         """True when a 'handled' row exists for the delivery."""
@@ -212,3 +244,79 @@ def store():
         if _store is None:
             _store = EventStore()
         return _store
+
+
+def migrate(old, new):
+    """Rename the old webhook-events DB (and its -wal and -shm files) to the new path once,
+    under a lock, when the new one does not exist yet."""
+    if not old or os.path.exists(new) or not os.path.exists(old):
+        return False
+    import fcntl
+    with open(os.path.join(os.path.dirname(new), '.events-migrate.lock'), 'a') as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        if os.path.exists(new) or not os.path.exists(old):
+            return False
+        for suffix in ('-wal', '-shm', ''):  # the main file last: a reader never sees it without its WAL
+            if os.path.exists(old + suffix):
+                os.replace(old + suffix, new + suffix)
+    return True
+
+
+def set_source(source):
+    """The default source of this process's log_event() rows (each entry point sets it)."""
+    global SOURCE
+    SOURCE = source
+
+
+def log_event(event, source=None, action=None, pr=None, actor=None, decisions=(), notes=(), error=None,
+              detail=None, repo=None):
+    """Append one event row. Never raises: logging must not break the action it records."""
+    try:
+        return store().add_event(source or SOURCE or 'other', event, action=action, pr=pr, actor=actor,
+                                 decisions=decisions, notes=notes, error=error, detail=detail, repo=repo)
+    except Exception:
+        return None
+
+
+_GH_WRITES = {('pr', 'ready'), ('pr', 'comment'), ('pr', 'edit'), ('pr', 'create'), ('pr', 'close'),
+              ('pr', 'merge'), ('pr', 'reopen'), ('issue', 'close'), ('issue', 'comment'), ('issue', 'edit'),
+              ('issue', 'create'), ('issue', 'reopen'), ('project', 'item-add'), ('label', 'create'),
+              ('run', 'rerun')}
+
+
+def command_kind(argv):
+    """'minbot' for a minbot --apply call, 'gh' for a gh call that writes, else None (reads
+    are not logged: they are many and change nothing). A card move (gh project item-edit)
+    is logged by board.move_card with its PR number, not here."""
+    argv = [str(a) for a in argv]
+    if not argv:
+        return None
+    base = os.path.basename(argv[0])
+    if base == 'minbot' or base == os.path.basename(os.environ.get('SWARM_MINBOT', 'minbot')):
+        return 'minbot' if '--apply' in argv else None
+    if base != 'gh' or len(argv) < 3:
+        return None
+    if tuple(argv[1:3]) in _GH_WRITES:
+        return 'gh'
+    if argv[1] == 'api':
+        i = argv.index('-X') + 1 if '-X' in argv else argv.index('--method') + 1 if '--method' in argv else 0
+        if i and i < len(argv) and argv[i].upper() in ('POST', 'PATCH', 'PUT', 'DELETE'):
+            return 'gh'
+    return None
+
+
+def log_command(argv, rc, who='', output=''):
+    """Log a minbot or gh write (see command_kind). Never raises."""
+    kind = command_kind(argv)
+    if not kind:
+        return None
+    argv = [str(a) for a in argv]
+    pr = None
+    for a in argv[1:]:
+        if a.isdigit() and 0 < int(a) < 1_000_000:
+            pr = int(a)
+            break
+    words = [a for a in argv[1:] if not a.startswith('-')][:3]
+    return log_event('command', source=kind, action=' '.join(words), pr=pr, actor=who or SOURCE or None,
+                     notes=[' '.join(a if len(a) < 200 else a[:200] + '...' for a in argv)[:1500]],
+                     error=None if rc == 0 else f'rc={rc}: {str(output or "")[:300]}')

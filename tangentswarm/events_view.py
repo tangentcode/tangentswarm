@@ -3,12 +3,14 @@
 Opens the event DB read-only, prints the rows since a day (today ET by default), then
 follows new rows every second. One line per row:
 
-  ET time  stage  event/action  repo#pr  sender  sig  decision -> actions done  error
+  ET time  source  stage  event/action  repo#pr  sender  sig  decision -> actions done  error
+  (a non-webhook row: ET time  source  event/action  repo#pr  actor  done  notes)
 
 An error is red; duplicate, log-only and rejected rows are dim. -v prints the full row as
 JSON (the raw body decoded) under each line.
 
-  swarm-events [--since today|all|YYYY-MM-DD] [-v] [--once] [--db PATH] [--color|--no-color]
+  swarm-events [--since today|all|YYYY-MM-DD] [--source S[,S...]] [-v] [--once] [--db PATH]
+               [--color|--no-color]
 """
 import argparse
 import json
@@ -49,12 +51,19 @@ def line(r, color=True):
     ev = r.get('event') or '-'
     if r.get('action'):
         ev += '/' + r['action']
-    where = (r.get('repo') or '-') + (f"#{r['pr']}" if r.get('pr') else '')
+    where = (r.get('repo') or '') + (f"#{r['pr']}" if r.get('pr') else '') or '-'
     sig = {1: 'sig ok', 0: 'SIG BAD', None: 'sig -'}.get(r.get('sig_ok'), 'sig ?')
     decision = ','.join(_list(r.get('decisions'))) or '-'
     done = ', '.join(_list(r.get('done'))) or '-'
     reason = f" ({r['reason']})" if r.get('reason') else ''
-    out = f"{t} {r.get('stage', ''):<8} {ev:<34} {where:<28} {r.get('sender') or '-':<20} {sig:<7} {decision}{reason} -> {done}"
+    if r.get('stage') == 'event':  # a non-webhook row (tangentswarm #32): its actor and notes
+        who = r.get('actor') or '-'
+        what = '; '.join(_list(r.get('notes')))[:160] or '-'
+        out = (f"{t} {r.get('source') or '-':<9} {ev:<34} {where:<28} {who[:20]:<20} "
+               f"{done if done != '-' else ''} {what}").rstrip()
+    else:
+        out = (f"{t} {r.get('source') or 'webhook':<9} {r.get('stage', ''):<8} {ev:<34} {where:<28} "
+               f"{r.get('sender') or '-':<20} {sig:<7} {decision}{reason} -> {done}")
     err = r.get('error')
     if not color:
         return out + (f"  ERROR: {err}" if err else '')
@@ -89,13 +98,20 @@ def connect(path):
     return db
 
 
-def rows_after(db, last_id, since=''):
-    return [dict(r) for r in db.execute('SELECT * FROM events WHERE id > ? AND received_at >= ? ORDER BY id',
-                                        (last_id, since))]
+def rows_after(db, last_id, since='', sources=()):
+    q, args = 'SELECT * FROM events WHERE id > ? AND received_at >= ?', [last_id, since]
+    if sources:
+        has_source = any(r[1] == 'source' for r in db.execute('PRAGMA table_info(events)'))
+        if has_source:
+            q += f" AND source IN ({', '.join('?' * len(sources))})"
+            args += list(sources)
+        elif 'webhook' not in sources:
+            return []
+    return [dict(r) for r in db.execute(q + ' ORDER BY id', args)]
 
 
 def run(path, since='today', verbose=False, once=False, color=None, out=sys.stdout, sleep=time.sleep,
-        polls=None):
+        polls=None, sources=()):
     color = out.isatty() if color is None else color
     lower = since_iso(since)
     while not os.path.exists(path):  # the server makes it on its first request
@@ -107,7 +123,7 @@ def run(path, since='today', verbose=False, once=False, color=None, out=sys.stdo
     last, n = 0, 0
     while True:
         try:
-            got = rows_after(db, last, lower)
+            got = rows_after(db, last, lower, sources)
         except sqlite3.OperationalError as e:  # e.g. a busy WAL checkpoint: try again
             got = []
             print(f"swarm-events: {e}", file=sys.stderr)
@@ -129,6 +145,9 @@ def main(argv=None):
     ap.add_argument('-v', '--verbose', action='store_true', help='print the full row as JSON')
     ap.add_argument('--once', action='store_true', help='print the rows and exit (no follow)')
     ap.add_argument('--db', default=eventdb.PATH)
+    ap.add_argument('--source', action='append', default=[],
+                    help='only these sources (repeat or comma list): webhook, mcp, stop-hook, launcher, slots, '
+                         'relay, minbot, gh, board, cascade, hr-gate')
     ap.add_argument('--color', dest='color', action='store_true', default=None)
     ap.add_argument('--no-color', dest='color', action='store_false')
     a = ap.parse_args(argv)
@@ -137,7 +156,8 @@ def main(argv=None):
     except ValueError:
         ap.error('--since: today, all or YYYY-MM-DD')
     try:
-        return run(a.db, a.since, a.verbose, a.once, a.color)
+        sources = tuple(s.strip() for x in a.source for s in x.split(',') if s.strip())
+        return run(a.db, a.since, a.verbose, a.once, a.color, sources=sources)
     except KeyboardInterrupt:
         return 0
 

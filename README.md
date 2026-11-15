@@ -939,13 +939,33 @@ swarm-hookgate wait                # return once the REST quota has a reserve; s
 
 The `SWARM_HOOK_*` variables override these limits. The state is in `~/.cache/swarm-hook`.
 
-## swarm-webhook and swarm-events
+## swarm-webhook, the events DB and swarm-events
 
 `swarm-webhook` (`tangentswarm/webhook.py`) is the GitHub org webhook receiver. It runs the
-board rules with no LLM. It logs every inbound request in an append-only SQLite event log,
-`~/.local/state/swarm-flow/webhook-events.sqlite` (`tangentswarm/eventdb.py`).
+board rules with no LLM.
 
-`swarm-events` is the console viewer of that log. It opens the DB read-only, prints today's
+Everything the swarm does is one row in one append-only SQLite table,
+`~/.local/state/swarm-flow/events.sqlite` (`tangentswarm/eventdb.py`, `$SWARM_EVENTS_DB`).
+The old `webhook-events.sqlite` is renamed to it once. Each row has a `source` and an
+`actor`:
+
+| source | what |
+| --- | --- |
+| webhook | every GitHub delivery (received, handled, replay) |
+| mcp | every worker MCP call (worker_status, handoff, request_review) |
+| stop-hook | each Stop hook run and its decision |
+| launcher | a launch (branch, draft PR, brief, worker) and a worker start |
+| slots | park (/exit), resume, feedback to a running Claude, tell |
+| relay | a merge-main relay to a Claude pane |
+| minbot, gh | every `minbot --apply` call and every gh call that writes |
+| board | every card move, with its PR and column |
+| cascade | each cascade pass (its lines) and each MinBot check |
+| hr-gate | hr-gate's own card moves |
+
+Rows are written with `eventdb.log_event()`, which never raises.
+
+`swarm-events` is the console viewer of that log. `--source mcp,stop-hook` shows only those
+sources. It opens the DB read-only, prints today's
 rows (ET), then follows new rows every second. Errors are red. Duplicates, log-only rows and
 rejected requests are dim. `-v` prints each row as JSON. `--since all|YYYY-MM-DD` and
 `--once` are also available.
