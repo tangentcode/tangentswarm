@@ -424,3 +424,32 @@ def test_idle_non_pr_workers_are_parked_but_never_a_coordinator(tmp_path, monkey
     lines = []
     slots.report(out=lines.append)  # a window-keyed entry does not break the report
     assert any(l.startswith('parked imp-22-rtl-eval') for l in lines)
+
+
+def _writer(path, base, n):
+    from tangentswarm import slots as S
+    for i in range(n):
+        S.unstarted_add(base + i, path=path, branch='b')
+
+
+def test_concurrent_writers_never_lose_a_record(tmp_path):
+    """Codex on PR #26: the spool's launchers and the cascade wrote the state at the same
+    time with no lock; one could drop another's unstarted or parked record."""
+    import multiprocessing
+    from tangentswarm import slots as S
+    path = tmp_path / 'slots.json'
+    ctx = multiprocessing.get_context('fork')
+    procs = [ctx.Process(target=_writer, args=(path, k * 100, 25)) for k in range(4)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(30)
+        assert p.exitcode == 0
+    assert len(S.load(path)['unstarted']) == 100
+    assert not list(tmp_path.glob('*.tmp'))
+
+
+def test_pending_launches_count_only_fresh_entries():
+    from tangentswarm import slots as S
+    st = {'launching': {'5': 1000, '6': 1000 - S.LAUNCHING_TTL - 1}}
+    assert S.pending_launches(st, now=1000) == [5]

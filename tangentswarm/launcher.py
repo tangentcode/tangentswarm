@@ -206,13 +206,13 @@ class Launcher:
         steps.append(note)
         if not self.dry:
             slots.mark_named([n])  # the draft PR exists: now it counts as named
-            slots.launch_done(n)
         steps.append(self.milestone(n, pr))
         steps.append(self.board(n, pr))
         path, note = self.brief(n, title, branch, pr)
         steps.append(note)
         if not self.dry:
             slots.unstarted_add(pr, branch=branch, brief=str(path), issue=n)
+            slots.launch_done(n)  # only now: until unstarted_add it holds its slot as "launching"
         steps.append(self.start(branch, pr, path))
         if not self.dry:
             slots.unstarted_done(pr)

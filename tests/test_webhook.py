@@ -283,3 +283,23 @@ def test_move_card_uses_the_option_id_for_columns_hr_gate_does_not_know():
     board.move_card(g, 'I', board.IN_PROGRESS, calls.append)
     board.move_card(g, 'I', board.READY, calls.append)
     assert moved == ['In Progress'] and calls[0][-1] == board.OPTION[board.READY]
+
+
+def test_a_merged_or_closed_pr_card_is_found_outside_the_open_snapshot(monkeypatch):
+    """Codex on PR #26: do_merged/do_closed looked only in the open-only board snapshot, so
+    the Done/Canceled move never found the card."""
+    from tangentswarm import boardcache
+    monkeypatch.setattr(boardcache, 'snapshot', lambda gql, max_age=0: {})
+    monkeypatch.setattr(boardcache, 'open_prs', lambda snap: [])
+    monkeypatch.setattr(boardcache, 'open_issues', lambda snap: [])
+    calls = []
+    ex = W.Executor(g={'project_id': lambda: 'P', 'STATUS_FIELD': 'F',
+                       'gql': lambda q, **v: {'repository': {'issueOrPullRequest': {'projectItems': {'nodes': [
+                           {'id': 'OTHER', 'project': {'id': 'PVT_other'}, 'fieldValueByName': None},
+                           {'id': 'IT9', 'project': {'id': board.PROJECT_ID},
+                            'fieldValueByName': {'name': 'Ready', 'optionId': board.OPTION[board.READY]}}]}}}},
+                       'fetch': lambda n, refresh=False: {}},
+                    sh=lambda argv: calls.append(argv) or '')
+    assert ex.card(9) == ('IT9', board.READY)
+    ex.run(W.Action('closed', 9))
+    assert calls and calls[0][-1] == board.OPTION[board.CANCELED] and calls[0][calls[0].index('--id') + 1] == 'IT9'

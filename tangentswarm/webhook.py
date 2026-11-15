@@ -272,6 +272,13 @@ def project_move(p):
     return [Action('skip', why=f"card moved {frm} -> {to}: his decision")]
 
 
+CARD_QUERY = """query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){
+  issueOrPullRequest(number:$n){...on PullRequest{projectItems(first:20){nodes{id project{id}
+    fieldValueByName(name:"Status"){...on ProjectV2ItemFieldSingleSelectValue{name optionId}}}}}
+  ...on Issue{projectItems(first:20){nodes{id project{id}
+    fieldValueByName(name:"Status"){...on ProjectV2ItemFieldSingleSelectValue{name optionId}}}}}}}}"""
+
+
 # -- the executor ------------------------------------------------------------------------
 
 class Executor:
@@ -304,12 +311,24 @@ class Executor:
         return tick.sh(argv, check=True).stdout
 
     def card(self, n):
-        """(item id, column) of PR or issue n on Project 4, from the board snapshot."""
+        """(item id, column) of PR or issue n on Project 4. The board snapshot has open items
+        only, so a merged or closed one (do_merged, do_closed, a closed linked issue) is read
+        from the item itself (Codex on PR #26: the Done/Canceled move never found its card)."""
         from . import boardcache
         snap = boardcache.snapshot(self.g['gql'], max_age=0)
         for it, c in boardcache.open_prs(snap) + boardcache.open_issues(snap):
             if c['number'] == n:
                 return it['id'], boardcache.col(it)
+        return self.card_direct(n)
+
+    def card_direct(self, n):
+        """(item id, column) from the PR or issue's own projectItems, open or closed."""
+        owner, name = REPO.split('/')
+        d = self.g['gql'](CARD_QUERY, owner=owner, name=name, n=n)
+        node = (((d or {}).get('repository') or {}).get('issueOrPullRequest') or {})
+        for it in (node.get('projectItems') or {}).get('nodes') or []:
+            if ((it.get('project') or {}).get('id')) == board.PROJECT_ID:
+                return it['id'], board.column(it.get('fieldValueByName'))
         return None, None
 
     def move(self, n, item, col):
@@ -510,8 +529,8 @@ class Executor:
             num = i.get('number')
             if not num or self.dry:
                 continue
+            it, _ = self.card(num)  # before the close: the issue is still in the open snapshot
             self._sh(['gh', 'issue', 'close', str(num), '-R', REPO, '--reason', 'completed'])
-            it, _ = self.card(num)
             if it:
                 self.move(num, it, board.DONE)
         if not self.dry:

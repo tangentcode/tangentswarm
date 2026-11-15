@@ -55,12 +55,17 @@ def test_a_launch_makes_the_branch_draft_pr_board_brief_and_worker(tmp_path, mon
     from tangentswarm import brief
     monkeypatch.setattr(brief, 'BRIEF_DIR', tmp_path / 'briefs')
     monkeypatch.setattr(brief, 'write_brief', lambda n: None)
-    run, started = Run(), []
+    run, started, held = Run(), [], []
     slots.launch_mark([412])
-    lz = L.Launcher(g=gate(), run=run, git_dir=tmp_path,
-                    launch=lambda branch, pr, brief: started.append((branch, pr, brief)) or
-                    ('launched', {'window': 'mn-601-x', 'pane': '%9'}))
+
+    def launch(branch, pr, brief):
+        st = slots.load()  # Codex on PR #26: at every step the launch holds a slot somewhere
+        held.append('412' in st['launching'] or str(pr) in st['unstarted'])
+        started.append((branch, pr, brief))
+        return ('launched', {'window': 'mn-601-x', 'pane': '%9'})
+    lz = L.Launcher(g=gate(), run=run, git_dir=tmp_path, launch=launch)
     steps = lz.launch(412, 'Board marks right and wrong')
+    assert held == [True]
     br = 'board-marks-right-wrong'
     assert ['git', '-C', str(tmp_path), 'push', '-q', 'origin', f"{'c' * 40}:refs/heads/{br}"] in run.calls
     create = [c for c in run.calls if c[:3] == ['gh', 'pr', 'create']][0]

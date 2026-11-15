@@ -823,8 +823,12 @@ def test_a_live_signal_queues_the_launches_and_respects_the_claude_cap(monkeypat
     assert out[-1] == 'launch: queued #40, #41 for swarm-promoted (branch, draft PR, brief, worker)'
     assert slots.load()['named'] == {}  # named only once a draft PR exists
     out.clear()
-    c.signal({})  # the next pass skips the queued ones
-    assert any(l.startswith('START_CLAUDE n=2 issues=#42,#43') for l in out)
+    c.signal({})  # Codex on PR #26: the 2 queued launches hold the last 2 Claudes of the cap
+    assert not any(l.startswith('START_CLAUDE') for l in out) and 'launching=2' in out[-1], out
+    monkeypatch.setattr(slots, 'live_claudes', lambda: 6)
+    out.clear()
+    c.signal({})  # room again: the picker skips the queued ones
+    assert any(l.startswith('START_CLAUDE n=2 issues=#42,#43') for l in out), out
     slots.save(dict(slots.load(), launching={}))  # the launches ended
     monkeypatch.setattr(slots, 'live_claudes', lambda: 10)
     out.clear()

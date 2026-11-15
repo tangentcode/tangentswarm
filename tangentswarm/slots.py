@@ -32,11 +32,14 @@ State: ~/.local/state/swarm-flow/slots.json
     swarm-revive PR TEXT...  resume PR's Claude in a rework slot and send TEXT (- reads stdin)
 """
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -80,9 +83,29 @@ def load(path=None):
 def save(d, path=None):
     path = path or STATE
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix('.tmp')
+    tmp = path.with_name(f'{path.name}.{os.getpid()}.{threading.get_ident()}.tmp')  # one per writer
     tmp.write_text(json.dumps(d, indent=1, sort_keys=True))
     os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def update(path=None):
+    """The state for one read-modify-write, under an interprocess lock (Codex on PR #26: the
+    spool's launchers, the cascade and park wrote the file at the same time, and one could
+    drop another's unstarted or parked record). It is saved on exit when it changed. Never
+    nest two update() blocks: flock on a second fd of the same file would wait for itself."""
+    path = path or STATE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_name(path.name + '.lock'), 'a') as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            d = load(path)
+            before = json.dumps(d, sort_keys=True)
+            yield d
+            if json.dumps(d, sort_keys=True) != before:
+                save(d, path)
+        finally:
+            fcntl.flock(lk, fcntl.LOCK_UN)
 
 
 def et_now():
@@ -235,39 +258,42 @@ def backlog_issues(snap, active_ft=None, prs=None, named=None, now=None, launchi
 def launch_mark(numbers, path=None, now=None):
     """Issues whose launch is queued: the picker skips them until the launch ends."""
     now = time.time() if now is None else now
-    d = load(path)
-    d['launching'] = {k: t for k, t in d['launching'].items() if now - float(t) < LAUNCHING_TTL}
-    d['launching'].update({str(n): now for n in numbers})
-    save(d, path)
+    with update(path) as d:
+        d['launching'] = {k: t for k, t in d['launching'].items() if now - float(t) < LAUNCHING_TTL}
+        d['launching'].update({str(n): now for n in numbers})
 
 
 def unstarted_add(pr, path=None, now=None, **rec):
     """A launch made the PR and its window: until a claude runs there, the PR is unstarted.
     Each signal pass retries it, and it takes a new-work slot meanwhile."""
-    d = load(path)
-    d['unstarted'][str(pr)] = dict(rec, at=time.time() if now is None else now, queued=0)
-    save(d, path)
+    with update(path) as d:
+        d['unstarted'][str(pr)] = dict(rec, at=time.time() if now is None else now, queued=0)
 
 
 def unstarted_done(pr, path=None):
-    d = load(path)
-    if d['unstarted'].pop(str(pr), None) is not None:
-        save(d, path)
+    with update(path) as d:
+        d['unstarted'].pop(str(pr), None)
 
 
 def unstarted_retry(pr, path=None):
     """The retry failed: it may be queued again on a later pass."""
-    d = load(path)
-    if str(pr) in d['unstarted']:
-        d['unstarted'][str(pr)]['queued'] = 0
-        save(d, path)
+    with update(path) as d:
+        if str(pr) in d['unstarted']:
+            d['unstarted'][str(pr)]['queued'] = 0
+
+
+def pending_launches(st, now=None):
+    """Issue numbers whose queued launch has not reached unstarted_add yet (fresh entries only).
+    Codex on PR #26: they held neither a new-work slot nor Claude capacity, so the next pass
+    could queue a second full batch."""
+    now = time.time() if now is None else now
+    return sorted(int(k) for k, t in (st.get('launching') or {}).items() if now - float(t) < LAUNCHING_TTL)
 
 
 def launch_done(n, path=None):
     """The launch of issue n ended (its draft PR exists, or it failed and may be tried again)."""
-    d = load(path)
-    if d['launching'].pop(str(n), None) is not None:
-        save(d, path)
+    with update(path) as d:
+        d['launching'].pop(str(n), None)
 
 
 def live_claudes(sessions=None, alive=None):
@@ -296,13 +322,11 @@ def prune_named(taken, path=None, now=None):
     whose issue no open PR closes (and older than 10 minutes: a new PR can lag in the board
     snapshot) is dropped. Returns the dropped issue numbers."""
     now = time.time() if now is None else now
-    d = load(path)
-    drop = [k for k, t in d['named'].items()
-            if int(k) not in taken and now - float(t) > 600]  # a new PR may lag in the snapshot
-    if drop:
+    with update(path) as d:
+        drop = [k for k, t in d['named'].items()
+                if int(k) not in taken and now - float(t) > 600]  # a new PR may lag in the snapshot
         for k in drop:
             d['named'].pop(k)
-        save(d, path)
     return sorted(int(k) for k in drop)
 
 
@@ -310,10 +334,9 @@ def mark_named(numbers, path=None, now=None):
     """Keep the issues START_CLAUDE named, so the next pass does not name them again while
     their Claude has no PR yet. Entries older than LAUNCH_GRACE are dropped."""
     now = time.time() if now is None else now
-    d = load(path)
-    d['named'] = {k: t for k, t in d['named'].items() if now - float(t) < LAUNCH_GRACE}
-    d['named'].update({str(n): now for n in numbers})
-    save(d, path)
+    with update(path) as d:
+        d['named'] = {k: t for k, t in d['named'].items() if now - float(t) < LAUNCH_GRACE}
+        d['named'].update({str(n): now for n in numbers})
 
 
 def start_plan(new_running, issues, ready, ready_target):
@@ -443,10 +466,9 @@ def park_idle_others(dry=False, out=print, found=None, park=None):
         if why:
             out(f"park: {c['window']} not parked: {why}")
             continue
-        st = load()
-        st['parked'][c['window']] = dict(session=c['session'], pane=c['pane'], worktree=c['cwd'],
-                                         window=c['window'], parked_at=et_now())
-        save(st)
+        with update() as st:
+            st['parked'][c['window']] = dict(session=c['session'], pane=c['pane'], worktree=c['cwd'],
+                                             window=c['window'], parked_at=et_now())
         done.append(c['window'])
         out(f"park: {c['window']} parked after {mins} min idle; session {c['session']} kept; its window stays")
     return done
@@ -484,9 +506,9 @@ def park_ready(prs, cols, dry=False, out=print, claudes=None, park=None, path=No
     st = load(path)
     gone = [k for k in st['rework'] if prs and (prs.get(int(k)) or {}).get('state', 'GONE') != 'OPEN']  # closed, merged
     if gone and not dry:
-        for k in gone:
-            st['rework'].pop(k)
-        save(st, path)
+        with update(path) as st:
+            for k in gone:
+                st['rework'].pop(k, None)
     done = []
     for c in claudes:
         n = c.get('pr')
@@ -507,10 +529,9 @@ def park_ready(prs, cols, dry=False, out=print, claudes=None, park=None, path=No
         if dry:
             out(f"park: would park #{n} (pane {c['pane']}, session {c['session'][:8]}): its PR is in {col}")
             continue
-        st = load(path)  # record the session first: the revive needs it even if the /exit fails
-        st['parked'][str(n)] = dict(session=c['session'], pane=c['pane'], worktree=c['cwd'],
-                                    branch=c.get('branch') or '', head=head, parked_at=et_now())
-        save(st, path)
+        with update(path) as st:  # record the session first: the revive needs it even if the /exit fails
+            st['parked'][str(n)] = dict(session=c['session'], pane=c['pane'], worktree=c['cwd'],
+                                        branch=c.get('branch') or '', head=head, parked_at=et_now())
         try:
             why = (park or _park)(c, out)
         except Exception as e:  # the cascade goes on
@@ -523,10 +544,9 @@ def park_ready(prs, cols, dry=False, out=print, claudes=None, park=None, path=No
                 except Exception as e:
                     out(f"park: #{n}: leftover relay failed: {type(e).__name__}: {str(e)[:120]}")
             continue
-        st = load(path)
-        st['parked'][str(n)]['window'] = c.get('window', '')
-        st['rework'].pop(str(n), None)
-        save(st, path)
+        with update(path) as st:
+            st['parked'].setdefault(str(n), {})['window'] = c.get('window', '')
+            st['rework'].pop(str(n), None)
         done.append(n)
         out(f"park: #{n} parked; session {c['session']} kept for swarm-revive {n}")
     return done
@@ -554,13 +574,11 @@ def relay_leftovers(n, cwd, out=print, path=None, find=None, tell=None):
     if not left:
         return None
     key = ','.join(str(p) for p, _ in left)
-    st = load(path)
-    told = st.setdefault('told', {})
-    if told.get(str(n)) == key:
+    if load(path)['told'].get(str(n)) == key:
         return None
     (tell or tell_worker)(n, workerprocs.stop_text(n, left))
-    st['told'][str(n)] = key
-    save(st, path)
+    with update(path) as st:
+        st['told'][str(n)] = key
     out(f"park: #{n}: asked its worker to stop {len(left)} leftover process(es): {key}")
     return key
 
@@ -608,12 +626,12 @@ def revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, path
         def mark(pane):
             if dry:
                 return
-            d = load(path)
-            d['rework'][str(n)] = dict(session=sid or '', window=window, pane=pane, worktree=wt, branch=branch,
-                                       head=_git(wt, 'rev-parse', 'HEAD'), started=et_now(), feedback=text[:200],
-                                       reason=revive_reason(text))
-            d['parked'].pop(str(n), None)
-            save(d, path)
+            head = _git(wt, 'rev-parse', 'HEAD')
+            with update(path) as d:
+                d['rework'][str(n)] = dict(session=sid or '', window=window, pane=pane, worktree=wt, branch=branch,
+                                           head=head, started=et_now(), feedback=text[:200],
+                                           reason=revive_reason(text))
+                d['parked'].pop(str(n), None)
 
         with sp.flocked(sp.resume_lock(window), blocking=False) as got:
             if not got:

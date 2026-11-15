@@ -641,9 +641,8 @@ class Cascade(Advance):
         self.flush()
         if not moved:  # no worker could be started: the card stays, the relay waits for one
             self.out(f"RELAY: swarm-resume {n} {flow.RELAY_DIR / f'relay-{n}-merge-main.md'}")
-        st = slots.load()
-        st['relayed'][str(n)] = head
-        slots.save(st)
+        with slots.update() as st:
+            st['relayed'][str(n)] = head
 
     def columns(self):
         """Flow.columns, and keep the PRs for the park and signal steps."""
@@ -686,13 +685,14 @@ class Cascade(Advance):
         issues = slots.backlog_issues(snap, board.active_fast_track(), prs,
                                       named=st['named'], launching=st['launching'])
         live = slots.live_claudes()
-        cap = max(0, slots.MAX_CLAUDES - live)
+        pending = slots.pending_launches(st)  # queued launches: each will start a Claude
+        cap = max(0, slots.MAX_CLAUDES - live - len(pending))
         unstarted = st['unstarted']
         cap = self.retry_starts(unstarted, cap)  # launched PRs with no Claude first
-        n, target = slots.start_plan(len(k['new']) + len(unstarted), issues, ready, READY_TARGET)
+        n, target = slots.start_plan(len(k['new']) + len(unstarted) + len(pending), issues, ready, READY_TARGET)
         facts = (f"new={len(k['new'])}/{target} rework={len(k['rework'])}/{slots.REWORK_SLOTS} "
                  f"ready={ready}/{READY_TARGET} backlog_without_pr={len(issues)} "
-                 f"claudes={live}/{slots.MAX_CLAUDES} launching={len(st['launching'])} "
+                 f"claudes={live}/{slots.MAX_CLAUDES} launching={len(pending)} "
                  f"unstarted={len(unstarted)}")
         if n and not cap:
             self.out(f"signal: {n} new-work slot(s) free, but {live} Claudes run (cap {slots.MAX_CLAUDES}): "
@@ -724,9 +724,9 @@ class Cascade(Advance):
                 self.out(f"start: would queue the worker start of #{pr} ({rec.get('branch')})")
             else:
                 spool.submit('start', '', pr=int(pr))
-                d = slots.load()
-                d['unstarted'][str(pr)]['queued'] = now
-                slots.save(d)
+                with slots.update() as d:
+                    if str(pr) in d['unstarted']:
+                        d['unstarted'][str(pr)]['queued'] = now
                 self.out(f"start: queued the worker start of #{pr} ({rec.get('branch')}): its window has no Claude")
             cap -= 1
         return cap
