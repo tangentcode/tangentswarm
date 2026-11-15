@@ -51,6 +51,11 @@ WORKING_TARGET = int(os.environ.get('SWARM_WORKING_TARGET', '2'))  # aim: about 
 DEPLOY_WAIT = int(os.environ.get('SWARM_DEPLOY_WAIT', '600'))      # seconds to wait for staging to serve a pull
 PTW_WAIT = int(os.environ.get('SWARM_PTW_WAIT', '1800'))           # seconds to wait for a cornerbot redeploy
 DEPLOY_POLL = 15
+BUDGET = int(os.environ.get('SWARM_CASCADE_BUDGET', '780'))   # whole run; the tick kills it at 900 s
+STEP_TIMEOUT = int(os.environ.get('SWARM_CASCADE_STEP_TIMEOUT', '300'))  # one hr-gate --apply run
+GATE_RESERVE = STEP_TIMEOUT + 30  # budget kept for the gate after a redeploy wait
+EXIT_TIMEOUT = 124
+CASCADE_LOG = Path(os.environ.get('SWARM_CASCADE_LOG', str(Path.home() / '.local' / 'state' / 'swarm-flow' / 'cascade.log')))
 CORNERBOT_FILE = Path(os.environ.get('SWARM_CORNERBOT_REQUEST', str(Path.home() / '.cache' / 'swarm-cornerbot-request')))
 MAX_PASSES = int(os.environ.get('SWARM_CASCADE_MAX_PASSES', '10'))  # cascade passes per lock hold
 RERUN = Path(os.environ.get('SWARM_CASCADE_RERUN', str(gatelock.LOCK.with_name('swarm-serial.rerun'))))
@@ -258,7 +263,9 @@ class Cascade(Advance):
         from . import flow
         self.sleep, self.clock = sleep, clock
         self.f = flow.Flow(dry_run=dry_run, out=lambda line: None, g=self.g)
+        self.f.tool_timeout = STEP_TIMEOUT
         self._seen = [0, 0]
+        self.deadline = self.clock() + BUDGET
 
     def flush(self):
         """Print the Flow lines (did/would, then notes) not printed yet."""
@@ -300,7 +307,8 @@ class Cascade(Advance):
         DEPLOY_WAIT s, or PTW_WAIT s while a cornerbot site (ptw) lags; that site gets one
         CORNERBOT_REQUEST per pull."""
         from . import flow
-        start, asked = self.clock(), bool(d.get('asked'))
+        start, asked, said = self.clock(), bool(d.get('asked')), self.clock()
+        self.out(f"redeploy: polling every staging .deploy-sha for #{d['pr']} {d['head'][:8]}")
         while True:
             lag = self.lagging(d)
             if not lag:
@@ -313,10 +321,18 @@ class Cascade(Advance):
                 asked = True
                 if not self.dry:
                     flow.save_pull(dict(d, asked=True))
-            if self.clock() - start >= (PTW_WAIT if corner else DEPLOY_WAIT):
+            # the wait limit, cut so the gate still fits in the run budget
+            limit = min(PTW_WAIT if corner else DEPLOY_WAIT, self.deadline - start - GATE_RESERVE)
+            waited = self.clock() - start
+            if waited >= limit:
                 self.out(f"waiting: #{d['pr']} {d['head'][:8]} is not served yet by "
-                         + '; '.join(f"{h} ({s[:8] if s else (e or 'empty')[:60]})" for _, h, s, e in lag))
+                         + '; '.join(f"{h} ({s[:8] if s else (e or 'empty')[:60]})" for _, h, s, e in lag)
+                         + f" after {int(waited)}s; the pull stays open for the next cascade")
                 return False
+            if self.clock() - said >= 60:
+                said = self.clock()
+                self.out(f"redeploy: still waiting for {', '.join(h for _, h, _, _ in lag)} "
+                         f"({int(waited)}s of {int(limit)}s)")
             self.sleep(DEPLOY_POLL)
 
     def finish(self, d, prs, scratch):
@@ -327,6 +343,7 @@ class Cascade(Advance):
         if self.touches_served(d['pr']) and not self.served(d):
             return False
         before = len(self.f.did)
+        self.out(f"gate: hr-gate on #{d['pr']} {d['head'][:8]} (timeout {STEP_TIMEOUT}s)")
         self.f.advance(d, prs, scratch)
         self.flush()
         if self.dry:  # nothing is saved: a would-line means the pull ends, a note means it waits
@@ -408,9 +425,14 @@ class Cascade(Advance):
 
     def run(self):
         from .promoted import read_columns
+        t0 = self.clock()
+        self.out(f"cascade: start{' (dry run)' if self.dry else ''}; budget {BUDGET}s")
+        self.out("promote: reading the board")
         if not self.promote(read_columns(self.g['gql'])):
             self.out('promote: ' + self.why[-1])
+        self.out("fill: reading the board")
         self.signal(self.fill())
+        self.out(f"cascade: done in {int(self.clock() - t0)}s")
         return 0
 
 
@@ -462,11 +484,34 @@ def run_locked(body, flag=None, lock=None, out=print, if_flagged=False, max_pass
                     passes += 1
                     if passes > 1:
                         out(f"rerun flag found: cascade pass {passes}")
-                    body()
+                    try:
+                        body()
+                    except BaseException as e:  # timeout, SIGTERM, error: keep the rerun; the with releases the lock
+                        flag_rerun(flag, by='kept after ' + type(e).__name__)
+                        out(f"stopped: {type(e).__name__}: {str(e)[:200]}; lock released, rerun flag kept")
+                        if isinstance(e, CascadeTimeout):
+                            return EXIT_TIMEOUT
+                        raise
         except gatelock.Busy as e:
             out(f"busy: {e}; rerun flag set, the lock holder runs the cascade again; {enqueue()}")
             return 0
     return 0
+
+
+class CascadeTimeout(Exception):
+    """The run budget ran out (SIGALRM) or the caller stopped us (SIGTERM)."""
+
+
+def watchdog(budget=None):
+    """SIGALRM after the budget and SIGTERM both raise CascadeTimeout in the main thread, so
+    run_locked keeps the rerun flag and the lock is released (subprocess.run kills its child)."""
+    import signal
+
+    def stop(signum, frame):
+        raise CascadeTimeout('run budget used up' if signum == signal.SIGALRM else f'signal {signum}')
+    signal.signal(signal.SIGALRM, stop)
+    signal.signal(signal.SIGTERM, stop)
+    signal.alarm(BUDGET if budget is None else budget)
 
 
 def queue_self(qdir=None):
@@ -480,7 +525,22 @@ def queue_self(qdir=None):
 
 
 def _say(line):
+    """A progress line: ET time stamp, printed at once, and kept in CASCADE_LOG (a caller that
+    pipes us through tail sees nothing until we exit)."""
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo('America/New_York'))
+    except Exception:
+        now = datetime.now()
+    line = f"{now.strftime('%H:%M:%S')} {line}"
     print(line, flush=True)
+    try:
+        CASCADE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(CASCADE_LOG, 'a') as f:
+            f.write(f"{now.strftime('%Y-%m-%d')} {line}\n")
+    except OSError:
+        pass
 
 
 def main(argv=None):
@@ -493,7 +553,9 @@ def main(argv=None):
     try:
         if a.cascade:
             if a.dry_run:  # no lock, no flag: a dry run changes nothing
+                watchdog()
                 return Cascade(dry_run=True, out=_say).run()
+            watchdog()
             return run_locked(lambda: Cascade(out=_say).run(), if_flagged=a.if_flagged, out=_say)
         if a.dry_run:
             return Advance(dry_run=True).step()
@@ -503,6 +565,9 @@ def main(argv=None):
         # No "busy, give up": the swarm-promoted daemon owns the queue and runs it under the lock.
         print(f"busy: {e}; " + queue_self())
         return gatelock.EXIT_BUSY
+    except CascadeTimeout as e:  # a dry run (no lock, no flag)
+        _say(f"stopped: {e}")
+        return EXIT_TIMEOUT
     except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as e:
         print(f"swarm-advance error: {e}", file=sys.stderr)
         return 2

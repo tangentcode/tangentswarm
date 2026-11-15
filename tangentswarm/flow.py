@@ -193,6 +193,7 @@ class Flow:
     def __init__(self, dry_run=False, out=print, g=None, now=time.time):
         self.dry, self.out, self.now = dry_run, out, now
         self.did, self.notes = [], []
+        self.tool_timeout = 1800  # one hr-gate / pending-promote run; the cascade sets less
         self.g = g if g is not None else runpy.run_path(str(BIN / 'hr-gate'), run_name='swarm_flow')
 
     def change(self, text):
@@ -205,7 +206,7 @@ class Flow:
 
     def tool(self, argv):
         env = dict(os.environ, **{gatelock.HELD_ENV: '1', gatelock.OLD_HELD_ENV: '1'})
-        r = subprocess.run([str(a) for a in argv], capture_output=True, text=True, timeout=1800, env=env)
+        r = subprocess.run([str(a) for a in argv], capture_output=True, text=True, timeout=self.tool_timeout, env=env)
         out = (r.stdout or '') + (r.stderr or '')
         log(f"tool\t{' '.join(str(a) for a in argv)}\trc={r.returncode}\n{out.rstrip()}")
         return r.returncode, out

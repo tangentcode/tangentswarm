@@ -366,17 +366,20 @@ def test_a_live_pull_gates_only_when_every_site_serves_the_head(monkeypatch, tmp
 
 
 def test_a_live_pull_times_out_on_a_lagging_ptw_and_stops_the_fill(monkeypatch, tmp_path):
+    monkeypatch.setattr(A, 'BUDGET', 100_000)  # the plain wait limits, not the budget cut
     from tangentswarm import flow as F
     W, O = 'w' * 40, 'o' * 40
     g = CascadeGate(served={'work': W, 'minavo': W, 'ptw': O})
     out, advanced, waited = live(monkeypatch, tmp_path, g, [],
                                  advance=lambda *a: pytest.fail('ptw does not serve it: no gate'), ready=(9, 10))
     assert advanced == [] and waited >= A.PTW_WAIT
-    assert out[-1] == "waiting: #9 00000000 is not served yet by ptw.example (oooooooo)"
+    assert out[-1] == (f"waiting: #9 00000000 is not served yet by ptw.example (oooooooo) after {A.PTW_WAIT}s; "
+                       "the pull stays open for the next cascade")
     assert F.load_pull()['asked'] is True  # the next cascade waits again but does not ask again
 
 
 def test_a_web_site_that_never_serves_times_out_after_deploy_wait(monkeypatch, tmp_path):
+    monkeypatch.setattr(A, 'BUDGET', 100_000)  # the plain wait limits, not the budget cut
     W, O = 'w' * 40, 'o' * 40
     g = CascadeGate(served={'work': O, 'minavo': W, 'ptw': W})
     out, advanced, waited = live(monkeypatch, tmp_path, g, [], advance=lambda *a: pytest.fail('no gate'))
@@ -415,3 +418,61 @@ def test_a_dry_run_counts_a_gated_running_pull_in_staging(monkeypatch, tmp_path)
     monkeypatch.setattr(F.Flow, 'advance', lambda self, d, prs, s: self.change(f"#{d['pr']} hr-gate --apply {d['pr']}"))
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False))
     assert pulled == [9] and 'fill: #9 is the extra Staging pull' in out
+
+
+# --- --cascade: run budget, timeouts, clean stop (7:02 PM ET tick ran past 600 s, no output) ---
+
+def test_the_redeploy_wait_is_cut_to_fit_the_run_budget(monkeypatch, tmp_path):
+    W, O = 'w' * 40, 'o' * 40
+    g = CascadeGate(served={'work': W, 'minavo': W, 'ptw': O})
+    out, advanced, waited = live(monkeypatch, tmp_path, g, [], advance=lambda *a: pytest.fail('no gate'))
+    limit = A.BUDGET - A.GATE_RESERVE
+    assert advanced == [] and limit <= waited < limit + A.DEPLOY_POLL
+    assert out[-1].endswith(f"after {waited}s; the pull stays open for the next cascade")
+    assert any(l.startswith('redeploy: still waiting for ptw.example (') for l in out)  # a line each minute
+
+
+def test_a_timeout_keeps_the_rerun_flag_and_releases_the_lock(tmp_path):
+    flag, lock, out = tmp_path / 'rerun', tmp_path / 'lock', []
+
+    def body():
+        raise A.CascadeTimeout('run budget used up')
+    rc = A.run_locked(body, flag=flag, lock=lock, out=out.append, env={})
+    assert rc == A.EXIT_TIMEOUT and flag.exists()
+    assert out[-1] == 'stopped: CascadeTimeout: run budget used up; lock released, rerun flag kept'
+    assert not A.gatelock.is_busy(lock)
+
+
+def test_an_error_keeps_the_rerun_flag_releases_the_lock_and_raises(tmp_path):
+    flag, lock, out = tmp_path / 'rerun', tmp_path / 'lock', []
+
+    def body():
+        raise RuntimeError('gh api graphql: rate limit')
+    with pytest.raises(RuntimeError):
+        A.run_locked(body, flag=flag, lock=lock, out=out.append, env={})
+    assert flag.exists() and not A.gatelock.is_busy(lock) and 'rerun flag kept' in out[-1]
+
+
+def test_the_watchdog_turns_sigterm_and_the_alarm_into_a_timeout(tmp_path):
+    import os
+    import signal
+    old = signal.getsignal(signal.SIGALRM), signal.getsignal(signal.SIGTERM)
+    try:
+        A.watchdog(budget=0)
+        with pytest.raises(A.CascadeTimeout, match='signal'):
+            os.kill(os.getpid(), signal.SIGTERM)
+        with pytest.raises(A.CascadeTimeout, match='budget'):
+            signal.raise_signal(signal.SIGALRM)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old[0])
+        signal.signal(signal.SIGTERM, old[1])
+
+
+def test_progress_lines_carry_a_time_and_go_to_the_log(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(A, 'CASCADE_LOG', tmp_path / 'cascade.log')
+    A._say('gate: hr-gate on #9')
+    printed = capsys.readouterr().out
+    import re
+    assert re.fullmatch(r'\d\d:\d\d:\d\d gate: hr-gate on #9\n', printed)
+    assert (tmp_path / 'cascade.log').read_text().endswith(printed)
