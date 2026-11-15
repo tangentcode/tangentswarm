@@ -26,6 +26,8 @@ The handoff (run), only for a worker worktree ~/ver/platform.<slug>:
      handoff goes on, so Codex reviews the fix (MethBot 2026-11-15: #518, #524, #525 sat
      61-75 min as idle drafts). A head that does
      not merge cleanly onto origin/main: nothing (the tick relays a merge-main).
+  4b. A dev server or other background process still runs in the worktree: no handoff; the
+     worker is asked to stop it (workerprocs), and its next Stop runs the handoff.
   5. Mark the PR ready (if it is a draft); move the card In Progress -> Auto Review.
   0. Not finished (dirty or unpushed) and the Claude's last message ends with a question:
      the card moves In Progress -> Needs Input, once per question (Michal 2026-11-15).
@@ -216,11 +218,18 @@ def needs_input(cwd, branch, transcript, g=None, dry=False, out=None, sh=None):
                + (' (dry run)' if dry else ''), out)
 
 
+def tell_worker(n, text):
+    from . import slots
+    return slots.tell_worker(n, text)
+
+
 def run(cwd, g=None, dry=False, out=None, sh=None, sleep=time.sleep, merges=merges_onto_main, minbot=minbot_check,
-        transcript=None):
+        transcript=None, procs=None, tell=None):
     """The handoff for one worktree. Returns the logged line, or None when nothing was due."""
-    from . import slots, tick
+    from . import slots, tick, workerprocs
     sh = sh or (lambda argv: tick.sh(argv, check=True))
+    procs = procs or workerprocs.leftovers
+    tell = tell or tell_worker
     cwd = Path(cwd)
     if not slots.is_platform_worktree(cwd):
         return None
@@ -243,6 +252,12 @@ def run(cwd, g=None, dry=False, out=None, sh=None, sleep=time.sleep, merges=merg
     if col not in (board.IN_PROGRESS, board.AUTO_REVIEW):
         mark_seen(key)
         return say(f"#{n} head {head[:7]} pushed; the card is in {col}: nothing to do", out)
+    left = procs(cwd)
+    if left:  # MethBot 2026-11-15: stop dev servers before the handoff; no human kill
+        if not dry:
+            tell(n, workerprocs.stop_text(n, left))
+        return say(f"#{n} head {head[:7]} pushed, but {len(left)} process(es) still run in the worktree "
+                   f"({', '.join(str(p) for p, _ in left[:5])}): asked the worker to stop them; no handoff yet", out)
     full = None
     for i in range(HEAD_TRIES):
         full = g['fetch'](n, refresh=True)

@@ -382,3 +382,17 @@ def test_the_cap_counts_workers_and_busy_claudes_but_not_idle_others(tmp_path, m
         (d / f'{pid}.json').write_text(json.dumps({'pid': pid, 'cwd': cwd, 'status': st}))
     monkeypatch.setattr(slots, 'WORKTREE_PARENT', Path('/home/u/ver'))
     assert slots.live_claudes(sessions=d, alive=lambda pid: True) == 4  # not the idle implish Claude
+
+
+def test_a_refused_park_names_the_leftover_process_to_the_worker_once():
+    told, out = [], []
+    left = [(2790171, '.venv/bin/python tcode-server.py --port 5391')]
+    for _ in range(2):
+        slots.relay_leftovers(532, '/w/b532', out=out.append, find=lambda cwd: left,
+                              tell=lambda n, text: told.append((n, text)))
+    assert len(told) == 1 and 'pid 2790171' in told[0][1]
+    assert out == ['park: #532: asked its worker to stop 1 leftover process(es): 2790171']
+    left.append((2790200, 'node vite'))
+    slots.relay_leftovers(532, '/w/b532', out=out.append, find=lambda cwd: left,
+                          tell=lambda n, text: told.append((n, text)))
+    assert len(told) == 2  # a new set of pids is told again

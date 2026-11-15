@@ -235,3 +235,18 @@ def test_install_allows_the_linked_node_modules(tmp_path):
     d = json.loads((w / '.claude' / 'settings.local.json').read_text())
     assert d['permissions']['additionalDirectories'] == [str(main_nm.resolve())]
     assert stophook.install(w, command='/bin/h') == 'present'
+
+
+def test_no_handoff_while_a_dev_server_runs_in_the_worktree(wt):
+    """MethBot 2026-11-15 4:31 AM ET: the worker must stop its dev servers before the handoff."""
+    head = run(wt, 'rev-parse', 'HEAD')
+    g, calls, told = G(head), [], []
+    left = [[(4242, 'python tcode-server.py --port 5391')]]
+    line = stophook.run(wt, g=g, sh=calls.append, merges=lambda c, h: True, sleep=lambda s: None,
+                        procs=lambda cwd: left[0], tell=lambda n, text: told.append((n, text)))
+    assert calls == [] and g.moves == [] and 'asked the worker to stop them; no handoff yet' in line
+    assert told[0][0] == 7 and 'pid 4242 (python tcode-server.py --port 5391)' in told[0][1]
+    left[0] = []  # the worker stopped it; its next Stop hands off
+    line = stophook.run(wt, g=g, sh=calls.append, merges=lambda c, h: True, sleep=lambda s: None,
+                        procs=lambda cwd: left[0], tell=lambda n, text: told.append((n, text)))
+    assert 'moved the card to Auto Review' in line and len(told) == 1

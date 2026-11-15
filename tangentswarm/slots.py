@@ -73,7 +73,8 @@ def load(path=None):
     d = d if isinstance(d, dict) else {}
     return {'parked': dict(d.get('parked') or {}), 'rework': dict(d.get('rework') or {}),
             'relayed': dict(d.get('relayed') or {}), 'named': dict(d.get('named') or {}),
-            'launching': dict(d.get('launching') or {}), 'unstarted': dict(d.get('unstarted') or {})}
+            'launching': dict(d.get('launching') or {}), 'unstarted': dict(d.get('unstarted') or {}),
+            'told': dict(d.get('told') or {})}
 
 
 def save(d, path=None):
@@ -451,6 +452,11 @@ def park_ready(prs, cols, dry=False, out=print, claudes=None, park=None, path=No
             why = f"{type(e).__name__}: {e}"
         if why:
             out(f"park: #{n} not parked: {why}")
+            if 'process' in why:
+                try:
+                    relay_leftovers(n, c['cwd'], out=out, path=path)
+                except Exception as e:
+                    out(f"park: #{n}: leftover relay failed: {type(e).__name__}: {str(e)[:120]}")
             continue
         st = load(path)
         st['parked'][str(n)]['window'] = c.get('window', '')
@@ -459,6 +465,39 @@ def park_ready(prs, cols, dry=False, out=print, claudes=None, park=None, path=No
         done.append(n)
         out(f"park: #{n} parked; session {c['session']} kept for swarm-revive {n}")
     return done
+
+
+def tell_worker(n, text, sp=None, host=None, out=print):
+    """Send one line to PR n's running Claude (not a revive: no rework slot). Returns True
+    when it was sent."""
+    sp = sp or parking()
+    host = host or make_host(sp)
+    window, wt, branch, entry = sp.resolve(host, str(n))
+    existing = sp.live_pane(host, window)
+    if not (existing and existing.get('agent') == 'claude'):
+        out(f"#{n}: no running Claude in {window}: not told")
+        return False
+    host.tell(existing['pane'], one_line(text))
+    return True
+
+
+def relay_leftovers(n, cwd, out=print, path=None, find=None, tell=None):
+    """Park was refused because a process of the worker still runs: name the leftovers to
+    the worker once per set of pids (MethBot 2026-11-15 4:31 AM ET: no human kill)."""
+    from . import workerprocs
+    left = (find or workerprocs.leftovers)(cwd)
+    if not left:
+        return None
+    key = ','.join(str(p) for p, _ in left)
+    st = load(path)
+    told = st.setdefault('told', {})
+    if told.get(str(n)) == key:
+        return None
+    (tell or tell_worker)(n, workerprocs.stop_text(n, left))
+    st['told'][str(n)] = key
+    save(st, path)
+    out(f"park: #{n}: asked its worker to stop {len(left)} leftover process(es): {key}")
+    return key
 
 
 # -- (b) revive a parked Claude with feedback -------------------------------------------------

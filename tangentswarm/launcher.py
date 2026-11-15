@@ -62,6 +62,8 @@ def brief_text(n, title, branch, pr):
         "header. Run only the exact test files you add or change, through ~/bin/test-slot, never the "
         "whole suite. Fix the root cause and cover the neighbor cases. A UI change needs screenshots "
         f"from staging or a local run of the real app, never an isolated component page. {SHOTS_RULE} "
+        "Before your final push, stop every dev server, watcher and background test run you started "
+        "(kill the pids you started): the handoff does not run while one is left in your worktree. "
         "When you are done, commit and push: the Stop hook marks the PR ready and asks Codex for a "
         "review. Then reply with: what changed, the tests you ran and their result, and a short PR "
         "body draft (Before, After, how to see it).\n")
