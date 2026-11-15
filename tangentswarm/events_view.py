@@ -141,12 +141,16 @@ def events(rows):
 
 
 def _delivery(rs):
-    rec = [r for r in rs if r.get('stage') == 'received']
-    first = rec[0] if rec else rs[0]
+    # a duplicate receipt is GitHub redelivering a queued event: never the event itself, but
+    # its handled rows still count (Codex on PR #36: the first receipt may be before --since)
+    rec = [r for r in rs if r.get('stage') == 'received' and r.get('reason') != 'duplicate']
+    rest = [r for r in rs if r.get('stage') != 'received']
+    if not rec and not rest:
+        return None
+    rs = rec + rest
+    first = rec[0] if rec else rest[0]
     if first.get('stage') == 'replay':
         rs, first = [first], dict(first, stage='replay')
-    if first.get('reason') == 'duplicate':
-        return None  # GitHub redelivered an event already queued
     done = [r for r in rs if r.get('stage') in ('handled', 'replay')]
     if first.get('stage') == 'replay':
         done = [first]

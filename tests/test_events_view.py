@@ -185,3 +185,16 @@ def test_a_colored_pipe_does_not_reprint_for_a_new_shade(tmp_path):
         t[0] += 120
     V.run(path, color=True, out=out, sleep=sleep, polls=3, clock=lambda: t[0])
     assert len(out.getvalue().splitlines()) == 3
+
+
+def test_handling_after_midnight_shows_when_the_receipt_was_before(tmp_path):
+    """Codex on PR #36: a duplicate receipt today hid today's handled row of yesterday's event."""
+    st = eventdb.EventStore(tmp_path / 'e.sqlite')
+    p = {'action': 'opened', 'repository': REPO, 'issue': {'number': 9}, 'sender': {'login': 'tangentstorm'}}
+    st.add_received('d9', 'issues', p, {}, b'{}', True, decisions=['card'], now=NOW)        # before --since
+    st.add_received('d9', 'issues', p, {}, b'{}', True, decisions=['card'], now=NOW + 2)    # duplicate
+    st.add('handled', 'd9', 'issues', p, decisions=['card'], notes=['#9 -> Triage'], now=NOW + 3)
+    today = [r for r in st.rows() if r['received'] > NOW + 1]
+    (e,) = V.events(today)
+    assert e['status'] == 'handled' and e['outcome'] == 'moved #9 to Triage' and e['pr'] == 9
+    assert V.events([today[0]]) == []  # only the duplicate: nothing to show
