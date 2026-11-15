@@ -70,15 +70,30 @@ def test_ci_completed_on_a_pr_and_merged_closed_opened():
 
 
 def test_michal_card_moves():
-    def move(frm, to, who=MICHAL):
-        return {'action': 'edited', 'sender': who, 'projects_v2_item': {'content_node_id': 'PR_x'},
-                'changes': {'field_value': {'from': {'id': board.OPTION[frm]}, 'to': {'id': board.OPTION[to]}}}}
+    def move(frm, to, who=MICHAL, project=board.PROJECT_ID, field=board.STATUS_FIELD):
+        return {'action': 'edited', 'sender': who,
+                'projects_v2_item': {'content_node_id': 'PR_x', 'project_node_id': project},
+                'changes': {'field_value': {'field_node_id': field, 'from': {'id': board.OPTION[frm]},
+                                            'to': {'id': board.OPTION[to]}}}}
     assert [a.kind for a in W.classify('projects_v2_item', move(board.HUMAN_REVIEW, board.IN_PROGRESS))] == \
         ['reject', 'cascade']
     assert [a.kind for a in W.classify('projects_v2_item', move(board.NEEDS_INPUT, board.IN_PROGRESS))] == ['answered']
     assert [a.kind for a in W.classify('projects_v2_item', move(board.READY, board.BACKLOG))] == ['skip']
     assert [a.kind for a in W.classify('projects_v2_item', move(board.HUMAN_REVIEW, board.IN_PROGRESS,
                                                                  {'login': 'tangentcode-minbot[bot]'}))] == ['skip']
+    # Codex on PR #26: another project, or another field, never acts
+    assert [a.kind for a in W.classify('projects_v2_item', move(board.HUMAN_REVIEW, board.IN_PROGRESS,
+                                                                 project='PVT_other'))] == ['skip']
+    assert [a.kind for a in W.classify('projects_v2_item', move(board.HUMAN_REVIEW, board.IN_PROGRESS,
+                                                                 field='PVTSSF_other'))] == ['skip']
+
+
+def test_a_card_of_another_repo_is_not_a_platform_pr():
+    ex = Fake()
+    ex._g['gql'] = lambda q, **v: {'node': {'number': 7, 'repository': {'nameWithOwner': 'tangentcode/other'}}}
+    assert ex.pr_of('X') is None
+    ex._g['gql'] = lambda q, **v: {'node': {'number': 7, 'repository': {'nameWithOwner': W.REPO}}}
+    assert ex.pr_of('X') == 7
 
 
 class Fake(W.Executor):

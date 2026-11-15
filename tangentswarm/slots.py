@@ -327,6 +327,20 @@ def live_claudes(sessions=None, alive=None):
     return n
 
 
+def claude_load(path=None, held=None):
+    """Live Claudes plus the reserved starts (queued launches, unstarted PRs with no Claude
+    yet, memory-held launches): what a new Claude start is admitted against (MAX_CLAUDES)."""
+    st = load(path)
+    if held is None:
+        try:
+            from . import launches
+            held = [r for r in launches.read_queue() if str(r.get('pr')) not in st['unstarted']]
+        except (OSError, ValueError):
+            held = []
+    waiting = [r for r in st['unstarted'].values() if not r.get('brief_pane')]  # a brief_pane one runs
+    return live_claudes() + len(pending_launches(st)) + len(waiting) + len(held)
+
+
 def prune_named(taken, path=None, now=None):
     """Drop stale 'named' entries: an issue named by a pass that never launched it (before
     the launcher) has no open PR, and its entry hid it from the picker for 45 minutes
@@ -677,6 +691,10 @@ def revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, path
                     f"{'its idle shell ' + existing['pane'] if existing else 'a new shell window'}: {line}")
                 out(f"would then send: {text[:120]}")
                 return 0
+            busy = claude_load()
+            if busy >= MAX_CLAUDES:  # Codex on PR #26: a resume started a Claude over the global cap
+                out(f"held: {busy} Claudes run or are reserved (cap {MAX_CLAUDES}); #{n} resumes when one ends")
+                return 3
             room = sp.headroom(host)
             if room < sp.RESUME_PARK_NEED_MB * sp.MB:
                 out(f"headroom {room // sp.MB} MB; asking swarm-park for {sp.RESUME_PARK_NEED_MB} MB")

@@ -258,6 +258,12 @@ def project_move(p):
     ch = ((p.get('changes') or {}).get('field_value') or {})
     if p.get('action') != 'edited' or not ch:
         return [Action('skip', why=f"projects_v2_item {p.get('action')}")]
+    # Codex on PR #26: only the board's own project and its Status field (another project's
+    # move with the same column names must never reach a platform worker)
+    if item.get('project_node_id') != board.PROJECT_ID:
+        return [Action('skip', why=f"projects_v2_item of another project ({item.get('project_node_id')})")]
+    if ch.get('field_node_id') and ch.get('field_node_id') != board.STATUS_FIELD:
+        return [Action('skip', why='projects_v2_item: not the Status field')]
     frm = board.column({'optionId': (ch.get('from') or {}).get('id'), 'name': (ch.get('from') or {}).get('name')})
     to = board.column({'optionId': (ch.get('to') or {}).get('id'), 'name': (ch.get('to') or {}).get('name')})
     if login(p.get('sender')) != MICHAL:
@@ -500,8 +506,11 @@ class Executor:
         self.note(f"issue #{a.pr} comment while in {col}: nothing to do")
 
     def pr_of(self, node):
-        d = self.g['gql']('query($id:ID!){node(id:$id){...on PullRequest{number} ...on Issue{number}}}', id=node)
-        return ((d or {}).get('node') or {}).get('number')
+        """The number of a card's PR or issue, only when it is in REPO (else None)."""
+        d = self.g['gql']('query($id:ID!){node(id:$id){...on PullRequest{number repository{nameWithOwner}} '
+                          '...on Issue{number repository{nameWithOwner}}}}', id=node)
+        nd = (d or {}).get('node') or {}
+        return nd.get('number') if ((nd.get('repository') or {}).get('nameWithOwner') == REPO) else None
 
     def comments_since_head(self, n):
         full = self.g['fetch'](n, refresh=True)

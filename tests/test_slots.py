@@ -453,3 +453,23 @@ def test_pending_launches_count_only_fresh_entries():
     from tangentswarm import slots as S
     st = {'launching': {'5': 1000, '6': 1000 - S.LAUNCHING_TTL - 1}}
     assert S.pending_launches(st, now=1000) == [5]
+
+
+def test_revive_holds_a_new_claude_at_the_global_cap_but_still_tells_a_running_one(wt, monkeypatch):
+    """Codex on PR #26: a resume started a Claude with MAX_CLAUDES already running."""
+    monkeypatch.setattr(slots, 'live_claudes', lambda *a, **k: slots.MAX_CLAUDES)
+    out, host = [], FakeHost()
+    assert slots.revive(7, 'go', out=out.append, sp=FakeSP(wt), host=host, claudes=[]) == 3
+    assert not host.typed and 'cap' in out[-1]
+    host = FakeHost()
+    rc = slots.revive(7, 'more', out=lambda s: None, sp=FakeSP(wt, live={'pane': '%5', 'agent': 'claude'}),
+                      host=host, claudes=[claude(1, wt, 'b7', 's7')])
+    assert rc == 0 and host.told == [('%5', 'more')]
+
+
+def test_claude_load_counts_live_and_reserved_starts():
+    from tangentswarm import launches
+    slots.save({'launching': {'5': __import__('time').time()}, 'unstarted': {'601': {'branch': 'b'},
+                                                                         '602': {'brief_pane': '%1'}}})
+    launches.hold('held-b', pr=700)
+    assert slots.claude_load() == slots.live_claudes() + 1 + 1 + 1
