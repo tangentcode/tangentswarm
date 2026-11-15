@@ -414,7 +414,8 @@ def test_empty_ready_stops_the_fill_and_starts_coders_on_active_issues(monkeypat
     assert pulled == [] and out == ['fill: Staging 1, Ready 0: Ready is empty',
                                     'STALLED: Human Review 0, Staging 1, Ready empty: new work must reach Ready',
                                     'START_CLAUDE n=4 issues=#40,#41,#42,#43 new=0/4 rework=0/3 ready=0/6 '
-                                    'backlog_without_pr=5']
+                                    'backlog_without_pr=5 keys=#40=(ft:no,due:none,n:40);#41=(ft:no,due:none,n:41);'
+                                    '#42=(ft:no,due:none,n:42);#43=(ft:no,due:none,n:43)']
 
 
 def test_start_claude_also_when_ready_is_full(monkeypatch, tmp_path):
@@ -422,7 +423,8 @@ def test_start_claude_also_when_ready_is_full(monkeypatch, tmp_path):
     cols = {board.READY: [pr(n, board.READY) for n in range(10, 17)]}
     monkeypatch.setattr(A, 'FLOOR', 0)
     out, _ = cascade(monkeypatch, tmp_path, cols, CascadeGate(issues=[(50, board.BACKLOG), (51, board.BACKLOG)]))
-    assert out[-1] == 'START_CLAUDE n=2 issues=#50,#51 new=0/3 rework=0/3 ready=7/6 backlog_without_pr=2'
+    assert out[-1] == ('START_CLAUDE n=2 issues=#50,#51 new=0/3 rework=0/3 ready=7/6 backlog_without_pr=2 '
+                       'keys=#50=(ft:no,due:none,n:50);#51=(ft:no,due:none,n:51)')
 
 
 def test_a_dry_run_shows_the_gate_after_every_site_serves_and_no_cornerbot_request(monkeypatch, tmp_path):

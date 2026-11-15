@@ -533,7 +533,8 @@ class Cascade(Advance):
                  f"ready={ready}/{READY_TARGET} backlog_without_pr={len(issues)}")
         if n:
             pick = [i['number'] for i in issues[:n]]
-            self.out(f"START_CLAUDE n={n} issues={','.join('#' + str(x) for x in pick)} {facts}")
+            self.out(f"START_CLAUDE n={n} issues={','.join('#' + str(x) for x in pick)} {facts} "
+                     f"keys={';'.join(slots.key_text(i) for i in issues[:n])}")
             if not self.dry:
                 slots.mark_named(pick)
         elif not issues:

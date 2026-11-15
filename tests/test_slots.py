@@ -15,7 +15,8 @@ def issue_nodes(issues):
                       'content': {'__typename': 'Issue', 'number': n, 'title': f'issue {n}',
                                   'state': kw.get('state', 'OPEN'),
                                   'repository': {'nameWithOwner': kw.get('repo', slots.REPO)},
-                                  'milestone': {'title': kw['milestone']} if kw.get('milestone') else None,
+                                  'milestone': ({'title': kw['milestone'], 'dueOn': kw.get('due')}
+                                                if kw.get('milestone') else None),
                                   'labels': {'nodes': [{'name': l} for l in kw.get('labels', ())]}}})
     return nodes
 
@@ -35,14 +36,34 @@ def pr_node(n, closes, col=board.IN_PROGRESS):
 
 # -- (c) the launch picker: Backlog issues without a PR ---------------------------------
 
-def test_the_picker_takes_only_backlog_issues_in_milestone_then_number_order():
+def test_launch_key_is_fast_track_then_nearest_due_date_then_number():
+    """Michal 2026-11-15 12:31 AM ET: a deterministic sort, no LLM choice, no tokens."""
+    issues = [
+        dict(number=412),                                                    # no milestone
+        dict(number=399),
+        dict(number=510, milestone='ptw 15', due='2026-11-20T00:00:00Z'),
+        dict(number=490, milestone='MVP', due='2026-12-15T00:00:00Z'),
+        dict(number=505, milestone='ptw 15', due='2026-11-20T00:00:00Z'),
+        dict(number=600, milestone='someday'),                               # milestone, no due date
+        dict(number=700, labels=['Fast-Track']),                            # the label wins over all
+        dict(number=650, ft=True),                                           # the active fast-track
+    ]
+    assert [i['number'] for i in sorted(issues, key=slots.launch_key)] == [650, 700, 505, 510, 490, 600, 399, 412]
+    assert slots.launch_key(dict(number=1)) == slots.launch_key(dict(number=1))  # pure: same input, same key
+    assert slots.key_text(issues[2]) == '#510=(ft:no,due:2026-11-20 ptw 15,n:510)'
+    assert slots.key_text(issues[0]) == '#412=(ft:no,due:none,n:412)'
+    assert slots.key_text(issues[5]) == '#600=(ft:no,due:none someday,n:600)'
+    assert slots.key_text(issues[6]) == '#700=(ft:yes,due:none,n:700)'
+
+
+def test_the_picker_takes_only_backlog_issues():
     """Michal 2026-11-15 12:16 AM ET: START_CLAUDE named Parked #344 (active_without_pr=1)
-    while Backlog held 16 approved issues, so the tick launched nothing."""
+    while Backlog held the approved issues, so the tick launched nothing."""
     snap = {'issues': issue_nodes([
         (344, board.ACTIVE),                                   # Active: not the launch queue
         (499, board.BACKLOG), (412, board.BACKLOG),
-        (505, board.BACKLOG, {'milestone': 'ptw 15'}), (490, board.BACKLOG, {'milestone': 'MVP'}),
-        (501, board.BACKLOG, {'milestone': 'MVP'}),
+        (505, board.BACKLOG, {'milestone': 'ptw 15', 'due': '2026-11-20T00:00:00Z'}),
+        (490, board.BACKLOG, {'milestone': 'MVP', 'due': '2026-12-15T00:00:00Z'}),
         (377, board.BACKLOG),                                  # held
         (350, board.BACKLOG),                                  # parked by the handoff list
         (420, board.BACKLOG, {'labels': ['parked']}),
@@ -50,12 +71,12 @@ def test_the_picker_takes_only_backlog_issues_in_milestone_then_number_order():
         (430, board.TRIAGE), (431, board.PARKED), (432, board.INBOX), (433, board.DISCUSS),
         (434, board.BACKLOG),                                  # an open PR closes it
         (435, board.BACKLOG, {'repo': 'tangentcode/other'}), (436, board.BACKLOG, {'state': 'CLOSED'}),
-        (507, board.BACKLOG, {'milestone': 'ptw 15'})]),
+        (507, board.BACKLOG, {'labels': ['fast-track']})]),
         'prs': [pr_node(90, [434])]}
     got = slots.backlog_issues(snap, active_ft=None, prs={}, now=0)
-    assert [i['number'] for i in got] == [505, 507, 490, 501, 412, 499]  # priority ms, other ms, none
-    ft = slots.backlog_issues(snap, active_ft=499, prs={}, now=0)
-    assert ft[0]['number'] == 499  # the active fast-track first
+    assert [i['number'] for i in got] == [507, 505, 490, 412, 499]
+    ft = [i['number'] for i in slots.backlog_issues(snap, active_ft=499, prs={}, now=0)]
+    assert ft[:2] == [499, 507]  # both fast-track: the lower number first
 
 
 def test_a_named_issue_is_not_named_again_until_the_grace_ends(tmp_path):

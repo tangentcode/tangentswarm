@@ -15,8 +15,8 @@ Of the usual 5 to 8 running Claudes:
   (c) signal   START_CLAUDE while fewer than NEW_SLOTS new-work Claudes run and Backlog issues
                without a PR exist (up to NEW_SLOTS_SHORT while Ready is short). The picker
                (backlog_issues) takes only the Backlog column, never Parked, Triage or the
-               NEVER_START list (#377 is held): the active fast-track first, then a
-               milestone (the priority milestone first), then the lowest number.
+               NEVER_START list (#377 is held). Order: launch_key, a pure sort (fast-track
+               label, then the nearest milestone due date, then the lowest number).
 
 A running Claude is found from ~/.claude/sessions/<pid>.json (pid, sessionId, cwd, tmux
 pane); only live Claudes in platform worktrees (~/ver/platform.*) count. A rework Claude is
@@ -174,16 +174,35 @@ def latest_session(worktree, projects=None):
 
 # -- (c) Backlog issues without a PR: the launch picker ----------------------------------------------------
 
+def launch_key(issue):
+    """The launch sort key of one issue (Michal 2026-11-15 12:31 AM ET: a deterministic sort,
+    no LLM choice). A pure function of {number, labels, milestone, due}:
+      (1) fast-track first (the label "fast-track", or the active fast-track: issue['ft']);
+      (2) then the milestone due date, nearest first; a milestone without a due date after
+          every dated one; no milestone last;
+      (3) then the lowest issue number."""
+    labels = {str(l).lower() for l in issue.get('labels') or ()}
+    ft = 0 if ('fast-track' in labels or issue.get('ft')) else 1
+    due = (issue.get('due') or '')[:10]
+    ms = 0 if due else 1 if issue.get('milestone') else 2
+    return (ft, ms, due, issue['number'])
+
+
+def key_text(issue):
+    """The sort key as START_CLAUDE prints it, e.g. #507=(ft:no,due:2026-11-20 ptw 15,n:507)."""
+    ft, ms, due, n = launch_key(issue)
+    when = f"{due} {issue.get('milestone')}" if ms == 0 else f"none {issue.get('milestone')}" if ms == 1 else 'none'
+    return f"#{n}=(ft:{'yes' if ft == 0 else 'no'},due:{when},n:{n})"
+
+
 def backlog_issues(snap, active_ft=None, prs=None, named=None, now=None):
     """The launch picker (Michal 2026-11-15 12:16 AM ET: START_CLAUDE named Parked #344 while
-    Backlog held 16 approved issues). Open platform issues in the BACKLOG column (by option id;
-    so never Triage, Inbox, Discuss, Active or Parked) that no open PR closes, without the label
-    "parked" or "triage", not in NEVER_START, and not named by START_CLAUDE in the last
-    LAUNCH_GRACE s (named: {number: time}; its Claude has no PR yet). Order: the active
-    fast-track, then a priority milestone, then any other milestone, then none; then the
-    lowest number. snap: the board snapshot (boardcache); prs: board PRs ({n: {closes}})."""
+    Backlog held the approved issues). Open platform issues in the BACKLOG column (by option
+    id; so never Triage, Inbox, Discuss, Active or Parked) that no open PR closes, without the
+    label "parked" or "triage", not in NEVER_START, and not named by START_CLAUDE in the last
+    LAUNCH_GRACE s (named: {number: time}; its Claude has no PR yet). Sorted by launch_key.
+    snap: the board snapshot (boardcache); prs: board PRs ({n: {closes}})."""
     from . import boardcache
-    from .tick import milestone_rank
     now = time.time() if now is None else now
     taken = {i['number'] for _, c in boardcache.open_prs(snap) for i in boardcache.closes(c)}
     taken |= {i for p in (prs or {}).values() if p.get('state', 'OPEN') == 'OPEN' for i in p.get('closes') or ()}
@@ -193,13 +212,13 @@ def backlog_issues(snap, active_ft=None, prs=None, named=None, now=None):
         n = c['number']
         if boardcache.col(it) != board.BACKLOG or n in taken or n in NEVER_START or n in recent:
             continue
-        if {'parked', 'triage'} & {l['name'].lower() for l in (c.get('labels') or {}).get('nodes') or []}:
+        labels = [l['name'] for l in (c.get('labels') or {}).get('nodes') or []]
+        if {'parked', 'triage'} & {l.lower() for l in labels}:
             continue
-        ms = (c.get('milestone') or {}).get('title')
-        ft = board.is_active_fast_track(n, (), active_ft)
-        rank = (0 if ft else 1, milestone_rank([ms]), 0 if ms else 1)
-        out.append(dict(number=n, title=c.get('title') or '', rank=rank, milestone=ms))
-    return sorted(out, key=lambda i: (i['rank'], i['number']))
+        m = c.get('milestone') or {}
+        out.append(dict(number=n, title=c.get('title') or '', labels=labels, milestone=m.get('title'),
+                        due=m.get('dueOn'), ft=board.is_active_fast_track(n, (), active_ft)))
+    return sorted(out, key=launch_key)
 
 
 def mark_named(numbers, path=None, now=None):

@@ -39,7 +39,7 @@ PR_FIELDS = """number state title isDraft headRefName headRefOid updatedAt body 
  closingIssuesReferences(first:5){nodes{number milestone{title} labels(first:10){nodes{name}}}}
  timelineItems(last:30,itemTypes:[PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]){nodes{__typename
    ...on ProjectV2ItemStatusChangedEvent{createdAt status}}}"""
-ISSUE_FIELDS = 'number title state repository{nameWithOwner} milestone{title} labels(first:10){nodes{name}}'
+ISSUE_FIELDS = 'number title state repository{nameWithOwner} milestone{title dueOn} labels(first:10){nodes{name}}'
 
 
 def _items(alias, filt, fields, kind, first, cursor_var):
