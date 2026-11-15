@@ -255,7 +255,9 @@ class Cascade(Advance):
                    .deploy-sha of EVERY staging site contains it, then hr-gate --apply.
                    A pull that still waits after the timeout (or for CI) stops the fill;
                    the next cascade continues it. Each move goes to the move log
-                   (tangentswarm.moves).
+                   (tangentswarm.moves). A fast-track PR (the active fast-track ticket, the
+                   PR Michal marks urgent) is the next pull: Flow.pull tries it first, and
+                   it is pulled also when Staging is at the floor (Michal 2026-11-14 8:43 PM).
       3. signal    Ready has fewer than READY_TARGET PRs: print one START_CLAUDE line for
                    swarmbot, so that about WORKING_TARGET coders work.
     """
@@ -387,15 +389,26 @@ class Cascade(Advance):
                 if not ready:
                     self.out(f"fill: Staging {len(st)}, Ready 0: Ready is empty")
                     return cols
+                # (d) Michal 2026-11-14 8:43 PM ET: a PR Michal marks urgent (the active fast-track)
+                # is the next Staging pull, also when Staging is at the floor. Flow.pull tries
+                # it first (ready_order: rank first); strict still needs a clean merge.
+                urgent = [p for p in ready if p.get('rank') == board.FAST_TRACK]
+                limit, pick = FLOOR, cols
                 if len(st) >= FLOOR:
-                    self.out(f"fill: Staging {len(st)}, floor {FLOOR}: no pull needed")
-                    return cols
-                p = self.f.pull(prs, cols, scratch, limit=FLOOR, strict=True)
+                    if not urgent:
+                        self.out(f"fill: Staging {len(st)}, floor {FLOOR}: no pull needed")
+                        return cols
+                    limit = len(st) + 1
+                    pick = dict(cols, **{board.READY: urgent})
+                    self.out(f"fill: Staging {len(st)}, floor {FLOOR}: fast-track "
+                             f"{', '.join('#' + str(p['number']) for p in urgent)} is pulled past the floor")
+                p = self.f.pull(prs, pick, scratch, limit=limit, strict=True)
                 self.flush()
                 if p is None:
                     self.out(f"fill: Staging {len(st)}: no {'extra ' if st else ''}Ready PR to pull without rework")
                     return cols
-                self.out(f"fill: #{p['number']} is the {'extra' if st else 'first'} Staging pull")
+                ft = ' (fast-track)' if p.get('rank') == board.FAST_TRACK else ''
+                self.out(f"fill: #{p['number']} is the {'extra' if st else 'first'} Staging pull{ft}")
                 if self.dry:  # nothing was pushed: show the rest of the chain, then count it in Staging
                     if self.touches_served(p['number']):
                         d = dict(pr=p['number'], head=p['head'], work=getattr(self.f, 'last_work', None))

@@ -254,7 +254,8 @@ def cascade(monkeypatch, tmp_path, cols, g, dry=True, **kw):
     pulled = []
 
     def pull(self, prs, c, scratch, limit=None, strict=False):
-        assert limit == A.FLOOR and strict  # the cascade never reworks to fill Staging
+        st = len(c.get(board.STAGING, []))
+        assert strict and limit == (A.FLOOR if st < A.FLOOR else st + 1)  # past the floor: fast-track only
         fits = [q for q in c.get(board.READY, []) if q['number'] not in kw.get('dirty', ())]
         if not fits:
             return None
@@ -303,6 +304,30 @@ def test_the_floor_sets_how_many_clean_prs_staging_gets(monkeypatch, tmp_path, f
     cols = {board.READY: [pr(n, board.READY) for n in range(10, 16)]}
     _, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False), dirty={11, 13})
     assert pulled == want
+
+
+def test_a_fast_track_pr_is_pulled_past_the_floor(monkeypatch, tmp_path):
+    """(d) Michal 8:43 PM ET: the PR marked urgent is the next Staging pull, also at the floor."""
+    cols = {board.STAGING: [pr(n, board.STAGING) for n in range(1, A.FLOOR + 1)],
+            board.READY: [pr(10, board.READY), pr(12, board.READY, rank=board.FAST_TRACK), pr(13, board.READY)]}
+    out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False))
+    assert pulled == [12]  # only the fast-track PR; #10 and #13 wait for the floor
+    assert f'fill: Staging {A.FLOOR}, floor {A.FLOOR}: fast-track #12 is pulled past the floor' in out
+    assert 'fill: #12 is the extra Staging pull (fast-track)' in out
+    assert f'fill: Staging {A.FLOOR + 1}, floor {A.FLOOR}: no pull needed' in out
+
+
+def test_a_fast_track_pr_that_does_not_merge_cleanly_is_not_pulled_past_the_floor(monkeypatch, tmp_path):
+    cols = {board.STAGING: [pr(n, board.STAGING) for n in range(1, A.FLOOR + 1)],
+            board.READY: [pr(10, board.READY), pr(12, board.READY, rank=board.FAST_TRACK)]}
+    out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False), dirty={12})
+    assert pulled == [] and f'fill: Staging {A.FLOOR}: no extra Ready PR to pull without rework' in out
+
+
+def test_the_pull_order_puts_the_fast_track_pr_first():
+    ready = [pr(5, board.READY, rank=board.NORMAL), pr(9, board.READY, rank=board.FAST_TRACK),
+             pr(7, board.READY, rank=board.MILESTONE)]
+    assert [p['number'] for p in flow.ready_order(ready, {9: 3})] == [9, 7, 5]
 
 
 def test_empty_ready_stops_the_fill_and_asks_for_two_coders(monkeypatch, tmp_path):
