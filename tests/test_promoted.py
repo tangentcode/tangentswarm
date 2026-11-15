@@ -411,3 +411,19 @@ def test_a_daemon_promote_queues_a_cascade_to_restock_staging(tmp_path, monkeypa
     monkeypatch.setattr(P.gatelock, 'gate_lock', lambda name: L())
     assert p.once() == 'promoted'
     assert order[-2:] == ['promoted #5: restock Staging', 'drain']
+
+
+def test_the_spool_thread_serves_while_the_main_loop_is_busy(monkeypatch):
+    """A drain under the lock can take minutes: worker requests must not wait for it."""
+    import threading
+    served = threading.Event()
+    p = P.Promoter(g={}, dry_run=False)
+    monkeypatch.setattr(p, 'each_second', served.set)
+    stop = threading.Event()
+    t = P.start_spool_thread(p, interval=0.01, stop=stop)
+    try:
+        assert served.wait(2)
+    finally:
+        stop.set()
+        t.join(2)
+    assert not t.is_alive()

@@ -524,10 +524,26 @@ def limit_pause(e, now=time.time):
     return int(max(60, (reset or now() + 600) - now() + 30))
 
 
+def start_spool_thread(p, interval=1.0, stop=None):
+    """Serve the worker spool every second in its own thread, so a long pass or a drain
+    under the lock never delays a worker's Stop-hook or MCP request."""
+    import threading
+    stop = stop or threading.Event()
+
+    def loop():
+        while not stop.is_set():
+            p.each_second()
+            stop.wait(interval)
+    t = threading.Thread(target=loop, name='spool', daemon=True)
+    t.start()
+    return t
+
+
 def run(p, poll=POLL, retry=RETRY, sleep=time.sleep):
     wake = {'now': False}
     signal.signal(signal.SIGUSR1, lambda *a: wake.update(now=True))
     say(f"swarm-promoted: polling every {poll}s (SIGUSR1 wakes it)")
+    start_spool_thread(p)
     what = 'idle'
     while True:
         limited = None
@@ -539,7 +555,6 @@ def run(p, poll=POLL, retry=RETRY, sleep=time.sleep):
             what = 'idle' if limited else 'busy'
         pause = limited or (retry if what == 'busy' else poll)
         for _ in range(pause):
-            p.each_second()
             if wake['now'] and not limited:
                 wake['now'] = False
                 from . import boardcache
