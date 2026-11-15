@@ -100,3 +100,20 @@ def test_a_body_edit_on_a_waiting_pull_re_runs_its_gate():
     lines = ev.poll()
     assert cascades == [1] and queued == [['--minbot', '519'], ['--minbot', '600']]
     assert any(l.endswith('cascade queued for swarm-promoted') and 'platform#519' in l for l in lines)
+
+
+def test_a_file_truncated_in_place_is_pending_and_read_from_the_start(tmp_path):
+    """Codex on PR #26: copy-truncate keeps the inode; a smaller file was not pending."""
+    import json
+    from tangentswarm import events as E
+    ev, off = tmp_path / 'ev.jsonl', tmp_path / 'off'
+    ev.write_text(json.dumps({'a': 1}) + '\n' + json.dumps({'a': 2}) + '\n')
+    assert not E.pending(ev, off)
+    with open(ev, 'r+') as f:  # truncate in place, then one new short record
+        f.truncate(0)
+        f.write(json.dumps({'b': 1}) + '\n')
+    assert E.pending(ev, off)
+    assert E.new_records(ev, off) == [{'b': 1}] and not E.pending(ev, off)
+    with open(ev, 'r+') as f:
+        f.truncate(0)
+    assert E.pending(ev, off) and E.new_records(ev, off) == [] and not E.pending(ev, off)

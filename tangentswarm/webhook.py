@@ -505,6 +505,15 @@ class Executor:
                                    f"({col}): {a.args.get('url')}", key=f"triage:{a.pr}:{a.args.get('url')}")
         self.note(f"issue #{a.pr} comment while in {col}: nothing to do")
 
+    def closing_issues(self, n):
+        """The issues PR n closes, with their repository (a cross-repo "Fixes o/r#17" is
+        another repo's issue 17, not this repo's)."""
+        owner, name = REPO.split('/')
+        d = self.g['gql'](f'query{{repository(owner:"{owner}",name:"{name}"){{pullRequest(number:{int(n)})'
+                          '{closingIssuesReferences(first:20){nodes{number repository{nameWithOwner}}}}}}')
+        pr = ((d or {}).get('repository') or {}).get('pullRequest') or {}
+        return (pr.get('closingIssuesReferences') or {}).get('nodes') or []
+
     def pr_of(self, node):
         """The number of a card's PR or issue, only when it is in REPO (else None)."""
         d = self.g['gql']('query($id:ID!){node(id:$id){...on PullRequest{number repository{nameWithOwner}} '
@@ -546,8 +555,12 @@ class Executor:
         item, _ = self.card(a.pr)
         if item:
             self.move(a.pr, item, board.DONE)
-        for i in ((full.get('closingIssuesReferences') or {}).get('nodes') or []):
+        for i in self.closing_issues(a.pr):
             num = i.get('number')
+            repo = (i.get('repository') or {}).get('nameWithOwner')
+            if repo != REPO:  # Codex on PR #26: never close a same-number platform issue
+                self.note(f"#{a.pr} closes {repo}#{num}: not a {REPO} issue, left to GitHub")
+                continue
             if not num or self.dry:
                 continue
             it, _ = self.card(num)  # before the close: the issue is still in the open snapshot

@@ -108,7 +108,7 @@ class Fake(W.Executor):
         self.calls, self.queued, self.cascades, self.relays, self.wakes = [], [], [], [], []
         self.col, self.full = col, full or {}
         self._g['fetch'] = lambda n, refresh=False: self.full
-        self._g['gql'] = lambda q, **v: {'repository': {'p': self.full}}  # advance.codex_details
+        self._g['gql'] = lambda q, **v: {'repository': {'p': self.full, 'pullRequest': self.full}}
 
     def card(self, n):
         return ('ITEM', self.col)
@@ -188,10 +188,15 @@ def test_a_comment_on_a_triage_issue_wakes_swarmbot():
 
 
 def test_a_merge_runs_the_cascade_and_closes_the_issues():
-    ex = Fake(col=board.HUMAN_REVIEW, full={'closingIssuesReferences': {'nodes': [{'number': 418}]}})
+    other = {'number': 17, 'repository': {'nameWithOwner': 'tangentcode/other'}}
+    ex = Fake(col=board.HUMAN_REVIEW, full={'closingIssuesReferences': {'nodes': [
+        {'number': 418, 'repository': {'nameWithOwner': W.REPO}}, other]}})
     ex.run(W.Action('merged', 540))
     assert ex.cascades == [1] and ['gh', 'issue', 'close', '418', '-R', W.REPO, '--reason', 'completed'] in ex.calls
     assert [c[-1] for c in ex.calls if c[:3] == ['gh', 'project', 'item-edit']].count(board.OPTION[board.DONE]) == 2
+    # Codex on PR #26: a cross-repo "Fixes tangentcode/other#17" never closes platform #17
+    assert not any(c[:4] == ['gh', 'issue', 'close', '17'] for c in ex.calls)
+    assert any('tangentcode/other#17' in d for d in ex.done)
 
 
 def test_a_failing_action_wakes_swarmbot_with_the_error():

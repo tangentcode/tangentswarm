@@ -61,13 +61,15 @@ def _offset(path, events):
 
 
 def pending(events=None, offset=None):
-    """True when the events file has grown past the saved offset (a stat, no read). The
-    first call saves the current end as the offset, so later events are seen."""
+    """True when the events file size differs from the saved offset (a stat, no read):
+    grown, or truncated in place (Codex on PR #26: a copy-truncate keeps the inode, and a
+    smaller file was never read again until it grew past the old size). The first call
+    saves the current end as the offset, so later events are seen."""
     events, offset = events or EVENTS, offset or OFFSET
     if not offset.exists():
         _save(offset, f"{_inode(events)}:{_size(events)}")
         return False
-    return _size(events) > _offset(offset, events)
+    return _size(events) != _offset(offset, events)
 
 
 def new_records(events=None, offset=None, save=True):
@@ -78,7 +80,7 @@ def new_records(events=None, offset=None, save=True):
     if size < start:
         start = 0
     if size == start:
-        if save and not offset.exists():
+        if save and (not offset.exists() or _offset(offset, events) != start):  # e.g. truncated to empty
             _save(offset, f"{_inode(events)}:{start}")
         return []
     with open(events, 'rb') as f:

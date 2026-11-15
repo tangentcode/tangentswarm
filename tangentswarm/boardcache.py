@@ -36,7 +36,7 @@ REPO = 'tangentcode/platform'
 STATUS = '{...on ProjectV2ItemFieldSingleSelectValue{name optionId}}'
 PR_FIELDS = """number state title isDraft headRefName headRefOid updatedAt body repository{nameWithOwner}
  milestone{title} labels(first:15){nodes{name}}
- closingIssuesReferences(first:5){nodes{number milestone{title} labels(first:10){nodes{name}}}}
+ closingIssuesReferences(first:5){nodes{number repository{nameWithOwner} milestone{title} labels(first:10){nodes{name}}}}
  timelineItems(last:30,itemTypes:[PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]){nodes{__typename
    ...on ProjectV2ItemStatusChangedEvent{createdAt status}}}"""
 ISSUE_FIELDS = 'number title state repository{nameWithOwner} milestone{title dueOn} labels(first:10){nodes{name}}'
@@ -130,7 +130,10 @@ def col(it):
 
 
 def closes(c):
-    return ((c.get('closingIssuesReferences') or {}).get('nodes')) or []
+    """The issues a PR closes in REPO. A cross-repo "Fixes o/r#17" is another repo's issue 17,
+    never this repo's (Codex on PR #26); a node without its repository is kept."""
+    return [i for i in ((c.get('closingIssuesReferences') or {}).get('nodes')) or []
+            if (i.get('repository') or {}).get('nameWithOwner', REPO) == REPO]
 
 
 def item_rows(snap):
