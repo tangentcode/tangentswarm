@@ -225,8 +225,11 @@ def classify(event, p):
             return [Action('skip', pr=n, why=f'pull_request {action}')]
         if action == 'closed':
             if pr.get('merged') and base == 'main':
-                return [Action('merged', n, f"#{n} merged into main", dict(head=(pr.get('head') or {}).get('sha'),
-                                                                           branch=(pr.get('head') or {}).get('ref')))]
+                head = pr.get('head') or {}
+                # a fork's branch name says nothing about this repo's branches (Codex on PR #42)
+                own = ((head.get('repo') or {}).get('full_name') or REPO) == REPO
+                return [Action('merged', n, f"#{n} merged into main", dict(head=head.get('sha'),
+                                                                           branch=head.get('ref') if own else None))]
             if pr.get('merged'):
                 return [Action('wake', n, f"#{n} merged into {base}, not main", dict(key=f'merge-base:{n}'))]
             return [Action('closed', n, f"#{n} closed without a merge")]

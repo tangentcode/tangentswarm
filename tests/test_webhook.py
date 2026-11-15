@@ -406,6 +406,9 @@ def test_a_merge_deletes_the_vn_siblings_but_not_one_that_heads_an_open_pr():
          'pull_request': dict(pr(540, merged=True), head={'sha': 'a' * 40, 'ref': 'ptw-quiz'})}
     (a,) = W.classify('pull_request', p)
     assert a.kind == 'merged' and a.args['branch'] == 'ptw-quiz'
+    fork = dict(p, pull_request=dict(p['pull_request'], head={'sha': 'a' * 40, 'ref': 'ptw-quiz',
+                                                              'repo': {'full_name': 'someone/platform'}}))
+    assert W.classify('pull_request', fork)[0].args['branch'] is None  # Codex on PR #42: a fork's branch
     refs = [{'ref': f'refs/heads/{b}'} for b in ('ptw-quiz-v1', 'ptw-quiz-v2', 'ptw-quiz-v10', 'ptw-quiz-vx',
                                                  'ptw-quiz-v1-old')]
     calls = []
