@@ -36,6 +36,7 @@ swarm-advance = "tangentswarm.advance:main"
 swarm-slots = "tangentswarm.slots:main"
 swarm-revive = "tangentswarm.slots:revive_main"
 swarm-stop-hook = "tangentswarm.stophook:main"
+swarm-worker-mcp = "tangentswarm.worker_mcp:main"
 
 [tool.setuptools]
 packages = ["tangentswarm", "tangentswarm.cloud", "tangentswarm.queue"]
