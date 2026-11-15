@@ -361,3 +361,13 @@ def test_no_wake_url_is_logged_not_a_type_error(tmp_path):
     W.post_wake({'source': 'swarm-webhook', 'why': 'x', 'pr': 1}, url_file=tmp_path / 'none', background=False)
     rec = json.loads(W.LOG.read_text().splitlines()[-1])
     assert rec['decision'] == 'wake-not-sent' and rec['why'] == 'x' and rec['reason'] == 'no wake URL configured'
+
+
+def test_a_late_delivery_never_restarts_a_merged_or_done_pr():
+    """Codex on PR #26: Codex findings after the merge resumed the worker and moved Done back."""
+    ex = Fake(col=board.DONE, full=dict(codex_pr(findings=True), state='MERGED'))
+    ex.run(W.Action('codex', 541))
+    assert ex.relays == [] and ex.calls == [] and 'no rework' in ex.done[-1]
+    ex = Fake(col=board.CANCELED, full=codex_pr(findings=True))  # open PR, but its card is Canceled
+    ex.run(W.Action('codex', 541))
+    assert ex.relays == [] and ex.calls == []

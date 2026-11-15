@@ -370,11 +370,16 @@ class Executor:
 
     def back_to_work(self, n, text, why):
         """Relay, then In Progress, only when a worker has it (never demote into a column with
-        no worker); else wake swarmbot."""
+        no worker); else wake swarmbot. A merged or closed PR, or a card in Done, Canceled or
+        Parked, is left alone (Codex on PR #26: a late Codex or CI delivery restarted done work)."""
+        from . import advance
+        state = (advance.codex_details(self.g['gql'], n).get('state') or 'OPEN')
+        item, col = self.card(n)
+        if state != 'OPEN' or col in (board.DONE, board.CANCELED, board.PARKED):
+            return self.note(f"#{n}: {why}, but the PR is {state.lower()} and its card is in {col}: no rework")
         ok, said = self.to_worker(n, text)
         if not ok:
             return self.wake(n, f"#{n}: {why}; no worker could take the relay ({said})", key=f'noworker:{n}:{why[:40]}')
-        item, col = self.card(n)
         if item and col not in (board.IN_PROGRESS, board.NEEDS_INPUT):
             self.move(n, item, board.IN_PROGRESS)
         self.note(f"#{n} relayed to its worker ({said})")
