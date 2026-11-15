@@ -6,7 +6,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # the private infra config: the tests use the placeholders of config.example.toml, never the real file
 os.environ['TANGENTSWARM_CONFIG'] = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                                 'config.example.toml')
+                                                 'tangentswarm', 'config.example.toml')
 
 
 @pytest.fixture(autouse=True)

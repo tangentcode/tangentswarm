@@ -1,4 +1,5 @@
 # tangentswarm private infra config (example with placeholders).
+# This file ships in the package (tangentswarm/config.example.toml).
 # Copy to ~/.config/tangentswarm/config.toml (or $TANGENTSWARM_CONFIG) and fill in the real
 # values. The real file is never committed. The tests run with this example file.
 

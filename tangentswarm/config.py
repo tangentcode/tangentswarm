@@ -2,15 +2,19 @@
 
 Project node ids, the Status option ids, staging hosts and secret file paths are not in
 the code (Michal 2026-11-15 2:04 PM ET). config.example.toml in the repo has the shape with
-placeholders; the tests run with it. With no config file the example is used and a warning
+placeholders (tangentswarm/config.example.toml, package data); the tests run with it. With no config file the example is used and a warning
 goes to stderr once, so a missing file shows instead of failing in silence.
 """
 import os
 import sys
-import tomllib
 from pathlib import Path
 
-EXAMPLE = Path(__file__).resolve().parent.parent / 'config.example.toml'
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10: the tomli backport (a dependency there only)
+    import tomli as tomllib
+
+EXAMPLE = Path(__file__).resolve().parent / 'config.example.toml'  # package data: in the wheel too
 _cache = {}
 
 

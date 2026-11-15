@@ -102,9 +102,13 @@ def deliver(pr, text, find=find_pane, tell=None):
 
 
 def recheck(staging, main, clean, move, say, details=None, dry=False, cache_path=None,
-            send=deliver, now=None):
-    """Move each Staging PR that conflicts with the new main to In Progress and relay a
-    merge-main. Returns the PR numbers that conflict."""
+            send=deliver, now=None, give=None):
+    """Relay a merge-main to each Staging PR that conflicts with the new main, and move it to
+    In Progress only once its worker has the relay (Codex on PR #26: a parked Staging worker
+    was demoted with no live pane to take it). give(n, text) -> (ok, note) is the
+    revive-capable handoff (Flow.give_worker); without it, send() to a live pane only. A PR
+    whose worker cannot be started stays in Staging, held from new pulls (NEEDS_WORKER).
+    Returns the PR numbers that conflict."""
     cache = load_cache(cache_path)
     bad = conflicts(staging, main, clean, cache)
     save_cache(cache, cache_path)
@@ -114,10 +118,20 @@ def recheck(staging, main, clean, move, say, details=None, dry=False, cache_path
         if dry:
             say(f"would move #{n} Staging -> In Progress: head {p['head'][:8]} conflicts with main {main[:8]}")
             continue
-        move(p['item'], board.IN_PROGRESS)
         text = relay_text(n, branch, p['head'], main)
         path = write_relay(n, text, now)
-        how = send(dict(number=n, branch=branch), text)
+        if give:
+            ok, how = give(n, text)
+        else:
+            how = send(dict(number=n, branch=branch), text)
+            ok = how == 'sent'
+        if not ok:
+            from . import flow
+            flow.hold(n, p['head'], f'conflicts with main {main[:8]}')
+            say(f"NEEDS_WORKER #{n}: conflicts with main {main[:8]}; no worker took the merge-main relay "
+                f"{path.name} ({how}); the card stays in Staging, its head is held from new pulls")
+            continue
+        move(p['item'], board.IN_PROGRESS)
         say(f"moved #{n} Staging -> In Progress: conflicts with main {main[:8]}; merge-main relay {path.name} {how}")
     if staging and not bad:
         say(f"main {main[:8]}: every Staging PR still merges cleanly ({len(staging)})")

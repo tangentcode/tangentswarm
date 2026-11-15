@@ -175,3 +175,26 @@ def test_the_cascade_retries_unstarted_prs_before_it_names_new_issues(monkeypatc
     assert reqs == [537, 538]  # both fit under the cap of 10
     assert not any(l.startswith('START_CLAUDE') for l in out)  # no room left for new issues
     assert 'start: queued the worker start of #537 (dictate-plain-text-field): its window has no Claude' in out
+
+
+def test_a_setup_failure_after_the_draft_pr_is_recovered_by_the_start_retry(tmp_path, monkeypatch):
+    """Codex on PR #26: a launch that failed after the draft PR but before unstarted_add was
+    stranded (the picker skips the issue, and retry_starts had no record)."""
+    from tangentswarm import brief
+    monkeypatch.setattr(brief, 'BRIEF_DIR', tmp_path / 'briefs')
+    monkeypatch.setattr(brief, 'write_brief', lambda n: None)
+    started = []
+    lz = L.Launcher(g=gate(), run=Run(), git_dir=tmp_path,
+                    launch=lambda branch, pr, brief: started.append(pr) or ('launched', {'window': 'w', 'pane': '%9'}))
+    slots.launch_mark([412])
+    monkeypatch.setattr(L.Launcher, 'board', lambda self, n, pr: (_ for _ in ()).throw(RuntimeError('rate limited')))
+    with pytest.raises(RuntimeError):
+        lz.launch(412, 'Board marks right and wrong')
+    rec = slots.load()['unstarted']['601']
+    assert rec['setup'] == 'pending' and rec['queued'] > 0 and '412' not in slots.load()['launching']
+    monkeypatch.undo()
+    monkeypatch.setattr(brief, 'BRIEF_DIR', tmp_path / 'briefs')
+    monkeypatch.setattr(brief, 'write_brief', lambda n: None)
+    note = lz.start_existing(601, rec)
+    assert started == [601] and 'claude runs' in note and '601' not in slots.load()['unstarted']
+    assert (tmp_path / 'briefs' / '601.txt').exists()

@@ -20,6 +20,7 @@ Each step is idempotent, so a failed launch can run again. The issue counts as n
 skips it for LAUNCHING_TTL, so the next pass does not name it twice).
 """
 import json
+import time
 import re
 import subprocess
 from pathlib import Path
@@ -205,23 +206,43 @@ class Launcher:
         pr, note = self.draft_pr(n, title, branch)
         steps.append(note)
         if not self.dry:
-            slots.mark_named([n])  # the draft PR exists: now it counts as named
-        steps.append(self.milestone(n, pr))
-        steps.append(self.board(n, pr))
-        path, note = self.brief(n, title, branch, pr)
-        steps.append(note)
-        if not self.dry:
-            slots.unstarted_add(pr, branch=branch, brief=str(path), issue=n)
-            slots.launch_done(n)  # only now: until unstarted_add it holds its slot as "launching"
+            # Codex on PR #26: from here the PR exists and the picker skips the issue, so the
+            # launch is recorded as unstarted at once (setup pending, a start in flight). A
+            # failed setup step is redone by retry_starts -> start_existing; the record also
+            # holds the launch's slot, so "launching" can end now.
+            slots.mark_named([n])
+            with slots.update() as d:
+                d['unstarted'][str(pr)] = dict(branch=branch, issue=n, title=title, brief='', setup='pending',
+                                               at=time.time(), queued=time.time())
+            slots.launch_done(n)
+        path, notes = self.setup(n, title, branch, pr)
+        steps += notes
         steps.append(self.start(branch, pr, path))
         if not self.dry:
             slots.unstarted_done(pr)
         return steps
 
-    def start_existing(self, pr, rec):
-        """Retry the worker start of a PR whose launch made the window but no Claude."""
+    def setup(self, n, title, branch, pr):
+        """Milestone, board cards and brief of a launched PR (each step is safe to redo).
+        Returns (brief path, notes) and marks the unstarted record's setup done."""
         from . import slots
-        note = self.start(rec['branch'], pr, rec['brief'])
+        notes = [self.milestone(n, pr), self.board(n, pr)]
+        path, note = self.brief(n, title, branch, pr)
+        notes.append(note)
+        if not self.dry:
+            with slots.update() as d:
+                if str(pr) in d['unstarted']:
+                    d['unstarted'][str(pr)].update(brief=str(path), setup='done')
+        return path, notes
+
+    def start_existing(self, pr, rec):
+        """Retry the worker start of a launched PR with no Claude; an unfinished setup is
+        redone first."""
+        from . import slots
+        path = rec.get('brief')
+        if rec.get('setup', 'done') != 'done' or not path:
+            path, _ = self.setup(int(rec['issue']), rec.get('title') or f"Issue #{rec['issue']}", rec['branch'], pr)
+        note = self.start(rec['branch'], pr, path)
         slots.unstarted_done(pr)
         return note
 

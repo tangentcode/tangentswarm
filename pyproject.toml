@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "PyYAML",
+    "tomli>=1.1; python_version < '3.11'",
     "mcp>=2.3,<3",
     "PyJWT[crypto]>=2.8",
     "uvicorn",
@@ -42,6 +43,9 @@ swarm-events = "tangentswarm.events_view:main"
 
 [tool.setuptools]
 packages = ["tangentswarm", "tangentswarm.cloud", "tangentswarm.queue"]
+
+[tool.setuptools.package-data]
+tangentswarm = ["config.example.toml"]
 
 [tool.setuptools.dynamic]
 version = { attr = "tangentswarm.__version__" }

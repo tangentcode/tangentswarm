@@ -31,6 +31,20 @@ def test_recheck_moves_and_relays_only_the_conflicting_pr(tmp_path, monkeypatch)
     assert 'merge-main relay' in said[-1] and said[-1].endswith('sent')
 
 
+def test_a_conflict_moves_the_card_only_once_a_worker_has_the_relay(tmp_path, monkeypatch):
+    """Codex on PR #26: a parked Staging worker was demoted while no live pane took the relay."""
+    from tangentswarm import flow
+    monkeypatch.setattr(M, 'RELAY_DIR', tmp_path)
+    moves, said, given = [], [], []
+    out = M.recheck(ST, MAIN, lambda m, h: h == A, lambda i, c: moves.append((i, c)), said.append,
+                    cache_path=tmp_path / 'c.json', give=lambda n, t: given.append(n) or (False, 'no worker'))
+    assert out == [6] and given == [6] and moves == []
+    assert said[-1].startswith('NEEDS_WORKER #6') and flow.held()[6]['head'] == B
+    out = M.recheck(ST, MAIN, lambda m, h: h == A, lambda i, c: moves.append((i, c)), said.append,
+                    cache_path=tmp_path / 'c.json', give=lambda n, t: (True, 'revived'))
+    assert moves == [('I6', board.IN_PROGRESS)] and said[-1].endswith('revived')
+
+
 def test_recheck_all_clean_moves_nothing(tmp_path):
     moves, said = [], []
     assert M.recheck(ST, MAIN, lambda m, h: True, moves.append, said.append, cache_path=tmp_path / 'c') == []
