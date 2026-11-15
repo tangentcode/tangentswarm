@@ -10,8 +10,9 @@ from tangentswarm import board, launcher as L, slots
 
 class Run:
     """Fake subprocess.run: records argv, answers by command."""
-    def __init__(self, branch_exists=False, pr_exists=None):
+    def __init__(self, branch_exists=False, pr_exists=None, pane_cmd='claude'):
         self.calls, self.branch_exists, self.pr_exists = [], branch_exists, pr_exists
+        self.pane_cmd = pane_cmd
 
     def __call__(self, argv, **k):
         self.calls.append(argv)
@@ -26,6 +27,8 @@ class Run:
             out = 'https://github.com/tangentcode/platform/pull/601'
         elif argv[:3] == ['gh', 'project', 'item-add']:
             out = json.dumps({'id': 'PRITEM'})
+        elif argv[:2] == ['tmux', 'display-message']:
+            out = self.pane_cmd
 
         class R:
             returncode, stdout, stderr = 0, out, ''
@@ -41,8 +44,10 @@ def gate():
 
 
 def test_slug_is_issue_number_plus_short_title():
-    assert L.slug('Board: mark right / wrong answers in the PTW quiz view!', 412) == \
-        'issue-412-board-mark-right-wrong-answers-in'
+    """MethBot 3:55 AM ET: windows must read mn-<PR>-<short slug>, like mn-536-avo-save-icon."""
+    assert L.slug('Board: mark right / wrong answers in the PTW quiz view!', 412) == 'board-mark-right-wrong'
+    assert L.slug('Dictate on a non plain text field should insert at the cursor', 503) == \
+        'dictate-plain-text-field'
     assert L.slug('', 7) == 'issue-7'
 
 
@@ -56,7 +61,7 @@ def test_a_launch_makes_the_branch_draft_pr_board_brief_and_worker(tmp_path, mon
                     launch=lambda branch, pr, brief: started.append((branch, pr, brief)) or
                     ('launched', {'window': 'mn-601-x', 'pane': '%9'}))
     steps = lz.launch(412, 'Board marks right and wrong')
-    br = 'issue-412-board-marks-right-and-wrong'
+    br = 'board-marks-right-wrong'
     assert ['git', '-C', str(tmp_path), 'push', '-q', 'origin', f"{'c' * 40}:refs/heads/{br}"] in run.calls
     create = [c for c in run.calls if c[:3] == ['gh', 'pr', 'create']][0]
     assert '--draft' in create and create[create.index('--body') + 1] == 'Fixes #412'
@@ -66,7 +71,7 @@ def test_a_launch_makes_the_branch_draft_pr_board_brief_and_worker(tmp_path, mon
     assert started == [(br, 601, str(tmp_path / 'briefs' / '601.txt'))]
     text = (tmp_path / 'briefs' / '601.txt').read_text()
     assert text.startswith('Task #412: Board marks right and wrong') and 'draft PR #601' in text
-    assert steps[-1] == 'worker launched in mn-601-x (%9)'
+    assert steps[-1] == 'worker launched in mn-601-x (%9, claude runs)'
     st = slots.load()
     assert '412' in st['named'] and '412' not in st['launching']  # named only once the PR exists
 
@@ -121,3 +126,47 @@ def test_stale_named_entries_without_a_draft_pr_are_dropped():
     slots.save(dict(slots.load(), named={'399': 1000.0, '412': 1000.0, '502': 5000.0}))
     assert slots.prune_named(taken={412}, now=5300.0) == [399]  # #502 is fresh: its PR may lag
     assert set(slots.load()['named']) == {'412', '502'}
+
+
+def test_a_launch_is_done_only_when_claude_runs_in_the_pane(tmp_path, monkeypatch):
+    """MethBot 3:55 AM ET: #537-#542 got a window with only a bash prompt."""
+    from tangentswarm import brief
+    monkeypatch.setattr(brief, 'BRIEF_DIR', tmp_path / 'briefs')
+    monkeypatch.setattr(brief, 'write_brief', lambda n: None)
+    run = Run(pane_cmd='bash')
+    lz = L.Launcher(g=gate(), run=run, git_dir=tmp_path,
+                    launch=lambda branch, pr, brief: ('launched', {'window': 'mn-601-x', 'pane': '%9'}))
+    with pytest.raises(RuntimeError, match='no claude runs in %9 after the start .it runs bash.'):
+        lz.launch(412, 'Board marks right and wrong')
+    rec = slots.load()['unstarted']['601']
+    assert rec['branch'] == 'board-marks-right-wrong' and rec['issue'] == 412  # retried by the next pass
+    run.pane_cmd = 'claude'
+    assert lz.start_existing(601, rec).endswith('claude runs)')
+    assert slots.load()['unstarted'] == {}
+
+
+def test_a_held_start_is_not_a_failure(tmp_path, monkeypatch):
+    lz = L.Launcher(g=gate(), run=Run(), git_dir=tmp_path, launch=lambda *a, **k: ('held', {'window': 'w'}))
+    assert lz.start('b', 601, '/brief').startswith('worker held (memory)')
+
+
+def test_swarm_start_scoped_runs_without_the_daemon_pythonpath():
+    """03:44-03:51 ET: the daemon's PYTHONPATH made swarm-start-scoped load this checkout's
+    tangentswarm.registry, which lacks first_prompt_problem; every start crashed."""
+    from tangentswarm import launches
+    env = launches.clean_env({'PYTHONPATH': '/x/flow-live', 'PATH': '/bin'})
+    assert env == {'PATH': '/bin'}
+
+
+def test_the_cascade_retries_unstarted_prs_before_it_names_new_issues(monkeypatch):
+    from tangentswarm import advance as A, spool
+    from test_advance import CascadeGate
+    slots.unstarted_add(537, branch='dictate-plain-text-field', brief='/b/537.txt', issue=503, now=1)
+    slots.unstarted_add(538, branch='minavo-open-file', brief='/b/538.txt', issue=415, now=2)
+    monkeypatch.setattr(slots, 'live_claudes', lambda: 8)
+    out = []
+    A.Cascade(g=CascadeGate(issues=[(40, board.BACKLOG)]), out=out.append).signal({})
+    reqs = sorted(json.loads(p.read_text())['pr'] for p in spool.SPOOL.glob('*.req.json'))
+    assert reqs == [537, 538]  # both fit under the cap of 10
+    assert not any(l.startswith('START_CLAUDE') for l in out)  # no room left for new issues
+    assert 'start: queued the worker start of #537 (dictate-plain-text-field): its window has no Claude' in out

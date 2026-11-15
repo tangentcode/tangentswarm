@@ -344,7 +344,7 @@ def test_empty_staging_gets_one_pull_then_only_clean_extras(monkeypatch, tmp_pat
     assert 'fill: #4, #6 pulled in one work merge: Staging 0 + 2, target 2' in out  # one batch, one push
     assert out.count('would run hr-gate --apply 4 (Ready -> Staging when it passes)') == 1
     assert out.count('would run hr-gate --apply 6 (Ready -> Staging when it passes)') == 1
-    assert out[-1] == 'signal: no Backlog issue without a PR (new=0/4 rework=0/3 ready=2/6 backlog_without_pr=0 claudes=0/10 launching=0): no START_CLAUDE'
+    assert out[-1] == 'signal: no Backlog issue without a PR (new=0/4 rework=0/3 ready=2/6 backlog_without_pr=0 claudes=0/10 launching=0 unstarted=0): no START_CLAUDE'
 
 
 def test_staging_empty_and_nothing_clean_pulls_nothing(monkeypatch, tmp_path):
@@ -363,7 +363,7 @@ def test_staging_at_the_floor_pulls_nothing(monkeypatch, tmp_path):
             board.READY: [pr(n, board.READY) for n in range(10, 16)]}
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate())
     assert pulled == [] and out == [f'fill: Staging {A.FLOOR}, target {A.FLOOR}: no pull needed',
-                                    'signal: no Backlog issue without a PR (new=0/3 rework=0/3 ready=6/6 backlog_without_pr=0 claudes=0/10 launching=0): no START_CLAUDE']
+                                    'signal: no Backlog issue without a PR (new=0/3 rework=0/3 ready=6/6 backlog_without_pr=0 claudes=0/10 launching=0 unstarted=0): no START_CLAUDE']
 
 
 @pytest.mark.parametrize('staging, want', [(0, [10, 12, 14, 15, 16]), (1, [10, 12, 14, 15, 16]), (2, [])])
@@ -465,7 +465,7 @@ def test_empty_ready_stops_the_fill_and_starts_coders_on_active_issues(monkeypat
     assert pulled == [] and out == ['fill: Staging 1, Ready 0: Ready is empty',
                                     'STALLED: Human Review 0, Staging 1, Ready empty: new work must reach Ready',
                                     'START_CLAUDE n=4 issues=#40,#41,#42,#43 new=0/4 rework=0/3 ready=0/6 '
-                                    'backlog_without_pr=5 claudes=0/10 launching=0 keys=#40=(ft:no,due:none,n:40);'
+                                    'backlog_without_pr=5 claudes=0/10 launching=0 unstarted=0 keys=#40=(ft:no,due:none,n:40);'
                                     '#41=(ft:no,due:none,n:41);#42=(ft:no,due:none,n:42);#43=(ft:no,due:none,n:43)',
                                     'launch: would queue #40 (issue 40)', 'launch: would queue #41 (issue 41)',
                                     'launch: would queue #42 (issue 42)', 'launch: would queue #43 (issue 43)']
@@ -477,7 +477,7 @@ def test_start_claude_also_when_ready_is_full(monkeypatch, tmp_path):
     monkeypatch.setattr(A, 'FLOOR', 0)
     out, _ = cascade(monkeypatch, tmp_path, cols, CascadeGate(issues=[(50, board.BACKLOG), (51, board.BACKLOG)]))
     assert out[-3] == ('START_CLAUDE n=2 issues=#50,#51 new=0/3 rework=0/3 ready=7/6 backlog_without_pr=2 '
-                       'claudes=0/10 launching=0 keys=#50=(ft:no,due:none,n:50);#51=(ft:no,due:none,n:51)')
+                       'claudes=0/10 launching=0 unstarted=0 keys=#50=(ft:no,due:none,n:50);#51=(ft:no,due:none,n:51)')
     assert out[-2:] == ['launch: would queue #50 (issue 50)', 'launch: would queue #51 (issue 51)']
 
 

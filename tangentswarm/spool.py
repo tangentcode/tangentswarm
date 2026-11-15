@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 SPOOL = Path(os.environ.get('SWARM_HANDOFF_SPOOL', str(Path.home() / '.cache' / 'swarm-handoff-spool')))
-OPS = ('stophook', 'handoff', 'status', 'request_review', 'launch')
+OPS = ('stophook', 'handoff', 'status', 'request_review', 'launch', 'start')
 WAIT = int(os.environ.get('SWARM_SPOOL_WAIT', '120'))  # s a worker MCP tool waits for its answer
 MAX_AGE = 3600  # s: an unclaimed request or an unread answer older than this is dropped
 NO_DAEMON = ("no answer from the swarm-promoted daemon in {wait}s; it runs the GitHub calls outside "
@@ -144,6 +144,9 @@ def execute(req):
     if op == 'launch':
         from . import launcher
         return launcher.execute(req)
+    if op == 'start':
+        from . import launcher
+        return launcher.execute_start(req)
     return {'ok': False, 'error': f'unknown op {op!r}'}
 
 
@@ -162,10 +165,11 @@ def serve(run_path):
         out = execute(req)
     except Exception as e:
         out = {'ok': False, 'error': f'{type(e).__name__}: {str(e)[:600]}'}
-    if req.get('op') in ('stophook', 'launch'):
+    if req.get('op') in ('stophook', 'launch', 'start'):
         if not out.get('ok'):
             from .stophook import say
-            what = f"launch #{req.get('issue')}" if req.get('op') == 'launch' else Path(req.get('cwd') or '').name
+            what = (f"launch #{req.get('issue')}" if req.get('op') == 'launch' else
+                    f"start #{req.get('pr')}" if req.get('op') == 'start' else Path(req.get('cwd') or '').name)
             say(f"{what}: {req.get('op')} failed: {out['error']}")
     else:
         _write(run_path.with_name(run_path.name.replace('.run.json', '.res.json')), out)

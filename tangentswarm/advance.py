@@ -655,12 +655,15 @@ class Cascade(Advance):
         st = slots.load()
         issues = slots.backlog_issues(snap, board.active_fast_track(), prs,
                                       named=st['named'], launching=st['launching'])
-        n, target = slots.start_plan(len(k['new']), issues, ready, READY_TARGET)
         live = slots.live_claudes()
         cap = max(0, slots.MAX_CLAUDES - live)
+        unstarted = st['unstarted']
+        cap = self.retry_starts(unstarted, cap)  # launched PRs with no Claude first
+        n, target = slots.start_plan(len(k['new']) + len(unstarted), issues, ready, READY_TARGET)
         facts = (f"new={len(k['new'])}/{target} rework={len(k['rework'])}/{slots.REWORK_SLOTS} "
                  f"ready={ready}/{READY_TARGET} backlog_without_pr={len(issues)} "
-                 f"claudes={live}/{slots.MAX_CLAUDES} launching={len(st['launching'])}")
+                 f"claudes={live}/{slots.MAX_CLAUDES} launching={len(st['launching'])} "
+                 f"unstarted={len(unstarted)}")
         if n and not cap:
             self.out(f"signal: {n} new-work slot(s) free, but {live} Claudes run (cap {slots.MAX_CLAUDES}): "
                      f"no launch ({facts})")
@@ -675,6 +678,28 @@ class Cascade(Advance):
             self.out(f"signal: no Backlog issue without a PR ({facts}): no START_CLAUDE")
         else:
             self.out(f"signal: the new-work slots are full ({facts}): no START_CLAUDE")
+
+    def retry_starts(self, unstarted, cap):
+        """Queue a worker start for each launched PR whose window has no Claude (oldest first,
+        within the Claude cap; one queued start per PR at a time). Returns the cap left."""
+        from . import slots, spool
+        now = time.time()
+        for pr, rec in sorted(unstarted.items(), key=lambda kv: kv[1].get('at', 0)):
+            if cap <= 0:
+                break
+            if now - float(rec.get('queued') or 0) < 600:
+                cap -= 1  # a start is in flight
+                continue
+            if self.dry:
+                self.out(f"start: would queue the worker start of #{pr} ({rec.get('branch')})")
+            else:
+                spool.submit('start', '', pr=int(pr))
+                d = slots.load()
+                d['unstarted'][str(pr)]['queued'] = now
+                slots.save(d)
+                self.out(f"start: queued the worker start of #{pr} ({rec.get('branch')}): its window has no Claude")
+            cap -= 1
+        return cap
 
     def launch(self, pick):
         """MethBot 2026-11-15 3:35 AM ET: nothing consumed START_CLAUDE. Queue each named issue

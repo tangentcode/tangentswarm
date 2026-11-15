@@ -30,10 +30,21 @@ REPO = 'tangentcode/platform'
 GIT = Path.home() / 'ver' / 'platform'
 
 
-def slug(title, n):
-    s = re.sub(r'[^a-z0-9]+', '-', (title or '').lower()).strip('-')
-    s = '-'.join(s.split('-')[:6])[:34].strip('-')
-    return f"issue-{n}-{s}" if s else f"issue-{n}"
+STOP = {'a', 'an', 'the', 'on', 'of', 'to', 'in', 'for', 'and', 'or', 'with', 'is', 'are', 'be', 'should',
+        'must', 'can', 'it', 'its', 'as', 'at', 'by', 'from', 'into', 'when', 'that', 'this', 'not', 'non', 'show'}
+
+
+def slug(title, n=None):
+    """A short branch slug like the hand launches (avo-save-icon): three or four words of the
+    title, at most 28 characters. The window becomes mn-<PR>-<slug>."""
+    words = [w for w in re.sub(r'[^a-z0-9]+', ' ', (title or '').lower()).split() if w not in STOP]
+    out = ''
+    for w in words[:4]:
+        nxt = f"{out}-{w}" if out else w
+        if len(nxt) > 28:
+            break
+        out = nxt
+    return out or f"issue-{n}"
 
 
 def brief_text(n, title, branch, pr):
@@ -80,6 +91,15 @@ class Launcher:
         return self.sh('git', '-C', self.git_dir, *args, check=check)
 
     # -- the steps --------------------------------------------------------------------
+    def pick_branch(self, n, title):
+        """The short slug, or slug-<N> when another PR's branch already has that name."""
+        b = slug(title, n)
+        if not self.git('ls-remote', 'origin', f'refs/heads/{b}', check=False).strip():
+            return b
+        body = self.sh('gh', 'pr', 'list', '-R', REPO, '--head', b, '--state', 'open', '--json', 'body',
+                       '--jq', '.[0].body', check=False)
+        return b if f'#{n}' in body else f"{b}-{n}"
+
     def branch(self, n, branch):
         """Push the scaffold branch (one empty "Start #N" commit on origin/main), unless it exists."""
         have = self.git('ls-remote', 'origin', f'refs/heads/{branch}', check=False)
@@ -154,19 +174,31 @@ class Launcher:
         return path, f"brief {path}"
 
     def start(self, branch, pr, path):
+        """Start the worker. Done only when a claude process runs in its pane (MethBot
+        2026-11-15 3:55 AM ET: #537-#542 got a window with only a bash prompt). A memory hold
+        is queued for swarm-tick. Raises otherwise."""
         if self.dry:
             return f"would start the worker: swarm-start-scoped {branch}, then send the brief line"
         from . import launches
         what, detail = (self._launch or launches.launch)(branch, pr=pr, brief=str(path))
+        if what == 'held':
+            return f"worker held (memory): queued for swarm-tick ({detail.get('window') if isinstance(detail, dict) else ''})"
         if what == 'refused':
-            raise RuntimeError(f"swarm-start-scoped refused: {detail}")
-        return f"worker {what}" + (f" in {detail.get('window')} ({detail.get('pane')})"
-                                   if isinstance(detail, dict) and detail.get('pane') else '')
+            raise RuntimeError(f"swarm-start-scoped refused: {str(detail)[-300:]}")
+        pane = detail.get('pane') if isinstance(detail, dict) else None
+        cmd = self.pane_command(pane) if pane else None
+        if cmd not in ('claude', 'node'):
+            raise RuntimeError(f"no claude runs in {pane or 'the window'} after the start (it runs {cmd or 'nothing'})")
+        return f"worker launched in {detail.get('window')} ({pane}, claude runs)" + (
+            f"; brief not sent: {detail['brief_error'][:120]}" if detail.get('brief_error') else '')
+
+    def pane_command(self, pane):
+        return self.sh('tmux', 'display-message', '-p', '-t', pane, '#{pane_current_command}', check=False)
 
     def launch(self, n, title):
         """Launch issue n. Returns the steps done; raises with the failed step's text."""
         from . import slots
-        branch = slug(title, n)
+        branch = self.pick_branch(n, title)
         steps = [self.branch(n, branch)]
         pr, note = self.draft_pr(n, title, branch)
         steps.append(note)
@@ -177,8 +209,36 @@ class Launcher:
         steps.append(self.board(n, pr))
         path, note = self.brief(n, title, branch, pr)
         steps.append(note)
+        if not self.dry:
+            slots.unstarted_add(pr, branch=branch, brief=str(path), issue=n)
         steps.append(self.start(branch, pr, path))
+        if not self.dry:
+            slots.unstarted_done(pr)
         return steps
+
+    def start_existing(self, pr, rec):
+        """Retry the worker start of a PR whose launch made the window but no Claude."""
+        from . import slots
+        note = self.start(rec['branch'], pr, rec['brief'])
+        slots.unstarted_done(pr)
+        return note
+
+
+def execute_start(req):
+    """The spool op 'start' (daemon side): {pr}: start the worker of an unstarted launch."""
+    from . import slots
+    pr = int(req['pr'])
+    rec = slots.load()['unstarted'].get(str(pr))
+    if not rec:
+        return {'ok': True, 'pr': pr, 'note': 'not in the unstarted list'}
+    try:
+        note = Launcher().start_existing(pr, rec)
+    except Exception:
+        slots.unstarted_retry(pr)
+        raise
+    from .stophook import say
+    say(f"start #{pr} (issue #{rec.get('issue')}): {note}")
+    return {'ok': True, 'pr': pr, 'note': note}
 
 
 def execute(req):

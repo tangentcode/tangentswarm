@@ -138,10 +138,21 @@ def ordered(rows, rank=lambda pr: 1):
 # ---------------------------------------------------------------------------
 # launching
 
+def clean_env(env=None):
+    """The environment for swarm-start-scoped: without PYTHONPATH. The swarm-promoted daemon
+    runs with PYTHONPATH=<its tangentswarm checkout>; inherited, it made swarm-start-scoped
+    load that checkout's tangentswarm.registry instead of the deployed swarm-tmux one, and
+    every launch crashed after the window was made (2026-11-15 03:44-03:51 ET, PRs #537-#542:
+    "module 'tangentswarm.registry' has no attribute 'first_prompt_problem'")."""
+    env = dict(os.environ if env is None else env)
+    env.pop('PYTHONPATH', None)
+    return env
+
+
 def start_scoped(branch, window=None):
     """Run swarm-start-scoped. Returns (rc, json dict or {'refused': text})."""
     r = subprocess.run([str(BIN / 'swarm-start-scoped'), branch, *([window] if window else [])],
-                       capture_output=True, text=True, timeout=300)
+                       capture_output=True, text=True, timeout=300, env=clean_env())
     try:
         out = json.loads(r.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError):

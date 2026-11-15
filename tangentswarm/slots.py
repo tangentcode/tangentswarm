@@ -73,7 +73,7 @@ def load(path=None):
     d = d if isinstance(d, dict) else {}
     return {'parked': dict(d.get('parked') or {}), 'rework': dict(d.get('rework') or {}),
             'relayed': dict(d.get('relayed') or {}), 'named': dict(d.get('named') or {}),
-            'launching': dict(d.get('launching') or {})}
+            'launching': dict(d.get('launching') or {}), 'unstarted': dict(d.get('unstarted') or {})}
 
 
 def save(d, path=None):
@@ -238,6 +238,28 @@ def launch_mark(numbers, path=None, now=None):
     d['launching'] = {k: t for k, t in d['launching'].items() if now - float(t) < LAUNCHING_TTL}
     d['launching'].update({str(n): now for n in numbers})
     save(d, path)
+
+
+def unstarted_add(pr, path=None, now=None, **rec):
+    """A launch made the PR and its window: until a claude runs there, the PR is unstarted.
+    Each signal pass retries it, and it takes a new-work slot meanwhile."""
+    d = load(path)
+    d['unstarted'][str(pr)] = dict(rec, at=time.time() if now is None else now, queued=0)
+    save(d, path)
+
+
+def unstarted_done(pr, path=None):
+    d = load(path)
+    if d['unstarted'].pop(str(pr), None) is not None:
+        save(d, path)
+
+
+def unstarted_retry(pr, path=None):
+    """The retry failed: it may be queued again on a later pass."""
+    d = load(path)
+    if str(pr) in d['unstarted']:
+        d['unstarted'][str(pr)]['queued'] = 0
+        save(d, path)
 
 
 def launch_done(n, path=None):
