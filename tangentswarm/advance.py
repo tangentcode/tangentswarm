@@ -118,9 +118,7 @@ def pass_text(head):
 
 class Advance:
     def __init__(self, g=None, dry_run=False, out=print, minbot=None):
-        import runpy
-        from .promoted import BIN
-        self.g = g if g is not None else runpy.run_path(str(BIN / 'hr-gate'), run_name='swarm_advance')
+        self.g = g if g is not None else hr_gate()
         self.dry, self.out = dry_run, out
         self.minbot = minbot or self._minbot
         self.why = []  # why each step had nothing to do, for the summary line
@@ -291,8 +289,7 @@ class Cascade(Advance):
                    for f in ((full.get('files') or {}).get('nodes') or []))
 
     def cornerbot_request(self, n, branch, head, work, host):
-        line = (f"CORNERBOT_REQUEST{' (dry run)' if self.dry else ''}: redeploy {host} from platform work "
-                f"{work[:8] if work else '(after the merge)'} (#{n} {branch} {head[:8]} is in work)")
+        line = request_line(n, branch, head, work, host, self.dry)
         if not self.dry:  # for swarmbot while this run still waits (stdout may be read only at exit)
             try:
                 CORNERBOT_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -302,13 +299,7 @@ class Cascade(Advance):
         return line
 
     def lagging(self, d):
-        """[(site key, host, static sha, err)] for each staging site that does not serve the
-        pulled head yet. A site serves it when its .deploy-sha is the pull's work commit or
-        contains the head (platform #493: ptw lagged while the other two served it)."""
-        if isinstance(self.g.get('_fetched'), list):
-            self.g['_fetched'].clear()  # fetch work again: a served commit may be new
-        return [(k, host, sha, err) for k, host, sha, err in self.g['served_all']()
-                if not (sha and (sha == d.get('work') or self.g['contains'](d['head'], sha)))]
+        return lagging(self.g, d)
 
     def served(self, d):
         """True once EVERY staging site serves the pulled head. Polls each .deploy-sha up to
@@ -322,6 +313,9 @@ class Cascade(Advance):
             lag = self.lagging(d)
             if not lag:
                 self.out(f"served: every staging site serves #{d['pr']} {d['head'][:8]}")
+                if asked and not self.dry and CORNERBOT_FILE.exists():
+                    CORNERBOT_FILE.unlink(missing_ok=True)
+                    self.out(f"CORNERBOT_DONE: every cornerbot site serves #{d['pr']} {d['head'][:8]}; request cleared")
                 return True
             corner = [(k, h) for k, h, _, _ in lag if k in CORNERBOT_SITES]
             if corner and not asked:
@@ -595,6 +589,80 @@ class Cascade(Advance):
         return 0
 
 
+def hr_gate():
+    """The live hr-gate namespace (its GraphQL, fetch, served_all, contains helpers)."""
+    import runpy
+    from .promoted import BIN
+    return runpy.run_path(str(BIN / 'hr-gate'), run_name='swarm_advance')
+
+
+def request_line(n, branch, head, work, host, dry=False):
+    return (f"CORNERBOT_REQUEST{' (dry run)' if dry else ''}: redeploy {host} from platform work "
+            f"{work[:8] if work else '(after the merge)'} (#{n} {branch} {head[:8]} is in work)")
+
+
+def lagging(g, d):
+    """[(site key, host, static sha, err)] for each staging site that does not serve the
+    pulled head yet. A site serves it when its .deploy-sha is the pull's work commit or
+    contains the head (platform #493: ptw lagged while the other two served it)."""
+    if isinstance(g.get('_fetched'), list):
+        g['_fetched'].clear()  # fetch work again: a served commit may be new
+    return [(k, host, sha, err) for k, host, sha, err in g['served_all']()
+            if not (sha and (sha == d.get('work') or g['contains'](d['head'], sha)))]
+
+
+def _age(s):
+    s = int(max(0, s))
+    return f"{s // 3600}h{s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m{s % 60:02d}s"
+
+
+def _et(t):
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.fromtimestamp(t, ZoneInfo('America/New_York')).strftime('%H:%M')
+    except Exception:
+        return time.strftime('%H:%M', time.localtime(t))
+
+
+def cornerbot_reminder(g, out=print, dry=False, now=time.time):
+    """Every `swarm-advance --cascade` run (also a busy run, a run with no rerun flag, and the
+    run the daemon drains from its queue) prints the open CORNERBOT_REQUEST again, with its
+    age, until every cornerbot site serves the pulled head; then it clears CORNERBOT_FILE.
+    Michal 2026-11-15: Human Review and Staging sat empty 10:20-11:11 PM ET because the line
+    for #495 4e3928e4 was printed once and lost. No GraphQL: the pull state, the
+    .deploy-sha files and git only. Returns the printed line or None."""
+    from . import flow
+    try:
+        at = CORNERBOT_FILE.stat().st_mtime
+        text = CORNERBOT_FILE.read_text().strip()
+    except OSError:
+        return None
+    m = re.search(r'\(#(\d+) ', text)
+    d = flow.load_pull()
+
+    def clear(line):
+        if not dry:
+            CORNERBOT_FILE.unlink(missing_ok=True)
+        out(line + ('' if not dry else ' (dry run: file kept)'))
+        return line
+    if not d or (m and int(m.group(1)) != d['pr']):
+        return clear(f"CORNERBOT_REQUEST cleared: no running pull waits on it ({text[:160]})")
+    try:
+        corner = [(k, h) for k, h, _, _ in lagging(g, d) if k in CORNERBOT_SITES]
+    except Exception as e:  # a site or git read failed: say the request again, decide next run
+        corner, why = None, f"{type(e).__name__}: {str(e)[:120]}"
+    if corner == []:
+        return clear(f"CORNERBOT_DONE: every cornerbot site serves #{d['pr']} {d['head'][:8]} "
+                     f"{_age(now() - at)} after the request; request cleared")
+    hosts = [h for _, h in corner] if corner else re.findall(r'redeploy (\S+) from', text)[:1] or ['?']
+    line = '; '.join(request_line(d['pr'], d.get('branch', ''), d['head'], d.get('work'), h) for h in hosts)
+    line += (f"; open {_age(now() - at)} (asked {_et(at)} ET)"
+             + ('; not served yet' if corner else f'; served check failed ({why})'))
+    out(line)
+    return line
+
+
 def queue_cascade(qdir=None):
     """Queue `swarm-advance --cascade --if-flagged` for the swarm-promoted daemon. A busy
     caller does this too: the lock holder may be hr-gate or pending-promote, which never
@@ -751,10 +819,13 @@ def main(argv=None):
         os.environ['SWARM_STAGING_FLOOR'] = str(a.floor)  # the move log records it
     try:
         if a.cascade:
-            if a.dry_run:  # no lock, no flag: a dry run changes nothing
-                watchdog()
-                return Cascade(dry_run=True, out=_say).run()
             watchdog()
+            try:  # before the lock: a busy run and a no-flag run print it too
+                cornerbot_reminder(hr_gate(), out=_say, dry=a.dry_run)
+            except Exception as e:  # the reminder must never stop the cascade
+                _say(f"cornerbot reminder failed: {type(e).__name__}: {str(e)[:160]}")
+            if a.dry_run:  # no lock, no flag: a dry run changes nothing
+                return Cascade(dry_run=True, out=_say).run()
             return run_locked(lambda: Cascade(out=_say).run(), if_flagged=a.if_flagged, out=_say)
         if a.dry_run:
             return Advance(dry_run=True).step()

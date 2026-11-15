@@ -30,6 +30,9 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(advance, 'RERUN', tmp_path / 'swarm-serial.rerun')
     monkeypatch.setattr(advance, 'CASCADE_LOG', tmp_path / 'cascade.log')
     monkeypatch.setattr(advance, 'CORNERBOT_FILE', tmp_path / 'cornerbot-request')
+    from tangentswarm import flow
+    monkeypatch.setattr(flow, 'STATE', tmp_path / 'pull.json')
+    monkeypatch.setattr(flow, 'LOG', tmp_path / 'flow.log')
     monkeypatch.setattr(advance, 'schedule', lambda reset, **kw: 'not scheduled (test)')
     # a queued cascade would be run by a daemon test's drain as a REAL ~/bin/swarm-advance
     monkeypatch.setattr(advance, 'queue_cascade', lambda qdir=None: 'not queued (test)')

@@ -1,4 +1,6 @@
 """swarm-advance: one step from the end of the line (promote, else pull, else MinBot pass)."""
+import os
+
 import pytest
 from pathlib import Path
 
@@ -471,8 +473,10 @@ def test_a_live_pull_gates_only_when_every_site_serves_the_head(monkeypatch, tmp
     assert advanced == [9] and waited == 3 * A.DEPLOY_POLL
     reqs = [l for l in out if l.startswith('CORNERBOT_REQUEST')]
     assert len(reqs) == 1 and reqs[0].startswith('CORNERBOT_REQUEST: redeploy ptw.example from platform work wwwwwwww')
-    assert (tmp_path / 'cornerbot').read_text().endswith(reqs[0] + '\n')
     assert "served: every staging site serves #9 00000000" in out
+    # the request file was written, then cleared once ptw served the head
+    assert "CORNERBOT_DONE: every cornerbot site serves #9 00000000; request cleared" in out
+    assert not (tmp_path / 'cornerbot').exists()
 
 
 def test_a_live_pull_times_out_on_a_lagging_ptw_and_stops_the_fill(monkeypatch, tmp_path):
@@ -486,6 +490,7 @@ def test_a_live_pull_times_out_on_a_lagging_ptw_and_stops_the_fill(monkeypatch, 
     assert out[-1] == (f"waiting: #9 00000000 is not served yet by ptw.example (oooooooo) after {A.PTW_WAIT}s; "
                        "the pull stays open for the next cascade")
     assert F.load_pull()['asked'] is True  # the next cascade waits again but does not ask again
+    assert 'CORNERBOT_REQUEST: redeploy ptw.example' in (tmp_path / 'cornerbot').read_text()  # kept: not served
 
 
 def test_a_web_site_that_never_serves_times_out_after_deploy_wait(monkeypatch, tmp_path):
@@ -617,3 +622,96 @@ def test_the_deadline_is_per_process_not_per_pass(monkeypatch):
         signal.signal(signal.SIGALRM, old[0])
         signal.signal(signal.SIGTERM, old[1])
         monkeypatch.setattr(A, 'DEADLINE', None)
+
+
+# -- CORNERBOT_REQUEST on every run until the site serves the head (Michal 2026-11-15) -------
+
+def corner_setup(tmp_path, pr=495, asked_age=3000, served=None, pull=True):
+    from tangentswarm import flow as F
+    W, O = 'w' * 40, 'o' * 40
+    if pull:
+        F.save_pull(dict(pr=pr, head='4' * 40, branch='avo', item='I', work=W, started=0, asked=True))
+    A.CORNERBOT_FILE.write_text("2026-11-15T03:20:18 CORNERBOT_REQUEST: redeploy ptw.example from platform "
+                                "work wwwwwwww (#495 avo 44444444 is in work)\n")
+    at = 1_000_000.0
+    os.utime(A.CORNERBOT_FILE, (at, at))
+    g = CascadeGate(served=served or {'work': W, 'minavo': W, 'ptw': O})
+    return g, lambda: at + asked_age
+
+
+def test_the_cornerbot_request_is_printed_again_with_its_age_while_ptw_lags(tmp_path):
+    g, now = corner_setup(tmp_path)
+    out = []
+    line = A.cornerbot_reminder(g, out=out.append, now=now)
+    assert out == [line]
+    assert line.startswith('CORNERBOT_REQUEST: redeploy ptw.example from platform work wwwwwwww (#495 avo 44444444 is in work)')
+    assert '; open 50m00s (asked ' in line and line.endswith('; not served yet')
+    assert A.CORNERBOT_FILE.exists()  # the age stays the age of the first request
+
+
+def test_the_cornerbot_request_is_cleared_once_ptw_serves_the_head(tmp_path):
+    W = 'w' * 40
+    g, now = corner_setup(tmp_path, asked_age=4000, served={'work': W, 'minavo': W, 'ptw': W})
+    out = []
+    A.cornerbot_reminder(g, out=out.append, now=now)
+    assert out == ['CORNERBOT_DONE: every cornerbot site serves #495 44444444 1h06m after the request; request cleared']
+    assert not A.CORNERBOT_FILE.exists()
+
+
+def test_a_cornerbot_request_without_its_pull_is_cleared(tmp_path):
+    for kw in ({'pull': False}, {'pr': 496}):
+        g, now = corner_setup(tmp_path, **kw)
+        out = []
+        A.cornerbot_reminder(g, out=out.append, now=now)
+        assert out[0].startswith('CORNERBOT_REQUEST cleared: no running pull waits on it (')
+        assert not A.CORNERBOT_FILE.exists()
+
+
+def test_a_dry_run_prints_the_cornerbot_reminder_and_keeps_the_file(tmp_path):
+    W = 'w' * 40
+    g, now = corner_setup(tmp_path, served={'work': W, 'minavo': W, 'ptw': W})
+    out = []
+    A.cornerbot_reminder(g, out=out.append, dry=True, now=now)
+    assert out[0].endswith('request cleared (dry run: file kept)') and A.CORNERBOT_FILE.exists()
+
+
+def test_a_failed_served_check_still_prints_the_request(tmp_path):
+    g, now = corner_setup(tmp_path)
+    g['served_all'] = lambda: (_ for _ in ()).throw(OSError('no route'))
+    out = []
+    A.cornerbot_reminder(g, out=out.append, now=now)
+    assert out[0].startswith('CORNERBOT_REQUEST: redeploy ptw.example ') and 'served check failed (OSError: no route)' in out[0]
+    assert A.CORNERBOT_FILE.exists()
+
+
+def test_no_cornerbot_file_prints_nothing(tmp_path):
+    out = []
+    assert A.cornerbot_reminder(CascadeGate(), out=out.append) is None and out == []
+
+
+@pytest.mark.parametrize('case', ['busy', 'no-flag', 'dry'])
+def test_every_cascade_run_prints_the_cornerbot_request(monkeypatch, tmp_path, case):
+    """10:20-11:11 PM ET: the line for #495 was printed once, then busy runs and the drained
+    `--if-flagged` runs said nothing."""
+    g, _ = corner_setup(tmp_path)
+    out = []
+    monkeypatch.setattr(A, '_say', out.append)
+    monkeypatch.setattr(A, 'watchdog', lambda budget=None: None)
+    monkeypatch.setattr(A, 'hr_gate', lambda: g)
+
+    class Busy:
+        def __enter__(self):
+            raise A.gatelock.Busy('held by pid 1')
+
+        def __exit__(self, *a):
+            return False
+    monkeypatch.setattr(A.gatelock, 'gate_lock', lambda *a, **k: Busy())
+    monkeypatch.setattr(A.Cascade, 'run', lambda self: 0)
+    monkeypatch.setattr(A.Cascade, '__init__', lambda self, *a, **k: None)
+    argv = {'busy': ['--cascade'], 'no-flag': ['--cascade', '--if-flagged'], 'dry': ['--cascade', '--dry-run']}[case]
+    assert A.main(argv) == 0
+    assert out[0].startswith('CORNERBOT_REQUEST: redeploy ptw.example ') and 'not served yet' in out[0]
+    if case == 'dry':
+        assert len(out) == 1
+    else:
+        assert out[1].startswith({'busy': 'busy: ', 'no-flag': 'no rerun flag'}[case])
