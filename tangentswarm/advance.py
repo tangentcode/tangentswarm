@@ -27,7 +27,8 @@ The merge or reject event runs this: the whole just-in-time cascade (see Cascade
 serial run under ~/.cache/swarm-serial.lock. A caller that finds the lock busy writes the
 rerun flag (~/.cache/swarm-serial.rerun), queues `swarm-advance --cascade --if-flagged` for
 the daemon, and exits 0. The holder runs the cascade again until no flag is left, then
-releases the lock. Lines for swarmbot: START_CLAUDE n=K issues=#A,#B ... and CORNERBOT_REQUEST: ...
+releases the lock. Lines for swarmbot: START_CLAUDE n=K issues=#A,#B ..., NEEDS_REWORK, RELAY,
+STALLED and REDEPLOY_LATE.
 """
 import argparse
 import json
@@ -53,10 +54,9 @@ STEP_TIMEOUT = int(os.environ.get('SWARM_CASCADE_STEP_TIMEOUT', '300'))  # one h
 EXIT_TIMEOUT = 124
 DEADLINE = None  # time.monotonic() deadline of this process (watchdog)
 CASCADE_LOG = Path(os.environ.get('SWARM_CASCADE_LOG', str(Path.home() / '.local' / 'state' / 'swarm-flow' / 'cascade.log')))
-CORNERBOT_FILE = Path(os.environ.get('SWARM_CORNERBOT_REQUEST', str(Path.home() / '.cache' / 'swarm-cornerbot-request')))
 MAX_PASSES = int(os.environ.get('SWARM_CASCADE_MAX_PASSES', '10'))  # cascade passes per lock hold
 RERUN = Path(os.environ.get('SWARM_CASCADE_RERUN', str(gatelock.LOCK.with_name('swarm-serial.rerun'))))
-CORNERBOT_SITES = ('ptw',)  # staging for these sites redeploys only through a cornerbot request
+REDEPLOY_LATE = int(os.environ.get('SWARM_REDEPLOY_LATE', '600'))  # lag warning only after this (Michal 2026-11-15)
 
 CODEX_FIELDS = """number isDraft headRefOid mergeable
  comments(last:40){nodes{author{login} body}}
@@ -247,7 +247,8 @@ class Cascade(Advance):
                    EVERY Ready PR that merges cleanly (git merge-tree) with main, work, each
                    Human Review and Staging PR and the batch so far is merged into work in
                    ONE push (Flow.pull_batch, up to flow.STAGING_MAX in Staging), so one
-                   redeploy (one CORNERBOT_REQUEST for ptw) covers all of them. Nothing is
+                   redeploy covers all of them (every staging site, ptw too, redeploys the
+                   work tip by itself: Michal 2026-11-15). Nothing is
                    rebased, reworked or sent back just to fill Staging. The promote ran
                    first in the pass, so a promote frees a slot and the next pull starts in
                    the same pass. A fast-track PR is pulled also at the target (Michal
@@ -285,16 +286,6 @@ class Cascade(Advance):
         return any(gatechecks.SERVED_RE.search(f.get('path') or '')
                    for f in ((full.get('files') or {}).get('nodes') or []))
 
-    def cornerbot_request(self, n, branch, head, work, host, also=()):
-        line = request_line(n, branch, head, work, host, self.dry, also)
-        if not self.dry:  # for swarmbot while this run still waits (stdout may be read only at exit)
-            try:
-                CORNERBOT_FILE.parent.mkdir(parents=True, exist_ok=True)
-                CORNERBOT_FILE.write_text(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {line}\n")
-            except OSError as e:
-                self.out(f"cornerbot request file not written: {e}")
-        return line
-
     def lagging(self, d):
         return lagging(self.g, d)
 
@@ -303,38 +294,32 @@ class Cascade(Advance):
         """ONE served check for each pull in flight, no wait: the serial lock is never held for
         a redeploy, so a promote never waits on one (Human Review sat empty about 15 min twice on
         2026-11-14 while pulls of #495 and #514 waited on a PTW redeploy). A pull whose head
-        every staging site serves gets hr-gate --apply. A batch (one work commit) gets ONE
-        CORNERBOT_REQUEST. The swarm-promoted daemon queues the next cascade when a staging
-        .deploy-sha changes. Returns the PRs whose pull ended (moved or failed)."""
+        every staging site serves gets hr-gate --apply. Every staging site redeploys the work
+        tip by itself (ptw: a timer, 2 to 4 min), and the swarm-promoted daemon queues the next
+        cascade when a staging .deploy-sha changes. A pull not served after REDEPLOY_LATE s
+        prints REDEPLOY_LATE. Returns the PRs whose pull ended (moved or failed)."""
         from . import flow
-        every = flow.load_pulls()
-        pulls = [d for d in every if only is None or d['pr'] in only]
-        ended, asked = [], {d.get('work') for d in every if d.get('asked')}
-        for d in pulls:
+        ended = []
+        for d in flow.load_pulls():
             n, head = d['pr'], d['head']
+            if only is not None and n not in only:
+                continue
             if self.touches_served(n):
                 lag = self.lagging(d)
                 if lag:
-                    corner = [h for k, h, _, _ in lag if k in CORNERBOT_SITES]
-                    if corner and d.get('work') not in asked:
-                        group = [q for q in flow.load_pulls() if q.get('work') == d.get('work')]
-                        also = [q['pr'] for q in group if q['pr'] != n]
-                        for host in corner:
-                            self.out(self.cornerbot_request(n, d.get('branch', ''), head, d.get('work'), host, also))
-                        asked.add(d.get('work'))
-                        if not self.dry:
-                            for q in group:
-                                flow.save_pull(dict(q, asked=True))
                     age = int(max(0, time.time() - float(d.get('started') or 0)))
-                    self.out(f"waiting: #{n} {head[:8]} is not served yet by "
-                             + '; '.join(f"{h} ({x[:8] if x else (e or 'empty')[:60]})" for _, h, x, e in lag)
-                             + f"; pulled {_age(age)} ago; no wait: the pull stays open, and a .deploy-sha "
-                               "change queues the next cascade")
+                    sites = '; '.join(f"{h} ({x[:8] if x else (e or 'empty')[:60]})" for _, h, x, e in lag)
+                    if age < REDEPLOY_LATE:  # a normal redeploy (2 to 4 min): no warning
+                        self.out(f"waiting: #{n} {head[:8]} not served yet by {sites}; pulled {_age(age)} ago; "
+                                 "no wait: a .deploy-sha change queues the next cascade")
+                    else:
+                        logs = deploy_logs()
+                        see = [logs[k] for k, *_ in lag if k in logs]
+                        self.out(f"REDEPLOY_LATE: #{n} {head[:8]} (work {str(d.get('work'))[:8]}) is not served "
+                                 f"by {sites} {_age(age)} after the work merge"
+                                 + (f"; see {', '.join(see)}" if see else ''))
                     continue
                 self.out(f"served: every staging site serves #{n} {head[:8]}")
-                if d.get('work') in asked and not self.dry and CORNERBOT_FILE.exists():
-                    CORNERBOT_FILE.unlink(missing_ok=True)
-                    self.out(f"CORNERBOT_DONE: every cornerbot site serves #{n} {head[:8]}; request cleared")
             before = len(self.f.did)
             self.out(f"gate: hr-gate on #{n} {head[:8]} (timeout {STEP_TIMEOUT}s)")
             self.f.advance(d, prs, scratch)
@@ -408,10 +393,6 @@ class Cascade(Advance):
                 if served:
                     p = served[0]
                     lag = self.lagging(dict(pr=p['number'], head=p['head'], work=work))
-                    for k, host, _, _ in lag:
-                        if k in CORNERBOT_SITES:
-                            self.out(self.cornerbot_request(p['number'], p.get('branch', ''), p['head'], work, host,
-                                                            [q['number'] for q in batch if q is not p]))
                     self.out("would gate each one when every staging site serves the batch (no wait; the "
                              "daemon queues a cascade on a .deploy-sha change)"
                              + (f" (now lagging: {', '.join(h for _, h, _, _ in lag)})" if lag else ''))
@@ -419,7 +400,7 @@ class Cascade(Advance):
                     self.out(f"would run hr-gate --apply {n} (Ready -> Staging when it passes)")
                 return dict(cols, **{board.READY: [q for q in cols.get(board.READY, []) if q not in batch],
                                      board.STAGING: st + batch})
-            # one check now, no wait: the PTW request goes out at once
+            # one check now, no wait (a PR without served files is gated at once)
             if self.gate_pulls(prs, scratch, only=set(nums)):
                 prs, cols = self.columns()
         return cols
@@ -591,12 +572,6 @@ def hr_gate():
     return runpy.run_path(str(BIN / 'hr-gate'), run_name='swarm_advance')
 
 
-def request_line(n, branch, head, work, host, dry=False, also=()):
-    return (f"CORNERBOT_REQUEST{' (dry run)' if dry else ''}: redeploy {host} from platform work "
-            f"{work[:8] if work else '(after the merge)'} (#{n} {branch} {head[:8]} is in work)"
-            + (f" with {', '.join('#' + str(x) for x in also)}" if also else ''))
-
-
 def lagging(g, d):
     """[(site key, host, static sha, err)] for each staging site that does not serve the
     pulled head yet. A site serves it when its .deploy-sha is the pull's work commit or
@@ -607,58 +582,21 @@ def lagging(g, d):
             if not (sha and (sha == d.get('work') or g['contains'](d['head'], sha)))]
 
 
+def deploy_logs(env=os.environ):
+    """{site key: deploy log path} from SWARM_DEPLOY_LOGS ("ptw=/path,work=/path"; set by the
+    ~/bin wrapper, so no host path is in the repo). REDEPLOY_LATE names the log of each
+    lagging site."""
+    out = {}
+    for part in (env.get('SWARM_DEPLOY_LOGS') or '').split(','):
+        k, _, v = part.partition('=')
+        if k.strip() and v.strip():
+            out[k.strip()] = v.strip()
+    return out
+
+
 def _age(s):
     s = int(max(0, s))
     return f"{s // 3600}h{s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m{s % 60:02d}s"
-
-
-def _et(t):
-    from datetime import datetime
-    try:
-        from zoneinfo import ZoneInfo
-        return datetime.fromtimestamp(t, ZoneInfo('America/New_York')).strftime('%H:%M')
-    except Exception:
-        return time.strftime('%H:%M', time.localtime(t))
-
-
-def cornerbot_reminder(g, out=print, dry=False, now=time.time):
-    """Every `swarm-advance --cascade` run (also a busy run, a run with no rerun flag, and the
-    run the daemon drains from its queue) prints the open CORNERBOT_REQUEST again, with its
-    age, until every cornerbot site serves the pulled head; then it clears CORNERBOT_FILE.
-    Michal 2026-11-15: Human Review and Staging sat empty 10:20-11:11 PM ET because the line
-    for #495 4e3928e4 was printed once and lost. No GraphQL: the pull state, the
-    .deploy-sha files and git only. Returns the printed line or None."""
-    from . import flow
-    try:
-        at = CORNERBOT_FILE.stat().st_mtime
-        text = CORNERBOT_FILE.read_text().strip()
-    except OSError:
-        return None
-    m = re.search(r'\(#(\d+) ', text)
-    pulls = flow.load_pulls()
-    d = next((q for q in pulls if m and q['pr'] == int(m.group(1))), None) if m else (pulls[0] if pulls else None)
-
-    def clear(line):
-        if not dry:
-            CORNERBOT_FILE.unlink(missing_ok=True)
-        out(line + ('' if not dry else ' (dry run: file kept)'))
-        return line
-    if not d:
-        return clear(f"CORNERBOT_REQUEST cleared: no running pull waits on it ({text[:160]})")
-    try:
-        corner = [(k, h) for k, h, _, _ in lagging(g, d) if k in CORNERBOT_SITES]
-    except Exception as e:  # a site or git read failed: say the request again, decide next run
-        corner, why = None, f"{type(e).__name__}: {str(e)[:120]}"
-    if corner == []:
-        return clear(f"CORNERBOT_DONE: every cornerbot site serves #{d['pr']} {d['head'][:8]} "
-                     f"{_age(now() - at)} after the request; request cleared")
-    hosts = [h for _, h in corner] if corner else re.findall(r'redeploy (\S+) from', text)[:1] or ['?']
-    also = [q['pr'] for q in pulls if q.get('work') == d.get('work') and q['pr'] != d['pr']]
-    line = '; '.join(request_line(d['pr'], d.get('branch', ''), d['head'], d.get('work'), h, also=also) for h in hosts)
-    line += (f"; open {_age(now() - at)} (asked {_et(at)} ET)"
-             + ('; not served yet' if corner else f'; served check failed ({why})'))
-    out(line)
-    return line
 
 
 def queue_cascade(qdir=None):
@@ -818,10 +756,6 @@ def main(argv=None):
     try:
         if a.cascade:
             watchdog()
-            try:  # before the lock: a busy run and a no-flag run print it too
-                cornerbot_reminder(hr_gate(), out=_say, dry=a.dry_run)
-            except Exception as e:  # the reminder must never stop the cascade
-                _say(f"cornerbot reminder failed: {type(e).__name__}: {str(e)[:160]}")
             if a.dry_run:  # no lock, no flag: a dry run changes nothing
                 return Cascade(dry_run=True, out=_say).run()
             return run_locked(lambda: Cascade(out=_say).run(), if_flagged=a.if_flagged, out=_say)

@@ -29,7 +29,6 @@ def isolated_state(tmp_path, monkeypatch):
     from tangentswarm import advance, gatelock
     monkeypatch.setattr(advance, 'RERUN', tmp_path / 'swarm-serial.rerun')
     monkeypatch.setattr(advance, 'CASCADE_LOG', tmp_path / 'cascade.log')
-    monkeypatch.setattr(advance, 'CORNERBOT_FILE', tmp_path / 'cornerbot-request')
     from tangentswarm import flow
     monkeypatch.setattr(flow, 'STATE', tmp_path / 'pull.json')
     monkeypatch.setattr(flow, 'LOG', tmp_path / 'flow.log')

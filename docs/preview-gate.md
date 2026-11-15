@@ -48,7 +48,7 @@ One run for PR n at head H:
    the preview site's `.deploy-sha` until it names the merge commit (limit 15 min).
    - Timeout: the run stops with `PREVIEW_BLOCKED: <app> preview does not serve <sha>
      after 15m`. That line is printed again on every run until the site serves the
-     commit. This is the same rule as CORNERBOT_REQUEST (commit ff0e959).
+     commit.
 4. **Smoke.** The generic smoke drive of the site, as staging-checks.sh runs it against
    staging, but against the preview profile. A failure here is a preview failure. It is
    not a fault of the PR when the same smoke also fails on plain work; then the lane

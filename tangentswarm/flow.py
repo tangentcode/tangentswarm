@@ -63,7 +63,7 @@ CI_WAIT_WORDS = ('IN_PROGRESS', 'QUEUED', 'PENDING', 'WAITING', 'REQUESTED', 'no
 # state of the one running pull
 
 def load_pulls():
-    """The pulls in flight: [{pr, head, branch, item, work, started, asked}], oldest first.
+    """The pulls in flight: [{pr, head, branch, item, work, started}], oldest first.
     A batch (Cascade fill) shares one work commit. The old one-pull file is read too."""
     try:
         d = json.loads(STATE.read_text())
@@ -553,7 +553,7 @@ class Flow:
         pulls = load_pulls()
         for d in pulls:
             self.out(f"pull: #{d['pr']} head {d['head'][:8]} in work {str(d.get('work'))[:8]} "
-                     f"since {int((self.now() - d['started']) // 60)} min" + (' (cornerbot asked)' if d.get('asked') else ''))
+                     f"since {int((self.now() - d['started']) // 60)} min")
         if not pulls:
             self.out('pull: none')
         return 0

@@ -425,12 +425,12 @@ def test_start_claude_also_when_ready_is_full(monkeypatch, tmp_path):
     assert out[-1] == 'START_CLAUDE n=2 issues=#50,#51 new=0/3 rework=0/3 ready=7/6 active_without_pr=2'
 
 
-def test_a_dry_run_shows_the_cornerbot_request_and_the_wait_for_every_site(monkeypatch, tmp_path):
+def test_a_dry_run_shows_the_gate_after_every_site_serves_and_no_cornerbot_request(monkeypatch, tmp_path):
     cols = {board.STAGING: [pr(1, board.STAGING)], board.READY: [pr(9, board.READY)]}
     g = CascadeGate(served={'work': 'h' * 40, 'minavo': 'h' * 40, 'ptw': 'o' * 40}, has={'h' * 40})
     out, pulled = cascade(monkeypatch, tmp_path, cols, g)
     assert pulled == [9]
-    assert any(l.startswith('CORNERBOT_REQUEST (dry run): redeploy ptw.example') and '#9 b9' in l for l in out)
+    assert not any('CORNERBOT' in l for l in out)  # ptw redeploys the work tip by itself (Michal 2026-11-15)
     assert ('would gate each one when every staging site serves the batch (no wait; the daemon queues a cascade '
             'on a .deploy-sha change) (now lagging: ptw.example)') in out
     assert 'would run hr-gate --apply 9 (Ready -> Staging when it passes)' in out
@@ -458,7 +458,6 @@ def live(monkeypatch, tmp_path, g, advance=None, ready=(9,), staging=(1,), hr=()
          board.HUMAN_REVIEW: [pr(n, board.HUMAN_REVIEW) for n in hr]}
     monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
     merge_fakes(monkeypatch)
-    monkeypatch.setattr(A, 'CORNERBOT_FILE', tmp_path / 'cornerbot')
     monkeypatch.setattr(F.Flow, 'pull_batch', batch)
     monkeypatch.setattr(F.Flow, 'advance', advance or adv)
     monkeypatch.setattr(F.Flow, 'columns', lambda self: ({}, c))
@@ -472,57 +471,52 @@ PTW_LAGS = {'work': W, 'minavo': W, 'ptw': O}
 ALL_SERVE = {'work': W, 'minavo': W, 'ptw': W}
 
 
-def test_a_batch_waits_on_no_redeploy_and_asks_cornerbot_once(monkeypatch, tmp_path):
+def test_a_batch_waits_on_no_redeploy(monkeypatch, tmp_path):
     """Michal 2026-11-15: Human Review sat empty about 15 min twice while single pulls of #495 and
     #514 each waited about 10 min on a PTW redeploy, holding the serial lock."""
     from tangentswarm import flow as F
+    monkeypatch.setattr(A.time, 'time', lambda: 60)  # pulled 1 min ago: a normal redeploy, no warning
     out, gated, slept, _ = live(monkeypatch, tmp_path, CascadeGate(served=PTW_LAGS), ready=(9, 10), staging=())
     assert slept == 0 and gated == []  # no sleep, no gate: the lock is free for a promote at once
     assert 'fill: #9, #10 pulled in one work merge: Staging 0 + 2, target 2' in out
-    reqs = [l for l in out if l.startswith('CORNERBOT_REQUEST')]
-    assert reqs == ['CORNERBOT_REQUEST: redeploy ptw.example from platform work wwwwwwww (#9 b9 00000000 is in work) '
-                    'with #10']  # ONE request for the whole batch
-    assert [d['asked'] for d in F.load_pulls()] == [True, True]
-    assert any(l.startswith('waiting: #10 00000000 is not served yet by ptw.example (oooooooo); pulled ') for l in out)
+    assert [d['pr'] for d in F.load_pulls()] == [9, 10]
+    assert any(l.startswith('waiting: #10 00000000 not served yet by ptw.example (oooooooo); pulled ') for l in out)
+    assert not any(l.startswith(('CORNERBOT', 'REDEPLOY_LATE')) for l in out)
 
 
 def test_the_next_cascade_gates_the_whole_batch_once_ptw_serves_it(monkeypatch, tmp_path):
     from tangentswarm import flow as F
     monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
-    F.save_pulls([dict(pr=n, head=f'{n}' * 40, branch='b', item='I', work=W, started=0, asked=True) for n in (9, 10)])
-    (tmp_path / 'cornerbot').write_text('x CORNERBOT_REQUEST: redeploy ptw.example ...\n')
+    F.save_pulls([dict(pr=n, head=f'{n}' * 40, branch='b', item='I', work=W, started=0) for n in (9, 10)])
     g = CascadeGate(served=ALL_SERVE, has={W})
     out, gated, slept, c = live(monkeypatch, tmp_path, g, ready=(9, 10), staging=())
     assert gated == [9, 10] and slept == 0 and F.load_pulls() == []
-    assert 'CORNERBOT_DONE: every cornerbot site serves #9 99999999; request cleared' in out
-    assert not (tmp_path / 'cornerbot').exists()
+    assert 'served: every staging site serves #9 99999999' in out
     assert 'fill: Staging 2, target 2: no pull needed' in out
 
 
 def test_a_promote_starts_the_next_pull_while_a_batch_still_waits(monkeypatch, tmp_path):
     """(2) A promote frees a Staging slot: the next Ready pull starts in the same pass, and the
-    waiting batch (asked before) gets one check and no second request."""
+    waiting batch gets one check."""
     from tangentswarm import flow as F
     monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
-    F.save_pull(dict(pr=9, head='9' * 40, branch='b', item='I', work=W, started=0, asked=True))
+    F.save_pull(dict(pr=9, head='9' * 40, branch='b', item='I', work=W, started=0))
     out, gated, slept, _ = live(monkeypatch, tmp_path, CascadeGate(served=PTW_LAGS), ready=(9, 11), staging=())
     assert slept == 0 and gated == []
     assert 'fill: #11 pulled in one work merge: Staging 0 + 1 in flight (#9) + 1, target 2' in out
     assert [d['pr'] for d in F.load_pulls()] == [9, 11]
-    assert not any(l.startswith('CORNERBOT_REQUEST') and '#9' in l for l in out)  # asked before
 
 
 def test_a_pull_without_served_files_is_gated_at_once(monkeypatch, tmp_path):
     out, gated, _, _ = live(monkeypatch, tmp_path, CascadeGate(served_files=False, served=PTW_LAGS), ready=(9,),
                             staging=())
-    assert gated == [9] and not any(l.startswith(('CORNERBOT', 'waiting')) for l in out)
+    assert gated == [9] and not any(l.startswith(('REDEPLOY_LATE', 'waiting')) for l in out)
 
 
 def test_a_web_site_that_never_serves_never_holds_the_lock(monkeypatch, tmp_path):
     g = CascadeGate(served={'work': O, 'minavo': W, 'ptw': W})
     out, gated, slept, _ = live(monkeypatch, tmp_path, g, advance=lambda *a: pytest.fail('no gate'))
     assert gated == [] and slept == 0
-    assert not any(l.startswith('CORNERBOT_REQUEST') for l in out)
 
 
 def test_a_dry_run_goes_on_after_a_running_pull_would_end(monkeypatch, tmp_path):
@@ -607,18 +601,40 @@ def test_progress_lines_carry_a_time_and_go_to_the_log(monkeypatch, tmp_path, ca
     assert (tmp_path / 'cascade.log').read_text().endswith(printed)
 
 
-def test_a_cornerbot_site_asked_before_gets_one_check_and_no_wait(monkeypatch, tmp_path):
-    """7:32 PM ET: pass after pass waited 430 s for the same ptw redeploy of #480, holding the lock."""
+def lag_pass(monkeypatch, tmp_path, age, logs='ptw=/log/ptw-deploy.log'):
+    """One pass over pull #480 (pulled `age` s ago) while ptw serves an older work commit."""
     from tangentswarm import flow as F
     monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
-    F.save_pull(dict(pr=480, head='5f6e09a4' + '0' * 32, branch='b', item='I', work='w' * 40, started=0, asked=True))
+    monkeypatch.setenv('SWARM_DEPLOY_LOGS', logs)
+    F.save_pull(dict(pr=480, head='5f6e09a4' + '0' * 32, branch='b', item='I', work='w' * 40, started=1000))
+    monkeypatch.setattr(A.time, 'time', lambda: 1000 + age)
     monkeypatch.setattr(F.Flow, 'advance', lambda *a: pytest.fail('not served: no gate'))
     monkeypatch.setattr(F.Flow, 'columns', lambda self: ({}, {}))
-    out, now = [], [0]
+    out, slept = [], []
     g = CascadeGate(served={'work': 'w' * 40, 'minavo': 'w' * 40, 'ptw': 'o' * 40})
-    A.Cascade(g=g, out=out.append, sleep=lambda s: now.__setitem__(0, now[0] + s), clock=lambda: now[0]).fill()
-    assert now[0] == 0 and not any(l.startswith('CORNERBOT_REQUEST') for l in out)
-    assert out[0].startswith('waiting: #480 5f6e09a4 is not served yet by ptw.example (oooooooo); pulled ')
+    A.Cascade(g=g, out=out.append, sleep=slept.append).fill()
+    assert slept == []  # 7:32 PM ET: pass after pass waited 430 s for one ptw redeploy, holding the lock
+    return out
+
+
+def test_a_lagging_pull_gets_one_check_and_no_warning_before_ten_minutes(monkeypatch, tmp_path):
+    out = lag_pass(monkeypatch, tmp_path, A.REDEPLOY_LATE - 1)
+    assert out[0] == ('waiting: #480 5f6e09a4 not served yet by ptw.example (oooooooo); pulled 9m59s ago; '
+                      'no wait: a .deploy-sha change queues the next cascade')
+
+
+def test_a_ptw_lag_over_ten_minutes_warns_and_names_the_deploy_log(monkeypatch, tmp_path):
+    """Michal 2026-11-15: warn only when the ptw .deploy-sha lags the work merge by more than
+    10 min, and point at the ptw deploy log (its path comes from the wrapper's environment)."""
+    out = lag_pass(monkeypatch, tmp_path, A.REDEPLOY_LATE + 60)
+    assert out[0] == ('REDEPLOY_LATE: #480 5f6e09a4 (work wwwwwwww) is not served by ptw.example (oooooooo) '
+                      '11m00s after the work merge; see /log/ptw-deploy.log')
+    assert lag_pass(monkeypatch, tmp_path, A.REDEPLOY_LATE + 60, logs='')[0].endswith('after the work merge')
+
+
+def test_deploy_logs_reads_site_equals_path_pairs():
+    assert A.deploy_logs({'SWARM_DEPLOY_LOGS': 'ptw=/a.log, work=/b.log,bad'}) == {'ptw': '/a.log', 'work': '/b.log'}
+    assert A.deploy_logs({}) == {}
 
 
 def test_the_deadline_is_per_process_not_per_pass(monkeypatch):
@@ -635,96 +651,3 @@ def test_the_deadline_is_per_process_not_per_pass(monkeypatch):
         signal.signal(signal.SIGALRM, old[0])
         signal.signal(signal.SIGTERM, old[1])
         monkeypatch.setattr(A, 'DEADLINE', None)
-
-
-# -- CORNERBOT_REQUEST on every run until the site serves the head (Michal 2026-11-15) -------
-
-def corner_setup(tmp_path, pr=495, asked_age=3000, served=None, pull=True):
-    from tangentswarm import flow as F
-    W, O = 'w' * 40, 'o' * 40
-    if pull:
-        F.save_pull(dict(pr=pr, head='4' * 40, branch='avo', item='I', work=W, started=0, asked=True))
-    A.CORNERBOT_FILE.write_text("2026-11-15T03:20:18 CORNERBOT_REQUEST: redeploy ptw.example from platform "
-                                "work wwwwwwww (#495 avo 44444444 is in work)\n")
-    at = 1_000_000.0
-    os.utime(A.CORNERBOT_FILE, (at, at))
-    g = CascadeGate(served=served or {'work': W, 'minavo': W, 'ptw': O})
-    return g, lambda: at + asked_age
-
-
-def test_the_cornerbot_request_is_printed_again_with_its_age_while_ptw_lags(tmp_path):
-    g, now = corner_setup(tmp_path)
-    out = []
-    line = A.cornerbot_reminder(g, out=out.append, now=now)
-    assert out == [line]
-    assert line.startswith('CORNERBOT_REQUEST: redeploy ptw.example from platform work wwwwwwww (#495 avo 44444444 is in work)')
-    assert '; open 50m00s (asked ' in line and line.endswith('; not served yet')
-    assert A.CORNERBOT_FILE.exists()  # the age stays the age of the first request
-
-
-def test_the_cornerbot_request_is_cleared_once_ptw_serves_the_head(tmp_path):
-    W = 'w' * 40
-    g, now = corner_setup(tmp_path, asked_age=4000, served={'work': W, 'minavo': W, 'ptw': W})
-    out = []
-    A.cornerbot_reminder(g, out=out.append, now=now)
-    assert out == ['CORNERBOT_DONE: every cornerbot site serves #495 44444444 1h06m after the request; request cleared']
-    assert not A.CORNERBOT_FILE.exists()
-
-
-def test_a_cornerbot_request_without_its_pull_is_cleared(tmp_path):
-    for kw in ({'pull': False}, {'pr': 496}):
-        g, now = corner_setup(tmp_path, **kw)
-        out = []
-        A.cornerbot_reminder(g, out=out.append, now=now)
-        assert out[0].startswith('CORNERBOT_REQUEST cleared: no running pull waits on it (')
-        assert not A.CORNERBOT_FILE.exists()
-
-
-def test_a_dry_run_prints_the_cornerbot_reminder_and_keeps_the_file(tmp_path):
-    W = 'w' * 40
-    g, now = corner_setup(tmp_path, served={'work': W, 'minavo': W, 'ptw': W})
-    out = []
-    A.cornerbot_reminder(g, out=out.append, dry=True, now=now)
-    assert out[0].endswith('request cleared (dry run: file kept)') and A.CORNERBOT_FILE.exists()
-
-
-def test_a_failed_served_check_still_prints_the_request(tmp_path):
-    g, now = corner_setup(tmp_path)
-    g['served_all'] = lambda: (_ for _ in ()).throw(OSError('no route'))
-    out = []
-    A.cornerbot_reminder(g, out=out.append, now=now)
-    assert out[0].startswith('CORNERBOT_REQUEST: redeploy ptw.example ') and 'served check failed (OSError: no route)' in out[0]
-    assert A.CORNERBOT_FILE.exists()
-
-
-def test_no_cornerbot_file_prints_nothing(tmp_path):
-    out = []
-    assert A.cornerbot_reminder(CascadeGate(), out=out.append) is None and out == []
-
-
-@pytest.mark.parametrize('case', ['busy', 'no-flag', 'dry'])
-def test_every_cascade_run_prints_the_cornerbot_request(monkeypatch, tmp_path, case):
-    """10:20-11:11 PM ET: the line for #495 was printed once, then busy runs and the drained
-    `--if-flagged` runs said nothing."""
-    g, _ = corner_setup(tmp_path)
-    out = []
-    monkeypatch.setattr(A, '_say', out.append)
-    monkeypatch.setattr(A, 'watchdog', lambda budget=None: None)
-    monkeypatch.setattr(A, 'hr_gate', lambda: g)
-
-    class Busy:
-        def __enter__(self):
-            raise A.gatelock.Busy('held by pid 1')
-
-        def __exit__(self, *a):
-            return False
-    monkeypatch.setattr(A.gatelock, 'gate_lock', lambda *a, **k: Busy())
-    monkeypatch.setattr(A.Cascade, 'run', lambda self: 0)
-    monkeypatch.setattr(A.Cascade, '__init__', lambda self, *a, **k: None)
-    argv = {'busy': ['--cascade'], 'no-flag': ['--cascade', '--if-flagged'], 'dry': ['--cascade', '--dry-run']}[case]
-    assert A.main(argv) == 0
-    assert out[0].startswith('CORNERBOT_REQUEST: redeploy ptw.example ') and 'not served yet' in out[0]
-    if case == 'dry':
-        assert len(out) == 1
-    else:
-        assert out[1].startswith({'busy': 'busy: ', 'no-flag': 'no rerun flag'}[case])
