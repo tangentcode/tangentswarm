@@ -8,8 +8,10 @@ import os
 import re
 from pathlib import Path
 
-PROJECT_ID = 'PVT_example'
-STATUS_FIELD = 'PVTSSF_example'
+from . import config as _config
+
+PROJECT_ID = _config.get('project', 'id')  # private: ~/.config/tangentswarm/config.toml
+STATUS_FIELD = _config.get('project', 'status_field')
 
 # internal key -> option id
 INBOX, TRIAGE, DISCUSS, BACKLOG, ACTIVE = 'Inbox', 'Triage', 'Discuss', 'Backlog', 'Active'
@@ -17,11 +19,9 @@ IN_PROGRESS, AUTO_REVIEW, NEEDS_INPUT = 'In Progress', 'Auto Review', 'Needs Inp
 READY, STAGING, HUMAN_REVIEW = 'Ready', 'Pending', 'Human Review'  # STAGING keeps the internal key "Pending"
 DONE, CANCELED, PARKED = 'Done', 'Canceled', 'Parked'
 
-OPTION = {
-    INBOX: 'opt-inbox', TRIAGE: 'opt-triage', DISCUSS: 'opt-discuss', BACKLOG: 'opt-backlog', ACTIVE: 'opt-active',
-    IN_PROGRESS: 'opt-in-progress', AUTO_REVIEW: 'opt-auto-review', NEEDS_INPUT: 'opt-needs-input', READY: 'opt-ready',
-    STAGING: 'opt-staging', HUMAN_REVIEW: 'opt-human-review', DONE: 'opt-done', CANCELED: 'opt-canceled', PARKED: 'opt-parked',
-}
+COLUMNS = (INBOX, TRIAGE, DISCUSS, BACKLOG, ACTIVE, IN_PROGRESS, AUTO_REVIEW, NEEDS_INPUT, READY, STAGING,
+           HUMAN_REVIEW, DONE, CANCELED, PARKED)
+OPTION = {c: _config.get('project', 'options', c) for c in COLUMNS}
 BY_ID = {v: k for k, v in OPTION.items()}
 
 # Timeline status-change events carry the column name as it was at the time.

@@ -1,0 +1,33 @@
+# tangentswarm private infra config (example with placeholders).
+# Copy to ~/.config/tangentswarm/config.toml (or $TANGENTSWARM_CONFIG) and fill in the real
+# values. The real file is never committed. The tests run with this example file.
+
+[project]
+# GitHub Projects v2 node ids of the board (gh project view N --owner ORG --format json).
+id = "PVT_example"
+status_field = "PVTSSF_example"
+
+[project.options]
+# Status column (internal key) -> single-select option id. Columns are matched by id only.
+"Inbox" = "opt-inbox"
+"Triage" = "opt-triage"
+"Discuss" = "opt-discuss"
+"Backlog" = "opt-backlog"
+"Active" = "opt-active"
+"In Progress" = "opt-in-progress"
+"Auto Review" = "opt-auto-review"
+"Needs Input" = "opt-needs-input"
+"Ready" = "opt-ready"
+"Pending" = "opt-staging"          # shown as "Staging" on the board
+"Human Review" = "opt-human-review"
+"Done" = "opt-done"
+"Canceled" = "opt-canceled"
+"Parked" = "opt-parked"
+
+[staging]
+# The staging sites that must serve a PR's head (key = host).
+sites = { work = "work.example.test", minavo = "minavo.example.test" }
+
+[webhook]
+# swarm-webhook HMAC secrets (any one may match). "~" is the home directory.
+secret_files = ["~/.config/tangentswarm/webhook-secret"]

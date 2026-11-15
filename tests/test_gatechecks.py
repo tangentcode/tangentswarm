@@ -118,7 +118,7 @@ def test_every_staging_site_must_serve_the_head():
     assert why == ('1 of 3 staging sites do not serve it: ptw.example.test: static .deploy-sha 95f38a27 '
                    'LACKS the head: staging does not serve it yet')
     ok, why = G.check_served_sites(web, False, sites, has)
-    assert ok and why.startswith('lenient re-gate: 1 of 3 staging sites') and 'pawntakesworld' in why
+    assert ok and why.startswith('lenient re-gate: 1 of 3 staging sites') and 'ptw.example.test' in why
     ok, why = G.check_served_sites(web, True, sites[:2], has)
     assert ok and why.startswith('all 2 staging sites serve it: work.example.test: static .deploy-sha 4fe539ad')
 

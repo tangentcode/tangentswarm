@@ -52,15 +52,15 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import board, eventdb
+from . import board, config, eventdb
 
 HOME = Path.home()
 STATE = HOME / '.local' / 'state' / 'swarm-flow'
 LOG = Path(os.environ.get('SWARM_WEBHOOK_LOG', str(STATE / 'webhook.log')))
 INBOX = Path(os.environ.get('SWARM_WEBHOOK_INBOX', str(STATE / 'webhook-inbox')))
 SEEN = Path(os.environ.get('SWARM_WEBHOOK_SEEN', str(STATE / 'webhook-seen.json')))
-SECRET_FILES = [Path(p) for p in os.environ.get(
-    'SWARM_WEBHOOK_SECRETS', f"{HOME}/.config/tangentswarm/webhook-secret:{HOME}/example/hook-secret").split(':') if p]
+SECRET_FILES = ([Path(p) for p in os.environ['SWARM_WEBHOOK_SECRETS'].split(':') if p]
+                if os.environ.get('SWARM_WEBHOOK_SECRETS') else config.files('webhook', 'secret_files'))
 WAKE_URL_FILE = Path(os.environ.get('SWARM_WAKE_URL_FILE', str(HOME / '.config' / 'tangentswarm' / 'swarmbot-wake-url')))
 WAKE_KEY_FILE = Path(os.environ.get('SWARM_WAKE_KEY_FILE', str(HOME / '.config' / 'tangentswarm' / 'swarmbot-wake-key')))
 PORT = int(os.environ.get('SWARM_WEBHOOK_PORT', '8772'))

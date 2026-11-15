@@ -3,8 +3,8 @@ from tangentswarm import board, tick
 
 
 def test_renamed_staging_column_maps_to_the_internal_key():
-    assert board.column({'name': 'Staging', 'optionId': 'opt-staging'}) == board.STAGING == 'Pending'
-    assert board.column({'name': 'Anything new', 'optionId': 'opt-human-review'}) == board.HUMAN_REVIEW
+    assert board.column({'name': 'Staging', 'optionId': board.OPTION[board.STAGING]}) == board.STAGING == 'Pending'
+    assert board.column({'name': 'Anything new', 'optionId': board.OPTION[board.HUMAN_REVIEW]}) == board.HUMAN_REVIEW
 
 
 def test_unknown_id_falls_back_to_the_name_and_missing_value_is_none():
@@ -17,7 +17,7 @@ def test_event_names_include_old_and_new_names():
 
 
 def test_board_prs_uses_option_ids():
-    item = {'id': 'I', 'fieldValueByName': {'name': 'Staging', 'optionId': 'opt-staging'},
+    item = {'id': 'I', 'fieldValueByName': {'name': 'Staging', 'optionId': board.OPTION[board.STAGING]},
             'content': {'__typename': 'PullRequest', 'number': 5, 'state': 'OPEN', 'isDraft': False,
                         'headRefName': 'b', 'headRefOid': 'h', 'title': 't', 'body': '',
                         'repository': {'nameWithOwner': tick.REPO}, 'milestone': None,
@@ -39,7 +39,7 @@ def test_priority_rank_order():
 
 
 def test_board_prs_fast_track_only_for_the_active_ticket(tmp_path):
-    item = {'id': 'I', 'fieldValueByName': {'name': 'Ready', 'optionId': 'opt-ready'},
+    item = {'id': 'I', 'fieldValueByName': {'name': 'Ready', 'optionId': board.OPTION[board.READY]},
             'content': {'__typename': 'PullRequest', 'number': 9, 'state': 'OPEN', 'isDraft': False,
                         'headRefName': 'b', 'headRefOid': 'h', 'title': 't', 'body': '',
                         'repository': {'nameWithOwner': tick.REPO}, 'milestone': None,

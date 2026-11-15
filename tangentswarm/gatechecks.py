@@ -26,7 +26,7 @@ its Redeploy failed, and the gate still passed.
 
 Condition 6 checks EVERY staging site (check_served_sites). Each site serves the platform
 work branch, so a PR with served files reaches all of them. Platform #493 entered Human
-Review while ptw.example.test still served 95f38a27, which did not contain its head
+Review while one staging site still served 95f38a27, which did not contain its head
 37ceb8f4; the gate had read only the one site that site_for picked.
 """
 import re
