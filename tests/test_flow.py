@@ -35,9 +35,14 @@ def test_gate_verdict_pass_wait_fail():
                               ('7b where-to-see line', False, 'missing')])[0] == 'fail'
 
 
-def test_ready_order_milestone_then_conflicts_then_oldest():
-    ready = [dict(number=9, rank=1), dict(number=4, rank=1), dict(number=7, rank=0), dict(number=2, rank=1)]
-    assert [p['number'] for p in flow.ready_order(ready, {4: 0, 2: 2, 9: 0})] == [7, 4, 9, 2]
+def test_ready_order_is_the_shared_pick_order():
+    """tangentswarm #35: fast-track, then the soonest milestone due date, then the number
+    (MVP PRs due Dec 1 went ahead of ptw 15 PRs due Nov 15)."""
+    ready = [dict(number=9, due='2026-12-01', milestone='MVP'), dict(number=4, milestone='no date'),
+             dict(number=7, due='2026-11-15', milestone='ptw 15'), dict(number=2),
+             dict(number=8, due='2026-12-01', milestone='MVP', rank=board.FAST_TRACK),
+             dict(number=3, due='2026-11-15', milestone='ptw 15')]
+    assert [p['number'] for p in flow.ready_order(ready, {3: 5})] == [8, 3, 7, 9, 4, 2]
 
 
 def test_event_filter_needs_no_api():
@@ -153,8 +158,10 @@ class _Ctx:
 # --- the step with a fake hr-gate -------------------------------------------------
 
 def card(n, col, head=None, rank=1, draft=False):
+    """rank 0 (a priority milestone) is the soonest due date in the shared pick order (#35)."""
+    due = dict(due='2026-11-15', milestone='ptw 15') if rank == board.MILESTONE else {}
     return dict(number=n, state='OPEN', draft=draft, branch=f'b{n}', head=head or f'{n:040d}', title='t',
-                col=col, item=f'I{n}', rank=rank, parked=False, body='')
+                col=col, item=f'I{n}', rank=rank, parked=False, body='', **due)
 
 
 class FakeG(dict):

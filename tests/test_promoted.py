@@ -51,10 +51,13 @@ def test_gate_times_take_the_latest_line_per_head():
     assert P.gated_heads(LOG) == {('#5', '55555555')}
 
 
-def test_staging_head_follows_queue_order():
+def test_staging_head_follows_the_shared_pick_order():
+    """tangentswarm #35: the soonest milestone due date goes first, not hr-gate's queue order."""
+    cols = {board.STAGING: [dict(number=5, head=H5, item='I5', due='2026-12-01', milestone='MVP'),
+                            dict(number=6, head=H6, item='I6', due='2026-11-15', milestone='ptw 15')]}
+    assert P.staging_head(cols, [{'pr': 5}, {'pr': 6}])['number'] == 6
     cols = {board.STAGING: [dict(number=5, head=H5, item='I5'), dict(number=6, head=H6, item='I6')]}
-    assert P.staging_head(cols, [{'pr': 6}, {'pr': 5}])['number'] == 6
-    assert P.staging_head(cols, [])['number'] == 5
+    assert P.staging_head(cols, [{'pr': 6}, {'pr': 5}])['number'] == 5  # no milestone: the lower number
 
 
 def test_staging_order_puts_only_the_active_fast_track_first():
