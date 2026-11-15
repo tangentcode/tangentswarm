@@ -757,10 +757,11 @@ class Cascade(Advance):
         from . import slots, spool
         now = time.time()
         for pr, rec in sorted(unstarted.items(), key=lambda kv: kv[1].get('at', 0)):
-            if cap <= 0:
-                break
+            brief_only = bool(rec.get('brief_pane'))  # its Claude runs: only the brief line is sent
+            if cap <= 0 and not brief_only:  # Codex on PR #26: a brief retry needs no capacity
+                continue
             if now - float(rec.get('queued') or 0) < 600:
-                cap -= 1  # a start is in flight
+                cap -= 0 if brief_only else 1  # a start is in flight
                 continue
             if self.dry:
                 self.out(f"start: would queue the worker start of #{pr} ({rec.get('branch')})")
@@ -769,8 +770,9 @@ class Cascade(Advance):
                 with slots.update() as d:
                     if str(pr) in d['unstarted']:
                         d['unstarted'][str(pr)]['queued'] = now
-                self.out(f"start: queued the worker start of #{pr} ({rec.get('branch')}): its window has no Claude")
-            cap -= 1
+                self.out(f"start: queued the {'brief line' if brief_only else 'worker start'} of #{pr} "
+                         f"({rec.get('branch')})" + ('' if brief_only else ': its window has no Claude'))
+            cap -= 0 if brief_only else 1
         return cap
 
     def launch(self, pick):

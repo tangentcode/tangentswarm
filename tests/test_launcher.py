@@ -226,3 +226,17 @@ def test_a_branch_is_reused_only_for_an_exact_closing_reference():
     assert L.closes('Fixes #50', 50) and L.closes('closes tangentcode/platform#50.', 50)
     assert L.closes('Some text\nResolves #50\n', 50)
     assert not L.closes('Fixes #507', 50) and not L.closes('see #50', 50) and not L.closes('', 50)
+
+
+def test_a_pending_brief_is_retried_even_at_the_claude_cap(monkeypatch):
+    """Codex on PR #26: the cap check stopped the retry of a brief to a Claude that runs."""
+    from tangentswarm import advance as A, spool
+    from test_advance import CascadeGate
+    slots.unstarted_add(537, branch='a', brief='/b/537.txt', issue=503, now=1)
+    slots.brief_pending(539, '%9', 'u.scope', '/b/539.txt', branch='c', now=2)
+    monkeypatch.setattr(slots, 'live_claudes', lambda: slots.MAX_CLAUDES)
+    out = []
+    A.Cascade(g=CascadeGate(issues=[(40, board.BACKLOG)]), out=out.append).signal({})
+    reqs = sorted(json.loads(p.read_text())['pr'] for p in spool.SPOOL.glob('*.req.json'))
+    assert reqs == [539]  # the brief line, not the new worker start of #537
+    assert 'start: queued the brief line of #539 (c)' in out
