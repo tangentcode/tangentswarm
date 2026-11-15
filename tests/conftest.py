@@ -30,6 +30,8 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(advance, 'RERUN', tmp_path / 'swarm-serial.rerun')
     monkeypatch.setattr(advance, 'CASCADE_LOG', tmp_path / 'cascade.log')
     from tangentswarm import flow
+    monkeypatch.setattr(flow, 'RELAY_DIR', tmp_path)
+    monkeypatch.setattr(flow, 'HELD', tmp_path / 'held.json')
     from tangentswarm import stophook
     from tangentswarm import spool
     from tangentswarm import events as _events

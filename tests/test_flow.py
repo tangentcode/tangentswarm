@@ -17,6 +17,14 @@ def state(tmp_path, monkeypatch):
 
 # --- pure helpers ---------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def worker_runs(monkeypatch):
+    """Flow.fail and the screenshot job need a worker: by default its Claude takes the relay
+    (never a real tmux or systemd-run in a test)."""
+    from tangentswarm import slots
+    monkeypatch.setattr(slots, 'revive', lambda n, text, out=print, **k: out(f'sent to #{n}') or 0)
+
+
 def test_gate_verdict_pass_wait_fail():
     assert flow.gate_verdict([('1 not draft', True, 'ready')]) == ('pass', [])
     v, why = flow.gate_verdict([('5 CI green (Linux)', False, 'Linux IN_PROGRESS'),
@@ -215,12 +223,11 @@ def test_pr_that_does_not_merge_onto_main_goes_back_with_a_relay(monkeypatch, tm
     prs = {1: card(1, HR), 2: card(2, HR), 7: card(7, RD, rank=0), 9: card(9, RD)}
     f, g = make_flow(prs, dry=False, clean=lambda a, b: not (a == 'main' and b == prs[7]['head']))
     monkeypatch.setattr(flow, 'stack_conflict', lambda *a: None)
-    monkeypatch.setattr(flow, 'Path', lambda p: tmp_path / p.replace('/', '_'))
     started = []
     monkeypatch.setattr(f, 'start_pull', lambda p, s: started.append(p['number']))
     f.step()
     assert g.moves == [('I7', IP)] and started == [9]
-    assert 'merge origin/main' in (tmp_path / '_tmp_relay-7-merge-main.md').read_text()
+    assert 'merge origin/main' in (flow.RELAY_DIR / 'relay-7-merge-main.md').read_text()
 
 
 def test_empty_ready_is_a_refill_note():
@@ -426,3 +433,27 @@ def test_pulls_state_reads_the_old_single_pull_file_and_drops_one_pr(tmp_path):
     assert flow.pulled_prs() == {514}
     flow.drop_pull(514)
     assert not flow.STATE.exists()
+
+
+def test_a_pull_waiting_only_on_screenshots_is_never_failed_and_gets_the_job(monkeypatch):
+    """#519 at 2:23 AM ET: a 7a-only wait failed after PULL_TIMEOUT into In Progress with no worker."""
+    from tangentswarm import slots
+    prs = {7: card(7, RD)}
+    f, g = make_flow(prs, dry=False, rows=[('7a screenshots current', False, 'no image in body')])
+    sent = []
+    monkeypatch.setattr(slots, 'revive', lambda n, text, out=print, **k: sent.append(n) or out('sent') or 0)
+    pull_state(7, started=10_000 - flow.PULL_TIMEOUT - 60)
+    f.advance(flow.load_pull(), prs, g['ScratchRepo']())
+    assert g.moves == [] and sent == [7]
+    assert any(n.startswith('SCREENSHOTS_NEEDED #7: still no screenshots after') for n in f.notes)
+    assert flow.load_pull()['pr'] == 7  # the pull stays open
+
+
+def test_needs_screenshots_exempts_api_docs_and_tooling():
+    from tangentswarm.gatechecks import needs_screenshots as ns
+    assert ns(['web/src/a.tsx'])
+    assert ns(['app/view.ts', 'api/x.py'])
+    assert not ns(['api/routes/x.ts', 'api/models.py'])
+    assert not ns(['docs/a.md', 'AGENTS.md'])
+    assert not ns(['.github/workflows/ci.yml', 'scripts/x.ts', 'tests/a.test.ts'])
+    assert ns(['web/src/a.tsx'], body='This is code-only.')  # web/ files still need shots

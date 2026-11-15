@@ -85,6 +85,22 @@ def probe_image(url, timeout=15, opener=urllib.request.urlopen):
     return True, ''
 
 
+UI_RE = re.compile(r'^web/|\.(css|html|mts|tsx?|jsx?|svg)$')
+NO_SHOTS_PREFIXES = ('api/', 'docs/', '.github/', 'scripts/', 'tests/', 'test/')
+CODE_ONLY_RE = re.compile(r'code[- ]only|tooling[- ]only|no deployable surface|nothing (?:to )?deploy', re.I)
+
+
+def needs_screenshots(paths, body=''):
+    """True when condition 7a applies: the PR changes a visible UI file. api-only and
+    docs-only PRs (and tooling: .github/, scripts/, tests/) are exempt, and so is a body
+    that says code-only (Michal 2026-11-15: #519 was demoted for screenshots it did not
+    need a worker for)."""
+    if CODE_ONLY_RE.search(body or '') and not any(p.startswith(('web/', 'app/')) for p in paths):
+        return False
+    return any(UI_RE.search(p) and not p.startswith(NO_SHOTS_PREFIXES) and not p.endswith('.md')
+               for p in paths)
+
+
 def check_images(body, repo, exists, probe=probe_image):
     """(ok, why) for condition 7a. exists(path) -> bool says if a file is on swarm-shots."""
     urls = image_urls(body)

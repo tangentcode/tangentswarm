@@ -287,6 +287,26 @@ class Advance:
             moves.log_move(n, 'Auto Review', 'Ready', head, note='swarm-advance MinBot pass')
         self.out(f"{'would ' if self.dry else ''}MinBot-pass #{n} at {head[:8]}: pass comment, "
                  "Auto Review -> Ready")
+        self.shots_on_ready(n, head)
+
+    def shots_on_ready(self, n, head):
+        """Michal 2026-11-15 2:23 AM ET (#519): a UI PR that reaches Ready with no screenshot
+        gets the screenshot job now (its worker is woken or resumed), not a demote 90 min
+        later. api-only and docs-only PRs need none (gatechecks.needs_screenshots)."""
+        from . import flow, gatechecks
+        try:
+            full = self.g['fetch'](n)
+            paths = [f.get('path') or '' for f in ((full.get('files') or {}).get('nodes') or [])]
+            body = full.get('body') or ''
+        except Exception as e:
+            self.out(f"#{n} screenshot check skipped: {type(e).__name__}: {str(e)[:120]}")
+            return
+        if not gatechecks.needs_screenshots(paths, body) or gatechecks.image_urls(body):
+            return
+        f = flow.Flow(dry_run=self.dry, out=lambda line: None, g=self.g)
+        f.screenshot_job(n, head, full)
+        for line in f.did + f.notes:
+            self.out(line)
 
     # the step ----------------------------------------------------------------
     def step(self):
@@ -530,7 +550,7 @@ class Cascade(Advance):
     def rework(self, p, conflicts):
         """Card to In Progress, NEEDS_REWORK line, and the relay: swarm-revive in a rework slot,
         else a swarm-resume relay line. One relay per head."""
-        from . import slots
+        from . import flow, slots
         n, head = p['number'], p.get('head') or ''
         files = sorted({f for _, fs in conflicts for f in fs})
         self.out(f"NEEDS_REWORK #{n} {' '.join(files) or '(files unknown)'}")
@@ -548,19 +568,10 @@ class Cascade(Advance):
         if self.dry:
             self.out(f"would move #{n} Ready -> In Progress and send: {msg[:160]}")
             return
-        self.f.fail(p, f"conflicts with {where}"[:200], relay='merge-main')
-        relay = Path(f"/tmp/relay-{n}-merge-main.md")
-        try:
-            relay.write_text(msg + '\n')
-        except OSError as e:
-            self.out(f"relay file not written: {e}")
-        try:
-            rc = slots.revive(n, msg, out=lambda line: self.out('revive: ' + line))
-        except Exception as e:  # the relay line below still goes out
-            self.out(f"revive: {type(e).__name__}: {str(e)[:160]}")
-            rc = 1
-        if rc:
-            self.out(f"RELAY: swarm-resume {n} {relay}")
+        moved = self.f.fail(p, f"conflicts with {where}"[:200], relay='merge-main', text=msg)
+        self.flush()
+        if not moved:  # no worker could be started: the card stays, the relay waits for one
+            self.out(f"RELAY: swarm-resume {n} {flow.RELAY_DIR / f'relay-{n}-merge-main.md'}")
         st = slots.load()
         st['relayed'][str(n)] = head
         slots.save(st)

@@ -10,6 +10,14 @@ from tangentswarm import board, flow, promoted
 H = 'a' * 40
 
 
+@pytest.fixture(autouse=True)
+def worker_runs(monkeypatch):
+    """Flow.fail and the screenshot job need a worker: by default its Claude takes the relay
+    (never a real tmux or systemd-run in a test)."""
+    from tangentswarm import slots
+    monkeypatch.setattr(slots, 'revive', lambda n, text, out=print, **k: out(f'sent to #{n}') or 0)
+
+
 def receipt(head, login='chatgpt-codex-connector[bot]'):
     return {'author': {'login': login},
             'body': f"Codex Review: Didn't find any major issues. :+1:\n\n**Reviewed commit:** `{head[:10]}`"}
@@ -411,28 +419,42 @@ def test_a_ready_pr_that_conflicts_with_main_goes_to_rework_with_its_files(monke
     assert 'main check: #481, #484 conflict with origin/main: sent to rework' in out
 
 
-def test_a_live_rework_moves_the_card_revives_the_claude_and_sends_one_relay_per_head(monkeypatch, tmp_path):
+def rework_case(monkeypatch, tmp_path, rc):
     from tangentswarm import flow as F, slots
-    monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
     monkeypatch.setattr(F, 'log', lambda line: None)
     merge_fakes(monkeypatch, main_dirty={481})
     moved, revived = [], []
     g = CascadeGate()
     g['move'] = lambda item, col: moved.append((item, col))
-    monkeypatch.setattr(slots, 'revive', lambda n, msg, out=print: revived.append((n, msg)) or 3)  # slots full
-    monkeypatch.setattr(A, 'Path', lambda p: tmp_path / Path(p).name)
+    monkeypatch.setattr(slots, 'revive', lambda n, msg, out=print: revived.append((n, msg)) or rc)
     out = []
     c = A.Cascade(g=g, dry_run=False, out=out.append, sleep=lambda s: None)
     cols = {board.READY: [pr(481, board.READY)]}
     assert c.main_check(cols)[board.READY] == []
+    return c, cols, out, moved, revived
+
+
+def test_a_live_rework_moves_the_card_once_its_claude_has_the_relay(monkeypatch, tmp_path):
+    c, cols, out, moved, revived = rework_case(monkeypatch, tmp_path, rc=0)
     assert moved == [('I481', board.IN_PROGRESS)]
     assert revived[0][0] == 481 and 'conflicts with origin/main: f481.ts' in revived[0][1]
     assert 'do not rebase' in revived[0][1].lower() and '\n' not in revived[0][1]
-    assert f'RELAY: swarm-resume 481 {tmp_path}/relay-481-merge-main.md' in out
     assert (tmp_path / 'relay-481-merge-main.md').read_text() == revived[0][1] + '\n'
+    assert not any(l.startswith('RELAY:') for l in out)
     c.main_check(cols)  # same head: no second relay, no second move
     assert len(revived) == 1 and len(moved) == 1
     assert 'rework: #481 already has a relay for 00000000: not sent again' in out
+
+
+def test_a_rework_with_no_worker_never_demotes_the_card(monkeypatch, tmp_path):
+    """Michal 2026-11-15 2:23 AM ET: never demote into a column with no worker."""
+    from tangentswarm import flow as F
+    c, cols, out, moved, revived = rework_case(monkeypatch, tmp_path, rc=3)  # rework slots full
+    assert moved == [] and len(revived) == 1
+    assert any(l.startswith('note: NEEDS_WORKER #481: conflicts with origin/main') and 'stays in Ready' in l
+               for l in out)
+    assert f'RELAY: swarm-resume 481 {tmp_path}/relay-481-merge-main.md' in out
+    assert F.held()[481]['head'] == f'{481:040d}'  # not pulled again at this head
 
 
 def test_empty_ready_stops_the_fill_and_starts_coders_on_active_issues(monkeypatch, tmp_path):
@@ -681,3 +703,37 @@ def test_the_deadline_is_per_process_not_per_pass(monkeypatch):
         signal.signal(signal.SIGALRM, old[0])
         signal.signal(signal.SIGTERM, old[1])
         monkeypatch.setattr(A, 'DEADLINE', None)
+
+
+def test_a_ui_pr_that_reaches_ready_without_screenshots_gets_the_job_at_once(board_read, monkeypatch):
+    """Michal 2026-11-15 2:23 AM ET: #519 was demoted 90 min after it reached Ready with no
+    image, while no Claude was on it."""
+    from tangentswarm import slots
+    cols = {board.HUMAN_REVIEW: [1, 2], board.STAGING: [3, 4, 5],
+            board.AUTO_REVIEW: [dict(number=7, head=H, item='I7')]}
+    board_read(cols)
+    sent = []
+    monkeypatch.setattr(slots, 'revive', lambda n, text, out=print, **k: sent.append((n, text)) or out('sent') or 0)
+    g = Gate(cols, details={7: codex_pr()})
+    g['fetch'] = lambda n, refresh=False: {'number': n, 'body': 'where to see it: staging',
+                                           'files': {'nodes': [{'path': 'web/src/badge.tsx'}]}}
+    out, calls = run(g)
+    assert g.moves == [('I7', board.READY)] and sent and sent[0][0] == 7
+    assert 'needs screenshots before Human Review' in sent[0][1] and '\n' not in sent[0][1]
+    assert any('#7 screenshot job sent to its worker' in l for l in out)
+    run(g)
+    assert len(sent) == 1  # once per head
+
+
+@pytest.mark.parametrize('paths', [['api/routes/a.py', 'api/x.ts'], ['docs/flow.md', 'README.md']])
+def test_api_only_and_docs_only_prs_get_no_screenshot_job(board_read, monkeypatch, paths):
+    from tangentswarm import slots
+    cols = {board.HUMAN_REVIEW: [1, 2], board.STAGING: [3, 4, 5],
+            board.AUTO_REVIEW: [dict(number=7, head=H, item='I7')]}
+    board_read(cols)
+    sent = []
+    monkeypatch.setattr(slots, 'revive', lambda n, text, out=print, **k: sent.append(n) or 0)
+    g = Gate(cols, details={7: codex_pr()})
+    g['fetch'] = lambda n, refresh=False: {'number': n, 'body': '', 'files': {'nodes': [{'path': p} for p in paths]}}
+    run(g)
+    assert g.moves == [('I7', board.READY)] and sent == []

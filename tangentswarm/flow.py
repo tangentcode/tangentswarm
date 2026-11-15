@@ -105,6 +105,33 @@ def drop_pull(n):
         save_pulls([p for p in pulls if p['pr'] != n])
 
 
+HELD = STATE.with_name('held.json')
+RELAY_DIR = Path(os.environ.get('SWARM_RELAY_DIR', '/tmp'))  # relay-<N>-<kind>.md for swarm-resume
+
+
+def shots_text(n):
+    from .gatechecks import SHOTS_RULE
+    return (f"Coordinator: #{n} needs screenshots before Human Review. Take them from staging (it serves "
+            f"work with your head) or from a local run of the real app, never an isolated component page. "
+            f"{SHOTS_RULE} Do not change code; push only the PR body edit.")
+
+
+def held():
+    """{PR number: {head, why}}: PRs whose failed pull found no worker (not pulled again at
+    that head)."""
+    try:
+        return {int(k): v for k, v in json.loads(HELD.read_text()).items()}
+    except (OSError, ValueError):
+        return {}
+
+
+def hold(n, head, why):
+    d = held()
+    d[n] = {'head': head, 'why': why[:200]}
+    HELD.parent.mkdir(parents=True, exist_ok=True)
+    HELD.write_text(json.dumps({str(k): v for k, v in d.items()}))
+
+
 def pulled_pr():
     """PR number of the oldest pull in flight, or None."""
     d = load_pull()
@@ -404,7 +431,16 @@ class Flow:
 
     def _pull_batch(self, prs, cols, scratch, room):
         staging, hr = cols.get(board.STAGING, []), cols.get(board.HUMAN_REVIEW, [])
-        ready = [p for p in cols.get(board.READY, []) if not p['draft']]
+        hd = held()
+        ready = []
+        for p in cols.get(board.READY, []):
+            if p['draft']:
+                continue
+            if (hd.get(p['number']) or {}).get('head') == p['head']:
+                self.note(f"#{p['number']} held: its last pull failed with no worker "
+                          f"({hd[p['number']]['why'][:100]}); a new head releases it")
+                continue
+            ready.append(p)
         if not ready or room < 1:
             return []
         scratch.ensure_main()
@@ -487,8 +523,14 @@ class Flow:
         rows, _ = self.g['evaluate'](full, hr_peers=self.g['list_hr_prs'](refresh=True), scratch=scratch)
         verdict, why = gate_verdict(rows)
         age = int(self.now() - d['started'])
-        if verdict == 'wait' and age > PULL_TIMEOUT:
+        shots = [w for w in why if w.startswith('7a')] if verdict == 'wait' else []
+        if shots:  # Michal 2026-11-15: screenshots are a job for a worker now, not a timeout
+            self.screenshot_job(n, d['head'], full)
+        if verdict == 'wait' and age > PULL_TIMEOUT and len(shots) < len(why):
             verdict, why = 'fail', [f"still waiting after {age // 60} min: " + '; '.join(why)]
+        elif verdict == 'wait' and age > PULL_TIMEOUT:
+            self.note(f"SCREENSHOTS_NEEDED #{n}: still no screenshots after {age // 60} min; the pull stays "
+                      "open (never demoted into a column with no worker)")
         if verdict == 'wait':
             self.note(f"#{n} pull waiting ({age // 60} min): " + '; '.join(w[:120] for w in why))
             return
@@ -509,17 +551,62 @@ class Flow:
         if rc == 0 or moved:
             drop_pull(n)
 
-    def fail(self, p, reason, relay=None):
+    def screenshot_job(self, n, head, full=None):
+        """A UI PR without screenshots: give its worker the screenshot job now, once per
+        head (wake its running Claude, or resume its parked one in a rework slot)."""
+        from . import tick
+        state = tick.State(tick.STATE_DIR / 'state.json')
+        key = f"shots-job:{n}@{head}"
+        if state.done(key):
+            return
+        text = shots_text(n)
+        if self.dry:
+            self.change(f"#{n} would give its worker the screenshot job")
+            return
+        rc, said = self.give_worker(n, text)
+        if rc == 0:
+            state.mark(key)
+            self.change(f"#{n} screenshot job sent to its worker ({said})")
+        else:
+            self.note(f"SCREENSHOTS_NEEDED #{n}: no worker could take the screenshot job ({said})")
+
+    def give_worker(self, n, text):
+        """(rc, last line) of slots.revive: 0 = its Claude runs and got the text."""
+        from . import slots
+        lines = []
+        try:
+            rc = slots.revive(n, text, out=lines.append)
+        except Exception as e:
+            return 1, f"{type(e).__name__}: {str(e)[:160]}"
+        return rc, (lines[-1] if lines else f'rc={rc}')
+
+    def fail(self, p, reason, relay=None, text=None):
+        """Send a pulled PR back to its worker. Michal 2026-11-15: never demote into a
+        column with no worker. The card moves to In Progress only once its Claude runs and
+        has the relay; else it stays where it is, its head is held from new pulls, and the
+        note says NEEDS_WORKER."""
         n = p['number']
-        if not self.dry:
-            self.g['move'](p['item'], board.IN_PROGRESS)
-            from . import moves
-            moves.log_move(n, p.get('col') or '?', 'In Progress', p.get('head', ''), note=reason[:120])
-            path = Path(f"/tmp/relay-{n}-{relay or 'gate'}.md")
-            path.write_text(f"Coordinator: #{n} left the Staging pull: {reason}. Fix the root cause, push, and "
-                            "report the head commit and test counts.\n")
-            drop_pull(n)
-        self.change(f"#{n} -> In Progress: {reason[:200]}")
+        text = text or (f"Coordinator: #{n} left the Staging pull: {reason}. Fix the root cause, push, and "
+                        "report the head commit and test counts.")
+        if self.dry:
+            self.change(f"#{n} -> In Progress (with its worker): {reason[:200]}")
+            return False
+        drop_pull(n)
+        try:
+            (RELAY_DIR / f"relay-{n}-{relay or 'gate'}.md").write_text(text + '\n')
+        except OSError:
+            pass
+        rc, said = self.give_worker(n, text)
+        if rc != 0:
+            hold(n, p.get('head', ''), reason)
+            self.note(f"NEEDS_WORKER #{n}: {reason[:160]}; the card stays in {p.get('col') or '?'} because no "
+                      f"worker could be started ({said}); its head is held from new pulls")
+            return False
+        self.g['move'](p['item'], board.IN_PROGRESS)
+        from . import moves
+        moves.log_move(n, p.get('col') or '?', 'In Progress', p.get('head', ''), note=reason[:120])
+        self.change(f"#{n} -> In Progress: {reason[:200]} (its worker has the relay: {said})")
+        return True
 
     # -- the step ---------------------------------------------------------------
     def step(self, promote=True):
