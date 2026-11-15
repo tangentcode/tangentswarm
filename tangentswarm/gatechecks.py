@@ -94,6 +94,23 @@ NO_SHOTS_PREFIXES = ('api/', 'docs/', '.github/', 'scripts/', 'tests/', 'test/')
 CODE_ONLY_RE = re.compile(r'code[- ]only|tooling[- ]only|no deployable surface|nothing (?:to )?deploy', re.I)
 
 
+WHERE_RE = re.compile(r"where[- ]to[- ]see|check it on staging|served on staging", re.I)  # as hr-gate 7b
+
+
+def body_problem(paths, body):
+    """Why the PR body no longer meets the body conditions (7a: an image when the PR needs
+    screenshots; 7b: a where-to-see line), or None. Cheap (no image probe): the promotion
+    fast path runs it, because a body edit after the gate pass could remove the evidence
+    (Codex on PR #26). The brief section never counts."""
+    from .brief import strip_brief
+    body = strip_brief(body)
+    if needs_screenshots(paths, body) and not image_urls(body):
+        return 'no image in body (edited after the gate pass)'
+    if not WHERE_RE.search(body):
+        return 'no where-to-see line in body (edited after the gate pass)'
+    return None
+
+
 def needs_screenshots(paths, body=''):
     """True when condition 7a applies: the PR changes a visible UI file. api-only and
     docs-only PRs (and tooling: .github/, scripts/, tests/) are exempt, and so is a body

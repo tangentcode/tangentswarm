@@ -59,6 +59,7 @@ import re
 import runpy
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -394,10 +395,26 @@ class State:
         self.save()
 
     def save(self):
+        """Write under an interprocess lock, merged with the file as it is now (Codex on PR
+        #26: the Stop hooks, the webhook, the cascade and the tick share this file, and a
+        stale full rewrite erased another process's once-keys). The once-keys are a union
+        (never removed); every other key is this process's value. One tmp file per writer."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix('.tmp')
-        tmp.write_text(json.dumps(self.data, indent=1, sort_keys=True))
-        os.replace(tmp, self.path)
+        with open(self.path.with_name(self.path.name + '.lock'), 'a') as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            try:
+                try:
+                    disk = json.loads(self.path.read_text())
+                except (OSError, ValueError):
+                    disk = {}
+                done = dict(disk.get('done') or {})
+                done.update(self.data['done'])
+                self.data['done'] = done
+                tmp = self.path.with_name(f'{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp')
+                tmp.write_text(json.dumps(self.data, indent=1, sort_keys=True))
+                os.replace(tmp, self.path)
+            finally:
+                fcntl.flock(lk, fcntl.LOCK_UN)
 
 
 def log(line):

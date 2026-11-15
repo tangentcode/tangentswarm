@@ -345,3 +345,26 @@ def test_a_broken_screenshot_relay_names_the_url_rule():
     rows = [('7a screenshots current', False, '1 of 1 image(s) do not render: x.png is not an absolute https URL')]
     (line,) = tick.gate_reasons(rows)
     assert 'absolute https image URLs' in line and 'never a relative file name' in line and 'x.png' in line
+
+
+def _marker(path, base, n):
+    from tangentswarm import tick as T
+    for i in range(n):
+        T.State(path).mark(f'k{base + i}')
+
+
+def test_state_writers_in_several_processes_keep_every_once_key(tmp_path):
+    """Codex on PR #26: concurrent Stop hooks erased each other's once-keys."""
+    import multiprocessing
+    path = tmp_path / 'state.json'
+    stale = tick.State(path)  # e.g. the tick, loaded before the hooks ran
+    ctx = multiprocessing.get_context('fork')
+    procs = [ctx.Process(target=_marker, args=(path, k * 100, 20)) for k in range(4)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(30)
+        assert p.exitcode == 0
+    stale.data['screens']['%1'] = {'key': 'x'}
+    stale.save()  # its stale copy must not erase the 80 keys
+    assert len(tick.State(path).data['done']) == 80 and tick.State(path).data['screens'] == {'%1': {'key': 'x'}}

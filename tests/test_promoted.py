@@ -118,7 +118,7 @@ class Scratch:
         pass
 
 
-def detail(n, head, draft=False, base='main', body='', notes=()):
+def detail(n, head, draft=False, base='main', body='Where to see: staging.', notes=()):
     return {'number': n, 'state': 'OPEN', 'headRefOid': head, 'isDraft': draft, 'baseRefName': base,
             'body': body, 'comments': {'nodes': list(notes)}, 'reviews': {'nodes': []}}
 
@@ -354,7 +354,7 @@ def test_once_drains_queued_requests_under_its_lock(tmp_path, monkeypatch, own_q
 
 
 def test_fast_path_needs_staging_to_serve_a_web_head(tmp_path, clean):
-    web = dict(detail(5, H5), files={'nodes': [{'path': 'web/app.ts'}]}, headRefName='b')
+    web = dict(detail(5, H5, body='Where to see: staging.\n![after](https://example.test/a.png)'), files={'nodes': [{'path': 'web/app.ts'}]}, headRefName='b')
     for served_sha, want in (('d' * 40, [5]), ('e' * 40, [])):   # 'd...' contains the head
         g = G(tmp_path, details={5: web})
         g.update(served_all=lambda: [('work', 'staging.example', served_sha, None)],
@@ -369,7 +369,7 @@ def test_fast_path_needs_staging_to_serve_a_web_head(tmp_path, clean):
 
 def test_fast_path_needs_every_staging_site_to_serve_the_head(tmp_path, clean):
     """platform #493: tangentcode and minavo served the head, ptw did not; it still moved."""
-    web = dict(detail(5, H5), files={'nodes': [{'path': 'web/tc/DbItemList.mts'}]}, headRefName='avo-x')
+    web = dict(detail(5, H5, body='Where to see: staging.\n![after](https://example.test/a.png)'), files={'nodes': [{'path': 'web/tc/DbItemList.mts'}]}, headRefName='avo-x')
     g = G(tmp_path, details={5: web})
     g.update(served_all=lambda: [('work', 'work.example.test', 'd' * 40, None),
                                  ('minavo', 'minavo.example.test', 'd' * 40, None),
@@ -448,3 +448,14 @@ def test_the_spool_thread_serves_while_the_main_loop_is_busy(monkeypatch):
         stop.set()
         t.join(2)
     assert not t.is_alive()
+
+
+def test_a_body_edit_that_removes_the_evidence_blocks_the_promotion():
+    """Codex on PR #26: a body edit after the gate pass removed the screenshots, and the
+    fast path still promoted the PR."""
+    from tangentswarm import gatechecks
+    ui = ['web/app.ts']
+    assert gatechecks.body_problem(ui, 'Where to see: staging.\n![a](https://example.test/a.png)') is None
+    assert gatechecks.body_problem(ui, 'Where to see: staging.') == 'no image in body (edited after the gate pass)'
+    assert gatechecks.body_problem(['api/x.py'], 'Where to see: staging.') is None
+    assert 'where-to-see' in gatechecks.body_problem(['api/x.py'], 'no line')

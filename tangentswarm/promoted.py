@@ -390,7 +390,8 @@ class Promoter:
         who = human_after(d, t)
         if who:
             return f"human comment after the gate ({', '.join(sorted(set(who)))})"
-        return self.served_problem(d, head) or merge(head)
+        paths = [f['path'] for f in ((d.get('files') or {}).get('nodes') or []) if f.get('path')]
+        return gatechecks.body_problem(paths, d.get('body') or '') or self.served_problem(d, head) or merge(head)
 
     def served_problem(self, d, head):
         """None if every staging site serves the head, else why not. Only for a PR that touches served
