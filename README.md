@@ -973,6 +973,25 @@ every 10 s (`--redraw`): rows from the last 2 minutes are bright, and each older
 darker gray. `-v` prints the rows as JSON. `--since all|YYYY-MM-DD` and `--once` are also
 available.
 
+The Agents screen (press `a` in a terminal, `e` to go back, `q` to quit; or start with
+`--agents`) shows one line per pane of the `agents` tmux session, read live from tmux, `/proc`
+and `~/.claude/sessions` (`tangentswarm/livestate.py`, `tangentswarm/agents_view.py`). When
+the panes do not fit, `j`/`k` (or the arrows) scroll a row and space/`b` (or PgDn/PgUp) a
+page; the header and the summary stay. No line is wider than the terminal. Each line shows:
+
+- the Claude pid, or "no claude" when no `claude` process runs in the pane;
+- active or idle: the Claude session status, and a screen capture once a minute (a screen
+  that changed in the last minute is active);
+- tests (pytest, jest, vitest, ...) and other processes in the pane;
+- the memory and CPU of the pane's process tree;
+- the PR and card, from the board snapshot file (never fetched by the viewer).
+
+The header shows the load average, the worker slice memory, the Claudes that count against
+`SWARM_MAX_CLAUDES`, and the start capacity. Starts are held while the worker memory is short
+or the 5-minute load average is over `SWARM_LOAD_PER_CPU` (default 1.5) per CPU
+(`launches.admits`). With `--once` or a pipe the screen prints once.
+`python -m tangentswarm.livestate --json` prints one sample as JSON (for the sanity check, #43).
+
 Install it, in one of these ways:
 
     pip install .                                          # the swarm-events entry point

@@ -71,6 +71,7 @@ WAKE_EVERY = 60          # s between two wakes
 WAKE_DEDUPE = 1800       # s: the same exception key wakes once
 WAKE_PENDING_MAX = 50    # exceptions kept for the next wake
 MAX_BODY = 2 * 1024 * 1024
+PROTECTED_BRANCHES = {'main', 'work', 'deploy', 'pages-site', 'pr-screenshots', 'parked', 'swarm-shots'}
 # Logged in the event DB only: one row each, no action, never queued (Michal 1:55 PM ET).
 LOG_ONLY = ('push', 'commit_comment', 'discussion', 'discussion_comment', 'pull_request_review_thread',
             'pull_request_review_comment')
@@ -224,7 +225,11 @@ def classify(event, p):
             return [Action('skip', pr=n, why=f'pull_request {action}')]
         if action == 'closed':
             if pr.get('merged') and base == 'main':
-                return [Action('merged', n, f"#{n} merged into main", dict(head=(pr.get('head') or {}).get('sha')))]
+                head = pr.get('head') or {}
+                # a fork's branch name says nothing about this repo's branches (Codex on PR #42)
+                own = ((head.get('repo') or {}).get('full_name') or REPO) == REPO
+                return [Action('merged', n, f"#{n} merged into main", dict(head=head.get('sha'),
+                                                                           branch=head.get('ref') if own else None))]
             if pr.get('merged'):
                 return [Action('wake', n, f"#{n} merged into {base}, not main", dict(key=f'merge-base:{n}'))]
             return [Action('closed', n, f"#{n} closed without a merge")]
@@ -580,7 +585,37 @@ class Executor:
                     self._sh([str(x) for x in argv])
                 except Exception as e:
                     self.note(f"{argv[1]}: {str(e)[:120]}")
+        if not self.dry and a.args.get('branch'):
+            try:
+                self.delete_vn(a.pr, a.args['branch'])
+            except Exception as e:  # the rest of the merge handling is done; report this part
+                self.note(f"#{a.pr}: -vN cleanup failed: {type(e).__name__}: {str(e)[:160]}")
         self.note(f"#{a.pr} merged: cascade, Done, linked issues closed")
+
+    def delete_vn(self, n, branch):
+        """tangentswarm #39 (Michal 2026-11-15 6:27 PM ET): on a platform merge, delete the
+        PR branch's speculative <branch>-v1, -v2, ... siblings (GitHub's delete-branch-on-merge
+        removes the head branch itself). A sibling that heads another open PR stays, and a
+        protected name is never touched. Returns the deleted names."""
+        if not branch or branch in PROTECTED_BRANCHES:
+            return []
+        refs = json.loads(self._sh(['gh', 'api', f'repos/{REPO}/git/matching-refs/heads/{branch}-v']) or '[]')
+        names = [r['ref'][len('refs/heads/'):] for r in refs if isinstance(r, dict) and r.get('ref')]
+        vn = [b for b in names if re.fullmatch(re.escape(branch) + r'-v\d+', b) and b not in PROTECTED_BRANCHES]
+        if not vn:
+            return []
+        heads = set((self._sh(['gh', 'api', '--paginate', f'repos/{REPO}/pulls?state=open&per_page=100',
+                               '--jq', '.[].head.ref']) or '').split())
+        done = []
+        for b in vn:
+            if b in heads:
+                self.note(f"#{n}: kept {b}: it heads an open PR")
+                continue
+            self._sh(['gh', 'api', '-X', 'DELETE', f'repos/{REPO}/git/refs/heads/{b}'])
+            done.append(b)
+        if done:
+            self.note(f"#{n}: deleted {', '.join(done)}")
+        return done
 
     def do_closed(self, a):
         item, col = self.card(a.pr)

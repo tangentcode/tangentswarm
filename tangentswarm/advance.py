@@ -177,11 +177,8 @@ def open_question(pr):
 
 
 def minbot_order(prs, active=None):
-    """Auto Review PRs to try: the active fast-track first, then the lowest number."""
-    def key(p):
-        ft = active is not None and (p['number'] == active or active in (p.get('closes') or ()))
-        return (0 if ft else 1, p['number'])
-    return sorted(prs, key=key)
+    """Auto Review PRs to try, in the shared pick order (board.pick_key; tangentswarm #35)."""
+    return sorted(prs, key=lambda p: board.pick_key(p, active))
 
 
 CI_BAD = ('failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale')
