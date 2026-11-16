@@ -268,3 +268,26 @@ def test_keys_work_before_the_event_db_exists(tmp_path):
 
 def test_key_list_reads_escape_sequences_as_one_key():
     assert V.key_list('a\x1b[6~j\x1b[Aq') == ['a', '\x1b[6~', 'j', '\x1b[A', 'q']
+
+
+def test_no_drawn_line_wraps_in_a_narrow_terminal():
+    """Codex on PR #48: in 80 columns the header and summary wrapped and pushed the header
+    off the screen; every line is now cut to the width, color codes kept."""
+    lines = AV.render(many(43), color=True, width=80, height=20)
+    assert len(lines) == 20
+    assert all(len(AV.ANSI.sub('', l)) <= 80 for l in lines)
+    assert lines[0].startswith('load') and AV.ANSI.sub('', lines[1]).startswith('capacity:')
+    assert AV.clip('\x1b[1mabcdef\x1b[0m', 3) == '\x1b[1mabc\x1b[0m'
+    assert AV.clip('abc', 3) == 'abc' and AV.clip('abcd', 3) == 'abc'
+
+
+def test_events_lines_are_cut_to_the_width():
+    from tangentswarm import eventdb
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        st = eventdb.EventStore(os.path.join(d, 'e.sqlite'))
+        body = {'action': 'opened', 'repository': {'full_name': 'tangentcode/platform'},
+                'pull_request': {'number': 5}, 'sender': {'login': 'x' * 40}}
+        st.add_received('d1', 'pull_request', body, {}, b'{}', True, decisions=['codex'], now=NOW - 5)
+        lines = V.render(st.rows(), NOW, color=True, width=40, height=10)
+    assert lines and all(len(AV.ANSI.sub('', l)) <= 40 for l in lines)

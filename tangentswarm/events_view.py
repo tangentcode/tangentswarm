@@ -270,9 +270,12 @@ def blocks(rows, now=None, color=True, verbose=False):
     return out
 
 
-def render(rows, now=None, color=True, verbose=False, height=None):
-    """The lines of one screen: the newest events that fit in height (all when None)."""
+def render(rows, now=None, color=True, verbose=False, height=None, width=None):
+    """The lines of one screen: the newest events that fit in height (all when None), each cut
+    to width so that none wraps (Codex on PR #48)."""
     out = [l for _, _, text in blocks(rows, now, color, verbose) for l in text.split('\n')]
+    if width:
+        out = [agents_view.clip(l, width) for l in out]
     return out[-height:] if height else out
 
 
@@ -393,7 +396,8 @@ def run(path, since='today', verbose=False, once=False, color=None, out=sys.stdo
                 out.write(CLEAR + '\n'.join(lines) + '\n')
                 drawn = now
         elif got or switched or drawn is None or now - drawn >= redraw:
-            out.write(CLEAR + '\n'.join(render(rows, now, color, verbose, height)) + '\n')
+            width = shutil.get_terminal_size((120, 40)).columns
+            out.write(CLEAR + '\n'.join(render(rows, now, color, verbose, height, width)) + '\n')
             drawn = now
         out.flush()
         n += 1

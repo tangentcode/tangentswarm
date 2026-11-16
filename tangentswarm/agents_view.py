@@ -3,10 +3,33 @@ from a livestate sample, under a header with the host load and the start capacit
 
   #  window                  claude   state      screen  mem    cpu   PR    card          processes
 """
+import re
+
 from . import launches
 
 RED, GREEN, YELLOW, DIM, BOLD, RESET = '\033[31m', '\033[32m', '\033[33m', '\033[2m', '\033[1m', '\033[0m'
 MB = 1024 ** 2
+
+
+ANSI = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def clip(text, width):
+    """text cut to width visible characters (color codes kept, and closed when cut), so a
+    line never wraps on the terminal (Codex on PR #48)."""
+    out, seen, i = [], 0, 0
+    while i < len(text):
+        m = ANSI.match(text, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        if seen == width:
+            return ''.join(out) + (RESET if ANSI.search(text) else '')
+        out.append(text[i])
+        seen += 1
+        i += 1
+    return text
 
 
 def ago(s):
@@ -91,8 +114,9 @@ TITLE = '  # window                            claude state      screen    mem  
 
 
 def render(st, color=True, width=200, height=None, top=0):
-    """The lines of the Agents screen. With a height, the header and the summary always show
-    and the pane rows scroll: top is the first row shown (clamped)."""
+    """The lines of the Agents screen. With a height, the header and the summary always show,
+    the pane rows scroll (top is the first row shown, clamped), and no line is wider than
+    width."""
     head = header(st)
     if color:
         cap = st['capacity']
@@ -121,7 +145,8 @@ def render(st, color=True, width=200, height=None, top=0):
     if len(body) > room:
         summary += f"; rows {top + 1}-{min(top + room, len(body))} of {len(body)}"
         keys += '  j/k or space/b scroll'
-    return head + body[top:top + room] + ['', summary + keys]
+    # every line is one terminal line, so page() counts what is drawn
+    return [clip(l, width) for l in head + body[top:top + room] + ['', summary + keys]]
 
 
 def page(height):

@@ -956,7 +956,9 @@ available.
 
 The Agents screen (press `a` in a terminal, `e` to go back, `q` to quit; or start with
 `--agents`) shows one line per pane of the `agents` tmux session, read live from tmux, `/proc`
-and `~/.claude/sessions` (`tangentswarm/livestate.py`, `tangentswarm/agents_view.py`):
+and `~/.claude/sessions` (`tangentswarm/livestate.py`, `tangentswarm/agents_view.py`). When
+the panes do not fit, `j`/`k` (or the arrows) scroll a row and space/`b` (or PgDn/PgUp) a
+page; the header and the summary stay. No line is wider than the terminal. Each line shows:
 
 - the Claude pid, or "no claude" when no `claude` process runs in the pane;
 - active or idle: the Claude session status, and a screen capture once a minute (a screen
