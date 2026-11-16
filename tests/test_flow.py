@@ -368,14 +368,14 @@ def test_strict_pull_takes_only_the_next_pr_and_only_when_it_is_merge_ready(monk
     monkeypatch.setattr(f, 'future_main', lambda scratch, cols: ('key', 'fm', None))
     monkeypatch.setattr(f, 'premerge_one', lambda p, scratch, fm: seen.append(p['number']) or ready[p['number']])
     started = []
-    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None: started.append((p['number'], tip)) or True)
+    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, rebuild=False: started.append((p['number'], tip, rebuild)) or True)
     _, cols = f.columns()
     assert f.pull(prs, cols, g['ScratchRepo'](), limit=5, strict=True) is None
     assert seen == [9] and started == [] and g.moves == []
     assert '#9 is next in the pick order and is not merge-ready: nothing behind it is pulled' in f.notes
     ready[9] = 'v9' * 20
     assert f.pull(prs, cols, g['ScratchRepo'](), limit=5, strict=True)['number'] == 9
-    assert started == [(9, 'v9' * 20)]
+    assert started == [(9, 'v9' * 20, True)]
 
 
 def test_pull_batch_merges_the_pre_merged_tips_into_work_in_one_push(repo, tmp_path):

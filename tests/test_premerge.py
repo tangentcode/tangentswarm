@@ -294,3 +294,53 @@ def test_future_main_takes_a_queued_pr_as_its_resolved_vn_tip(world):
     key, fm, why = f2.future_main(s, cols)
     assert why is None and f'#7@{tip[:12]}' in key
     assert f2.premerge(cols, s)[9] == remote(s, origin, 'b9-v1')
+
+
+# --- Codex on PR #66 -------------------------------------------------------------
+
+def test_a_head_missing_from_the_scratch_repo_is_not_a_conflict(world):
+    """A commit the scratch repo cannot fetch is never read as a conflict: no -vN, no label,
+    no worker; the next pass tries again."""
+    w, s, h, origin = world
+    f, sent = make(world)
+    cols = {HR: [card(1, HR, h['hr1'])], RD: [card(7, RD, '1' * 40)]}
+    assert f.premerge(cols, s) == {7: None}
+    assert remote(s, origin, 'b7-v1') is None and sent == [] and flow.LABELS_WRITTEN == [(1, 'add', ['merge-ready'])]
+    assert any(n.startswith('#7: head 11111111 is not in the scratch repo') for n in f.notes)
+    key, fm, why = f.future_main(s, {HR: [card(1, HR, '2' * 40)]})
+    assert fm is None and 'is not in the scratch repo' in why
+
+
+def test_a_ready_record_whose_tip_is_gone_is_rebuilt_as_the_next_vn(world):
+    w, s, h, origin = world
+    f, _ = make(world)
+    cols = {HR: [card(1, HR, h['hr1'])], RD: [card(9, RD, h['z'])]}
+    f.premerge(cols, s)
+    recs = flow.load_premerge()
+    recs['9']['tip'] = '3' * 40  # its tip cannot be fetched any more
+    flow.save_premerge(recs)
+    tips = f.premerge(cols, s)
+    assert tips == {9: remote(s, origin, 'b9-v2')} and flow.load_premerge()['9']['vbranch'] == 'b9-v2'
+
+
+def test_a_tip_that_conflicts_only_with_stale_work_rebuilds_work_as_future_main(world):
+    """work holds a PR that was pulled and then sent back: the next tip merges cleanly onto
+    future main but not onto work. work becomes future main + the PR in a fast-forward push
+    (no force, no worker), instead of blocking the queue forever."""
+    w, s, h, origin = world
+    run(w, 'checkout', '-q', '-b', 'stale', h['hr1'])
+    (w / 'z.txt').write_text('stale\n')
+    run(w, 'add', '.')
+    run(w, 'commit', '-qm', 'a PR that was sent back')
+    old = run(w, 'rev-parse', 'HEAD')
+    run(w, 'push', '-q', str(origin), f'{old}:refs/heads/work')
+    f, sent = make(world)
+    cols = {HR: [card(1, HR, h['hr1'])], RD: [card(9, RD, h['z']), card(11, RD, h['st2'])]}
+    batch = f.pull_batch({}, cols, s, room=2)
+    assert [p['number'] for p in batch] == [9, 11] and sent == []
+    new = remote(s, origin, 'work')
+    v9 = remote(s, origin, 'b9-v1')
+    assert subprocess.run(['git', '--git-dir', s.dir, 'merge-base', '--is-ancestor', old, new]).returncode == 0
+    assert run(w, 'show', f'{new}:z.txt') == 'z' and run(w, 'show', f'{new}:s.txt') == 's'
+    assert any(n.startswith('#9: its pre-merged tip') and 'work is rebuilt as future main + #9' in n for n in f.notes)
+    assert subprocess.run(['git', '--git-dir', s.dir, 'merge-base', '--is-ancestor', v9, new]).returncode == 0
