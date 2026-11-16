@@ -207,7 +207,7 @@ class Launcher:
         if self.dry:
             return f"would start the worker: swarm-start-scoped {branch}, then send the brief line"
         from . import launches, slots
-        what, detail = (self._launch or launches.launch)(branch, pr=pr, brief=str(path))
+        what, detail = (self._launch or launches.launch)(branch, pr=pr, brief=str(path) if path else None)
         if what == 'held':  # no held list (#40): the unstarted record stays, and the cascade retries it
             return (f"worker held (memory): the cascade starts it when memory frees "
                     f"({detail.get('window') if isinstance(detail, dict) else ''})")
@@ -284,9 +284,16 @@ class Launcher:
                 return f"brief line sent to the running Claude in {rec['brief_pane']}"
             with slots.update() as d:  # its Claude is gone: start a worker again
                 d['unstarted'].get(str(pr), {}).pop('brief_pane', None)
-        path = rec.get('brief')
+        path = rec.get('brief') or None
         if rec.get('setup', 'done') != 'done' or not path:
-            path, _ = self.setup(int(rec['issue']), rec.get('title') or f"Issue #{rec['issue']}", rec['branch'], pr)
+            if rec.get('issue') is None:
+                # Codex on PR #46: a row of the retired held list may have no brief and no
+                # issue (swarm-launch never needed them); start it with no brief, as before
+                if rec.get('setup', 'done') != 'done':
+                    raise RuntimeError(f"PR #{pr}: setup is not done and the record names no issue")
+            else:
+                path, _ = self.setup(int(rec['issue']), rec.get('title') or f"Issue #{rec['issue']}",
+                                     rec['branch'], pr)
         return self.start(rec['branch'], pr, path, issue=rec.get('issue'))
 
 
