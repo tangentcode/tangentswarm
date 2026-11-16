@@ -19,6 +19,7 @@ without a merge: Canceled).
     swarm-watch --panes               the latest capture of every pane, with its class
 """
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -59,12 +60,25 @@ def _ts(iso):
 
 CODEX_Q = ('query{{repository(owner:"tangentcode",name:"platform"){{p: pullRequest(number:{n}){{headRefOid '
            'comments(last:40){{nodes{{author{{login}} body createdAt}}}} '
-           'reviews(last:20){{nodes{{author{{login}} submittedAt}}}}}}}}}}')
+           'reviews(last:20){{nodes{{author{{login}} submittedAt commit{{oid}}}}}}}}}}}}')
+
+
+def names_head(body, head):
+    """True when a Codex comment is a result for this head: a review-state summary whose
+    commit_sha is the head, or a receipt that names the head's short SHA."""
+    m = re.search(r'codex-review-state:v1\s*(\{.*?\})\s*-->', body or '', re.S)
+    if m:
+        try:
+            return (json.loads(m.group(1)).get('code_review') or {}).get('commit_sha') == head
+        except ValueError:
+            return False
+    return bool(head) and head[:8] in (body or '')
 
 
 def codex_facts(full):
     """{req, reply, limit}: the time of the latest "@codex review" by a person, whether Codex
-    answered after it, and whether that answer is a usage-limit notice."""
+    answered it for the CURRENT head (Codex on PR #51: a late review of an older head is no
+    answer), and whether Codex sent a usage-limit notice after it (whatever head)."""
     def who(x):
         return ((x.get('author') or {}).get('login') or '')
     req = None
@@ -75,12 +89,14 @@ def codex_facts(full):
     if req is None:
         return {'req': None, 'reply': False, 'limit': False}
     from .webhook import codex_running
+    head = full.get('headRefOid') or ''
     after = [c for c in (full.get('comments') or {}).get('nodes') or []
              if who(c).startswith(CODEX) and (_ts(c.get('createdAt')) or 0) > req
              and not codex_running(c.get('body'))]  # Codex on PR #51: "running" is not an answer
     reviews = [r for r in (full.get('reviews') or {}).get('nodes') or []
-               if who(r).startswith(CODEX) and (_ts(r.get('submittedAt')) or 0) > req]
-    return {'req': req, 'reply': bool(after or reviews),
+               if who(r).startswith(CODEX) and (_ts(r.get('submittedAt')) or 0) > req
+               and (r.get('commit') or {}).get('oid') == head]
+    return {'req': req, 'reply': bool(reviews or any(names_head(c.get('body'), head) for c in after)),
             'limit': any(LIMIT_RE.search(c.get('body') or '') for c in after)}
 
 

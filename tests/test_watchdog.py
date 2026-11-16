@@ -13,7 +13,7 @@ def iso(t):
     return datetime.fromtimestamp(t, timezone.utc).isoformat().replace('+00:00', 'Z')
 
 
-def pr_full(req=None, reply=None, body='Reviewed commit abc. Looks fine.'):
+def pr_full(req=None, reply=None, body='Reviewed commit hhhhhhhhhh. Looks fine.'):
     comments = []
     if req is not None:
         comments.append({'author': {'login': 'tangentstorm'}, 'body': '@codex review', 'createdAt': iso(req)})
@@ -258,7 +258,7 @@ def test_worker_root(tmp_path, monkeypatch):
     assert Path(WD.worker_root(str(tmp_path / 'platform.feat') + ' (deleted)')).name == 'platform.feat'
 
 
-RUNNING = ('<!-- codex-review-state:v1 {"code_review":{"commit_sha":"abc","has_any_findings":null,'
+RUNNING = ('<!-- codex-review-state:v1 {"code_review":{"commit_sha":"' + 'h' * 40 + '","has_any_findings":null,'
            '"status":"running"}} -->\n| 📝 **Code Review** | 🔄 **Running** since now | `abc` |')
 
 
@@ -286,3 +286,25 @@ def test_a_dry_run_records_no_outage_and_the_live_pass_still_alerts():
     r.w.dry = False
     r.w.codex_pass(_snap(r), T0 + 2000)
     assert len(r.alerts) == 1
+
+
+def test_a_late_review_of_an_older_head_is_not_the_answer():
+    """Codex on PR #51: only a result for the current head answers the request."""
+    head, old = 'h' * 40, 'o' * 40
+    full = pr_full(req=T0)
+    full['reviews']['nodes'] = [{'author': {'login': 'chatgpt-codex-connector'}, 'submittedAt': iso(T0 + 60),
+                                 'commit': {'oid': old}}]
+    full['comments']['nodes'] += [
+        {'author': {'login': 'chatgpt-codex-connector'}, 'createdAt': iso(T0 + 61),
+         'body': f'<!-- codex-review-state:v1 {{"code_review":{{"commit_sha":"{old}","status":"completed"}}}} -->'},
+        {'author': {'login': 'chatgpt-codex-connector'}, 'createdAt': iso(T0 + 62),
+         'body': f"Reviewed commit `{old[:10]}`. Didn't find any major issues."}]
+    f = WD.codex_facts(full)
+    assert f['reply'] is False and WD.codex_wait(f, T0 + 1900)[0] == 'silent'
+    full['reviews']['nodes'][0]['commit']['oid'] = head
+    assert WD.codex_facts(full)['reply'] is True
+    summary = pr_full(req=T0, reply=T0 + 60,
+                      body=f'<!-- codex-review-state:v1 {{"code_review":{{"commit_sha":"{head}","status":"completed"}}}} -->')
+    assert WD.codex_facts(summary)['reply'] is True
+    limit = pr_full(req=T0, reply=T0 + 60, body='You have reached your Codex usage limits for code reviews.')
+    assert WD.codex_facts(limit)['limit'] is True  # a limit notice names no head and still counts
