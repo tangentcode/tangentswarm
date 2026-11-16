@@ -964,11 +964,15 @@ The old `webhook-events.sqlite` is renamed to it once. Each row has a `source` a
 
 Rows are written with `eventdb.log_event()`, which never raises.
 
-`swarm-events` is the console viewer of that log. `--source mcp,stop-hook` shows only those
-sources. It opens the DB read-only, prints today's
-rows (ET), then follows new rows every second. Errors are red. Duplicates, log-only rows and
-rejected requests are dim. `-v` prints each row as JSON. `--since all|YYYY-MM-DD` and
-`--once` are also available.
+`swarm-events` is the console viewer of that log. It opens the DB read-only and shows
+today's events (ET), one row per event: time, status (handled, queued, failed), event, PR,
+actor and the outcome in plain words ("moved #513 to Done; cascade"). Skipped events, log-only
+events, redeliveries and cascade passes that did nothing are hidden. A signature shows only
+when it failed (white on red); a failed event is red. In a terminal the screen is redrawn
+every 10 s (`--redraw`): rows from the last 2 minutes are bright, and each older minute is a
+darker gray. `-v` prints the rows as JSON. `--since all|YYYY-MM-DD` and `--once` are also
+available. `--source mcp,stop-hook`
+shows only those sources.
 
 Install it, in one of these ways:
 
