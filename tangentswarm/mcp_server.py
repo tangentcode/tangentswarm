@@ -47,6 +47,10 @@ bindings, so send_keys refuses the prefix key. For tmux commands on an agent's o
 or window (show_window, select_pane, zoom, unzoom, rename_window, move_window,
 set_pane_title) call tmux_action. ctrl+b (Claude Code's "run in background") is a Claude
 Code key, not tmux's; a lone C-b is refused unless allow_ctrl_b=true.
+Screen text (capture_pane, last_lines) is a diagnostic picture, not evidence of typed input:
+Claude draws grey/dim autocomplete suggestions after an empty prompt. Judge the prompt
+with agent_status.prompt / prompt_blank or pane_ready, and type with tell_agent, which
+refuses to overwrite real input.
 Targets use tmux syntax: session, session:window, session:window.pane or %pane_id.
 cloud_* tools talk to Claude Code cloud sessions through the tangentswarm cloud hub
 (`swarm cloud serve`, ws://127.0.0.1:5002/ws). There are no kill tools and no
@@ -148,7 +152,12 @@ def list_panes(target: str | None = None, all: bool = False) -> dict:
 @_scoped(SCOPE_READ)
 def capture_pane(target: str, history_lines: int | None = None, escapes: bool = False) -> str:
     """Return the visible text of a pane, plus `history_lines` lines of scrollback when set.
-    escapes=true keeps colour/attribute escape sequences (capture-pane -e)."""
+    escapes=true keeps colour/attribute escape sequences (capture-pane -e).
+
+    This is the raw screen, for diagnostics. It is not evidence of typed input: plain text
+    loses the grey/dim styling of an agent's autocomplete suggestion, which then looks
+    exactly like typed text after the prompt glyph. Use agent_status (prompt,
+    prompt_blank) or pane_ready to read the prompt, and tell_agent to type."""
     try:
         return tmux.capture_pane(target, history_lines=history_lines, escapes=escapes)
     except tmux.TmuxError as e:
@@ -161,7 +170,8 @@ async def send_keys(target: str, text: str, enter: bool = True, literal: bool = 
     """Type into a coding agent's pane. Refused unless the pane's foreground process is a
     registered agent, so it never types into a shell. literal=true (the default) sends the
     text verbatim with send-keys -l, then, if enter is set, waits 0.5s and presses Enter in
-    a separate call. literal=false passes `text` as one tmux key name, such as 'C-c',
+    a separate call. send_keys does not check that the agent took the Enter, since it is
+    also how you answer dialogs; use tell_agent to deliver a message. literal=false passes `text` as one tmux key name, such as 'C-c',
     'Escape' or 'Up'.
 
     Keys go straight to the agent, never through tmux's prefix or key bindings, so the
@@ -171,7 +181,7 @@ async def send_keys(target: str, text: str, enter: bool = True, literal: bool = 
     why = tmux.refused_key(text, target, literal=literal)
     if why == 'prefix':
         raise ToolError(
-            f"refusing to send {text.strip()}: it is tmux's prefix key, and send_keys goes straight "
+            f"refusing to send {text.strip()!r}: it is (or contains) tmux's prefix key, and send_keys goes straight "
             "to the agent, so tmux would never see it. Use tmux_action for tmux commands "
             f"({', '.join(tmux_actions.ACTIONS)}).")
     if why == 'ctrl_b' and not allow_ctrl_b:
@@ -247,7 +257,12 @@ async def start_agent(agent: registry.AgentName, repo: str, branch: str, session
     '<agent>-<branch>'. The window is a persistent bash shell in the worktree: the agent's
     fixed, scoped launch line is typed into it, and when the agent exits the shell stays
     (up-arrow restarts it). A later start finds that window by name and reuses it only if
-    its input buffer is positively empty there; otherwise it refuses, and never opens a duplicate."""
+    its input buffer is positively empty there; otherwise it refuses, and never opens a
+    duplicate. Before launch the worktree is marked trusted for the agent ('trust' in the
+    result; Claude and Codex config, Muse flag; status 'reused' with the current state when
+    the agent was already running). 'startup' reports whether the agent reached its prompt or
+    stopped on a named first-run screen (startup.blocked.kind: trust_prompt, theme_picker,
+    login, api_key_prompt, bypass_permissions_confirm, update_prompt)."""
     try:
         return await anyio.to_thread.run_sync(
             lambda: worktrees.spawn_agent(agent, repo, branch, session=session,
@@ -278,7 +293,16 @@ async def remove_worktree(repo: str, branch: str, delete_branch: bool = False) -
 async def agent_status(target: str) -> dict:
     """Report which coding agent (claude, codex, gemini, opencode and others) runs in a pane,
     whether its input prompt is blank, its current command and path, and the last screen
-    lines. Read-only."""
+    lines. 'blocked' names a first-run or blocking screen (trust, theme, login, API key,
+    bypass confirmation, update) the agent is stuck on, or is null. Read-only.
+
+    prompt_blank and, for claude and muse, `prompt` ({input, suggestion, blank}) are the
+    interpreted prompt: `input` is the typed text as the screen shows it (Claude's prompt
+    padding removed, typed spaces and line breaks kept; tmux drops blanks at a line end),
+    `suggestion` is grey/dim ghost text the agent drew that is not typed. When a dim run
+    can't be told apart from input, it stays in `input`, so `blank` errs toward false. last_lines is the screen as drawn, for diagnostics, with
+    a recognised suggestion in the prompt box wrapped as
+    '[ghost suggestion, not typed: ...]'; do not read typed input from it."""
     try:
         return await anyio.to_thread.run_sync(agents.agent_status, target)
     except tmux.TmuxError as e:
@@ -289,7 +313,8 @@ async def agent_status(target: str) -> dict:
 async def pane_ready(target: str, probe: bool = False) -> dict:
     """Report whether the agent's input prompt is empty. probe=true uses scialect's space probe
     (type a space, check, then backspace) to see past placeholder text. The probe needs the
-    shell scope."""
+    shell scope. On a blocking screen (see agent_status) ready is false, 'blocked' names it,
+    and nothing is typed."""
     if probe:
         require_scope(SCOPE_SHELL)
     try:
@@ -318,8 +343,14 @@ async def tell_agent(target: str, text: str, new_conversation: bool = False,
                      require_empty_prompt: bool = True) -> dict:
     """Send a message to a coding agent the way scialect's tell-worker does. It makes sure the
     prompt is empty with the space probe and refuses if someone is typing. Then it optionally
-    sends '/new', presses Enter and waits 10s. Last, it types the text literally, waits 0.5s
-    and presses Enter."""
+    sends '/new', submits it and waits 10s. Last, it types the text literally, presses Enter
+    once the text shows in the input box, and checks that the text left the box, pressing
+    Enter again while it is still there (checking after 0.5s, 1s, 2s and 4s). It fails, with the
+    screen's last lines, if the text never showed up, is still unsent after the retries, or
+    the box never came back blank (a dialog may be open; Enter is never pressed into one).
+    It refuses, typing nothing, while the agent is on a first-run or blocking screen (trust,
+    theme, login, ...), even with require_empty_prompt=false. Returns enter_presses and
+    submit_verified."""
     try:
         return await anyio.to_thread.run_sync(lambda: agents.tell_agent(
             target, text, new_conversation=new_conversation, require_empty_prompt=require_empty_prompt))

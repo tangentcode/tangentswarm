@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
-from . import tmux
+from . import tmux, trust
 
 AgentName = Literal['claude', 'muse', 'grok', 'gemini', 'codex']
 
@@ -63,8 +63,9 @@ REGISTRY = {
         'muse', ('~/.local/bin/muse',), flags=('--trust-workspace',),
         names=frozenset({'muse'}), prefixes=('muse-bin',), adapter='full'),
     'grok': AgentSpec(
-        'grok', ('~/.grok/bin/grok',),
-        names=frozenset({'grok'}), prefixes=('grok-linux',), adapter='none'),
+        # --trust records trust for the repo root; Grok 1.0.62 ignores a worktree-path entry
+        'grok', ('~/.grok/bin/grok',), flags=('--trust',),
+        names=frozenset({'grok'}), prefixes=('grok-linux',), adapter='basic'),
     'gemini': AgentSpec(
         'gemini', ('~/.npm-global/bin/gemini', '~/workspace/.npm-global/bin/gemini', '~/.local/bin/gemini',
                    '/usr/local/bin/gemini', '/usr/bin/gemini'),
@@ -181,7 +182,10 @@ ECHO_WAIT = 3.0
 PROMPT_TAILS = ('$ ', '# ')
 PROMPT_OPTION = '@swarm_prompt'
 SHELL_FIELDS = ('pane_id', 'pane_current_command', 'window_panes', 'history_size', 'pane_height',
-                'cursor_y', 'cursor_x', 'pane_current_path')
+                'pane_width', 'cursor_y', 'cursor_x', 'pane_current_path')
+# How many screen rows above the cursor are read to find where its logical line starts. A
+# prompt plus launch line longer than this many rows is refused (fails closed).
+LOOK_BACK = 64
 SHELL_STATE_FORMAT = '\t'.join('#{%s}' % f for f in SHELL_FIELDS)
 
 
@@ -197,7 +201,7 @@ def shell_state(target, run):
     if len(parts) != len(SHELL_FIELDS):
         raise tmux.TmuxError(['display-message', target], 1, f"cannot read the state of {target}")
     st = dict(zip(SHELL_FIELDS, parts))
-    for k in ('window_panes', 'history_size', 'pane_height', 'cursor_y', 'cursor_x'):
+    for k in ('window_panes', 'history_size', 'pane_height', 'pane_width', 'cursor_y', 'cursor_x'):
         if not st[k].isdigit():
             raise tmux.TmuxError(['display-message', target], 1, f"bad {k} {st[k]!r} for {target}")
         st[k] = int(st[k])
@@ -211,18 +215,32 @@ def _logical_lines(run, pane, start, end):
     return lines[:-1] if lines and lines[-1] == '' else lines
 
 
-def _prompt_row(run, st):
-    """(row, why): the cursor's logical line and None, or None and why it is not a single
-    logical line with nothing drawn below it."""
+def _cursor_line(run, st, need=0):
+    """(line, why): the whole logical line that ends at the cursor row and None, or None and
+    why that line cannot be read whole or is not the last thing drawn. A prompt or an input
+    line may wrap across rows: the rows from the cursor back to the previous logical line are
+    read and joined. This does not use history_size as a scroll counter, so it also works when
+    the history is full and old rows are discarded. need is the expected length of the line."""
     pane, y = st['pane_id'], st['cursor_y']
-    first = y - 1 if (y > 0 or st['history_size'] > 0) else y
+    back = max(LOOK_BACK, need // max(st['pane_width'], 1) + 2)
+    first = max(-st['history_size'], y - back)
     lines = _logical_lines(run, pane, first, y)
     below = _logical_lines(run, pane, y + 1, st['pane_height'] - 1) if y + 1 < st['pane_height'] else []
-    if len(lines) != y - first + 1:
+    # whole only if an earlier logical line was read too, or the read starts at the very top
+    # of a pane that has no history (so nothing came before it)
+    if not lines or (len(lines) < 2 and not (first == 0 and st['history_size'] == 0)):
         return None, "the cursor row continues wrapped input; the input buffer is not empty"
     if any(l.strip() for l in below):
         return None, "text is drawn below the prompt; the input buffer is not empty"
     return lines[-1], None
+
+
+def _cursor_at_end(st, length):
+    """True if the cursor is right after a logical line of `length` columns that starts at
+    column 0 (a line that exactly fills its last row leaves the cursor at column 0 or width)."""
+    w = st['pane_width']
+    col = length % w if w > 0 else length
+    return st['cursor_x'] == col or (length > 0 and col == 0 and st['cursor_x'] == w)
 
 
 def known_prompts(target, run):
@@ -252,32 +270,46 @@ def shell_problem(target, cwd, run):
         why = _base_problem(st, cwd)
         if why:
             return why
-        row, why = _prompt_row(run, st)
+        known = known_prompts(target, run)
+        row, why = _cursor_line(run, st, max(len(k) for k in known))
         if why:
             return why
-        known = known_prompts(target, run)
     except tmux.TmuxError as e:
         return f"{target}: {e.stderr or 'no such pane'}"
-    if not any(row.rstrip(' ') == k.rstrip(' ') and st['cursor_x'] == len(k) for k in known):
+    if not any(row.rstrip(' ') == k.rstrip(' ') and _cursor_at_end(st, len(k)) for k in known):
         return (f"input buffer not positively empty (cursor line {row.strip()[-40:]!r}, column "
                 f"{st['cursor_x']}; expected exactly {' or '.join(repr(k) for k in known)})")
     return None
 
 
+def _prompt_at_cursor(row, st):
+    """The text of the logical line `row` up to the cursor, with trailing blanks that the
+    capture trimmed put back, or None if there is text after the cursor. The line may wrap:
+    its length is the shortest k * width + cursor_x that holds all of its text."""
+    w, x, text = st['pane_width'], st['cursor_x'], row.rstrip(' ')
+    if w <= 0 or x > w:
+        return None
+    length = x
+    while length < len(text):
+        length += w
+    return (row + ' ' * length)[:length]
+
+
 def first_prompt_problem(target, cwd, run):
     """For a shell start_agent itself just created (detached, so nobody else has typed in it):
     None once bash shows its first prompt, which is then recorded as the pane's known prompt.
-    The first prompt must be one logical line ending in '$ ' or '# ' with the cursor at its end."""
+    The first prompt must be one logical line (it may wrap across rows) ending in '$ ' or '# '
+    with the cursor at its end."""
     try:
         st = shell_state(target, run)
         why = _base_problem(st, cwd)
         if why:
             return why
-        row, why = _prompt_row(run, st)
+        row, why = _cursor_line(run, st)
         if why:
             return why
-        prompt = (row + ' ' * st['cursor_x'])[:st['cursor_x']]
-        if row.rstrip(' ') != prompt.rstrip(' ') or not prompt.endswith(PROMPT_TAILS):
+        prompt = _prompt_at_cursor(row, st)
+        if prompt is None or not prompt.endswith(PROMPT_TAILS):
             return f"no prompt yet (cursor line {row.strip()[-40:]!r}, column {st['cursor_x']})"
         run([tmux.TMUX, 'set-option', '-p', '-t', target, PROMPT_OPTION, prompt])
     except tmux.TmuxError as e:
@@ -291,7 +323,7 @@ def type_launch_line(target, line, run, sleep=time.sleep, wait=None):
     cursor. Raises AgentError (Enter not pressed) otherwise."""
     st0 = shell_state(target, run)
     known = known_prompts(target, run)
-    start_abs = st0['history_size'] + st0['cursor_y']
+    want = [k + line for k in known]
     run([tmux.TMUX, 'send-keys', '-t', target, '-l', '--', line])
     deadline = time.monotonic() + (ECHO_WAIT if wait is None else wait)
     sleep(tmux.ENTER_DELAY)
@@ -299,15 +331,11 @@ def type_launch_line(target, line, run, sleep=time.sleep, wait=None):
         st = shell_state(target, run)
         got = None
         if st['pane_current_command'] in SHELL_NAMES and st['pane_id'] == st0['pane_id']:
-            first = start_abs - st['history_size']
-            lines = _logical_lines(run, target, first, st['cursor_y'])
-            below = _logical_lines(run, target, st['cursor_y'] + 1, st['pane_height'] - 1) \
-                if st['cursor_y'] + 1 < st['pane_height'] else []
-            if len(lines) == 1 and not any(l.strip() for l in below):
-                got = lines[0]
-                if any(got.rstrip(' ') == (k + line).rstrip(' ') for k in known):
-                    run([tmux.TMUX, 'send-keys', '-t', target, 'Enter'])
-                    return
+            got, _ = _cursor_line(run, st, max(len(x) for x in want))
+            if got is not None and any(got.rstrip(' ') == x.rstrip(' ') and _cursor_at_end(st, len(x))
+                                       for x in want):
+                run([tmux.TMUX, 'send-keys', '-t', target, 'Enter'])
+                return
         if time.monotonic() >= deadline:
             raise AgentError(f"{target}: the input buffer does not read back as exactly the launch line "
                              f"({(got or '').strip()[-60:]!r}); Enter was NOT pressed")
@@ -339,6 +367,8 @@ def launch_agent(agent, cwd, session='agents', window_name=None, run=None, shell
     An existing window of that name (or shell_pane) is reused only if shell_problem() passes;
     otherwise a new window (or the session) is created with a fresh bash. The fixed launch line
     is typed, and Enter pressed only after it reads back exactly (type_launch_line).
+    The agent's trust for cwd is recorded first (see trust.py), so it does not stop on a
+    "trust this folder?" screen; the result's 'trust' says what was done or why not.
     Raises AgentError, leaving any shell open, if the shell is busy, elsewhere or not ready.
     Internal: callers go through worktrees.spawn_agent, which gives every agent its own
     worktree and never starts one in the plain checkout."""
@@ -347,6 +377,7 @@ def launch_agent(agent, cwd, session='agents', window_name=None, run=None, shell
     validate_session(session)
     name = validate_window_name(window_name) if window_name else default_window_name(agent, real)
     run = run or tmux.run_checked
+    trusted = trust.pretrust(agent, real)
     has = tmux.has_session(session)
     if shell_pane is None and has:
         shell_pane = find_window_pane(session, name, run)
@@ -379,7 +410,8 @@ def launch_agent(agent, cwd, session='agents', window_name=None, run=None, shell
     except tmux.TmuxError as e:
         raise AgentError(f"{target}: {e.stderr or 'tmux failed'}; Enter was NOT pressed") from e
     return {'agent': agent, 'argv': argv, 'launch_line': line, 'cwd': real, 'session': session,
-            'window_name': name, 'pane': info, 'shell_reused': reused}
+            'window_name': name, 'pane': info, 'shell_reused': reused,
+            'trust': trusted}
 
 
 # ---------------------------------------------------------------------------

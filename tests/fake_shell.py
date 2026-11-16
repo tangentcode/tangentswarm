@@ -1,7 +1,7 @@
 """A tmux stand-in with one bash pane, for the start_agent shell tests.
 
 It models what the launcher reads: the screen rows (with soft wraps), the cursor, the
-history size and the pending input buffer. send-keys -l appends to the buffer (when echo
+history size (capped at history_limit, if set) and the pending input buffer. send-keys -l appends to the buffer (when echo
 is on) and Enter submits it. It can be passed as `run` or patched over subprocess.run.
 """
 import re
@@ -11,17 +11,18 @@ import subprocess
 
 class FakeShell:
     def __init__(self, fg='bash', pending='', cwd=None, panes=1, tail='$ ', windows=(), width=80,
-                 height=24, echo=True, header='me@host:~/proj (b)', below='', pane='%99'):
+                 height=24, echo=True, header='me@host:~/proj (b)', below='', pane='%99',
+                 history_limit=None):
         self.calls, self.entered = [], []
         self.fg, self.pending, self.cwd, self.panes, self.tail = fg, pending, cwd, panes, tail
         self.windows, self.width, self.height, self.echo = list(windows), width, height, echo
         self.header, self.below, self.pane = header, below, pane
-        self.options = {}
+        self.options, self.history_limit = {}, history_limit
 
     # -- the screen -------------------------------------------------------------------
     def rows(self):
         """[(text, wrapped)] of every row, history first; the cursor ends the input line."""
-        out = [(self.header, False)]
+        out = [(h, False) for h in self.header.split('\n')]
         line = self.tail + self.pending
         chunks = [line[i:i + self.width] for i in range(0, len(line), self.width)] or ['']
         if len(chunks[-1]) == self.width:
@@ -34,6 +35,10 @@ class FakeShell:
     def screen(self):
         rows = self.rows()
         hist = max(0, len(rows) - self.height)
+        if self.history_limit is not None and hist > self.history_limit:
+            gone = hist - self.history_limit            # the oldest rows are discarded
+            rows, hist = rows[gone:], self.history_limit
+            self.cursor = (self.cursor[0] - gone, self.cursor[1])
         return rows, hist, self.cursor[0] - hist, self.cursor[1]
 
     def capture(self, args):
@@ -57,7 +62,8 @@ class FakeShell:
         rows, hist, y, x = self.screen()
         cwd = self.cwd or next((a[a.index('-c') + 1] for a in self.calls if '-c' in a), '/nowhere')
         vals = dict(pane_id=self.pane, pane_current_command=self.fg, window_panes=self.panes,
-                    history_size=hist, pane_height=self.height, cursor_y=y, cursor_x=x,
+                    history_size=hist, pane_height=self.height,
+                    pane_width=self.width, cursor_y=y, cursor_x=x,
                     pane_current_path=cwd, **self.options)
         return re.sub(r'#\{(@?\w+)\}', lambda m: str(vals.get(m.group(1), '')), fmt) + '\n'
 

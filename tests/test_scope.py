@@ -274,6 +274,47 @@ def test_real_bash_pending_input_or_a_moved_shell_is_refused_not_run(fake_bins, 
         subprocess.run(['tmux', 'kill-server'], capture_output=True)
 
 
+def test_real_bash_with_a_wrapping_prompt_and_a_full_history(fake_bins, root, tmp_path, monkeypatch):  # noqa: F811
+    """Codex P2 x2 against real tmux and bash: a login prompt wider than the pane is an empty
+    prompt, and a full history (old rows discarded) does not break the read-back."""
+    if not shutil.which('tmux') or not os.path.exists('/bin/bash'):
+        pytest.skip('tmux or bash not installed')
+    claude = Path(fake_bins['claude'])
+    claude.write_text('#!/bin/sh\nseq 40\nexit 0\n')        # scrolls, then the shell comes back
+    sbin = tmp_path / 'sbin'
+    sbin.mkdir()
+    (sbin / 'systemd-run').write_text(FAKE_SYSTEMD_RUN)
+    (sbin / 'systemd-run').chmod(0o755)
+    home = tmp_path / 'home'
+    home.mkdir(exist_ok=True)
+    (home / '.bash_profile').write_text("seq 60\nPS1='" + 'p' * 150 + "\\$ '\nPROMPT_COMMAND=\n")
+    monkeypatch.setenv('HOME', str(home))
+    monkeypatch.setenv('PATH', f"{sbin}:{os.environ['PATH']}")
+    monkeypatch.setenv('SCOPE_LOG', str(tmp_path / 'scope.log'))
+    monkeypatch.setenv('TMUX_TMPDIR', str(tmp_path))
+    monkeypatch.delenv('TMUX', raising=False)
+    cwd = str((root / 'proj').resolve())
+    try:
+        subprocess.run(['tmux', '-f', '/dev/null', 'new-session', '-d', '-s', 'scoped', '-n', 'other',
+                        '-x', '80', '-y', '10', 'sleep 300'], check=True)
+        subprocess.run(['tmux', 'set-option', '-g', 'history-limit', '5'], check=True)
+        out = registry.launch_agent('claude', 'proj', session='scoped')
+        target = out['pane']['pane_id']
+        hist = subprocess.run(['tmux', 'display-message', '-p', '-t', target, '#{history_limit}'],
+                              capture_output=True, text=True).stdout.strip()
+        assert hist == '5'
+        assert len(registry.known_prompts(target, tmux.run_checked)[0]) == 152
+        for _ in range(100):                                    # the agent ran and exited
+            if (tmp_path / 'scope.log').exists() and registry.shell_problem(target, cwd, tmux.run_checked) is None:
+                break
+            subprocess.run(['sleep', '0.1'])
+        assert registry.shell_problem(target, cwd, tmux.run_checked) is None
+        out2 = registry.launch_agent('claude', 'proj', session='scoped')
+        assert out2['shell_reused'] is True and out2['pane']['pane_id'] == target
+    finally:
+        subprocess.run(['tmux', 'kill-server'], capture_output=True)
+
+
 def test_legacy_pane_respawn_reruns_its_exact_argv_scoped(tmp_path, monkeypatch):
     if not shutil.which('tmux'):
         pytest.skip('tmux not installed')
