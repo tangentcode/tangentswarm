@@ -419,8 +419,12 @@ class Executor:
         """An exception for swarmbot: deduped by key for WAKE_DEDUPE s, and at most one POST
         per WAKE_EVERY s for all keys together (Codex on PR #26: a burst of distinct failures
         woke the LLM once per delivery). Exceptions inside the interval wait in the pending
-        list; the next POST carries them in "also"."""
+        list; the next POST carries them in "also". Another repo's exception names its repo in
+        the text and the dedupe key (Codex on PR #47: same-number PRs of two repos)."""
         key = key or why[:80]
+        if not self.platform():
+            key = f"{self.repo}:{key}"
+            why = why if why.startswith(self.repo) else f"{self.repo}: {why}"
         t = now()
         payload = {'source': 'swarm-webhook', 'kind': 'exception', 'pr': n or None, 'why': why,
                    'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'log': str(LOG)}

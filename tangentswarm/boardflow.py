@@ -70,8 +70,9 @@ def minbot_repo(adv, n, repo):
         why = 'is a draft'
     elif A.open_question(d):
         why = A.open_question(d)
-    elif d.get('mergeable') == 'CONFLICTING':
-        why = 'conflicts with main (GitHub mergeable)'
+    elif d.get('mergeable') != 'MERGEABLE':  # Codex on PR #47: UNKNOWN is not a pass
+        why = ('conflicts with main (GitHub mergeable)' if d.get('mergeable') == 'CONFLICTING'
+               else f"GitHub has not confirmed it merges cleanly yet (mergeable {d.get('mergeable')})")
     elif not A.codex_clean(d):
         why = f"not Codex-clean on {head[:8]}"
     else:

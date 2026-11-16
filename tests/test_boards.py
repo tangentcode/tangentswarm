@@ -96,6 +96,8 @@ def test_minbot_repo_passes_a_clean_pr_to_ready_then_promotes(monkeypatch):
     assert adv.minbots[0][:4] == ('evidence', 47, '--repo', TS) and moved[0] == ('I47', board.READY)
     d['mergeable'] = 'CONFLICTING'
     assert not boardflow.minbot_repo(adv, 47, TS) and 'conflicts with main' in adv.lines[-1]
+    d['mergeable'] = 'UNKNOWN'  # Codex on PR #47: not confirmed is not a pass
+    assert not boardflow.minbot_repo(adv, 47, TS) and 'not confirmed' in adv.lines[-1]
 
 
 def test_every_read_and_cleanup_of_another_repo_uses_that_repo(monkeypatch):
@@ -120,3 +122,15 @@ def test_a_project_6_pr_is_fast_track_by_its_own_labels(monkeypatch):
     monkeypatch.setattr(boards, 'open_prs', lambda gql, b: adv.cols)
     monkeypatch.setattr(board, 'move_card', lambda *a, **k: None)
     assert boardflow.promote(adv, B6) == [40, 30]
+
+
+def test_same_number_findings_in_two_repos_both_wake():
+    """Codex on PR #47: the wake key had no repo, so the second repo's handoff was lost."""
+    wakes = []
+    for repo in (TS, 'tangentcode/methodology'):
+        ex = Fake6(col=board.AUTO_REVIEW, full=codex_pr(findings=True))
+        ex.give, ex.wake_post = None, wakes.append
+        ex.run(W.Action('codex', 47, args={'repo': repo}))
+    keys = [k for k in W._seen()['wake'] if k.startswith('tangentcode/')]
+    assert sorted(k.split(':')[0] for k in keys) == ['tangentcode/methodology', TS]  # both kept, none deduped
+    assert wakes[0]['why'].startswith(TS + ':')
