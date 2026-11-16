@@ -300,6 +300,27 @@ def test_codex_box_needs_the_glyph_in_column_zero():
     assert agents.input_box(screen, '›') == 'Explain this:\n› quoted'
 
 
+@pytest.mark.parametrize('text', ['Skip', 'Skip until next version'])
+def test_codex_menu_that_opens_on_enter_gets_no_more_enters(text):
+    # the selected option '› 3. Skip until next version' holds the text, but it is not
+    # the box we typed into, so Enter is not pressed into the menu (Codex on PR #17)
+    pane = BoxPane(style='codex')
+    dialog = (FIX / 'codex_update_dialog.ansi').read_text()
+    capture = lambda t: agents.input_view(dialog if enters(pane) else pane.raw())   # noqa: E731
+    t = agents.CodexTui('t', capture=capture, send_literal=pane.literal, send_key=pane.key,
+                        sleep=lambda s: None)
+    with pytest.raises(agents.SubmitError) as e:
+        t.send_text(text)
+    assert e.value.state == 'unconfirmed' and enters(pane) == 1
+
+
+def test_submit_state_pending_only_for_the_unchanged_box():
+    t = agents.CodexTui('t')
+    assert t._submit_state('› Skip\n\n  ⏎ send', 'Skip', 'Skip') == 'pending'
+    assert t._submit_state('› 3. Skip until next version\n', 'Skip', 'Skip') == 'unknown'
+    assert t._submit_state('›\n\n  ⏎ send', 'Skip', 'Skip') == 'sent'
+
+
 def test_fingerprint_matches_flat_box():
     assert agents.fingerprint('\n │ \n a │ b') == 'ab'
     assert agents.holds_text('a\n│ b', 'a │ b')

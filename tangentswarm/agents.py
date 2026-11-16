@@ -587,13 +587,13 @@ class TuiAgent:
             self._sleep(ENTER_DELAY)
             self._send_key(self.target, 'Enter')
             return {'enter_presses': 1, 'submit_verified': False}
-        self._wait_until_typed(text)
+        typed = self._wait_until_typed(text)
         self._send_key(self.target, 'Enter')
         presses, state, screen = 1, None, ''
         for i, wait in enumerate(SUBMIT_BACKOFF):
             self._sleep(wait)
             screen = self.screen()
-            state = self._submit_state(screen, text)
+            state = self._submit_state(screen, text, typed)
             if state == 'sent':
                 return {'enter_presses': presses, 'submit_verified': True}
             if state == 'pending' and i < len(SUBMIT_BACKOFF) - 1:
@@ -609,20 +609,25 @@ class TuiAgent:
                           f"never came back blank within {waited:g}s (a dialog or menu may be open), so "
                           "Enter was not pressed again; the text may or may not have been submitted")
 
-    def _submit_state(self, screen, text):
+    def _submit_state(self, screen, text, typed=None):
         """'pending' if the text is still in the input box, 'sent' if the box is blank,
-        else 'unknown' (no box, or something else in it, such as a dialog's menu)."""
+        else 'unknown' (no box, or something else in it, such as a dialog's menu).
+
+        typed is the box as it was just before Enter. A lost Enter leaves the box as it
+        was, so with typed given the box is 'pending' only if it still reads the same.
+        A box that changed, such as a Codex menu whose selected option ('› 3. Skip until
+        next version') holds the text, is 'unknown' and never gets another Enter."""
         box = input_box(screen, self.glyph, self.framed)
         if box is None:
             return 'unknown'
         if holds_text(box, text):
-            return 'pending'
+            return 'pending' if typed is None or _flat(box) == _flat(typed) else 'unknown'
         return 'sent' if box.strip() == '' else 'unknown'
 
     def _wait_until_typed(self, text):
         """Wait at least ENTER_DELAY, then until the input box shows the text and stays the
         same for one TYPED_POLL. Only the box is compared, so a spinner elsewhere on a busy
-        agent's screen does not hold this up."""
+        agent's screen does not hold this up. Returns the box as it was before Enter."""
         self._sleep(ENTER_DELAY)
         waited, last, screen = ENTER_DELAY, None, ''
         while True:
@@ -630,7 +635,7 @@ class TuiAgent:
             box = input_box(screen, self.glyph, self.framed)
             if holds_text(box, text):
                 if box == last:
-                    return
+                    return box
                 last = box
             else:
                 last = None
@@ -639,7 +644,7 @@ class TuiAgent:
             self._sleep(TYPED_POLL)
             waited += TYPED_POLL
         if last is not None:        # in the box, but still being redrawn: go ahead
-            return
+            return last
         raise SubmitError('not_typed', screen,
                           f"{self.target}: the typed text never showed up in {self.name}'s input box "
                           f"within {TYPED_TIMEOUT:g}s (a dialog or menu may have taken the keystrokes), "
