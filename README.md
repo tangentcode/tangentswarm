@@ -965,10 +965,13 @@ The old `webhook-events.sqlite` is renamed to it once. Each row has a `source` a
 Rows are written with `eventdb.log_event()`, which never raises.
 
 `swarm-events` is the console viewer of that log. `--source mcp,stop-hook` shows only those
-sources. It opens the DB read-only, prints today's
-rows (ET), then follows new rows every second. Errors are red. Duplicates, log-only rows and
-rejected requests are dim. `-v` prints each row as JSON. `--since all|YYYY-MM-DD` and
-`--once` are also available.
+sources. It opens the DB read-only and shows today's events (ET), one row per event: time,
+status (handled, queued, failed), event (an action row starts with its source), PR, actor and the outcome in plain words ("moved #513 to Done; cascade"). Skipped events, log-only
+events, redeliveries and cascade passes that did nothing are hidden. A signature shows only
+when it failed (white on red); a failed event is red. In a terminal the screen is redrawn
+every 10 s (`--redraw`): rows from the last 2 minutes are bright, and each older minute is a
+darker gray. `-v` prints the rows as JSON. `--since all|YYYY-MM-DD` and `--once` are also
+available.
 
 Install it, in one of these ways:
 
@@ -983,6 +986,28 @@ open in tmux:
 
 Private ids, hosts and secret paths are in `~/.config/tangentswarm/config.toml`, never in
 the repo. `tangentswarm/config.example.toml` shows the shape.
+
+## swarm-tmux-status: which swarm windows are working
+
+`swarm-tmux-status` is a standalone console table of the windows in the swarm tmux session
+(default `agents`, or `--session` / `$SWARM_TMUX_SESSION`). It reads tmux only. Each window
+gets one class from its foreground command and its screen:
+
+- `WORKING`: Claude runs and is busy ("esc to interrupt" under its input box)
+- `idle`: Claude runs but does no work
+- `shell`: no Claude, a shell prompt
+- a program name (such as `python`): no Claude, another program in the foreground
+
+A row also shows the window index, the ticket from the window name (`mn-458-...` is
+`mn #458`) and the last activity line (Claude's last transcript entry, or the shell's last
+line that is not a prompt). The default view lists only the working windows. Keys: `a`
+toggles all windows, up/down or `j`/`k` select, Enter or `z` zooms into the window's recent
+output, Esc or `q` goes back, `r` refreshes now. It refreshes every `--interval` s (default 2).
+
+    swarm-tmux-status                    # the interactive table
+    swarm-tmux-status --once [--all]     # print the table once
+    swarm-tmux-status --zoom 41          # print the recent output of window 41
+    ln -sf "$PWD/bin/swarm-tmux-status" ~/bin/swarm-tmux-status   # this checkout, no install
 
 ## License
 
