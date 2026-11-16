@@ -254,11 +254,15 @@ async def start_agent(agent: registry.AgentName, repo: str, branch: str, session
     .swarm.yaml can list paths to symlink or copy into the worktree. Retrying is safe: an
     existing worktree is reused, and a live agent of the same kind already in it is returned
     (reused=true) instead of starting another. window_name is kebab-case, default
-    '<agent>-<branch>'. The window closes when the agent exits. Before launch the worktree
-    is marked trusted for the agent ('trust' in the result; Claude and Codex config, Muse
-    flag; status 'reused' with the current state when the agent was already running). 'startup' reports whether the agent reached its prompt or stopped on a named
-    first-run screen (startup.blocked.kind: trust_prompt, theme_picker, login,
-    api_key_prompt, bypass_permissions_confirm, update_prompt)."""
+    '<agent>-<branch>'. The window is a persistent bash shell in the worktree: the agent's
+    fixed, scoped launch line is typed into it, and when the agent exits the shell stays
+    (up-arrow restarts it). A later start finds that window by name and reuses it only if
+    its input buffer is positively empty there; otherwise it refuses, and never opens a
+    duplicate. Before launch the worktree is marked trusted for the agent ('trust' in the
+    result; Claude and Codex config, Muse flag; status 'reused' with the current state when
+    the agent was already running). 'startup' reports whether the agent reached its prompt or
+    stopped on a named first-run screen (startup.blocked.kind: trust_prompt, theme_picker,
+    login, api_key_prompt, bypass_permissions_confirm, update_prompt)."""
     try:
         return await anyio.to_thread.run_sync(
             lambda: worktrees.spawn_agent(agent, repo, branch, session=session,

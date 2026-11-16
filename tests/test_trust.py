@@ -14,6 +14,8 @@ tomllib = pytest.importorskip('tomllib')
 
 from tangentswarm import agents, registry, tmux, trust, worktrees
 
+from fake_shell import FakeShell
+
 FIX = Path(__file__).parent / 'fixtures'
 
 CLAUDE_JSON = {
@@ -508,14 +510,8 @@ def test_pretrust_by_agent(claude_json, codex_toml, wt):
 # ---------------------------------------------------------------------------
 # launching pre-trusts the worktree
 
-class Recorder:
-    def __init__(self):
-        self.calls = []
-
-    def __call__(self, argv):
-        self.calls.append(argv)
-        return subprocess.CompletedProcess(
-            argv, 0, stdout='agents\t5\tclaude-feat\t0\t%99\t1\t0\tclaude\t80\t24\t1\t0\t/x\n', stderr='')
+class Recorder(FakeShell):
+    """tmux stand-in: a new window is an idle bash at its -c directory (see fake_shell)."""
 
 
 @pytest.fixture
@@ -526,6 +522,7 @@ def claude_bin(tmp_path, monkeypatch):
     p.chmod(0o755)
     monkeypatch.setenv('TANGENTSWARM_AGENT_CLAUDE', str(p))
     monkeypatch.setattr(tmux, 'has_session', lambda s: True)
+    monkeypatch.setattr(tmux, 'ENTER_DELAY', 0)
     return str(p)
 
 
@@ -533,11 +530,13 @@ def test_launch_trusts_before_starting(claude_json, wt, claude_bin, monkeypatch)
     monkeypatch.setenv('TANGENTSWARM_AGENT_ROOT', str(wt.parent))
     seen = []
 
+    shell = Recorder()
+
     def run(argv):
         seen.append(json.loads(claude_json.read_text())['projects'].get(str(wt)))
-        return Recorder()(argv)
+        return shell(argv)
     out = registry.launch_agent('claude', str(wt), run=run)
-    assert seen == [{'hasTrustDialogAccepted': True}]        # already trusted when tmux ran
+    assert seen and all(e == {'hasTrustDialogAccepted': True} for e in seen)  # trusted before tmux ran
     assert out['trust']['status'] == 'trusted'
 
 

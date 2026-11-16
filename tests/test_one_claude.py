@@ -50,7 +50,7 @@ def test_start_agent_refuses_a_claude_started_outside_tmux(w, claude_bin):  # no
                               refuse=lambda p: 'a Claude already runs in x: one Claude per worktree')
     assert rec.calls == []
     worktrees.spawn_agent('claude', 'proj', 'feat', run=rec, refuse=lambda p: None)
-    assert len(rec.calls) == 1
+    assert len(rec.new_windows()) == 1
 
 
 def test_revive_refuses_when_another_claude_runs_in_the_worktree(wt):  # noqa: F811

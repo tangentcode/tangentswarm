@@ -565,6 +565,8 @@ def spawn_agent(agent, repo, branch, session='agents', window_name=None, top=Non
             why = (refuse or workerprocs.refuse_second_claude)(wt['path'])
             if why:
                 raise WorktreeError(why)
+        # launch_agent finds an existing window by session and name, wherever its shell is and
+        # whatever it runs, and refuses it unless it is an idle shell here: never a duplicate
         out = registry.launch_agent(agent, wt['path'], session=session, window_name=name, run=run)
     pane_id = out['pane'].get('pane_id')
     startup = _watch_startup(pane_id, agent) if pane_id else {'state': 'unknown', 'blocked': None}
