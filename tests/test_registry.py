@@ -382,7 +382,7 @@ def test_typed_space_before_a_suggestion_stays_typed(monkeypatch):
     assert '❯\xa0merge [ghost suggestion, not typed: it into work]' in st['last_lines']
 
 
-@pytest.mark.parametrize('glyph', ['>', '›', '❯', '─', '│', '╭'])
+@pytest.mark.parametrize('glyph', ['›', '❯', '─', '│', '╭'])
 def test_dim_run_with_a_kept_glyph_is_not_a_suggestion(monkeypatch, glyph):
     # input_view() keeps prompt glyphs and box drawing even when dim, so the prompt reads
     # as not blank; the run can't be told apart from input, so none of it is a suggestion
@@ -392,6 +392,16 @@ def test_dim_run_with_a_kept_glyph_is_not_a_suggestion(monkeypatch, glyph):
     assert st['prompt_blank'] is False
     assert st['prompt'] == {'input': text, 'suggestion': None, 'blank': False}
     assert not any('ghost suggestion' in l for l in st['last_lines'])
+
+
+def test_a_dim_angle_bracket_inside_a_line_is_part_of_the_suggestion(monkeypatch):
+    # input_view() keeps a dim '>' only at the start of a line (Gemini's prompt); inside
+    # a line it is placeholder text (Claude's 'Try "refactor <filepath>"'), so it is blanked
+    # and the whole dim run is a suggestion. prompt.blank still agrees with prompt_blank.
+    text = 'compare the left > right side'
+    st = status_of(monkeypatch, box(f'\x1b[2m{text}\x1b[0m'))
+    assert st['prompt_blank'] is True
+    assert st['prompt'] == {'input': '', 'suggestion': text, 'blank': True}
 
 
 def test_dim_runs_split_by_a_plain_space_are_one_suggestion(monkeypatch):
