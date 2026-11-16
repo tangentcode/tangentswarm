@@ -671,3 +671,48 @@ def test_a_queued_pr_merged_since_the_pre_merge_still_matches(tmp_path, monkeypa
     s3 = GitScratch(rows, ancestor=False)
     p, g, merges, cols = premerged(tmp_path, monkeypatch, f"{old} #2@{'b' * 12} #1@a", scratch=s3)
     assert p.fast_path(cols, reread=lambda: cols) == [5] and merges
+
+
+def test_the_pre_merge_base_must_match_the_queue_in_order(tmp_path, monkeypatch):
+    """(c) Future main is main + the queued PRs merged in queue order (Human Review, then
+    Staging, by the shared pick order). The same PRs in another order, a PR merged since
+    that is not first in the base, or an extra queued PR in the base run the full check."""
+    staging = [dict(number=4, head='4' * 40, item='I4'), dict(number=5, head=H5, item='I5', own_labels=['merge-ready'])]
+    ahead_ok = f"{MAIN[:12]} #1@a #4@{'4' * 12}"
+    for base, skip in ((ahead_ok, True),
+                       (f"{MAIN[:12]} #4@{'4' * 12} #1@a", False),        # the same PRs, another order
+                       (f"{MAIN[:12]} #1@a #4@{'4' * 12} #9@{'9' * 12}", False),  # a PR not ahead any more
+                       (f"{MAIN[:12]} #1@a", False)):                    # #4 is missing
+        p = premerged(tmp_path, monkeypatch, base)[0]
+        assert p.premerge_current(staging[1], {}, [(1, 'a'), (4, '4' * 40)], lambda: MAIN, Scratch(),
+                                  lambda: 'main') is skip, base
+    # a merged PR must come first in the base (it was first in the queue)
+    old, rows = 'd' * 12, f"{MAIN} {'d' * 40} {'b' * 40}\n"
+    for base, skip in ((f"{old} #2@{'b' * 12} #1@a", True), (f"{old} #1@a #2@{'b' * 12}", False)):
+        p, g, merges, cols = premerged(tmp_path, monkeypatch, base)
+        assert p.premerge_current(cols[board.STAGING][0], {}, [(1, 'a')], lambda: MAIN, GitScratch(rows),
+                                  lambda: 'main') is skip, base
+
+
+def test_a_moved_pr_with_a_new_head_on_the_re_read_is_checked_at_that_head(tmp_path, monkeypatch):
+    """Codex on PR #68: #5 moved, then got a new head before the re-read. The next candidate
+    is checked against #5's NEW Human Review head, not the Staging copy saved at the move;
+    the saved copy is only for a board that does not show the move yet."""
+    from tangentswarm import flow
+    new5 = 'f' * 40
+    monkeypatch.setattr(flow, 'merge_commit', lambda s, a, b, m: None if new5 in a and b == H8 else f'{a}+{b}')
+    g = G(tmp_path, details={5: detail(5, H5), 8: detail(8, H8)})
+    (tmp_path / 'hr.log').write_text(LOG8)
+    cols = {board.STAGING: [dict(number=5, head=H5, item='I5'), dict(number=8, head=H8, item='I8')]}
+    fresh = {board.HUMAN_REVIEW: [dict(number=5, head=new5, item='I5')],
+             board.STAGING: [dict(number=8, head=H8, item='I8')]}
+    p = P.Promoter(g=g)
+    assert p.fast_path(cols, reread=lambda: fresh) == [5]
+    assert p.left == [(8, H8, 'conflicts with #5 in Human Review')]
+    lag = {board.STAGING: [dict(number=8, head=H8, item='I8')]}  # the move is not on the board yet
+    monkeypatch.setattr(flow, 'merge_commit', lambda s, a, b, m: None if H5 in a and b == H8 else f'{a}+{b}')
+    g = G(tmp_path, details={5: detail(5, H5), 8: detail(8, H8)})
+    (tmp_path / 'hr.log').write_text(LOG8)
+    p = P.Promoter(g=g)
+    assert p.fast_path(cols, reread=lambda: lag) == [5]
+    assert p.left == [(8, H8, 'conflicts with #5 in Human Review')]

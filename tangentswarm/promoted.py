@@ -489,8 +489,9 @@ class Promoter:
                 return state['main']
 
             while True:
-                hr = [q for q in cols.get(board.HUMAN_REVIEW, []) if q['number'] not in done]
-                hr += list(done.values())
+                hr = list(cols.get(board.HUMAN_REVIEW, []))  # fresh entries win (a new head; Codex on PR #68)
+                seen = {q['number'] for q in hr}
+                hr += [q for n, q in done.items() if n not in seen]  # board lag only
                 staging = [q for q in cols.get(board.STAGING, []) if q['number'] not in done]
                 if len(hr) >= HR_TARGET or not staging:
                     break
@@ -541,9 +542,10 @@ class Promoter:
         """tangentswarm #67 (c): True if Staging PR p carries merge-ready and its pre-merge
         record (flow.PREMERGE_STATE) was built for its current head on the current future main
         ahead of it: main and the PRs `ahead` ([(n, head)]: Human Review, then Staging before
-        p). Then the scratch merge is skipped. A PR of the record's base that is no longer
-        queued must be merged into main since (each new first-parent commit of main is the
-        merge of one such head, nothing else), and every queued PR ahead must be in the base.
+        p, each in the shared pick order). Then the scratch merge is skipped. The ordered
+        (PR, head) list must match: the base is the PRs merged since (first in it; each new
+        first-parent commit of main is the merge of one such head, nothing else), then
+        exactly `ahead`, in queue order.
         Else False: the full scratch merge runs."""
         from . import flow
         labels = set(p.get('own_labels') or []) | {l['name'] for l in ((d or {}).get('labels') or {}).get('nodes') or []}
@@ -555,9 +557,14 @@ class Promoter:
             return False
         base_main, *deps = rec['base'].split()
         want = [f"#{n}@{h[:12]}" for n, h in ahead]
-        if len(set(deps)) != len(deps) or not set(want) <= set(deps):
+        # Strict queue order (future main = main + the queued PRs merged in queue order): the
+        # base is the PRs merged since (a prefix: they were first in the queue), then exactly
+        # `ahead`, in the same order.
+        if len(deps) < len(want) or deps[len(deps) - len(want):] != want:
             return False
-        gone = [x for x in deps if x not in want]
+        gone = deps[:len(deps) - len(want)]
+        if any(x in want for x in gone):
+            return False
         main = tip()
         if not main:
             return False
