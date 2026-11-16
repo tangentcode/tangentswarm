@@ -68,7 +68,7 @@ BOARD_EVERY = int(os.environ.get('SWARM_BOARD_EVERY', '300'))  # s between passe
 DEPLOY_LAG = int(os.environ.get('SWARM_DEPLOY_LAG', '600'))  # s before a staging deploy lag wakes swarmbot (#37)
 LAG_EVERY = 60  # s between deploy-lag checks
 MAIN_RETRY = int(os.environ.get('SWARM_MAIN_RETRY', '300'))  # s between retries of a held merge-main handoff
-HR_TARGET = int(os.environ.get('SWARM_PROMOTE_HR_TARGET', '2'))  # only raise it for a dry-run proof
+HR_TARGET = int(os.environ.get('SWARM_PROMOTE_HR_TARGET', os.environ.get('SWARM_HR_TARGET', '2')))  # only raise it for a dry-run proof
 WATCH = os.environ.get('SWARM_WATCH', '1') != '0'  # the watchdog thread (tangentswarm.watchdog)
 
 
@@ -93,8 +93,10 @@ def read_board(gql, max_age=None):
         closes = [dict(number=i['number'], labels=_names(i)) for i in boardcache.closes(c)]
         ft.append(dict(number=c['number'], kind='PullRequest', state='OPEN', col=col, labels=_names(c), closes=closes))
         due, ms = boardcache.pr_due(c)
+        names = boardcache.pr_labels(c)  # tangentswarm #65: the promote order sees every fast-track label
         cols.setdefault(col, []).append(dict(number=c['number'], head=c['headRefOid'], item=it['id'],
-                                             closes=[i['number'] for i in closes], due=due, milestone=ms))
+                                             closes=[i['number'] for i in closes], due=due, milestone=ms,
+                                             labels=names, own_labels=_names(c), ft=board.is_fast_track(names)))
     for it, c in boardcache.open_issues(snap):
         ft.append(dict(number=c['number'], kind='Issue', state='OPEN', col=boardcache.col(it),
                        labels=_names(c), closes=[]))

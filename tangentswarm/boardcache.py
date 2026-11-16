@@ -135,6 +135,12 @@ def pr_due(c):
     return board.soonest_due([c.get('milestone') or {}] + [i.get('milestone') or {} for i in closes(c)])
 
 
+def pr_labels(c):
+    """The labels of a PR and of the issues it closes in REPO (tangentswarm #65: a fast-track
+    label on either makes the PR fast-track in board.pick_key)."""
+    return _names(c) + [l for i in closes(c) for l in _names(i)]
+
+
 def closes(c):
     """The issues a PR closes in REPO. A cross-repo "Fixes o/r#17" is another repo's issue 17,
     never this repo's (Codex on PR #26); a node without its repository is kept."""

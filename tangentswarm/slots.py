@@ -62,6 +62,10 @@ NEVER_START = {int(x) for x in os.environ.get(
 LAUNCH_GRACE = int(os.environ.get('SWARM_LAUNCH_GRACE', '2700'))  # s: a named issue is not named again
 LAUNCHING_TTL = int(os.environ.get('SWARM_LAUNCHING_TTL', '1800'))  # s: a queued launch, until its PR exists
 MAX_CLAUDES = int(os.environ.get('SWARM_MAX_CLAUDES', '10'))  # every live Claude on the host
+# tangentswarm #65 (Michal 2026-11-16 3:17 PM ET): a conflict fix for fill never waits for
+# a rework slot; the only limits are the live Claudes and the host MemAvailable.
+CONFLICT_MAX_CLAUDES = int(os.environ.get('SWARM_CONFLICT_MAX_CLAUDES', '9'))
+CONFLICT_AVAIL_MIN = int(float(os.environ.get('SWARM_CONFLICT_AVAIL_MIN_GB', '1.5')) * 1024 ** 3)
 TMUX_SESSION = 'agents'
 FEEDBACK_MAX = 4000
 
@@ -213,8 +217,9 @@ def launch_key(issue):
 
 def key_text(issue):
     """The sort key as START_CLAUDE prints it, e.g. #507=(ft:no,due:2026-11-20 ptw 15,n:507)."""
-    ft, ms, due, n = launch_key(issue)
-    when = f"{due} {issue.get('milestone')}" if ms == 0 else f"none {issue.get('milestone')}" if ms == 1 else 'none'
+    ft, _, _, n = launch_key(issue)
+    due = (issue.get('due') or '')[:10]  # from the issue: a fast-track key holds no due date
+    when = f"{due} {issue.get('milestone')}" if due else f"none {issue.get('milestone')}" if issue.get('milestone') else 'none'
     return f"#{n}=(ft:{'yes' if ft == 0 else 'no'},due:{when},n:{n})"
 
 
@@ -322,6 +327,31 @@ def claude_load(spool=None):
     running in the spool (each is a Claude about to start)."""
     from . import spool as _spool
     return live_claudes() + len(_spool.in_flight(spool=spool))
+
+
+def mem_available(meminfo=None):
+    """The host MemAvailable in bytes, read live from /proc/meminfo, or None when unreadable."""
+    try:
+        text = meminfo() if meminfo else Path('/proc/meminfo').read_text()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith('MemAvailable:'):
+            return int(line.split()[1]) * 1024
+    return None
+
+
+def conflict_capacity(load=None, avail=None):
+    """(ok, why): may a conflict fix start a Claude? Only CONFLICT_MAX_CLAUDES live Claudes
+    (claude_load: running plus starts in the spool) and CONFLICT_AVAIL_MIN host MemAvailable
+    hold it (tangentswarm #65); no rework-slot limit."""
+    busy = claude_load() if load is None else load
+    if busy >= CONFLICT_MAX_CLAUDES:
+        return False, f"{busy} Claudes run or start (cap {CONFLICT_MAX_CLAUDES})"
+    avail = mem_available() if avail is None else avail
+    if avail is not None and avail < CONFLICT_AVAIL_MIN:
+        return False, f"MemAvailable {avail // 1024 ** 2} MB (needs {CONFLICT_AVAIL_MIN // 1024 ** 2} MB)"
+    return True, ''
 
 
 def worker_memory():
@@ -635,11 +665,14 @@ def _event(event, **kw):
     eventdb.log_event(event, source='slots', **kw)
 
 
-def revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, path=None, refuse=None):
+def revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, path=None, refuse=None,
+           priority=False, capacity=None):
     """(b) Resume PR n's Claude (claude --resume SESSION) in its window, in a rework slot,
     and send the feedback. 0 done, 1 refused or failed, 3 held (no rework slot or memory).
     Every non-dry call is one events DB row: 'resume' (a new Claude), 'feedback' (to a
-    running one), or the hold or refusal (tangentswarm #32)."""
+    running one), or the hold or refusal (tangentswarm #32). priority (a conflict fix for fill,
+    tangentswarm #65): no rework-slot wait; a new Claude starts only within conflict_capacity
+    (capacity: its stand-in for tests)."""
     lines = []
 
     def said(line):
@@ -647,7 +680,7 @@ def revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, path
         out(line)
     rc, error = None, None
     try:
-        rc = _revive(n, text, dry, said, sp, host, claudes, path, refuse)
+        rc = _revive(n, text, dry, said, sp, host, claudes, path, refuse, priority, capacity)
         return rc
     except Exception as e:
         error = f'{type(e).__name__}: {str(e)[:300]}'
@@ -667,7 +700,8 @@ def one_line_safe(text):
         return str(text or '')[:200]
 
 
-def _revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, path=None, refuse=None):
+def _revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, path=None, refuse=None,
+            priority=False, capacity=None):
     n = int(str(n).lstrip('#'))
     try:
         text = one_line(text)
@@ -684,7 +718,7 @@ def _revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, pat
         mine = [c for c in claudes if c['cwd'] == wt]
         rework_wts = {r.get('worktree') for k, r in st['rework'].items() if k != str(n)}
         busy = [c for c in claudes if c['cwd'] in rework_wts]
-        if not mine and len(busy) >= REWORK_SLOTS:
+        if not mine and not priority and len(busy) >= REWORK_SLOTS:
             out(f"held: the {REWORK_SLOTS} rework slots are in use ("
                 + ', '.join('#' + k for k, r in st['rework'].items() if r.get('worktree') in {c['cwd'] for c in busy})
                 + "); try again when one is parked")
@@ -739,16 +773,21 @@ def _revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, pat
                     f"{'its idle shell ' + existing['pane'] if existing else 'a new shell window'}: {line}")
                 out(f"would then send: {text[:120]}")
                 return 0
-            busy = claude_load()
+            if priority:  # tangentswarm #65: only the live Claudes and MemAvailable hold it
+                ok, why = (capacity or conflict_capacity)()
+                if not ok:
+                    out(f"held: {why}; #{n} resumes on the next pass")
+                    return 3
+            busy = 0 if priority else claude_load()
             if busy >= MAX_CLAUDES:  # Codex on PR #26: a resume started a Claude over the global cap
                 out(f"held: {busy} Claudes run or are reserved (cap {MAX_CLAUDES}); #{n} resumes when one ends")
                 return 3
-            room = sp.headroom(host)
-            if room < sp.RESUME_PARK_NEED_MB * sp.MB:
+            room = None if priority else sp.headroom(host)
+            if room is not None and room < sp.RESUME_PARK_NEED_MB * sp.MB:
                 out(f"headroom {room // sp.MB} MB; asking swarm-park for {sp.RESUME_PARK_NEED_MB} MB")
                 host.run_park(sp.RESUME_PARK_NEED_MB)
                 room = sp.headroom(host)
-            if room < sp.RESUME_MIN_MB * sp.MB:
+            if room is not None and room < sp.RESUME_MIN_MB * sp.MB:
                 out(f"held: {window} needs {sp.RESUME_MIN_MB} MB under {sp.SLICE} MemoryHigh, have {room // sp.MB} MB")
                 return 3
             pane, reused = sp.shell_for(host, window, wt, existing)

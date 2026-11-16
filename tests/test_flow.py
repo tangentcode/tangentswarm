@@ -215,27 +215,35 @@ def test_full_staging_pulls_nothing_and_touches_no_ready_pr(monkeypatch):
     assert f.did == [] and g.moves == []
 
 
-def test_pull_takes_the_top_fitting_ready_pr_only(monkeypatch):
+def premerged(monkeypatch, f, tips):
+    """Stub the pre-merge: tips {PR: tip or None}; returns the PRs asked, in order."""
+    asked = []
+    monkeypatch.setattr(f, 'future_main', lambda scratch, cols: ('key', 'fm', None))
+    monkeypatch.setattr(f, 'premerge_one', lambda p, scratch, fm: asked.append(p['number']) or tips.get(p['number']))
+    return asked
+
+
+def test_pull_takes_only_the_next_ready_pr_in_the_pick_order(monkeypatch):
+    """tangentswarm #65 (Codex on PR #66: swarm-flow step too): #8 is next and not merge-ready
+    (it conflicts with the queue: its worker resolves its -vN), so #7 does not jump it."""
     prs = {1: card(1, HR), 2: card(2, HR), 3: card(3, ST), 7: card(7, RD), 8: card(8, RD, rank=0), 9: card(9, RD)}
     f, g = make_flow(prs)
-    monkeypatch.setattr(flow, 'stack_conflict', lambda s, m, bases, head: '#2' if head == prs[8]['head'] else None)
+    asked = premerged(monkeypatch, f, {7: 'v7', 9: 'v9'})
     started = []
-    monkeypatch.setattr(f, 'start_pull', lambda p, s: started.append(p['number']))
+    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False: started.append(p['number']))
     f.step()
-    assert started == [7]
-    assert any('#8 skipped this step: conflicts with #2' in n for n in f.notes)
-
+    assert started == [] and asked == [8]
+    assert '#8 is next in the pick order and is not merge-ready: nothing behind it is pulled' in f.notes
 
 def test_pr_that_does_not_merge_onto_main_goes_back_with_a_relay(monkeypatch, tmp_path):
     prs = {1: card(1, HR), 2: card(2, HR), 7: card(7, RD, rank=0), 9: card(9, RD)}
     f, g = make_flow(prs, dry=False, clean=lambda a, b: not (a == 'main' and b == prs[7]['head']))
-    monkeypatch.setattr(flow, 'stack_conflict', lambda *a: None)
+    premerged(monkeypatch, f, {9: 'v9'})
     started = []
-    monkeypatch.setattr(f, 'start_pull', lambda p, s: started.append(p['number']))
+    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False: started.append((p['number'], tip, pre_merged)))
     f.step()
-    assert g.moves == [('I7', IP)] and started == [9]
+    assert g.moves == [('I7', IP)] and started == [(9, 'v9', True)]
     assert 'merge origin/main' in (flow.RELAY_DIR / 'relay-7-merge-main.md').read_text()
-
 
 def test_empty_ready_is_a_refill_note():
     f, _ = make_flow({1: card(1, HR), 2: card(2, HR)})
@@ -314,18 +322,16 @@ def test_main_busy_exits_75(monkeypatch):
     assert flow.main(['step']) == flow.gatelock.EXIT_BUSY
 
 
-def test_fast_track_takes_the_first_staging_slot_and_jumps_ready(monkeypatch):
+def test_fast_track_goes_first_in_the_pick_order(monkeypatch):
+    monkeypatch.setattr(flow, 'STAGING_MIN', 3)
     prs = {1: card(1, HR), 2: card(2, HR), 3: card(3, ST), 4: card(4, ST),
            7: card(7, RD, rank=0), 8: card(8, RD, rank=board.FAST_TRACK)}
     f, g = make_flow(prs)
-    seen = {}
-    monkeypatch.setattr(flow, 'stack_conflict', lambda s, m, bases, head: seen.setdefault(head, bases) and None)
+    asked = premerged(monkeypatch, f, {7: 'v7', 8: 'v8'})
     started = []
-    monkeypatch.setattr(f, 'start_pull', lambda p, s: started.append(p['number']))
+    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False: started.append((p['number'], tip)))
     f.step()
-    assert started == [8]
-    assert [n for n, _ in seen[prs[8]['head']]] == ['#1', '#2']  # Human Review only, not Staging
-
+    assert started == [(8, 'v8')] and asked == [8]
 
 def test_step_without_promote_never_runs_pending_promote(monkeypatch):
     calls = []
@@ -356,63 +362,58 @@ def test_merge_work_says_when_the_tip_is_already_in_work(repo, tmp_path):
     assert f.merge_work(447, h['main'], 'main') == 0 and 'already in work' in out[0]
 
 
-def test_strict_pull_skips_without_rework_and_needs_every_pair_clean(monkeypatch):
-    """swarm-advance --cascade: only a PR that merges cleanly with main, work and each Human
-    Review and Staging head is pulled. Nothing is moved and no relay is written."""
-    prs = {1: card(1, HR), 3: card(3, ST), 6: card(6, RD, rank=0), 7: card(7, RD, rank=0),
-           8: card(8, RD, rank=0), 9: card(9, RD, rank=board.FAST_TRACK)}
-    dirty = {('main', prs[6]['head']), ('work', prs[7]['head']), (prs[3]['head'], prs[8]['head'])}
-    f, g = make_flow(prs, dry=False, clean=lambda a, b: (a, b) not in dirty)
-    monkeypatch.setattr(f, 'fetch_work', lambda scratch: 'work')
-    seen = {}
-    monkeypatch.setattr(flow, 'stack_conflict', lambda s, m, bases, head: seen.setdefault(head, bases) and None)
+def test_strict_pull_takes_only_the_next_pr_and_only_when_it_is_merge_ready(monkeypatch):
+    """swarm-advance --cascade, tangentswarm #65: the next PR in the pick order is pulled with
+    its pre-merged tip; when it is not merge-ready, nothing behind it is pulled. Nothing is
+    moved and no relay is written by the pull."""
+    prs = {1: card(1, HR), 3: card(3, ST), 6: card(6, RD, rank=0), 9: card(9, RD, rank=board.FAST_TRACK)}
+    f, g = make_flow(prs, dry=False)
+    ready = {9: None, 6: 'v6' * 20}
+    seen = []
+    monkeypatch.setattr(f, 'future_main', lambda scratch, cols: ('key', 'fm', None))
+    monkeypatch.setattr(f, 'premerge_one', lambda p, scratch, fm: seen.append(p['number']) or ready[p['number']])
     started = []
-    monkeypatch.setattr(f, 'start_pull', lambda p, s: started.append(p['number']) or True)
+    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False: started.append((p['number'], tip, pre_merged)) or True)
     _, cols = f.columns()
-    p = f.pull(prs, cols, g['ScratchRepo'](), limit=5, strict=True)
-    assert p['number'] == 9 and started == [9] and g.moves == []
-    assert [n for n, _ in seen[prs[9]['head']]] == ['#1', '#3']  # strict: a fast-track stacks on Staging too
-    started.clear()
-    del prs[9]
-    cols[RD] = [prs[n] for n in (6, 7, 8)]
-    assert f.pull(prs, cols, g['ScratchRepo'](), limit=5, strict=True) is None and started == []
-    assert g.moves == []
-    notes = '\n'.join(f.notes)
-    assert '#6 skipped: does not merge cleanly with main (no rework' in notes
-    assert '#7 skipped: does not merge cleanly with work' in notes
-    assert '#8 skipped: does not merge cleanly with #3' in notes
-    assert notes.endswith('no Ready PR merges cleanly with main, work and every Human Review and Staging PR')
+    assert f.pull(prs, cols, g['ScratchRepo'](), limit=5, strict=True) is None
+    assert seen == [9] and started == [] and g.moves == []
+    assert '#9 is next in the pick order and is not merge-ready: nothing behind it is pulled' in f.notes
+    ready[9] = 'v9' * 20
+    assert f.pull(prs, cols, g['ScratchRepo'](), limit=5, strict=True)['number'] == 9
+    assert started == [(9, 'v9' * 20, True)]
 
 
-def test_pull_batch_merges_every_clean_ready_pr_into_work_in_one_push(repo, tmp_path):
-    """Staging stocking (Michal 2026-11-15): one work push for the whole batch, so one staging
-    redeploy covers it. x and y each merge cleanly with work but not with each other: x enters
-    the batch, y is skipped with a note, z enters too."""
+def test_pull_batch_merges_the_pre_merged_tips_into_work_in_one_push(repo, tmp_path):
+    """Staging stocking: one work push for the whole batch, so one staging redeploy covers it.
+    tangentswarm #65: each tip is a <branch>-v1 = future main (main + #1 in Human Review) + the
+    head. x and y each pre-merge cleanly but not with each other: x enters the batch, y stops
+    it, and z behind y is not pulled (strict order)."""
     s, h = repo
     origin = tmp_path / 'origin.git'
     run(tmp_path, 'init', '-q', '--bare', str(origin))
     run(s.dir, 'push', '-q', str(origin), f"{h['hr1']}:refs/heads/work")
     s.main = h['main']
     s.ensure_main = s.ensure = lambda *a: None
-
-    def mt_clean(d, a, b):
-        return subprocess.run(['git', '--git-dir', d, 'merge-tree', '--write-tree', a, b],
-                              capture_output=True).returncode == 0
-    g = {'origin_url': lambda: str(origin), 'merge_tree_clean': mt_clean, 'queue_from_board_or_file': lambda: []}
+    g = {'origin_url': lambda: str(origin), 'merge_tree_clean': lambda d, a, b: True,
+         'queue_from_board_or_file': lambda: []}
     f = flow.Flow(out=lambda line: None, g=g, now=lambda: 10_000)
     prs = {n: card(n, RD, head=h[k]) for n, k in ((7, 'x'), (8, 'y'), (9, 'z'))}
     cols = {HR: [card(1, HR, head=h['hr1'])], RD: [prs[7], prs[8], prs[9]]}
     batch = f.pull_batch(prs, cols, s, room=5)
-    assert [p['number'] for p in batch] == [7, 9]
-    assert any(n.startswith('#8 skipped: does not merge cleanly onto the batch (#7)') for n in f.notes)
+    assert [p['number'] for p in batch] == [7]
+    assert any(n.startswith('#8 is next in the pick order and its tip') and 'nothing behind it is pulled' in n
+               for n in f.notes)
+    v7 = run(s.dir, 'ls-remote', str(origin), 'refs/heads/b7-v1').split()[0]
     tip = run(s.dir, 'ls-remote', str(origin), 'refs/heads/work').split()[0]
     assert tip == f.last_work
-    for head in (h['x'], h['z'], h['hr1']):
-        assert subprocess.run(['git', '--git-dir', s.dir, 'merge-base', '--is-ancestor', head, tip]).returncode == 0
-    assert run(s.dir, 'rev-list', '--count', f"{h['hr1']}..{tip}", '--merges') == '2'  # one merge commit per PR
-    assert [(d['pr'], d['work']) for d in flow.load_pulls()] == [(7, tip), (9, tip)]
-    assert f.did[-1].startswith(f"did: #7 {h['x'][:8]}, #9 {h['z'][:8]} pulled: 2 head(s) merged into work") \
+    for c in (h['x'], h['hr1'], v7):
+        assert subprocess.run(['git', '--git-dir', s.dir, 'merge-base', '--is-ancestor', c, tip]).returncode == 0
+    assert subprocess.run(['git', '--git-dir', s.dir, 'merge-base', '--is-ancestor', h['z'], tip]).returncode != 0
+    assert [(d['pr'], d['tip'], d['work']) for d in flow.load_pulls()] == [(7, v7, tip)]
+    assert f.did[-1].startswith(f"did: #7 {v7[:8]} pulled: 1 pre-merged tip(s) in work") \
         and 'in one push' in f.did[-1]
+    assert run(s.dir, 'rev-parse', f'{tip}^{{tree}}') == run(s.dir, 'rev-parse', f'{v7}^{{tree}}')
+    assert run(s.dir, 'ls-remote', str(origin), 'refs/heads/b7') == ''  # the PR's own branch is never pushed
 
 
 def test_pull_batch_dry_run_pushes_nothing_and_saves_nothing(repo, tmp_path):

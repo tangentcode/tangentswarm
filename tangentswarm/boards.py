@@ -34,7 +34,7 @@ def open_prs(gql, b, org='tangentcode'):
             cols.setdefault(board.column(it.get('fieldValueByName')), []).append(dict(
                 number=c['number'], repo=repo, head=c['headRefOid'], item=it['id'], draft=c['isDraft'],
                 mergeable=c.get('mergeable'), closes=[i['number'] for i in cl], due=due, milestone=ms,
-                ft=board.is_fast_track(names)))  # this repo's own labels (Codex on PR #47)
+                labels=names, ft=board.is_fast_track(names)))  # this repo's own labels (Codex on PR #47)
         if not items['pageInfo']['hasNextPage']:
             return cols
         cursor = items['pageInfo']['endCursor']

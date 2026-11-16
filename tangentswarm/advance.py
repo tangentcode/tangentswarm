@@ -47,7 +47,8 @@ MINBOT = os.environ.get('SWARM_MINBOT', 'minbot')
 MINBOT_ROWS = ('1 ', '2 ', '3 ', '5 ')  # not draft, mergeable, Codex clean, Linux CI
 
 # --cascade (Michal 2026-11-14)
-FLOOR = int(os.environ.get('SWARM_STAGING_FLOOR', '2'))  # pull while Staging has fewer (--floor; compare 1 and 2)
+# the Staging WIP target (tangentswarm #65: never pulled past; SWARM_STAGING_TARGET, --floor)
+FLOOR = int(os.environ.get('SWARM_STAGING_FLOOR', os.environ.get('SWARM_STAGING_TARGET', '2')))
 READY_TARGET = int(os.environ.get("SWARM_READY_TARGET", "6"))      # Ready short: one more new-work slot (slots.NEW_SLOTS_SHORT)
 BUDGET = int(os.environ.get('SWARM_CASCADE_BUDGET', '780'))   # whole run; the tick kills it at 900 s
 STEP_TIMEOUT = int(os.environ.get('SWARM_CASCADE_STEP_TIMEOUT', '300'))  # one hr-gate --apply run
@@ -439,16 +440,19 @@ class Cascade(Advance):
                    staging site's .deploy-sha contains its head, hr-gate --apply moves it
                    into Staging. The serial lock is never held for a redeploy, so a promote
                    never waits on one. The swarm-promoted daemon queues the next cascade
-                   when a staging .deploy-sha changes. (B) While Staging + pulls in flight
-                   is below FLOOR (the target, default 2; --floor or SWARM_STAGING_FLOOR),
-                   EVERY Ready PR that merges cleanly (git merge-tree) with main, work, each
-                   Human Review and Staging PR and the batch so far is merged into work in
-                   ONE push (Flow.pull_batch, up to flow.STAGING_MAX in Staging), so one
-                   redeploy covers all of them (every staging site, ptw too, redeploys the
-                   work tip by itself: Michal 2026-11-15). Nothing is
-                   rebased, reworked or sent back just to fill Staging. The promote ran
-                   first in the pass, so a promote frees a slot and the next pull starts in
-                   the same pass. A fast-track PR is pulled also at the target (Michal
+                   when a staging .deploy-sha changes. (B) Every pass pre-merges the top
+                   Ready PRs onto future main (main + Human Review + Staging heads, in
+                   that order) as a new <branch>-vN (Flow.premerge, tangentswarm #65): a
+                   clean one gets the label merge-ready; a real conflict gets pre-merging
+                   and a worker resolves it on the -vN only (never on the PR branch).
+                   (C) While Staging + pulls in flight is below FLOOR (the WIP target,
+                   default 2; --floor, SWARM_STAGING_FLOOR or SWARM_STAGING_TARGET), the
+                   Ready PRs are pulled in strict pick order, up to the target, as their
+                   -vN tips in ONE work push (Flow.pull_batch), so one redeploy covers all
+                   of them. The first PR that is not merge-ready stops the pull: nothing
+                   behind it is pulled, and nothing is pulled past the target, also for
+                   fast-track. The promote ran first in the pass, so a promote frees a slot
+                   and the next pull starts in the same pass (Michal
                    2026-11-14 8:43 PM). Each move goes to the move log (tangentswarm.moves).
       park         (tangentswarm.slots) the Claude of each PR in Ready exits; its tmux
                    window, branch and worktree stay, and its session id is kept so that
@@ -534,9 +538,11 @@ class Cascade(Advance):
     # -- 2. fill ------------------------------------------------------------------
     def fill(self):
         """Staging stocking (Michal 2026-11-15). (A) gate the pulls in flight that staging
-        serves (no wait). (B) While Staging + pulls in flight < FLOOR (the target, default 2),
-        pull EVERY clean Ready PR (up to flow.STAGING_MAX in Staging) in ONE work push, so one
-        redeploy covers them. A fast-track PR is pulled also at the target. The promote ran
+        serves (no wait). (B) Pre-merge the top Ready PRs onto future main (Flow.premerge,
+        every pass; tangentswarm #65). (C) While Staging + pulls in flight < FLOOR (the WIP
+        target, default 2), pull Ready PRs in strict pick order, up to the target, in ONE
+        work push, so one redeploy covers them; the first one that is not merge-ready stops
+        the pull (no queue-jumping, never past the target, also for fast-track). The promote ran
         first in this pass, so a promote frees a slot and the next pull starts in the same
         pass; the pull's redeploy never holds the lock."""
         from . import flow
@@ -559,29 +565,29 @@ class Cascade(Advance):
             fl = f" + {len(flying)} in flight ({', '.join('#' + str(n) for n in sorted(flying))})" if flying else ''
             ready = [p for p in cols.get(board.READY, []) if not p.get('draft') and p['number'] not in flying]
             have = len(st) + len(flying)
-            # (d) Michal 2026-11-14 8:43 PM ET: a PR Michal marks urgent (the active fast-track)
-            # is pulled also when Staging is at the target; strict still needs a clean merge.
-            urgent = [p for p in ready if p.get('rank') == board.FAST_TRACK]
-            if have >= FLOOR and not urgent:
+            # tangentswarm #65 (Michal 2026-11-16 3:22 PM ET): every pass keeps the top Ready
+            # PRs pre-merged onto future main, so a freed Staging slot refills at once. Fixed
+            # WIP: never past the target, also for a fast-track PR (it goes first in the order).
+            try:
+                self.f.premerge(cols, scratch)
+            finally:
+                self.flush()
+            if have >= FLOOR:
                 self.out(f"fill: Staging {len(st)}{fl}, target {FLOOR}: no pull needed")
                 return cols
             if not ready:
                 self.out(f"fill: Staging {len(st)}{fl}, Ready 0: Ready is empty")
                 return cols
-            if have >= FLOOR:
-                pick, room = dict(cols, **{board.READY: urgent}), len(urgent)
-                self.out(f"fill: Staging {len(st)}{fl}, target {FLOOR}: fast-track "
-                         f"{', '.join('#' + str(p['number']) for p in urgent)} is pulled past the target")
-            else:
-                pick, room = dict(cols, **{board.READY: ready}), max(1, flow.STAGING_MAX - have)
+            pick, room = dict(cols, **{board.READY: ready}), FLOOR - have
             batch = self.f.pull_batch(prs, pick, scratch, room)
             self.flush()
             if not batch:
-                self.out(f"fill: Staging {len(st)}{fl}: no {'extra ' if have else ''}Ready PR to pull without rework")
+                self.out(f"fill: Staging {len(st)}{fl}: the next Ready PR is not merge-ready; nothing is pulled "
+                         "past it (strict order)")
                 return cols
             nums = [p['number'] for p in batch]
             getattr(self, 'pulled', []).extend(nums)
-            ft = ' (fast-track)' if any(p.get('rank') == board.FAST_TRACK for p in batch) else ''
+            ft = ' (fast-track)' if any(board.item_fast_track(p, board.active_fast_track()) for p in batch) else ''
             self.out(f"fill: {', '.join('#' + str(n) for n in nums)} pulled in one work merge{ft}: "
                      f"Staging {len(st)}{fl} + {len(batch)}, target {FLOOR}")
             if self.dry:  # nothing was pushed: show the rest of the chain, then count them in Staging
@@ -627,8 +633,10 @@ class Cascade(Advance):
 
     def unblock(self, cols, pulled):
         """(2) Human Review or Staging is empty and no Ready PR could be pulled: never end
-        quietly. The Ready PR with the fewest conflicts (against origin/main, work and each
-        Human Review and Staging head) gets a rework relay and a NEEDS_REWORK line."""
+        quietly. tangentswarm #65 (Michal 2026-11-16 3:22 PM ET): strict order, so the line
+        names the NEXT Ready PR in the pick order and its pre-merge state; its conflict is
+        resolved by its worker on a <branch>-vN (Flow.premerge), never on its own branch. A
+        conflict with origin/main itself was sent to rework by main_check."""
         from . import flow
         hr, st = cols.get(board.HUMAN_REVIEW, []), cols.get(board.STAGING, [])
         ready = [p for p in cols.get(board.READY, []) if not p.get('draft')]
@@ -637,26 +645,17 @@ class Cascade(Advance):
         if not ready:
             self.out(f"STALLED: Human Review {len(hr)}, Staging {len(st)}, Ready empty: new work must reach Ready")
             return
-        with self.g['ScratchRepo']() as scratch:
-            scratch.ensure_main()
-            main = self.f.sha_of(scratch, scratch.main)
-            bases = [('origin/main', main), (flow.WORK, self.f.fetch_work(scratch))]
-            bases += [(f"#{q['number']}", q['head']) for q in hr + st]
-            scratch.ensure(*[sha for _, sha in bases], *[p['head'] for p in ready])
-            found = []
-            for p in ready:
-                conf = [(name, self.f.files(scratch, sha, p['head'])) for name, sha in bases
-                        if not self.f.clean(scratch, sha, p['head'])]
-                found.append((len(conf), p, conf))
-        self.f.cmap.save()
-        order = {q['number']: i for i, q in enumerate(flow.ready_order(ready, {c[1]['number']: c[0] for c in found}))}
-        n_conf, p, conf = min(found, key=lambda t: (t[0], order[t[1]['number']]))
-        self.out(f"STALLED: Human Review {len(hr)}, Staging {len(st)}, no Ready PR can be pulled; "
-                 f"best candidate #{p['number']} ({n_conf} conflict(s))")
-        if conf:
-            self.rework(p, conf)
+        p = flow.ready_order(ready)[0]
+        rec = flow.load_premerge().get(str(p['number'])) or {}
+        if rec.get('head') != p.get('head'):
+            how = 'not pre-merged yet'
+        elif rec.get('status') == 'ready':
+            how = f"merge-ready on {rec.get('vbranch')}; its pull did not go through (see the notes above)"
         else:
-            self.out(f"NEEDS_REWORK #{p['number']} (no merge conflict: it fails the stack check; see the notes above)")
+            how = (f"pre-merging: its worker resolves the conflict on {rec.get('vbranch')}"
+                   + ('' if str(rec.get('relayed') or '').startswith(str(rec.get('vbranch'))) else ' (no worker has the relay yet)'))
+        self.out(f"STALLED: Human Review {len(hr)}, Staging {len(st)}, no Ready PR was pulled; "
+                 f"next in order #{p['number']}: {how}")
 
     def rework(self, p, conflicts):
         """Card to In Progress, NEEDS_REWORK line, and the relay: swarm-revive in a rework slot,

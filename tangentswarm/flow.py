@@ -2,8 +2,9 @@
 
 Columns (matched by option id, see tangentswarm.board):
   Ready         finished PRs (Claude done, Codex clean on head, exact-head MinBot pass).
-                They get no merge, no gate and no GitHub check. They wait in order:
-                fast-track (methodology#60), priority milestone, fewest conflicts, oldest.
+                They get no merge, no gate and no GitHub check. They wait in the shared pick
+                order (board.pick_key, tangentswarm #65): fast-track by the lowest number,
+                then the soonest milestone due date, then the lowest number.
   Staging       3 to 5 fully prepared PRs (internal key "Pending"): merged into work,
                 served on staging, CI green, body complete, every gate condition passes.
   Human Review  exactly 2.
@@ -33,6 +34,7 @@ Only the pulled PR is merged, deployed or gated. No -vN copies, no re-merge of t
 Exit 0 = step done, 75 = busy (another merge/gate step runs), 2 = error.
 """
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -49,11 +51,16 @@ BIN = Path(os.environ.get('SWARM_TICK_BIN', str(HOME / 'bin')))
 STATE = Path(os.environ.get('SWARM_FLOW_STATE', str(HOME / '.local' / 'state' / 'swarm-flow' / 'pull.json')))
 LOG = STATE.with_name('flow.log')
 REPO = 'tangentcode/platform'
-HR_TARGET = 2
-STAGING_MIN = int(os.environ.get('SWARM_STAGING_MIN', '3'))
+# tangentswarm #65: fixed WIP targets (configurable; the number is not settled). Never past them.
+HR_TARGET = int(os.environ.get('SWARM_HR_TARGET', '2'))
+STAGING_TARGET = int(os.environ.get('SWARM_STAGING_TARGET', '2'))
+STAGING_MIN = int(os.environ.get('SWARM_STAGING_MIN', str(STAGING_TARGET)))
 STAGING_MAX = int(os.environ.get('SWARM_STAGING_MAX', '5'))
 PULL_TIMEOUT = int(os.environ.get('SWARM_PULL_TIMEOUT', str(90 * 60)))
 WORK = 'work'
+# tangentswarm #65 (Michal 2026-11-16 3:22 PM ET): pre-merge the top Ready PRs onto future main
+PREMERGE_AHEAD = int(os.environ.get('SWARM_PREMERGE_AHEAD', '2'))
+PRE_MERGING, MERGE_READY = 'pre-merging', 'merge-ready'
 # hr-gate rows that mean "wait", not "fail", while a pull is running.
 WAIT_ROWS = ('5 ', '6 ', '7a', '7b')
 CI_WAIT_WORDS = ('IN_PROGRESS', 'QUEUED', 'PENDING', 'WAITING', 'REQUESTED', 'no Linux GitHub checks')
@@ -106,6 +113,58 @@ def drop_pull(n):
 
 
 HELD = STATE.with_name('held.json')
+PREMERGE_STATE = STATE.with_name('premerge.json')  # {PR: {head, base, vbranch, tip|seed, status, relayed}}
+
+
+def load_premerge():
+    try:
+        d = json.loads(PREMERGE_STATE.read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_premerge(d):
+    """Write the whole state (a tmp file of this process and thread, then a rename). Writers
+    that change records use premerge_update, which holds the lock."""
+    import threading
+    PREMERGE_STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PREMERGE_STATE.with_name(f'{PREMERGE_STATE.name}.{os.getpid()}.{threading.get_ident()}.tmp')
+    tmp.write_text(json.dumps(d, indent=1))
+    os.replace(tmp, PREMERGE_STATE)
+
+
+@contextlib.contextmanager
+def premerge_update():
+    """One locked read-modify-write of PREMERGE_STATE (Codex on PR #66: the webhook and the
+    cascade both write it). Yields the records; they are saved on a normal exit."""
+    import fcntl
+    PREMERGE_STATE.parent.mkdir(parents=True, exist_ok=True)
+    with open(PREMERGE_STATE.with_name(PREMERGE_STATE.name + '.lock'), 'a') as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        recs = load_premerge()
+        yield recs
+        save_premerge(recs)
+
+
+def set_premerge(n, rec, only_if=None):
+    """Put (or with rec None, drop) the record of PR n under the lock. only_if(old record)
+    must be true for the change (a check against a newer writer)."""
+    with premerge_update() as recs:
+        if only_if is not None and not only_if(recs.get(str(n)) or {}):
+            return False
+        if rec is None:
+            recs.pop(str(n), None)
+        else:
+            recs[str(n)] = rec
+        return True
+
+
+def label_write(n, op, names):
+    """minbot label add|remove N NAMES on the platform repo. Returns None, or the error."""
+    from .labels import MINBOT
+    r = proc.sh(MINBOT, '--apply', 'label', op, str(n), *names, '--repo', REPO, check=False, who='swarm-flow')
+    return None if r.returncode == 0 else ((r.stderr or r.stdout or '').strip()[:200] or f'rc={r.returncode}')
 RELAY_DIR = Path(os.environ.get('SWARM_RELAY_DIR', '/tmp'))  # relay-<N>-<kind>.md for swarm-resume
 
 
@@ -189,8 +248,34 @@ def ready_order(ready, conflicts=None, active=None):
     """Ready PRs in pull order: the shared pick order (board.pick_key: fast-track, the soonest
     milestone due date, the lowest number; tangentswarm #35, Michal 2026-11-15 6:09 PM ET: MVP
     PRs due Dec 1 went ahead of ptw 15 PRs due Nov 15). The pull still takes the first one in
-    this order that merges cleanly; conflicts no longer reorder them."""
+    this order that merges cleanly; conflicts no longer reorder them. active: the active
+    fast-track ticket (default: board.active_fast_track(); tangentswarm #65)."""
+    if active is None:
+        active = board.active_fast_track()
     return sorted(ready, key=lambda p: board.pick_key(p, active))
+
+
+def vn_text(n, branch, rec):
+    """The relay for a pre-merge conflict (tangentswarm #65): resolve it on the speculative
+    -vN branch only; the PR's own branch stays as it is (clean against main)."""
+    vn, files = rec['vbranch'], ', '.join(rec.get('files') or []) or 'files unknown'
+    if rec.get('bad_tip'):
+        return (f"Coordinator: #{n}: your {vn} tip {rec['bad_tip'][:8]} still has conflict markers (<<<<<<< or "
+                f">>>>>>>). Finish the merge on {vn} only: remove every marker, run the tests, commit, and git push "
+                f"origin {vn}. Never change {branch}. No rebase, no force-push. Report the new {vn} tip.")
+    return (f"Coordinator: #{n} is next in Ready, and its head {rec['head'][:8]} conflicts with future main "
+            f"(main + the Human Review and Staging PRs: {rec.get('base')}) in {files}. Resolve it on the NEW "
+            f"speculative branch {vn} ONLY. Never merge main, work or staging into {branch}, and do not change {branch}. "
+            f"Steps: commit or stash nothing new on {branch}; git fetch origin; git switch -c {vn} origin/{vn} "
+            f"(it holds future main); git merge {rec['head']} (your head); resolve the conflicts; run the tests; "
+            f"git push origin {vn}; then git switch {branch}. No rebase, no force-push. Report the {vn} tip and "
+            "the test counts.")
+
+
+def no_worker(said):
+    """True when give_worker failed because the PR has no worktree or window to resume."""
+    s = said or ''
+    return any(w in s for w in ('no surviving worktree', 'not in the registry', 'is gone'))
 
 
 def event_wants_step(name, payload):
@@ -248,6 +333,17 @@ def merge_commit(scratch, a, b, msg, why=None):
     return git(scratch, 'commit-tree', tree, '-p', a, '-p', b, '-m', msg).stdout.strip()
 
 
+def marker_problem(scratch, base, tip):
+    """Why tip must not reach work, or None: the diff base..tip adds a conflict marker (Codex
+    on PR #66: a worker can push a -vN with an unresolved merge; the same rule as
+    merge_problem_text)."""
+    r = git(scratch, 'diff', base, tip, check=False)
+    if r.returncode:
+        return f"cannot diff {str(base)[:8]}..{str(tip)[:8]}"
+    m = MARKER_RE.search(r.stdout or '')
+    return f"{str(tip)[:8]} adds a conflict marker ({m.group(1)})" if m else None
+
+
 def conflict_files(scratch, a, b):
     """The paths that conflict when b merges into a (git merge-tree --name-only; local)."""
     r = git(scratch, 'merge-tree', '--write-tree', '--name-only', '--no-messages', a, b, check=False)
@@ -277,6 +373,7 @@ class Flow:
     def __init__(self, dry_run=False, out=print, g=None, now=time.time):
         self.dry, self.out, self.now = dry_run, out, now
         self.did, self.notes = [], []
+        self._fm, self._premerged = {}, {}  # one future main and one pre-merge per PR per pass
         self.tool_timeout = 1800  # one hr-gate / pending-promote run; the cascade sets less
         from .conflictmap import ConflictMap
         self.cmap = ConflictMap()  # merge-tree answers per SHA pair
@@ -348,10 +445,11 @@ class Flow:
     def _pull(self, prs, cols, scratch, limit=None, strict=False):
         """Start one pull. Returns the pulled PR, or None. limit: pull only while Staging has
         fewer PRs than this (default STAGING_MIN).
-        strict (the swarm-advance cascade): no rework to fill Staging. A Ready PR is pulled
-        only if it merges cleanly with main, with work, and with each Human Review and Staging
-        head (one pair at a time), and stacks cleanly on all of them. Any other PR is skipped
-        with a note: it is not moved, and no relay is written."""
+        tangentswarm #65: only the NEXT Ready PR in the pick order is pulled, as its
+        pre-merged tip (premerge_one: <branch>-vN = future main + head); when it is not
+        merge-ready, nothing behind it is pulled. Not strict (swarm-flow step): a PR that
+        does not merge onto main first goes back to its worker with a merge-main relay.
+        strict (the swarm-advance cascade): no such relay (main_check does it)."""
         staging = cols.get(board.STAGING, [])
         if len(staging) >= (STAGING_MIN if limit is None else limit):
             return None
@@ -369,31 +467,21 @@ class Flow:
         for p in ready:
             conflicts[p['number']] = sum(not self.clean(scratch, sha, p['head'])
                                          for sha in [main] + [s for _, s in bases])
-        work = self.fetch_work(scratch) if strict else None
-        for p in ready_order(ready, conflicts):
+        fm = self.future_main(scratch, cols)
+        for p in ready_order(ready, conflicts, board.active_fast_track()):
             n = p['number']
-            if strict:
-                bad = [label for label, sha in [('main', main), (WORK, work)] + bases
-                       if not self.clean(scratch, sha, p['head'])]
-                if bad:
-                    self.note(f"#{n} skipped: does not merge cleanly with {', '.join(bad)} (no rework to fill Staging)")
-                    continue
-            elif not self.clean(scratch, main, p['head']):
+            if not strict and not self.clean(scratch, main, p['head']):
                 self.fail(p, 'does not merge cleanly onto main: merge origin/main into the branch (no rebase)',
                           relay='merge-main')
-                continue
-            # A fast-track PR takes the FIRST Staging slot (methodology#60): it stacks on main +
-            # Human Review only; the Staging PRs behind it are re-stacked at their own promotion.
-            # Strict: no re-stack, so it must stack on every Staging PR too.
-            mine = bases[:len(hr)] if p['rank'] == board.FAST_TRACK and not strict else bases
-            bad = self.cmap.stack(main, mine, p['head'], lambda: stack_conflict(scratch, main, mine, p['head']))
-            if bad:
-                self.note(f"#{n} skipped this step: conflicts with {bad} (Ready order kept)")
-                continue
-            return p if self.start_pull(p, scratch) else None
-        self.note('no Ready PR merges cleanly with main, work and every Human Review and Staging PR'
-                  if strict else
-                  'no Ready PR stacks cleanly on main + Human Review + Staging: one speculative rebase needed')
+                continue  # it left Ready (In Progress with its worker)
+            # tangentswarm #65: strict order; the next PR must be pre-merged onto future main
+            # (Codex on PR #66: also for swarm-flow step, so a queue conflict gets its -vN worker)
+            tip = self.premerge_one(p, scratch, fm)
+            if not tip:
+                self.note(f"#{n} is next in the pick order and is not merge-ready: nothing behind it is pulled")
+                return None
+            return p if self.start_pull(p, scratch, tip, pre_merged=True) else None
+        self.note('no Ready PR merges cleanly onto main: each one went back to its worker')
 
     def staging_order(self, staging):
         """Staging in the shared pick order (board.pick_key; tangentswarm #35)."""
@@ -404,11 +492,20 @@ class Flow:
         git(scratch, 'fetch', '--no-tags', '--quiet', self.g['origin_url'](), f'{WORK}:refs/heads/{WORK}')
         return git(scratch, 'rev-parse', f'refs/heads/{WORK}').stdout.strip()
 
-    def merge_into_work(self, scratch, n, tip, label):
+    def merge_into_work(self, scratch, n, tip, label, pre_merged=False):
         """Merge tip into origin work and push it (a fast-forward; never with --dry-run).
         Returns (work commit, None), (work commit, 'already in work') or (None, why). The merge is refused unless it is clean
-        (merge_problem_text): a conflict never reaches work."""
+        (merge_problem_text): a conflict never reaches work. pre_merged: tip is a pre-merged
+        -vN on the current future main, so work gets its tree (work_commit; tangentswarm #65)."""
         work = self.fetch_work(scratch)
+        if pre_merged:
+            merged = self.work_commit(scratch, work, tip, [tip], f"Staging: {WORK} = future main + #{n} ({label})\n\n"
+                                                                 f"swarm-flow, pre-merged tip {tip}.")
+            if merged is None:
+                return None, f"pre-merged tip {tip[:8]} has a conflict marker"
+            if not self.dry:
+                git(scratch, 'push', '--quiet', self.g['origin_url'](), f'{merged}:refs/heads/{WORK}')
+            return merged, None
         if git(scratch, 'merge-base', '--is-ancestor', tip, work, check=False).returncode == 0:
             return work, 'already in work'
         why = []
@@ -420,87 +517,348 @@ class Flow:
             git(scratch, 'push', '--quiet', self.g['origin_url'](), f'{merged}:refs/heads/{WORK}')
         return merged, None
 
-    def start_pull(self, p, scratch):
+    def start_pull(self, p, scratch, tip=None, pre_merged=False):
+        """tip: the pre-merged -vN tip to merge into work (default: the head)."""
         n, head = p['number'], p['head']
-        merged, why = self.merge_into_work(scratch, n, head, p['branch'])
+        tip = tip or head
+        merged, why = self.merge_into_work(scratch, n, tip, p['branch'], pre_merged=pre_merged)
         if merged is None:
             self.note(f"#{n} refused, work NOT pushed: {why}")
             return False
         self.last_work = merged  # the work commit (also for a dry run, where it is not pushed)
         if not self.dry:
-            save_pull(dict(pr=n, head=head, branch=p['branch'], item=p['item'], work=merged, started=self.now()))
-        self.change(f"#{n} pulled: merged head {head[:8]} into {WORK} ({merged[:8]}); staging redeploys")
+            save_pull(dict(pr=n, head=head, tip=tip, branch=p['branch'], item=p['item'], work=merged,
+                           started=self.now()))
+        what = f"head {head[:8]}" if tip == head else f"pre-merged tip {tip[:8]} (head {head[:8]})"
+        self.change(f"#{n} pulled: merged {what} into {WORK} ({merged[:8]}); staging redeploys")
         return True
 
     def pull_batch(self, prs, cols, scratch, room):
-        """Staging stocking (Michal 2026-11-15): pull EVERY clean Ready PR, up to room, in ONE
-        work push, so one staging redeploy (one PTW request) covers all of them. A PR enters
-        the batch only if it merges cleanly with main, work and each Human Review and Staging
-        head, stacks on them, and merges cleanly onto the batch so far (one merge commit per
-        PR on top of work). Nothing is reworked to fill Staging. Returns the pulled PRs."""
+        """Staging stocking: pull Ready PRs, up to room, in ONE work push, so one staging
+        redeploy covers all of them. tangentswarm #65 (Michal 2026-11-16 3:22 PM ET): strict
+        order, no queue-jumping. The PRs go in the shared pick order; each one must be
+        merge-ready (premerge_one: pre-merged onto future main as a <branch>-vN tip) and
+        merge cleanly with the batch so far. The first one that is not stops the batch:
+        nothing behind it is pulled. work gets the tree of future main + the batch
+        (work_commit). Returns the pulled PRs."""
         try:
             return self._pull_batch(prs, cols, scratch, room)
         finally:
             self.cmap.save()
 
     def _pull_batch(self, prs, cols, scratch, room):
-        staging, hr = cols.get(board.STAGING, []), cols.get(board.HUMAN_REVIEW, [])
-        hd = held()
-        ready = []
-        for p in cols.get(board.READY, []):
-            if p['draft']:
-                continue
-            if (hd.get(p['number']) or {}).get('head') == p['head']:
-                self.note(f"#{p['number']} held: its last pull failed with no worker "
-                          f"({hd[p['number']]['why'][:100]}); a new head releases it")
-                continue
-            ready.append(p)
+        ready = [p for p in cols.get(board.READY, []) if not p['draft']]
         if not ready or room < 1:
             return []
-        scratch.ensure_main()
-        main = self.sha_of(scratch, scratch.main)
-        bases = [(f"#{p['number']}", p['head']) for p in hr + self.staging_order(staging)]
-        scratch.ensure(*[sha for _, sha in bases], *[p['head'] for p in ready])
-        conflicts = {p['number']: sum(not self.clean(scratch, sha, p['head']) for sha in [main] + [s for _, s in bases])
-                     for p in ready}
+        hd = held()
+        fm = self.future_main(scratch, cols)
         work = self.fetch_work(scratch)
-        tip, batch = work, []
-        for p in ready_order(ready, conflicts):
+        target, batch, tips = None, [], {}  # target: future main + the batch so far
+        for p in ready_order(ready, None, board.active_fast_track()):
             if len(batch) >= room:
                 break
             n, head = p['number'], p['head']
-            bad = [label for label, sha in [('main', main), (WORK, work)] + bases if not self.clean(scratch, sha, head)]
-            if bad:
-                self.note(f"#{n} skipped: does not merge cleanly with {', '.join(bad)} (no rework to fill Staging)")
-                continue
-            bad = self.cmap.stack(main, bases, head, lambda: stack_conflict(scratch, main, bases, head))
-            if bad:
-                self.note(f"#{n} skipped this step: conflicts with {bad} (Ready order kept)")
-                continue
-            if git(scratch, 'merge-base', '--is-ancestor', head, tip, check=False).returncode != 0:
+            if (hd.get(n) or {}).get('head') == head:
+                self.note(f"#{n} is next in the pick order and held: its last pull failed with no worker "
+                          f"({hd[n]['why'][:100]}); a new head releases it; nothing behind it is pulled")
+                break
+            t = self.premerge_one(p, scratch, fm)
+            if not t:
+                self.note(f"#{n} is next in the pick order and is not merge-ready: nothing behind it is pulled")
+                break
+            if target is not None:  # each tip is future main + one PR: they must merge with each other
                 why = []
-                merged = merge_commit(scratch, tip, head, f"Merge #{n} ({p['branch']}) into {WORK} for Staging\n\n"
-                                                          f"swarm-flow batch, head {head}.", why=why)
+                merged = merge_commit(scratch, target, t, f"batch: + #{n}", why=why)
                 if merged is None:
-                    self.note(f"#{n} skipped: does not merge cleanly onto the batch "
-                              f"({', '.join('#' + str(q['number']) for q in batch)}): {why[0]}")
-                    continue
-                tip = merged
+                    self.note(f"#{n} is next in the pick order and its tip {t[:8]} does not merge cleanly with "
+                              f"{', '.join('#' + str(q['number']) for q in batch)} in this batch: {why[0]}; "
+                              "nothing behind it is pulled (the next pass pre-merges it onto them)")
+                    break
+                t_target = merged
+            else:
+                t_target = t
+            target = t_target
             batch.append(p)
+            tips[n] = t
         if not batch:
-            self.note('no Ready PR merges cleanly with main, work and every Human Review and Staging PR')
             return []
-        if tip != work and not self.dry:
+        # Codex on PR #66: work gets the tree of future main + the batch, never a merge with
+        # work's old content (a PR sent back must not stay in it, or stay recorded as merged)
+        tip = self.work_commit(scratch, work, target, [tips[p['number']] for p in batch],
+                               f"Staging: {WORK} = future main + {', '.join('#' + str(p['number']) for p in batch)}"
+                               f"\n\nswarm-flow batch, future main {fm[0]}.")
+        if tip is None:
+            return []
+        if not self.dry:
             git(scratch, 'push', '--quiet', self.g['origin_url'](), f'{tip}:refs/heads/{WORK}')
         self.last_work = tip
         if not self.dry:
             now = self.now()
-            save_pulls(load_pulls() + [dict(pr=p['number'], head=p['head'], branch=p['branch'], item=p['item'],
-                                            work=tip, started=now) for p in batch])
-        names = ', '.join(f"#{p['number']} {p['head'][:8]}" for p in batch)
-        self.change(f"{names} pulled: {len(batch)} head(s) merged into {WORK} ({tip[:8]}) in one push; "
-                    "staging redeploys once")
+            save_pulls(load_pulls() + [dict(pr=p['number'], head=p['head'], tip=tips[p['number']], branch=p['branch'],
+                                            item=p['item'], work=tip, started=now) for p in batch])
+        names = ', '.join(f"#{p['number']} {tips[p['number']][:8]}" for p in batch)
+        self.change(f"{names} pulled: {len(batch)} pre-merged tip(s) in {WORK} ({tip[:8]} = future main + the batch) "
+                    "in one push; staging redeploys once")
         return batch
+
+    # -- pre-merge onto future main (tangentswarm #65, Michal 2026-11-16 3:22 and 3:24 PM ET) --
+    def work_commit(self, scratch, work, tree_of, tips, msg):
+        """The new work commit for a pull of pre-merged tips (tangentswarm #65; Codex on PR
+        #66): its tree is `tree_of`'s tree (future main + the pulled PRs), never a merge with
+        work's old content, and its parents are work and the tips, so the push is a
+        fast-forward (no force) and a PR that was pulled, sent back and pulled again gets
+        all of its content back. Nothing outside future main stays in work."""
+        bad = marker_problem(scratch, work, tree_of)
+        if bad:  # never a conflict marker in work
+            self.note(f"{WORK} NOT pushed: {bad}")
+            return None
+        parents = [x for t in [work, *tips] for x in ('-p', t)]
+        return git(scratch, 'commit-tree', f'{tree_of}^{{tree}}', *parents, '-m', msg).stdout.strip()
+
+    def have(self, scratch, *shas, branch=None):
+        """True when every commit is in the scratch repo: fetched when missing (scratch.ensure,
+        then origin branch `branch`). A missing commit is never read as a conflict (Codex on PR #66)."""
+        def missing():
+            return [x for x in shas if not x or git(scratch, 'cat-file', '-e', f'{x}^{{commit}}', check=False).returncode]
+        if not missing():
+            return True
+        try:
+            scratch.ensure(*shas)
+        except RuntimeError:
+            pass
+        if missing() and branch:
+            self.fetch_branch(scratch, branch)
+        return not missing()
+
+    def future_main(self, scratch, cols):
+        """(key, commit or None, why): main plus every queued PR merged in, in queue order
+        (Human Review, then Staging, each in the pick order, then the pulls in flight). key
+        names main and the queued heads, so a pre-merge is redone only when future main
+        changes. A queued PR enters as its pre-merged tip (a resolved -vN) only while every
+        PR that tip was built on is still ahead of it in the queue or in main (queued_tip;
+        Codex on PR #66: a tip built on a PR that was sent back carried that PR along).
+        Else as its head; if the head does not merge, it is pre-merged again onto the queue
+        ahead of it (a new -vN; its worker resolves a real conflict)."""
+        scratch.ensure_main()
+        main = self.sha_of(scratch, scratch.main)
+        active = board.active_fast_track()
+        queue = [q for c in (board.HUMAN_REVIEW, board.STAGING)
+                 for q in sorted(cols.get(c, []), key=lambda q: board.pick_key(q, active))]
+        seen = {q['number'] for q in queue}  # then the pulls in flight: in work, on their way to Staging
+        queue += [dict(number=d['pr'], head=d['head'], branch=d.get('branch'), item=d.get('item'), col='pull')
+                  for d in load_pulls() if d['pr'] not in seen]
+        toks = [f"#{q['number']}@{q['head'][:12]}" for q in queue]
+        key = ' '.join([main[:12]] + toks)
+        if key in self._fm:
+            return self._fm[key]
+        lost = [q for q in queue if not self.have(scratch, q['head'])]
+        if lost:  # never cached: the next pass fetches again
+            return key, None, f"#{lost[0]['number']} head {lost[0]['head'][:8]} is not in the scratch repo"
+        recs = load_premerge()
+        cur, why = main, None
+        for i, q in enumerate(queue):
+            use = self.queued_tip(scratch, q, recs.get(str(q['number'])), toks[:i], main) or q['head']
+            if not self.ancestor(scratch, use, cur):
+                nxt = merge_commit(scratch, cur, use, f"future main: + #{q['number']}")
+                if nxt is None and q.get('branch'):  # pre-merge it again onto the queue ahead of it
+                    nxt = self.premerge_one(q, scratch, (' '.join([main[:12]] + toks[:i]), cur, None))
+                if nxt is None:
+                    cur, why = None, (f"#{q['number']} does not merge onto main + the queue ahead of it; "
+                                      "it is pre-merged again (see its -vN)")
+                    break
+                cur = nxt
+        self._fm[key] = (key, cur, why)
+        return self._fm[key]
+
+    def queued_tip(self, scratch, q, rec, ahead, main):
+        """The pre-merged tip of queued PR q if it is still valid: the same head, and every
+        PR in the future main it was built on (its record's base) is still in `ahead` (the
+        queue tokens before q) or merged into main. Else None."""
+        rec = rec or {}
+        if not (rec.get('status') == 'ready' and rec.get('head') == q['head'] and rec.get('tip')):
+            return None
+        deps = (rec.get('base') or '').split()[1:]
+        for d in deps:
+            if d in ahead:
+                continue
+            h = d.split('@', 1)[-1]
+            if not (h and self.ancestor(scratch, h, main)):
+                return None
+        if not self.have(scratch, rec['tip'], branch=rec.get('vbranch')):
+            return None
+        return None if marker_problem(scratch, main, rec['tip']) else rec['tip']
+
+    def premerge(self, cols, scratch):
+        """Every cascade pass: keep the top PREMERGE_AHEAD Ready PRs pre-merged onto future
+        main (premerge_one); every Staging and Human Review PR carries merge-ready; a PR sent
+        back (In Progress, Auto Review, Needs Input) loses both labels (its pre-merge is
+        void). Returns {PR: tip or None} for the pre-merged Ready PRs."""
+        self._premerged = {}  # a new pass: each PR is looked at again
+        for c in (board.STAGING, board.HUMAN_REVIEW):
+            for p in cols.get(c, []):
+                self.set_labels(p, MERGE_READY, drop=False)
+        for c in (board.IN_PROGRESS, board.AUTO_REVIEW, board.NEEDS_INPUT):
+            for p in cols.get(c, []):
+                self.set_labels(p, None)
+        flying = pulled_prs()
+        ready = [p for p in cols.get(board.READY, []) if not p.get('draft') and p['number'] not in flying]
+        top = ready_order(ready, None, board.active_fast_track())[:PREMERGE_AHEAD]
+        if not top:
+            return {}
+        fm = self.future_main(scratch, cols)
+        if fm[1] is None:
+            self.note(f"pre-merge: future main cannot be built ({fm[2]}); no Ready PR is pre-merged")
+        return {p['number']: self.premerge_one(p, scratch, fm) for p in top}
+
+    def premerge_one(self, p, scratch, fm):
+        """The merge-ready tip of Ready PR p, or None. A new <branch>-vN = future main + the
+        PR head, made mechanically when it merges cleanly (label merge-ready). On a real
+        conflict, <branch>-vN = future main is pushed and the PR's worker resolves the
+        merge there (label pre-merging); its pushed tip that holds both makes it
+        merge-ready. Nothing is ever merged into the PR's own branch. A new head or a new
+        future main rebuilds it as the next -vN. Kept per PR in PREMERGE_STATE."""
+        n, head, branch = p['number'], p['head'], p.get('branch') or f'pr-{p["number"]}'
+        key, base, why = fm
+        if n in self._premerged:
+            return self._premerged[n]
+        if not self.have(scratch, head):  # Codex on PR #66: a missing head is not a conflict
+            self.note(f"#{n}: head {head[:8]} is not in the scratch repo (fetch failed): not pre-merged this pass")
+            self._premerged[n] = None
+            return None
+        recs = load_premerge()
+        rec = recs.get(str(n))
+        if (rec and rec.get('status') == 'ready' and rec.get('tip')
+                and not self.have(scratch, rec['tip'], branch=rec.get('vbranch'))):
+            rec = None  # its tip is gone (a deleted -vN): build the next -vN
+        if rec and rec.get('head') == head and rec.get('base') == key and rec.get('vbranch'):
+            main = key.split()[0]
+            if rec.get('status') == 'ready' and not marker_problem(scratch, main, rec['tip']):
+                self.set_labels(p, MERGE_READY)
+                self._premerged[n] = rec['tip']
+                return rec['tip']
+            tip = self.fetch_branch(scratch, rec['vbranch'])
+            bad = marker_problem(scratch, main, tip) if tip and tip != rec.get('seed') else None
+            if bad:  # Codex on PR #66: an unresolved merge is never merge-ready
+                self.note(f"#{n}: {rec['vbranch']} {bad}: not merge-ready; its worker is told")
+                rec = dict(rec, status='conflict', bad_tip=tip)
+                if not self.dry:
+                    set_premerge(n, rec)
+            elif (tip and tip != rec.get('seed') and self.ancestor(scratch, head, tip)
+                    and self.ancestor(scratch, rec.get('seed') or '', tip)):
+                if not self.dry:
+                    rec.update(status='ready', tip=tip)
+                    set_premerge(n, rec)
+                self.set_labels(p, MERGE_READY)
+                self.change(f"#{n} merge-ready: its worker resolved the pre-merge on {rec['vbranch']} ({tip[:8]})")
+                self._premerged[n] = tip
+                return tip
+            self.set_labels(p, PRE_MERGING)
+            self.vn_worker(p, rec)
+            self._premerged[n] = None
+            return None
+        if base is None:
+            self.note(f"#{n}: not pre-merged: future main cannot be built ({why})")
+            self._premerged[n] = None
+            return None
+        vn = self.next_vn(scratch, branch, rec)
+        merged = merge_commit(scratch, base, head, f"Pre-merge #{n} ({branch}) onto future main\n\n"
+                                                   f"swarm-flow, future main {key}, head {head}.")
+        if merged is not None:
+            if not self.dry:
+                git(scratch, 'push', '--quiet', self.g['origin_url'](), f'{merged}:refs/heads/{vn}')
+                set_premerge(n, dict(head=head, base=key, vbranch=vn, tip=merged, status='ready'))
+            self.set_labels(p, MERGE_READY)
+            self.change(f"#{n} pre-merged onto future main ({key}): {vn} {merged[:8]} is merge-ready")
+            self._premerged[n] = merged
+            return merged
+        files = conflict_files(scratch, base, head)
+        rec = dict(head=head, base=key, vbranch=vn, seed=base, status='conflict', files=files, relayed='')
+        if not self.dry:
+            git(scratch, 'push', '--quiet', self.g['origin_url'](), f'{base}:refs/heads/{vn}')
+            set_premerge(n, rec)
+        self.set_labels(p, PRE_MERGING)
+        self.change(f"#{n} conflicts with future main ({key}) in {', '.join(files) or 'files unknown'}: "
+                    f"{vn} holds future main for its worker")
+        self.vn_worker(p, rec)
+        self._premerged[n] = None
+        return None
+
+    def next_vn(self, scratch, branch, rec=None):
+        """<branch>-v(N+1): N is the highest -vN on origin (or in the record)."""
+        r = git(scratch, 'ls-remote', '--heads', self.g['origin_url'](), f'refs/heads/{branch}-v*', check=False)
+        ns = [int(m.group(1)) for line in (r.stdout or '').splitlines()
+              for m in [re.search(re.escape(branch) + r'-v(\d+)$', line)] if m]
+        m = re.search(r'-v(\d+)$', (rec or {}).get('vbranch') or '')
+        ns += [int(m.group(1))] if m else []
+        return f"{branch}-v{max(ns, default=0) + 1}"
+
+    def fetch_branch(self, scratch, name):
+        """The tip of origin branch name, fetched into the scratch repo, or None."""
+        ref = f'refs/swarm-premerge/{name}'  # its own namespace: never a local branch
+        r = git(scratch, 'fetch', '--no-tags', '--quiet', self.g['origin_url'](), f'+refs/heads/{name}:{ref}',
+                check=False)
+        if r.returncode:
+            return None
+        return git(scratch, 'rev-parse', ref, check=False).stdout.strip() or None
+
+    @staticmethod
+    def ancestor(scratch, a, b):
+        return bool(a) and git(scratch, 'merge-base', '--is-ancestor', a, b, check=False).returncode == 0
+
+    def set_labels(self, p, want, drop=True):
+        """Make the PR carry `want` (MERGE_READY, PRE_MERGING or None) of the two pre-merge
+        labels; drop=True also removes the other one. Writes go through minbot; a failed
+        write is a note (the next pass tries again)."""
+        n = p['number']
+        have = set(p.get('own_labels') if p.get('own_labels') is not None else p.get('labels') or ())
+        add = [want] if want and want not in have else []
+        rm = [l for l in (MERGE_READY, PRE_MERGING) if l != want and l in have] if drop else []
+        for op, names in (('add', add), ('remove', rm)):
+            if not names:
+                continue
+            if self.dry:
+                self.change(f"#{n} would {op} label {', '.join(names)}")
+                continue
+            err = label_write(n, op, names)
+            if err:
+                self.note(f"#{n}: label {op} {', '.join(names)} failed: {err}")
+                continue
+            have = (have | set(names)) if op == 'add' else (have - set(names))
+            self.change(f"#{n} label {op} {', '.join(names)}")
+        p['own_labels'] = sorted(have)
+
+    def vn_worker(self, p, rec):
+        """Send the PR's worker the -vN conflict relay, once per record (head, future main,
+        -vN). give_worker with priority: no rework-slot wait (slots.conflict_capacity is the
+        only limit); a PR with no worktree gets a worker start (start_worker). The card stays
+        in Ready (label pre-merging): it keeps its place in the order. NEEDS_WORKER when no
+        worker takes it; the next pass tries again."""
+        n = p['number']
+        token = rec.get('vbranch') + (f"@{rec['bad_tip']}" if rec.get('bad_tip') else '')
+        if rec.get('relayed') == token:
+            return True
+        text = vn_text(n, p.get('branch') or '', rec)
+        if self.dry:
+            self.change(f"#{n} would give its worker the pre-merge conflict on {rec['vbranch']}")
+            return False
+        relay_path = RELAY_DIR / f"relay-{n}-premerge.md"
+        try:
+            relay_path.write_text(text + '\n')
+        except OSError:
+            pass
+        rc, said = self.give_worker(n, text, priority=True)
+        if rc != 0 and no_worker(said):
+            said = self.start_worker(p, relay_path, said)
+        if rc != 0:
+            self.note(f"NEEDS_WORKER #{n}: its pre-merge on {rec['vbranch']} conflicts; no worker took the relay "
+                      f"({said}); the next pass tries again")
+            return False
+        with premerge_update() as recs:  # only the record of this -vN (a newer one may exist)
+            if (recs.get(str(n)) or {}).get('vbranch') == rec['vbranch']:
+                recs[str(n)]['relayed'] = token
+        rec['relayed'] = token
+        self.change(f"#{n}: worker assigned to resolve {rec['vbranch']} ({said})")
+        return True
 
     def merge_work(self, n, tip, label):
         """swarm-flow merge-work: the one safe staging merge for a hand step (a -vN tip)."""
@@ -584,6 +942,21 @@ class Flow:
         else:
             self.note(f"SCREENSHOTS_NEEDED #{n}: no worker could take the screenshot job ({said})")
 
+    def start_worker(self, p, relay_path, why):
+        """The PR has no worktree or window to resume: queue a worker start through the
+        launcher (the spool op 'start': swarm-start-scoped makes the worktree and window, and
+        the new Claude is told to read the relay file). Within the same limits. Returns a note."""
+        from . import slots, spool
+        n = p['number']
+        ok, held = slots.conflict_capacity()
+        if not ok:
+            return f"no worker to resume ({why}) and no start: {held}"
+        if any(int(r.get('pr') or 0) == n for r in spool.in_flight(('start',))) or str(n) in slots.load()['unstarted']:
+            return f"no worker to resume ({why}); its worker start is already queued"
+        slots.unstarted_add(n, branch=p.get('branch') or '', brief=str(relay_path), setup='done', issue=None)
+        spool.submit('start', '', pr=n)
+        return f"no worker to resume ({why}); queued a worker start with the relay {relay_path.name}"
+
     def hand_off(self, n, text):
         """(ok, note): give_worker as a success boolean, for callers that take (ok, note)
         (Codex on PR #26: mainmerge read give_worker's rc 0 as a failure)."""
@@ -620,12 +993,13 @@ class Flow:
             moves.log_move(n, board.READY, 'In Progress', p.get('head', ''), note=('held: ' + h.get('why', ''))[:120])
             self.change(f"#{n} -> In Progress: the held handoff reached its worker ({said})")
 
-    def give_worker(self, n, text):
-        """(rc, last line) of slots.revive: 0 = its Claude runs and got the text."""
+    def give_worker(self, n, text, priority=False):
+        """(rc, last line) of slots.revive: 0 = its Claude runs and got the text. priority: a
+        conflict fix for fill (tangentswarm #65): no rework-slot wait, only the hard limits."""
         from . import slots
         lines = []
         try:
-            rc = slots.revive(n, text, out=lines.append)
+            rc = slots.revive(n, text, out=lines.append, **({'priority': True} if priority else {}))
         except Exception as e:
             return 1, f"{type(e).__name__}: {str(e)[:160]}"
         return rc, (lines[-1] if lines else f'rc={rc}')

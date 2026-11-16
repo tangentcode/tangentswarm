@@ -957,11 +957,22 @@ swarm-flow status             # Human Review, Staging, Ready, and the running pu
 One step:
 
 1. **Promote.** Human Review has fewer than 2: `pending-promote --apply` (never `--fill`).
-2. **Pull.** Staging has fewer than 3 and no pull runs: take the top Ready PR (priority
-   milestone, fewest conflicts, oldest) that stacks cleanly on main + Human Review +
-   Staging (local merge-tree only). A PR that does not merge onto main goes back to In
-   Progress with a merge-main relay. Merge the head into `work` as one merge commit and
-   push it; the push redeploys staging.
+2. **Pull.** Staging is below its target (`SWARM_STAGING_TARGET`, default 2) and no pull
+   runs: take the NEXT Ready PR in the shared pick order (`board.pick_key`: fast-track by
+   the lowest number, then the soonest milestone due date, then the lowest number). If it
+   does not stack cleanly on main + Human Review + Staging (local merge-tree only),
+   nothing behind it is pulled (tangentswarm #65: no queue-jumping). A PR that does not
+   merge onto main goes back to In Progress with a merge-main relay. Merge the head into
+   `work` as one merge commit and push it; the push redeploys staging.
+
+The cascade (`swarm-advance --cascade`) pre-merges the top Ready PRs every pass
+(tangentswarm #65). Future main is main plus every queued PR (Human Review, then Staging,
+then pulls in flight). A new `<branch>-vN` = future main + the PR head is pushed. A clean
+one gets the label `merge-ready`. A real conflict gets `pre-merging`, and the PR's worker
+resolves it on that `-vN` only; nothing is ever merged into the PR's own branch. A new head
+or a new future main builds the next `-vN`. The pull takes the `-vN` tips in strict order
+and stops at the first PR that is not merge-ready. Staging and Human Review PRs carry
+`merge-ready`; a merge to main removes both labels.
 3. **Advance the pull.** Evaluate hr-gate on the pulled head. All pass: `hr-gate --apply`
    puts it into Staging. CI running or screenshots missing: wait (90 minutes at most). A
    hard failure or a moved head: back to In Progress with the reason.
@@ -971,7 +982,8 @@ GitHub hook runs `swarm-flow event` on `projects_v2_item` and merge events.
 
 ### Fast-track (methodology#60)
 
-First keep the flow full (Human Review 2, Staging 3-5, more Ready). Within that, a PR
+First keep the flow full (Human Review 2, Staging 2, more Ready; fixed WIP targets,
+never pulled past). Within that, a PR
 labeled `fast-track` or `high priority` (on the PR or on an issue it closes) jumps the
 queue at every step: pane order in swarm-tick, the Ready head, the
 FIRST Staging slot (it stacks on main + Human Review only; the Staging PRs behind it are
