@@ -472,7 +472,7 @@ class Executor:
 
     def do_codex(self, a):
         from . import advance
-        full = advance.codex_details(self.g['gql'], a.pr)
+        full = advance.codex_details(self.g['gql'], a.pr, self.repo)  # Codex on PR #47: this repo's PR
         if a.args.get('commit') and a.args['commit'] != full.get('headRefOid'):
             return self.note(f"#{a.pr}: Codex reviewed an older head: skip")
         status, detail = advance.codex_decision(full)  # exact head, like the MinBot pass
@@ -640,8 +640,9 @@ class Executor:
             self.move(a.pr, item, board.CANCELED)
         if not self.dry:  # a canceled launch must not be started again (start retry, held queue)
             from . import launches, slots
-            slots.unstarted_done(a.pr)
-            launches.drop_pr(a.pr)
+            if self.platform():  # Codex on PR #47: launch records are platform PR numbers
+                slots.unstarted_done(a.pr)
+                launches.drop_pr(a.pr)
 
     def do_card(self, a):
         """A new PR (draft -> In Progress, ready -> Auto Review) or issue (Triage) gets its card.
