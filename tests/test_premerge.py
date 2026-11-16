@@ -1,0 +1,296 @@
+"""tangentswarm #65 (Michal 2026-11-16 3:17, 3:22 and 3:24 PM ET): one shared pick order, strict
+order with no queue-jumping, fixed WIP targets, pre-merge onto future main as <branch>-vN, the
+pre-merging and merge-ready labels, and a worker only for a real conflict."""
+import subprocess
+
+import pytest
+
+from tangentswarm import board, flow, slots
+
+RD, ST, HR, IP = board.READY, board.STAGING, board.HUMAN_REVIEW, board.IN_PROGRESS
+
+
+# --- (a) the shared pick order --------------------------------------------------
+
+def test_fast_track_labels_sort_first_by_number_then_due_date_then_number():
+    """Two fast-track PRs, neither active (one by its own label, one by an issue it closes),
+    sort before the soonest-milestone PR, lowest number first."""
+    items = [dict(number=30, due='2026-11-20', milestone='soon'),
+             dict(number=41, labels=['Fast-Track']),
+             dict(number=35, closes=[dict(number=7, labels=['fast-track'])]),
+             dict(number=20, milestone='undated'),
+             dict(number=10),
+             dict(number=25, due='2026-12-01', milestone='later'),
+             dict(number=26, due='2026-11-20', milestone='soon')]
+    assert [p['number'] for p in sorted(items, key=board.pick_key)] == [35, 41, 26, 30, 25, 20, 10]
+    assert [p['number'] for p in flow.ready_order(items, None, None)] == [35, 41, 26, 30, 25, 20, 10]
+
+
+def test_the_active_ticket_and_the_label_regex_count_as_fast_track():
+    assert board.item_fast_track(dict(number=9, closes=[488]), active=488)
+    assert board.item_fast_track(dict(number=9, labels=['high priority']))
+    assert not board.item_fast_track(dict(number=9, labels=['fast-tracked-later']))
+
+
+# --- a real repo: main, a Human Review head, and Ready heads ----------------------
+
+class Scratch:
+    def __init__(self, path):
+        self.dir, self.main = str(path), None
+
+    def ensure_main(self):
+        return self.main
+
+    def ensure(self, *a):
+        pass
+
+
+def run(cwd, *a):
+    return subprocess.run(['git', *a], cwd=cwd, capture_output=True, text=True, check=True).stdout.strip()
+
+
+@pytest.fixture
+def world(tmp_path):
+    w = tmp_path / 'w'
+    w.mkdir()
+    run(w, 'init', '-q', '-b', 'main')
+    run(w, 'config', 'user.email', 't@example.com')
+    run(w, 'config', 'user.name', 't')
+    (w / 'a.txt').write_text('1\n')
+    run(w, 'add', '.')
+    run(w, 'commit', '-qm', 'base')
+    main = run(w, 'rev-parse', 'HEAD')
+
+    def branch(name, path, text, base=main):
+        run(w, 'checkout', '-q', '-b', name, base)
+        (w / path).write_text(text)
+        run(w, 'add', '.')
+        run(w, 'commit', '-qm', name)
+        return run(w, 'rev-parse', 'HEAD')
+    h = dict(main=main, hr1=branch('hr1', 'b.txt', 'hr1\n'), c=branch('c', 'b.txt', 'C\n'),
+             z=branch('z', 'z.txt', 'z\n'), st2=branch('st2', 's.txt', 's\n'))
+    origin = tmp_path / 'origin.git'
+    run(tmp_path, 'init', '-q', '--bare', str(origin))
+    run(w, 'push', '-q', str(origin), f"{h['hr1']}:refs/heads/work", f"{main}:refs/heads/main")
+    s = Scratch(w / '.git')
+    s.main = main
+    return w, s, h, origin
+
+
+def card(n, col, head, labels=()):
+    return dict(number=n, state='OPEN', draft=False, branch=f'b{n}', head=head, title='t', col=col, item=f'I{n}',
+                rank=1, parked=False, body='', labels=list(labels), own_labels=list(labels))
+
+
+def make(world, dry=False, rcs=None):
+    w, s, h, origin = world
+    g = {'origin_url': lambda: str(origin), 'merge_tree_clean': lambda d, a, b: True}
+    f = flow.Flow(dry_run=dry, out=lambda line: None, g=g, now=lambda: 10_000)
+    sent = []
+
+    def give(n, text, priority=False):
+        sent.append((n, text, priority))
+        return (rcs.pop(0) if rcs else 0), 'sent to its Claude'
+    f.give_worker = give
+    return f, sent
+
+
+def remote(s, origin, ref):
+    out = run(s.dir, 'ls-remote', str(origin), f'refs/heads/{ref}')
+    return out.split()[0] if out else None
+
+
+def resolve_on(w, origin, vn, head):
+    """The worker: check out the -vN (future main), merge the PR head, resolve, push the -vN."""
+    run(w, 'fetch', '-q', str(origin), f'+refs/heads/{vn}:refs/heads/{vn}')
+    run(w, 'checkout', '-q', vn)
+    subprocess.run(['git', 'merge', '-q', '--no-edit', head], cwd=w, capture_output=True)
+    (w / 'b.txt').write_text('hr1\nC\n')
+    run(w, 'add', '.')
+    run(w, 'commit', '-qm', 'resolve')
+    run(w, 'push', '-q', str(origin), f'{vn}:refs/heads/{vn}')
+    return run(w, 'rev-parse', 'HEAD')
+
+
+def test_a_conflicting_next_pr_blocks_the_pull_until_its_worker_resolves_the_vn(world):
+    """Strict order: #7 conflicts with future main (main + #1 in Human Review), so #9 behind it
+    is not pulled. #7's worker gets ONE relay to resolve it on b7-v1 (= future main), never on
+    b7. Once the worker pushes b7-v1 with the head merged in, #7 is merge-ready and both go."""
+    w, s, h, origin = world
+    f, sent = make(world)
+    p7, p9 = card(7, RD, h['c']), card(9, RD, h['z'])
+    cols = {HR: [card(1, HR, h['hr1'], ['merge-ready'])], RD: [p7, p9]}
+    assert f.pull_batch({}, cols, s, room=2) == []
+    assert any(n == '#7 is next in the pick order and is not merge-ready: nothing behind it is pulled' for n in f.notes)
+    fm = remote(s, origin, 'b7-v1')
+    assert fm and remote(s, origin, 'b7') is None  # the PR's own branch is never touched
+    assert subprocess.run(['git', '--git-dir', s.dir, 'merge-base', '--is-ancestor', h['hr1'], fm]).returncode == 0
+    assert len(sent) == 1 and sent[0][0] == 7 and sent[0][2] is True
+    assert 'b7-v1 ONLY' in sent[0][1] and 'Never merge main, work or staging into b7' in sent[0][1]
+    assert (7, 'add', ['pre-merging']) in flow.LABELS_WRITTEN
+    assert p7['own_labels'] == ['pre-merging']
+    # the next cascade at the same head and future main: no second relay
+    f.premerge(cols, s)
+    assert len(sent) == 1
+    # the worker resolves it on b7-v1
+    tip = resolve_on(w, origin, 'b7-v1', h['c'])
+    f.premerge(cols, s)
+    assert (7, 'add', ['merge-ready']) in flow.LABELS_WRITTEN and (7, 'remove', ['pre-merging']) in flow.LABELS_WRITTEN
+    batch = f.pull_batch({}, cols, s, room=2)
+    assert [p['number'] for p in batch] == [7, 9]
+    assert flow.load_pulls()[0]['tip'] == tip
+    assert remote(s, origin, 'b9-v1')  # #9 was pre-merged mechanically, no worker
+    assert len(sent) == 1
+
+
+def test_a_clean_pr_is_pre_merged_mechanically_and_rebuilt_as_v2_when_future_main_changes(world):
+    w, s, h, origin = world
+    f, sent = make(world)
+    p9 = card(9, RD, h['z'], ['pre-merging'])
+    cols = {HR: [card(1, HR, h['hr1'])], RD: [p9]}
+    tips = f.premerge(cols, s)
+    v1 = remote(s, origin, 'b9-v1')
+    assert tips == {9: v1} and sent == []
+    assert (9, 'add', ['merge-ready']) in flow.LABELS_WRITTEN and (9, 'remove', ['pre-merging']) in flow.LABELS_WRITTEN
+    assert (1, 'add', ['merge-ready']) in flow.LABELS_WRITTEN  # Human Review must carry merge-ready
+    f.premerge(cols, s)
+    assert remote(s, origin, 'b9-v2') is None  # same future main: no rebuild
+    cols[ST] = [card(2, ST, h['st2'], ['merge-ready'])]  # the queue changed: future main changed
+    f2, _ = make(world)
+    tips = f2.premerge(cols, s)
+    v2 = remote(s, origin, 'b9-v2')
+    assert v2 and tips == {9: v2}
+    for c in (h['hr1'], h['st2'], h['z']):
+        assert subprocess.run(['git', '--git-dir', s.dir, 'merge-base', '--is-ancestor', c, v2]).returncode == 0
+
+
+def test_only_the_top_ready_prs_are_pre_merged(world, monkeypatch):
+    w, s, h, origin = world
+    monkeypatch.setattr(flow, 'PREMERGE_AHEAD', 1)
+    f, _ = make(world)
+    cols = {RD: [card(9, RD, h['z']), card(8, RD, h['st2'])]}
+    assert list(f.premerge(cols, s)) == [8]
+    assert remote(s, origin, 'b9-v1') is None
+
+
+def test_a_pr_sent_back_loses_the_pre_merge_labels(world):
+    w, s, h, origin = world
+    f, _ = make(world)
+    f.premerge({IP: [card(5, IP, h['z'], ['merge-ready', 'pre-merging'])]}, s)
+    assert (5, 'remove', ['merge-ready', 'pre-merging']) in flow.LABELS_WRITTEN
+
+
+def test_no_worker_gives_needs_worker_and_the_next_pass_tries_again(world):
+    w, s, h, origin = world
+    f, sent = make(world, rcs=[3, 0])
+    cols = {HR: [card(1, HR, h['hr1'])], RD: [card(7, RD, h['c'])]}
+    f.premerge(cols, s)
+    assert len(sent) == 1
+    assert any(n.startswith('NEEDS_WORKER #7: its pre-merge on b7-v1 conflicts; no worker took the relay')
+               for n in f.notes)
+    assert flow.load_premerge()['7']['relayed'] == ''
+    f.premerge(cols, s)
+    assert len(sent) == 2 and flow.load_premerge()['7']['relayed'] == 'b7-v1'
+    assert remote(s, origin, 'b7-v2') is None  # the same -vN: nothing changed
+
+
+def test_a_dry_run_pushes_nothing_and_writes_no_label(world):
+    w, s, h, origin = world
+    f, sent = make(world, dry=True)
+    cols = {HR: [card(1, HR, h['hr1'])], RD: [card(7, RD, h['c']), card(9, RD, h['z'])]}
+    f.premerge(cols, s)
+    assert remote(s, origin, 'b7-v1') is None and remote(s, origin, 'b9-v1') is None
+    assert flow.LABELS_WRITTEN == [] and sent == [] and flow.load_premerge() == {}
+    assert any('would add label pre-merging' in d for d in f.did)
+
+
+# --- the hard limits: 9 live Claudes and MemAvailable -----------------------------
+
+def test_conflict_capacity_is_nine_claudes_and_1_5_gb():
+    assert slots.conflict_capacity(load=8, avail=2 * 1024 ** 3) == (True, '')
+    ok, why = slots.conflict_capacity(load=9, avail=8 * 1024 ** 3)
+    assert not ok and 'cap 9' in why
+    ok, why = slots.conflict_capacity(load=1, avail=1024 ** 3)
+    assert not ok and 'MemAvailable 1024 MB' in why
+    assert slots.mem_available(lambda: 'MemTotal: 10 kB\nMemAvailable:    2048 kB\n') == 2048 * 1024
+
+
+def test_a_priority_revive_waits_for_no_rework_slot_but_holds_at_the_limit(tmp_path, monkeypatch):
+    """A conflict fix for the next PR does not wait for a rework slot; the Claude cap or the
+    RAM limit gives NEEDS_WORKER (rc 3) and no launch."""
+    import contextlib
+
+    class Refused(Exception):
+        pass
+
+    class SP:
+        RESUME_PARK_NEED_MB = RESUME_MIN_MB = 1
+        MB = 1
+        SLICE = 's'
+
+        def resolve(self, host, key):
+            return 'mn-7-b7', str(tmp_path), 'b7', None
+
+        @contextlib.contextmanager
+        def flocked(self, path, blocking=True):
+            yield True
+
+        def resume_lock(self, w):
+            return w
+
+        def live_pane(self, host, w):
+            return None
+
+        def scoped_command(self, w, resume=False):
+            return ['claude'], 'unit'
+
+        def launch_line(self, argv):
+            return ' '.join(argv)
+
+        def shell_for(self, host, w, wt, existing):
+            pytest.fail('no launch over the limit')
+    SP.Refused = Refused
+    monkeypatch.setattr(slots, '_git', lambda wt, *a: 'b7')
+    monkeypatch.setattr(slots, 'latest_session', lambda wt: 'S')
+    path = tmp_path / 'slots.json'
+    with slots.update(path) as d:  # every rework slot is in use
+        for k in ('1', '2', '3'):
+            d['rework'][k] = dict(worktree=f'/w{k}')
+    claudes = [dict(cwd=f'/w{k}', pid=k) for k in (1, 2, 3)]
+    lines = []
+    rc = slots._revive(7, 'fix it', out=lines.append, sp=SP(), host=object(), claudes=claudes, path=path,
+                       refuse=lambda wt: None, priority=True, capacity=lambda: (False, '9 Claudes run (cap 9)'))
+    assert rc == 3 and lines[-1] == 'held: 9 Claudes run (cap 9); #7 resumes on the next pass'
+    lines.clear()
+    rc = slots._revive(7, 'fix it', out=lines.append, sp=SP(), host=object(), claudes=claudes, path=path,
+                       refuse=lambda wt: None)
+    assert rc == 3 and 'rework slots are in use' in lines[-1]  # without priority it waits for a slot
+
+
+def test_a_merge_to_main_removes_the_pre_merge_labels_and_record():
+    from tangentswarm import webhook as W
+    flow.save_premerge({'7': {'head': 'h'}, '9': {'head': 'g'}})
+    ex = W.Executor.__new__(W.Executor)
+    notes = []
+    ex.note = notes.append
+    ex.drop_premerge_labels(7)
+    assert (7, 'remove', ['merge-ready']) in flow.LABELS_WRITTEN
+    assert (7, 'remove', ['pre-merging']) in flow.LABELS_WRITTEN
+    assert list(flow.load_premerge()) == ['9'] and notes == []
+
+
+def test_future_main_takes_a_queued_pr_as_its_resolved_vn_tip(world):
+    """#7 was resolved on b7-v1 and pulled into Staging: future main for the next Ready PR
+    is built from that tip, not from #7's raw head (which conflicts with #1)."""
+    w, s, h, origin = world
+    f, _ = make(world)
+    cols = {HR: [card(1, HR, h['hr1'])], RD: [card(7, RD, h['c'])]}
+    f.premerge(cols, s)
+    tip = resolve_on(w, origin, 'b7-v1', h['c'])
+    f.premerge(cols, s)
+    assert flow.load_premerge()['7']['tip'] == tip
+    cols = {HR: [card(1, HR, h['hr1'])], ST: [card(7, ST, h['c'])], RD: [card(9, RD, h['z'])]}
+    f2, _ = make(world)
+    key, fm, why = f2.future_main(s, cols)
+    assert why is None and f'#7@{tip[:12]}' in key
+    assert f2.premerge(cols, s)[9] == remote(s, origin, 'b9-v1')

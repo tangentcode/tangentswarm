@@ -161,17 +161,29 @@ def pick_key(item, active=None):
     picker (launch, fill Ready -> Staging, promote Staging -> Human Review, the MinBot check,
     swarm-tick) sorts by this key. A pure function of {number, ft, labels, closes, due,
     milestone}:
-      (1) fast-track first: item['ft'], the label "fast-track" (an issue), or the ONE active
-          fast-track ticket (`active`: this item or an issue it closes);
+      (1) fast-track first, by the lowest number (tangentswarm #65, Michal 2026-11-16 3:17 PM
+          ET): item_fast_track (a fast-track label on it or an issue it closes, or the
+          active fast-track ticket);
       (2) then the milestone due date (YYYY-MM-DD), soonest first; a milestone without a due
           date after every dated one; no milestone last;
       (3) then the lowest number."""
-    labels = {str(l).lower() for l in item.get('labels') or ()}
-    ft = (item.get('ft') or 'fast-track' in labels or item.get('rank') == FAST_TRACK
-          or is_active_fast_track(item['number'], item.get('closes') or (), active))
+    ft = item_fast_track(item, active)
     due = (item.get('due') or '')[:10]
     ms = 0 if due else 1 if item.get('milestone') else 2
     return (0 if ft else 1, ms, due, item['number'])
+
+
+def item_fast_track(item, active=None):
+    """The ONE fast-track test of every picker (tangentswarm #65): item['ft'] (a builder set
+    it from the PR's labels and its closing issues' labels), rank FAST_TRACK, a label that
+    FAST_TRACK_RE matches on the item (item['labels']) or on an issue it closes (closes as
+    {number, labels} dicts), or the active fast-track ticket (this item or an issue it closes)."""
+    closes = item.get('closes') or ()
+    nums = [c.get('number') if isinstance(c, dict) else c for c in closes]
+    names = list(item.get('labels') or ())
+    names += [l for c in closes if isinstance(c, dict) for l in c.get('labels') or ()]
+    return bool(item.get('ft') or item.get('rank') == FAST_TRACK or is_fast_track(str(l) for l in names)
+                or is_active_fast_track(item.get('number'), nums, active))
 
 
 def soonest_due(milestones):

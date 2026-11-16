@@ -666,12 +666,29 @@ class Executor:
                     self._sh([str(x) for x in argv])
                 except Exception as e:
                     self.note(f"{argv[1]}: {str(e)[:120]}")
+        if not self.dry and self.platform():  # tangentswarm #65: the pre-merge labels end at the merge
+            try:
+                self.drop_premerge_labels(a.pr)
+            except Exception as e:
+                self.note(f"#{a.pr}: pre-merge label removal failed: {type(e).__name__}: {str(e)[:160]}")
         if not self.dry and a.args.get('branch'):
             try:
                 self.delete_vn(a.pr, a.args['branch'])
             except Exception as e:  # the rest of the merge handling is done; report this part
                 self.note(f"#{a.pr}: -vN cleanup failed: {type(e).__name__}: {str(e)[:160]}")
         self.note(f"#{a.pr} merged: cascade, Done, linked issues closed")
+
+    def drop_premerge_labels(self, n):
+        """Remove merge-ready and pre-merging from a PR merged to main (tangentswarm #65), and
+        its pre-merge record. A label the PR does not carry is not an error."""
+        from . import flow
+        for name in (flow.MERGE_READY, flow.PRE_MERGING):
+            err = flow.label_write(n, 'remove', [name])
+            if err and 'not found' not in err.lower() and '404' not in err:
+                self.note(f"#{n}: label remove {name}: {err}")
+        recs = flow.load_premerge()
+        if recs.pop(str(n), None) is not None:
+            flow.save_premerge(recs)
 
     def delete_vn(self, n, branch):
         """tangentswarm #39 (Michal 2026-11-15 6:27 PM ET): on a platform merge, delete the

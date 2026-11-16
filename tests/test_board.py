@@ -38,7 +38,9 @@ def test_priority_rank_order():
     assert board.priority_rank(True, False) < board.priority_rank(False, True) < board.priority_rank(False, False)
 
 
-def test_board_prs_fast_track_only_for_the_active_ticket(tmp_path):
+def test_board_prs_fast_track_from_a_closing_issue_label_or_the_active_ticket(tmp_path):
+    """tangentswarm #65: a fast-track label on the PR or an issue it closes makes it
+    fast-track in the pick order, not only the ONE active ticket."""
     item = {'id': 'I', 'fieldValueByName': {'name': 'Ready', 'optionId': board.OPTION[board.READY]},
             'content': {'__typename': 'PullRequest', 'number': 9, 'state': 'OPEN', 'isDraft': False,
                         'headRefName': 'b', 'headRefOid': 'h', 'title': 't', 'body': '',
@@ -49,7 +51,11 @@ def test_board_prs_fast_track_only_for_the_active_ticket(tmp_path):
     page = {'organization': {'projectV2': {'items': {'nodes': [item],
                                                      'pageInfo': {'hasNextPage': False, 'endCursor': None}}}}}
     g = {'gql': lambda q, c=None: page, 'PARKED': set()}
-    assert tick.board_prs(g)[9]['rank'] == board.NORMAL  # labeled, but not the active one
+    p = tick.board_prs(g)[9]
+    assert p['rank'] == board.FAST_TRACK and p['ft']  # labeled through #488, not the active one
+    assert 'fast-track' in p['labels']
+    item['content']['closingIssuesReferences']['nodes'][0]['labels']['nodes'] = [{'name': 'bug'}]
+    assert tick.board_prs(g)[9]['rank'] == board.NORMAL
     board.FT_STATE.write_text('{"active": 488}')
     assert tick.board_prs(g)[9]['rank'] == board.FAST_TRACK
 

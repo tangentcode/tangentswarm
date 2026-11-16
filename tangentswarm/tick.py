@@ -465,14 +465,14 @@ def board_prs_open(g, max_age=None):
         miles = [(c.get('milestone') or {}).get('title')] + [(i.get('milestone') or {}).get('title') for i in cl]
         labels = {l['name'] for l in ((c.get('labels') or {}).get('nodes') or [])}
         nums = [i.get('number') for i in cl]
+        names = boardcache.pr_labels(c)  # tangentswarm #65: its own and its closing issues' labels
+        ft = board.is_fast_track(names) or board.is_active_fast_track(c['number'], nums, active)
         out[c['number']] = dict(number=c['number'], state=c['state'], draft=c['isDraft'],
                                 branch=c['headRefName'], head=c['headRefOid'], title=c['title'],
                                 body=c.get('body') or '', updated=c.get('updatedAt'),
-                                col=boardcache.col(it), item=it['id'], closes=nums,
+                                col=boardcache.col(it), item=it['id'], closes=nums, labels=names, own_labels=boardcache._names(c),
                                 due=boardcache.pr_due(c)[0], milestone=boardcache.pr_due(c)[1],
-                                ft=board.is_active_fast_track(c['number'], nums, active),
-                                rank=board.priority_rank(board.is_active_fast_track(c['number'], nums, active),
-                                                         milestone_rank(miles) == 0),
+                                ft=ft, rank=board.priority_rank(ft, milestone_rank(miles) == 0),
                                 parked=c['number'] in g['PARKED'] | EXTRA_PARKED or 'parked' in labels)
     return out
 
@@ -492,11 +492,12 @@ def board_prs(g):
             nums = [i.get('number') for i in cl]
             miles = [(c.get('milestone') or {}).get('title')] + [(i.get('milestone') or {}).get('title') for i in cl]
             labels = {l['name'] for l in c['labels']['nodes']}
-            ft = board.is_active_fast_track(c['number'], nums, active)
+            names = boardcache.pr_labels(c)  # tangentswarm #65: its own and its closing issues' labels
+            ft = board.is_fast_track(names) or board.is_active_fast_track(c['number'], nums, active)
             due, milestone = boardcache.pr_due(c)
             out[c['number']] = dict(number=c['number'], state=c['state'], draft=c['isDraft'],
                                     branch=c['headRefName'], head=c['headRefOid'], title=c['title'],
-                                    body=c.get('body') or '', col=col, item=it['id'], closes=nums,
+                                    body=c.get('body') or '', col=col, item=it['id'], closes=nums, labels=names, own_labels=boardcache._names(c),
                                     due=due, milestone=milestone, ft=ft,
                                     rank=board.priority_rank(ft, milestone_rank(miles) == 0),
                                     parked=c['number'] in g['PARKED'] | EXTRA_PARKED or 'parked' in labels)

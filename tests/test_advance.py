@@ -350,13 +350,18 @@ def cascade(monkeypatch, tmp_path, cols, g, dry=True, **kw):
     merge_fakes(monkeypatch, kw.get('dirty', ()), kw.get('main_dirty', ()))
     pulled = []
 
-    def pull_batch(self, prs, c, scratch, room):
-        fits = [q for q in c.get(board.READY, []) if q['number'] not in kw.get('dirty', ())][:room]
+    def pull_batch(self, prs, c, scratch, room):  # strict order (#65): the first dirty PR stops it
+        fits = []
+        for q in c.get(board.READY, []):
+            if q['number'] in kw.get('dirty', ()) or len(fits) >= room:
+                break
+            fits.append(q)
         pulled.extend(q['number'] for q in fits)
         if fits:
             self.change(f"{', '.join('#' + str(q['number']) for q in fits)} pulled")
         return fits
     monkeypatch.setattr(F.Flow, 'pull_batch', pull_batch)
+    monkeypatch.setattr(F.Flow, 'premerge', lambda self, cols, scratch: {})  # tested in test_flow
     monkeypatch.setattr(F.Flow, 'columns', lambda self: ({}, {k: list(v) for k, v in cols.items()}))
     out = []
     c = A.Cascade(g=g, dry_run=dry, out=out.append, sleep=lambda s: None)
@@ -367,26 +372,25 @@ def cascade(monkeypatch, tmp_path, cols, g, dry=True, **kw):
     return out, pulled
 
 
-def test_empty_staging_gets_one_pull_then_only_clean_extras(monkeypatch, tmp_path):
+def test_strict_order_a_pr_that_is_not_merge_ready_stops_the_pull(monkeypatch, tmp_path):
+    """tangentswarm #65 (Michal 2026-11-16 3:22 PM ET): no queue-jumping. #5 is not merge-ready,
+    so #6 behind it is not pulled even though it merges cleanly."""
     cols = {board.READY: [pr(n, board.READY) for n in (4, 5, 6, 7)],
             board.IN_PROGRESS: [pr(8, board.IN_PROGRESS)]}
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(), dirty={5, 7})
-    assert pulled == [4, 6]  # #5 and #7 do not merge cleanly: skipped, not reworked
-    assert 'fill: #4, #6 pulled in one work merge: Staging 0 + 2, target 2' in out  # one batch, one push
+    assert pulled == [4]
+    assert 'fill: #4 pulled in one work merge: Staging 0 + 1, target 2' in out
     assert out.count('would run hr-gate --apply 4 (Ready -> Staging when it passes)') == 1
-    assert out.count('would run hr-gate --apply 6 (Ready -> Staging when it passes)') == 1
-    assert out[-1] == 'signal: no Backlog issue without a PR (new=0/4 rework=0/3 ready=2/6 backlog_without_pr=0 claudes=0/10 launching=0 unstarted=0): no START_CLAUDE'
+    assert not any('hr-gate --apply 6' in l for l in out)
 
 
 def test_staging_empty_and_nothing_clean_pulls_nothing(monkeypatch, tmp_path):
     cols = {board.READY: [pr(n, board.READY) for n in range(6, 12)]}
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(), dirty=set(range(6, 12)))
-    assert pulled == [] and out[:3] == [
-        'fill: Staging 0: no Ready PR to pull without rework',
-        'STALLED: Human Review 0, Staging 0, no Ready PR can be pulled; best candidate #6 (1 conflict(s))',
-        'NEEDS_REWORK #6 f6.ts']
-    assert out[3].startswith('would move #6 Ready -> In Progress and send: Coordinator: #6 cannot enter Staging: '
-                             'it conflicts with work: f6.ts. Merge origin/main into your branch')
+    assert pulled == [] and out[:2] == [
+        'fill: Staging 0: the next Ready PR is not merge-ready; nothing is pulled past it (strict order)',
+        'STALLED: Human Review 0, Staging 0, no Ready PR was pulled; next in order #6: not pre-merged yet']
+    assert not any('NEEDS_REWORK' in l or 'In Progress' in l for l in out)  # never a rework on its own branch
 
 
 def test_staging_at_the_floor_pulls_nothing(monkeypatch, tmp_path):
@@ -397,14 +401,13 @@ def test_staging_at_the_floor_pulls_nothing(monkeypatch, tmp_path):
                                     'signal: no Backlog issue without a PR (new=0/3 rework=0/3 ready=6/6 backlog_without_pr=0 claudes=0/10 launching=0 unstarted=0): no START_CLAUDE']
 
 
-@pytest.mark.parametrize('staging, want', [(0, [10, 12, 14, 15, 16]), (1, [10, 12, 14, 15, 16]), (2, [])])
-def test_below_the_target_one_batch_takes_every_clean_ready_pr(monkeypatch, tmp_path, staging, want):
-    """Michal 2026-11-15: one work merge for all clean Ready PRs, so one redeploy covers them.
-    The target (FLOOR) says WHEN to pull; the batch is capped by flow.STAGING_MAX."""
+@pytest.mark.parametrize('staging, want', [(0, [10, 11]), (1, [10]), (2, [])])
+def test_the_staging_wip_target_caps_the_batch(monkeypatch, tmp_path, staging, want):
+    """tangentswarm #65: fixed WIP. One work merge for the batch, never past the target."""
     cols = {board.STAGING: [pr(n, board.STAGING) for n in range(1, staging + 1)],
             board.READY: [pr(n, board.READY) for n in range(10, 17)]}
-    _, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False), dirty={11, 13})
-    assert pulled == want[:flow.STAGING_MAX - staging]
+    _, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False))
+    assert A.FLOOR == 2 and pulled == want
 
 
 def test_pulls_in_flight_count_toward_the_target(monkeypatch, tmp_path):
@@ -417,21 +420,25 @@ def test_pulls_in_flight_count_toward_the_target(monkeypatch, tmp_path):
     assert pulled == [] and 'fill: Staging 1 + 1 in flight (#3), target 2: no pull needed' in out
 
 
-def test_a_fast_track_pr_is_pulled_past_the_floor(monkeypatch, tmp_path):
-    """(d) Michal 8:43 PM ET: the PR marked urgent is the next Staging pull, also at the floor."""
+def test_a_fast_track_pr_is_never_pulled_past_the_target(monkeypatch, tmp_path):
+    """tangentswarm #65 (Michal 2026-11-16 3:22 PM ET): never pull past the target; a fast-track
+    PR only goes first in the order."""
     cols = {board.STAGING: [pr(n, board.STAGING) for n in range(1, A.FLOOR + 1)],
             board.READY: [pr(10, board.READY), pr(12, board.READY, rank=board.FAST_TRACK), pr(13, board.READY)]}
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False))
-    assert pulled == [12]  # only the fast-track PR; #10 and #13 wait for the floor
-    assert f'fill: Staging {A.FLOOR}, target {A.FLOOR}: fast-track #12 is pulled past the target' in out
-    assert f'fill: #12 pulled in one work merge (fast-track): Staging {A.FLOOR} + 1, target {A.FLOOR}' in out
+    assert pulled == [] and f'fill: Staging {A.FLOOR}, target {A.FLOOR}: no pull needed' in out
 
 
-def test_a_fast_track_pr_that_does_not_merge_cleanly_is_not_pulled_past_the_floor(monkeypatch, tmp_path):
-    cols = {board.STAGING: [pr(n, board.STAGING) for n in range(1, A.FLOOR + 1)],
-            board.READY: [pr(10, board.READY), pr(12, board.READY, rank=board.FAST_TRACK)]}
-    out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False), dirty={12})
-    assert pulled == [] and f'fill: Staging {A.FLOOR}: no extra Ready PR to pull without rework' in out
+def test_fill_runs_the_pre_merge_every_pass_also_at_the_target(monkeypatch, tmp_path):
+    from tangentswarm import flow as F
+    seen = []
+    cols = {board.STAGING: [pr(n, board.STAGING) for n in range(1, A.FLOOR + 1)], board.READY: [pr(10, board.READY)]}
+    cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False))
+    monkeypatch.setattr(F.Flow, 'premerge', lambda self, c, scratch: seen.append(sorted(c)) or {})
+    c = A.Cascade(g=CascadeGate(served_files=False), dry_run=True, out=lambda l: None, sleep=lambda s: None)
+    c.pulled = []
+    c.fill()
+    assert seen and board.READY in seen[0]
 
 
 def test_the_pull_order_puts_the_fast_track_pr_first():
@@ -550,6 +557,7 @@ def live(monkeypatch, tmp_path, g, advance=None, ready=(9,), staging=(1,), hr=()
     monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
     merge_fakes(monkeypatch)
     monkeypatch.setattr(F.Flow, 'pull_batch', batch)
+    monkeypatch.setattr(F.Flow, 'premerge', lambda self, cols, scratch: {})  # tested in test_flow
     monkeypatch.setattr(F.Flow, 'advance', advance or adv)
     monkeypatch.setattr(F.Flow, 'columns', lambda self: ({}, c))
     out, slept = [], []
