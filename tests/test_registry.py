@@ -296,6 +296,25 @@ def test_pending_input_split_by_a_readline_break_is_refused(fake_bins, root, mon
     assert registry.shell_problem('%7', str((root / 'proj').resolve()), rec) is None
 
 
+# Codex on 7464a9b: readline's pad inside the typed line itself (a wide character in the path)
+@pytest.mark.parametrize('before', [77, 76, 157, 10])
+def test_a_wide_character_in_the_launch_line_reads_back(monkeypatch, before):
+    monkeypatch.setattr(tmux, 'ENTER_DELAY', 0)
+    rec = Recorder(tail='$ ', pane='%99')
+    line = '/tmp/' + 'x' * (before - 5) + '界/claude --a b'     # '$ ' + before columns: 界 at the edge
+    registry.type_launch_line('%99', line, rec, sleep=lambda s: None, wait=0)
+    assert rec.entered == [line]
+
+
+def test_a_wrong_read_back_with_a_wide_character_is_not_entered(monkeypatch):
+    monkeypatch.setattr(tmux, 'ENTER_DELAY', 0)
+    rec = Recorder(tail='$ ', pane='%99', echo=False)
+    rec.pending = '/tmp/' + 'x' * 72 + '畍/claude'            # another wide character at the edge
+    with pytest.raises(registry.AgentError, match='Enter was NOT pressed'):
+        registry.type_launch_line('%99', '/tmp/' + 'x' * 72 + '界/claude', rec, sleep=lambda s: None, wait=0)
+    assert rec.entered == []
+
+
 # Codex P2 (history limit): a full history must not hide the start of the typed line
 @pytest.mark.parametrize('tail', ['$ ', LONG_PROMPT])
 def test_a_full_history_does_not_break_the_read_back(fake_bins, root, monkeypatch, tail):
