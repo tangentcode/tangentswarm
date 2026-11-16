@@ -90,13 +90,15 @@ def row(r, width=200):
 TITLE = '  # window                            claude state      screen    mem   cpu PR     card          processes'
 
 
-def render(st, color=True, width=200, height=None):
-    """The lines of the Agents screen."""
-    lines = header(st)
+def render(st, color=True, width=200, height=None, top=0):
+    """The lines of the Agents screen. With a height, the header and the summary always show
+    and the pane rows scroll: top is the first row shown (clamped)."""
+    head = header(st)
     if color:
         cap = st['capacity']
-        lines[1] = (GREEN if cap['free'] else RED) + lines[1] + RESET
-    lines += ['', (BOLD + TITLE + RESET) if color else TITLE]
+        head[1] = (GREEN if cap['free'] else RED) + head[1] + RESET
+    head += ['', (BOLD + TITLE + RESET) if color else TITLE]
+    body = []
     for r in st['agents']:
         text = row(r, width)
         if color:
@@ -106,10 +108,27 @@ def render(st, color=True, width=200, height=None):
                 text = BOLD + text + RESET
             elif r['state'] == 'no claude':
                 text = DIM + text + RESET
-        lines.append(text)
+        body.append(text)
     n = sum(1 for r in st['agents'] if r['claude'])
     act = sum(1 for r in st['agents'] if r['state'] == 'active')
     tests = sum(1 for r in st['agents'] if r['tests'])
-    lines += ['', f"{len(st['agents'])} panes; {n} with a Claude ({act} active); {tests} running tests"
-              "    keys: e events  a agents  q quit"]
-    return lines[:height] if height else lines
+    summary = f"{len(st['agents'])} panes; {n} with a Claude ({act} active); {tests} running tests"
+    keys = '    keys: e events  a agents  q quit'
+    if not height:
+        return head + body + ['', summary + keys]
+    room = page(height)
+    top = clamp(top, len(body), height)
+    if len(body) > room:
+        summary += f"; rows {top + 1}-{min(top + room, len(body))} of {len(body)}"
+        keys += '  j/k or space/b scroll'
+    return head + body[top:top + room] + ['', summary + keys]
+
+
+def page(height):
+    """How many pane rows one screen of this height shows: all but the 4 header and 2 summary lines."""
+    return max(1, height - 6)
+
+
+def clamp(top, rows, height):
+    """The first row shown: top, kept so that the last page is full."""
+    return max(0, min(top, rows - page(height)))

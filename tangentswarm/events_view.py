@@ -306,9 +306,26 @@ class TermKeys:
         return os.read(self.stream.fileno(), 32).decode(errors='replace') if r else ''
 
 
-def agents_screen(sample, color=True, height=None):
+def agents_screen(sample, color=True, height=None, top=0):
+    """(the lines of the Agents screen, the first row shown after clamping top)."""
     width = shutil.get_terminal_size((200, 40)).columns
-    return agents_view.render(sample(), color, width, height)
+    st = sample()
+    top = agents_view.clamp(top, len(st['agents']), height) if height else 0
+    return agents_view.render(st, color, width, height, top), top
+
+
+SCROLL = {'j': 1, 'k': -1, '\x1b[B': 1, '\x1b[A': -1}  # a row; space, b, PgDn, PgUp: a page
+PAGE = {' ': 1, 'b': -1, '\x1b[6~': 1, '\x1b[5~': -1}
+
+
+def key_list(pressed):
+    """The keys in what was read: an escape sequence (arrow, PgUp/PgDn) is one key."""
+    out, i = [], 0
+    while i < len(pressed):
+        m = re.match(r'\x1b\[[0-9;]*[~A-Za-z]', pressed[i:])
+        out.append(m.group(0) if m else pressed[i])
+        i += len(out[-1])
+    return out
 
 
 def run(path, since='today', verbose=False, once=False, color=None, out=sys.stdout, sleep=time.sleep,
@@ -323,27 +340,34 @@ def run(path, since='today', verbose=False, once=False, color=None, out=sys.stdo
         watch = livestate.PaneWatch()
         sample = lambda: livestate.collect(watch, now=clock())  # noqa: E731
     if screen == 'agents' and (once or not tty):
-        out.write('\n'.join(agents_screen(sample, color)) + '\n')
+        out.write('\n'.join(agents_screen(sample, color)[0]) + '\n')
         out.flush()
         return 0
     if tty and keys is None:
         with TermKeys(sleep=sleep) as k:
             return run(path, since, verbose, once, color, out, sleep, polls, redraw, clock, tty, screen, k, sample)
-    while not os.path.exists(path) and screen == 'events':  # the server makes it on its first request
+    # the server makes the DB on its first request; a terminal waits for it in the main loop
+    # (Codex on PR #48: the keys must work before it exists)
+    while not os.path.exists(path) and not keys:
         if once:
             print(f"swarm-events: no event DB at {path} yet", file=out)
             return 1
         sleep(1)
     db = None
-    rows, last, n, shown, drawn, pressed = [], 0, 0, None, None, ''
+    rows, last, n, shown, drawn, pressed, top = [], 0, 0, None, None, '', 0
     while True:
         switched = False
-        for ch in pressed:
-            if ch in 'qQ':
+        height = shutil.get_terminal_size((120, 40)).lines - 1
+        for ch in key_list(pressed):
+            if ch in ('q', 'Q'):
                 return 0
             want = {'a': 'agents', 'e': 'events'}.get(ch.lower())
             if want and want != screen:
                 screen, switched = want, True
+            elif screen == 'agents' and (ch in SCROLL or ch in PAGE):
+                # Codex on PR #48: every pane row must be reachable in a short terminal
+                top = max(0, top + SCROLL.get(ch, 0) + PAGE.get(ch, 0) * agents_view.page(height))
+                switched = True
         if db is None and os.path.exists(path):
             db = connect(path)
         try:
@@ -365,11 +389,10 @@ def run(path, since='today', verbose=False, once=False, color=None, out=sys.stdo
                     shown[key] = stable
         elif screen == 'agents':
             if switched or drawn is None or now - drawn >= redraw:
-                height = shutil.get_terminal_size((120, 40)).lines - 1
-                out.write(CLEAR + '\n'.join(agents_screen(sample, color, height)) + '\n')
+                lines, top = agents_screen(sample, color, height, top)
+                out.write(CLEAR + '\n'.join(lines) + '\n')
                 drawn = now
         elif got or switched or drawn is None or now - drawn >= redraw:
-            height = shutil.get_terminal_size((120, 40)).lines - 1
             out.write(CLEAR + '\n'.join(render(rows, now, color, verbose, height)) + '\n')
             drawn = now
         out.flush()

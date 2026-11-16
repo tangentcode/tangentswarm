@@ -222,3 +222,49 @@ def test_admits_uses_the_cpu_load():
     m = dict(current=1000 * MB, high=4608 * MB, max=5120 * MB, avail=4 * 1024 ** 3)
     assert launches.admits(dict(m, load=[0, 1, 0], cpus=4))
     assert not launches.admits(dict(m, load=[0, 6.5, 0], cpus=4))
+
+
+def many(n):
+    st = sample()
+    base = st['agents'][2]
+    return dict(st, agents=[dict(base, index=i, window=f'w-{i}') for i in range(n)])
+
+
+def test_agents_screen_scrolls_and_keeps_the_header_and_summary():
+    """Codex on PR #48: with more panes than fit, every row must be reachable."""
+    st = many(43)
+    lines = AV.render(st, color=False, height=20)
+    assert len(lines) == 20 and lines[1].startswith('capacity:')
+    assert ' w-0 ' in lines[4] and 'rows 1-14 of 43' in lines[-1] and 'j/k' in lines[-1]
+    last = AV.render(st, color=False, height=20, top=999)
+    assert ' w-42' in last[-3] and 'rows 30-43 of 43' in last[-1]
+    assert AV.clamp(999, 43, 20) == 29 and AV.clamp(-3, 43, 20) == 0 and AV.clamp(5, 3, 20) == 0
+    short = AV.render(many(3), color=False, height=20)
+    assert 'rows' not in short[-1] and len(short) == 4 + 3 + 2
+
+
+def test_swarm_events_keys_scroll_the_agents_screen(monkeypatch, tmp_path):
+    monkeypatch.setattr(V.shutil, 'get_terminal_size', lambda *a: os.terminal_size((200, 21)))
+    presses = iter(['a', ' ', 'k', '\x1b[6~\x1b[6~', 'b', 'q'])
+    out = io.StringIO()
+    st = many(43)
+    V.run(str(tmp_path / 'e.sqlite'), out=out, tty=True, color=False, clock=lambda: NOW,
+          keys=lambda t: next(presses), sample=lambda: st, redraw=1000)
+    frames = [f.split('\n') for f in out.getvalue().split(V.CLEAR)[1:] if f.startswith('load')]
+    tops = [next(l for l in f if 'rows' in l).split('rows ')[1].split('-')[0] for f in frames]
+    assert tops == ['1', '15', '14', '30', '16']
+
+
+def test_keys_work_before_the_event_db_exists(tmp_path):
+    """Codex on PR #48: a terminal never blocks on a missing DB; a and q still work."""
+    presses = iter(['', 'a', 'q'])
+    slept = []
+    out = io.StringIO()
+    rc = V.run(str(tmp_path / 'none.sqlite'), out=out, tty=True, color=False, clock=lambda: NOW,
+               keys=lambda t: next(presses), sample=lambda: many(2), redraw=1000, sleep=slept.append)
+    frames = out.getvalue().split(V.CLEAR)[1:]
+    assert rc == 0 and slept == [] and len(frames) == 2 and frames[1].startswith('load 0.50')
+
+
+def test_key_list_reads_escape_sequences_as_one_key():
+    assert V.key_list('a\x1b[6~j\x1b[Aq') == ['a', '\x1b[6~', 'j', '\x1b[A', 'q']
