@@ -64,6 +64,7 @@ CASCADE_EMPTY_HR = int(os.environ.get('SWARM_CASCADE_EMPTY_HR', '900'))
 PULL = os.environ.get('SWARM_PROMOTE_PULL') == '1'  # also run the Staging pull
 REPO = 'tangentcode/platform'
 BACKSTOP = int(os.environ.get('SWARM_PROMOTE_BACKSTOP', '900'))  # retry a leftover head at most this often
+BOARD_EVERY = int(os.environ.get('SWARM_BOARD_EVERY', '300'))  # s between passes of a board without staging (#45)
 DEPLOY_LAG = int(os.environ.get('SWARM_DEPLOY_LAG', '600'))  # s before a staging deploy lag wakes swarmbot (#37)
 LAG_EVERY = 60  # s between deploy-lag checks
 MAIN_RETRY = int(os.environ.get('SWARM_MAIN_RETRY', '300'))  # s between retries of a held merge-main handoff
@@ -530,12 +531,29 @@ class Promoter:
                 if str((held.get(p['number']) or {}).get('why', '')).startswith('conflicts with main')
                 and held[p['number']].get('head') == p.get('head')]
 
+    def board_passes(self, now=None):
+        """Every BOARD_EVERY s, queue the pass of each board without staging (#45: Project 6):
+        its MinBot checks and promote, for what no event finished (Codex on PR #47: a promote
+        that met GitHub's mergeable UNKNOWN had no retry). Returns the boards queued."""
+        now = time.time() if now is None else now
+        if now - getattr(self, 'boards_at', 0.0) < BOARD_EVERY:
+            return []
+        self.boards_at = now
+        out = []
+        for b in board.BOARDS:
+            if not b.staging:
+                gatelock.enqueue([str(BIN / 'swarm-advance'), '--promote-board', str(b.number), '--board-pass'],
+                                 by='swarm-promoted')
+                out.append(b.number)
+        return out
+
     def once(self, retry=False):
         """One check. Returns 'idle', 'busy' or 'promoted'. A retry after busy goes straight
         to the lock (the read under the lock is fresh), so a long busy spell costs no reads."""
         main = self.main_sha()
         main_moved = main is not None and main != self.last_main
         if not self.dry:
+            self.board_passes()
             self.deploy_lag()
         waiting = gatelock.queued()
         if not retry:

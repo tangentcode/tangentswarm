@@ -209,7 +209,7 @@ def test_a_failed_job_on_the_head_blocks_the_minbot_pass_and_says_why(board_read
     runs = [{'name': 'Linux mna tests', 'status': 'completed', 'conclusion': 'failure'},
             {'name': 'Linux rs tests', 'status': 'completed', 'conclusion': 'success'},
             {'name': 'docs', 'status': 'completed', 'conclusion': 'skipped'}]
-    monkeypatch.setattr(A, 'check_runs', lambda head: runs)
+    monkeypatch.setattr(A, 'check_runs', lambda head, repo=None: runs)
     g = Gate(cols, details={7: codex_pr()})
     out, calls = run(g)
     assert g.moves == [] and len(calls) == 1

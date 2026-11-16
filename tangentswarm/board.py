@@ -1,4 +1,5 @@
-"""Project 4 Status columns, matched by option id, never by name.
+"""The swarm's project boards (Project 4, and Project 6: #45) and their Status columns, matched
+by option id, never by name.
 
 The board renames columns (Pending is now shown as Staging). Option ids stay the same,
 so every reader maps a status value's optionId to the stable internal key below.
@@ -22,7 +23,40 @@ DONE, CANCELED, PARKED = 'Done', 'Canceled', 'Parked'
 COLUMNS = (INBOX, TRIAGE, DISCUSS, BACKLOG, ACTIVE, IN_PROGRESS, AUTO_REVIEW, NEEDS_INPUT, READY, STAGING,
            HUMAN_REVIEW, DONE, CANCELED, PARKED)
 OPTION = {c: _config.get('project', 'options', c) for c in COLUMNS}
-BY_ID = {v: k for k, v in OPTION.items()}
+
+
+class Board:
+    """One project board the swarm runs (tangentswarm #45, Michal 2026-11-15 7:20 PM ET: the
+    same flow on Project 4 with platform and on Project 6 with tangentswarm and
+    methodology). Its node ids and option ids are private config."""
+
+    def __init__(self, number, id, status_field, option, repos, staging):
+        self.number, self.id, self.status_field = number, id, status_field
+        self.option, self.repos, self.staging = dict(option), tuple(repos), bool(staging)
+
+    def __repr__(self):
+        return f"Board({self.number}, {', '.join(self.repos)})"
+
+
+DEFAULT = Board(int(_config.get('project', 'number', default=4)), PROJECT_ID, STATUS_FIELD, OPTION,
+                _config.get('project', 'repos', default=['tangentcode/platform']),
+                _config.get('project', 'staging', default=True))
+BOARDS = [DEFAULT] + [Board(int(b['number']), b['id'], b['status_field'],
+                            {c: (b.get('options') or {}).get(c) for c in COLUMNS}, b.get('repos') or [],
+                            b.get('staging', False))
+                      for b in _config.get('boards', default=[]) or []]
+REPOS = tuple(r for b in BOARDS for r in b.repos)
+BY_ID = {v: k for b in BOARDS for k, v in b.option.items() if v}  # option ids are unique per board
+
+
+def for_repo(repo):
+    """The board whose repos include repo, or None (a repo the swarm does not run)."""
+    return next((b for b in BOARDS if repo in b.repos), None)
+
+
+def for_project(node_id):
+    """The board with this project node id, or None."""
+    return next((b for b in BOARDS if node_id and b.id == node_id), None)
 
 # Timeline status-change events carry the column name as it was at the time.
 ALIASES = {STAGING: {'Approved', 'Staging'}}
@@ -158,23 +192,34 @@ def is_active_fast_track(number, closes=(), active=None):
 HR_GATE_COLS = {IN_PROGRESS, AUTO_REVIEW, STAGING, HUMAN_REVIEW, DONE, BACKLOG}  # hr-gate's OPT names
 
 
-def move_card(g, item, col, sh=None, n=None):
-    """Move a Project 4 card to column col, by option id. hr-gate's move() knows only its own
+def move_card(g, item, col, sh=None, n=None, b=None):
+    """Move a card to column col, by option id. hr-gate's move() knows only its own
     OPT names (no Ready, Needs Input, Triage...): platform #537/#540/#542/#543 at 11:03 AM ET
     2026-11-15 got their MinBot pass comment, then KeyError 'Ready', and stayed in Auto
-    Review. Every mover goes through here."""
+    Review. Every mover goes through here. b: the card's board (default: Project 4, the
+    only one hr-gate knows)."""
     from . import eventdb
     try:
-        _move(g, item, col, sh)
+        _move(g, item, col, sh, b)
     except Exception as e:  # Codex on PR #33: the row says what happened, not what was tried
         eventdb.log_event('move', source='board', action=col, pr=n, actor=eventdb.SOURCE or None,
-                          detail={'item': item, 'col': col}, error=f'{type(e).__name__}: {str(e)[:300]}')
+                          detail={'item': item, 'col': col, 'board': (b or DEFAULT).number},
+                          error=f'{type(e).__name__}: {str(e)[:300]}')
         raise
     eventdb.log_event('move', source='board', action=col, pr=n, actor=eventdb.SOURCE or None,
-                      detail={'item': item, 'col': col})  # tangentswarm #32
+                      detail={'item': item, 'col': col, 'board': (b or DEFAULT).number})  # tangentswarm #32
 
 
-def _move(g, item, col, sh=None):
+def _move(g, item, col, sh=None, b=None):
+    if b is not None and b is not DEFAULT:
+        argv = ['gh', 'project', 'item-edit', '--id', item, '--project-id', b.id,
+                '--field-id', b.status_field, '--single-select-option-id', b.option[col]]
+        if sh:
+            sh(argv)
+        else:
+            from . import tick
+            tick.sh(argv, check=True)
+        return
     if 'move' in g and col in (g.get('OPT') or HR_GATE_COLS):
         return g['move'](item, col)
     argv = ['gh', 'project', 'item-edit', '--id', item, '--project-id', g['project_id'](),
