@@ -269,6 +269,7 @@ tangentswarm/
   worktrees.py     one worktree per agent: layout, sync, .swarm.yaml, spawn/list/remove
   mcp_server.py    swarm-mcp (stdio, or Streamable HTTP with OAuth or an API key)
   agent_mcp_server.py  swarm-agent: agents' message tools (stdio, or one shared HTTP server)
+  agent_report.py  report_status: agent done / needs-input / blocked reports and the swarm's actions
   http_app.py      Streamable HTTP app + auth wiring shared by swarm-mcp and swarm-agent
   queue/           swarm-hub: SQLite message queue, its HTTP server and client
   auth.py          OAuth resource server + optional built-in authorization server
@@ -730,6 +731,7 @@ swarm-agent --http --host 127.0.0.1 --port 8768 --path /mcp/agent \
 | `whoami()` | the bound name and the credential it authenticated with |
 | `send_message(recipient, type, body, context?)` | posts to the hub, signed with the bound name |
 | `read_messages(since?, limit?)` | new messages addressed to you; moves your read cursor |
+| `report_status(state, pr, window, message?, question?)` | tells the swarm you are done, need input, are blocked or are working; the swarm acts on it (below) |
 
 One server serves many agents, so each MCP session (`Mcp-Session-Id`) is bound to an
 agent name, taken from the first of: `register_agent(name)`, an `X-Swarm-Agent: <name>`
@@ -747,6 +749,27 @@ Clients that cannot set headers (claude.ai connectors) call `register_agent` fir
 server instructions tell them to. Names are self-declared: anyone with a valid
 credential is trusted to say who they are. Every send is logged to stderr with the name
 and the credential (`apikey` or `oauth:<client_id>`).
+
+### Agent status reports (report_status)
+
+A swarm worker (any agent, here or in the cloud) tells the swarm its state over this HTTP
+server, so the swarm does not have to guess from an unchanged tmux screen (tangentswarm #53).
+Each report is one `agent-report` row in the swarm events DB (`swarm-events` shows it), and
+the swarm-promoted daemon acts on it through the spool op `report`
+(`tangentswarm/agent_report.py`):
+
+| state | what the swarm does |
+|-------|---------------------|
+| `done` | the worktree must be clean and pushed (else the worker is told why); the Stop-hook handoff advances the card; then the Claude is closed with `/exit` once idle. The window stays and the session is kept for `swarm-revive`. |
+| `needs-input` (with `question`) | posts the question on the ticket, moves the card to Needs Input, and closes the Claude. Moving the card back to In Progress resumes it with the answer. Until the report is handled, the Stop-hook handoff does not run. |
+| `blocked` (with `message`) | posts the blocker on the ticket and moves the card to Needs Input; the Claude keeps running. |
+| `working` | the events DB row only. |
+
+Identity: `pr` is the agent's PR and `window` its tmux window name. The daemon refuses a
+report whose window is not the one the swarm gives that PR, and one MCP session can report
+for only one `PR@window`. The worker brief tells every worker to call this. The #40
+watchdog's pane capture is the fallback only: `agent_report.last_report(pr)` says whether
+the agent reported recently.
 
 ### Auth
 

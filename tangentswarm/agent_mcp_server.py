@@ -27,6 +27,11 @@ trusted to say who they are. Each send is logged to stderr with the name and the
 authenticated principal (OAuth client id or "apikey"), so a misbehaving credential can be
 traced and revoked.
 
+report_status(state, pr, window, message?, question?) is how any agent (Claude or not, here
+or in the cloud) tells the swarm it is done, needs input, is blocked or is working
+(tangentswarm #53). The report goes to the swarm events DB and the swarm acts on it (see
+tangentswarm/agent_report.py). An MCP session is bound to one PR@window, like the agent name.
+
 This is deliberately separate from swarm-mcp (tangentswarm/mcp_server.py), which runs on
 the host and drives tmux: that one controls agents, this one lets an agent talk back.
 """
@@ -62,7 +67,13 @@ register_agent with your name (for example '<repo>/<branch>' or your session nam
 your client already sends an X-Swarm-Agent header. Then send_message(recipient, type,
 body, context): type is status, blocker, question, or done; recipient is a person or agent
 name; context is optional free text (repo/branch, PR URL). read_messages returns new
-messages addressed to you and remembers how far you have read."""
+messages addressed to you and remembers how far you have read.
+
+A swarm worker reports its state with report_status(state, pr, window, message, question):
+state is done (committed and pushed; the swarm hands off the PR and closes you), needs-input
+(pass the question; it goes on the ticket and you are closed until it is answered), blocked
+(pass the reason), or working. pr is your PR number; window is your tmux window name. End
+your turn right after a done or needs-input report."""
 
 # True in apikey mode (set by build_http_app): the key gate has authenticated the caller.
 API_KEY_MODE = False
@@ -116,6 +127,7 @@ class Identities:
 
 
 IDENTITIES = Identities()
+REPORTERS = Identities()   # session key -> 'PR@window' (report_status)
 
 
 def check_name(name):
@@ -243,7 +255,36 @@ async def read_messages(ctx: Context, since: int | None = None, limit: int = 50)
     return {'agent': agent, 'messages': msgs, 'cursor': cursor}
 
 
-TOOLS = [register_agent, whoami, send_message, read_messages]
+async def report_status(state: str, pr: int, window: str, ctx: Context, message: str | None = None,
+                        question: str | None = None) -> dict:
+    """Tell the swarm your state, instead of letting it guess from your screen.
+    state: done (your work is committed and pushed: the swarm hands off the PR, advances the
+    card and closes this Claude with /exit; the window stays), needs-input (pass question:
+    it goes on the ticket, the card moves to Needs Input and you are closed until it is
+    answered), blocked (pass message: the reason), or working (progress, logged only).
+    pr: your PR number. window: your tmux window name (tmux display-message -p '#W').
+    End your turn right after done or needs-input."""
+    from . import agent_report as R
+    try:
+        rep = R.check(state, pr, window, message, question)
+    except R.ReportError as e:
+        raise ToolError(str(e)) from e
+    key, who = session_key(ctx), principal()
+    if key is not None:
+        REPORTERS.bind(key, f"{rep['pr']}@{rep['window']}", who)
+    agent = current_agent(ctx, required=False)
+    try:
+        res = await anyio.to_thread.run_sync(
+            lambda: R.accept(rep['state'], rep['pr'], rep['window'], rep['message'], rep['question'],
+                             agent=agent, principal=who))
+    except R.ReportError as e:
+        raise ToolError(str(e)) from e
+    log(f"report pr={rep['pr']} window={rep['window']} state={rep['state']} agent={agent} principal={who} "
+        f"event={res.get('event')}")
+    return res
+
+
+TOOLS = [register_agent, whoami, send_message, read_messages, report_status]
 
 
 def build_server(**kwargs):
