@@ -808,8 +808,8 @@ class Tick:
         if codex_clean or self.state.done(key) or codex_requested(full):
             return
         if not self.dry:
-            sh(['gh', 'pr', 'comment', str(n), '-R', REPO, '--body', '@codex review'], check=True)
-            self.state.mark(key)
+            from . import codexrounds
+            codexrounds.request(n, head, 'swarm-tick', state=self.state)
         self.change(f"#{n} posted \"@codex review\" for head {head[:8]}")
 
     # step 3 ---------------------------------------------------------------
