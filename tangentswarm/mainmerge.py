@@ -94,10 +94,14 @@ def deliver(pr, text, find=find_pane, tell=None):
     pane = find(pr)
     if pane is None:
         return 'held: no live Claude pane'
+    from . import eventdb
     try:
         tell(pane, text.strip())
     except Exception as e:  # AgentNotReady and tmux errors: keep the file for the retry
+        eventdb.log_event('tell', source='relay', action='held', pr=pr.get('number'), actor=pane, error=str(e)[:300])
         return f'held: {e}'
+    eventdb.log_event('tell', source='relay', action='sent', pr=pr.get('number'), actor=pane,
+                      notes=[text.strip()[:600]])  # tangentswarm #32
     return 'sent'
 
 

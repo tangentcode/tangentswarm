@@ -71,6 +71,7 @@ WAKE_EVERY = 60          # s between two wakes
 WAKE_DEDUPE = 1800       # s: the same exception key wakes once
 WAKE_PENDING_MAX = 50    # exceptions kept for the next wake
 MAX_BODY = 2 * 1024 * 1024
+PROTECTED_BRANCHES = {'main', 'work', 'deploy', 'pages-site', 'pr-screenshots', 'parked', 'swarm-shots'}
 # Logged in the event DB only: one row each, no action, never queued (Michal 1:55 PM ET).
 LOG_ONLY = ('push', 'commit_comment', 'discussion', 'discussion_comment', 'pull_request_review_thread',
             'pull_request_review_comment')
@@ -239,7 +240,11 @@ def classify(event, p):
             return [Action('skip', pr=n, why=f'pull_request {action}')]
         if action == 'closed':
             if pr.get('merged') and base == 'main':
-                return [Action('merged', n, f"#{n} merged into main", dict(head=(pr.get('head') or {}).get('sha')))]
+                head = pr.get('head') or {}
+                # a fork's branch name says nothing about this repo's branches (Codex on PR #42)
+                own = ((head.get('repo') or {}).get('full_name') or REPO) == REPO
+                return [Action('merged', n, f"#{n} merged into main", dict(head=head.get('sha'),
+                                                                           branch=head.get('ref') if own else None))]
             if pr.get('merged'):
                 return [Action('wake', n, f"#{n} merged into {base}, not main", dict(key=f'merge-base:{n}'))]
             return [Action('closed', n, f"#{n} closed without a merge")]
@@ -361,7 +366,7 @@ class Executor:
     def move(self, n, item, col):
         if self.dry:
             return self.note(f"would move #{n} to {col}")
-        board.move_card(self.g, item, col, self._sh)
+        board.move_card(self.g, item, col, self._sh, n=n)
         self.note(f"#{n} -> {col}")
 
     def minbot(self, n):
@@ -409,27 +414,7 @@ class Executor:
         per WAKE_EVERY s for all keys together (Codex on PR #26: a burst of distinct failures
         woke the LLM once per delivery). Exceptions inside the interval wait in the pending
         list; the next POST carries them in "also"."""
-        key = key or why[:80]
-        t = now()
-        payload = {'source': 'swarm-webhook', 'kind': 'exception', 'pr': n or None, 'why': why,
-                   'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'log': str(LOG), **(extra or {})}
-        with _lock:
-            st = _seen()
-            last = st.setdefault('wake', {})
-            if t - float(last.get(key, 0)) < WAKE_DEDUPE:
-                return self.note(f"exception already sent: {why[:120]}")
-            last[key] = t
-            if not self.dry:
-                st.setdefault('wake_pending', []).append(payload)
-                del st['wake_pending'][:-WAKE_PENDING_MAX]
-            _save_seen(st)
-        log(decision='wake', **payload)
-        if self.dry:
-            return self.note(f"would wake swarmbot: {why}")
-        if flush_wakes(self.wake_post or post_wake, now=now):
-            self.note(f"woke swarmbot: {why}")
-        else:
-            self.note(f"swarmbot wake queued (one POST per {WAKE_EVERY} s): {why}")
+        self.note(wake_exception(n, why, key=key, now=now, dry=self.dry, post=self.wake_post, extra=extra))
 
     # -- handlers -----------------------------------------------------------------------
     def run(self, a):
@@ -627,7 +612,37 @@ class Executor:
                     self._sh([str(x) for x in argv])
                 except Exception as e:
                     self.note(f"{argv[1]}: {str(e)[:120]}")
+        if not self.dry and a.args.get('branch'):
+            try:
+                self.delete_vn(a.pr, a.args['branch'])
+            except Exception as e:  # the rest of the merge handling is done; report this part
+                self.note(f"#{a.pr}: -vN cleanup failed: {type(e).__name__}: {str(e)[:160]}")
         self.note(f"#{a.pr} merged: cascade, Done, linked issues closed")
+
+    def delete_vn(self, n, branch):
+        """tangentswarm #39 (Michal 2026-11-15 6:27 PM ET): on a platform merge, delete the
+        PR branch's speculative <branch>-v1, -v2, ... siblings (GitHub's delete-branch-on-merge
+        removes the head branch itself). A sibling that heads another open PR stays, and a
+        protected name is never touched. Returns the deleted names."""
+        if not branch or branch in PROTECTED_BRANCHES:
+            return []
+        refs = json.loads(self._sh(['gh', 'api', f'repos/{REPO}/git/matching-refs/heads/{branch}-v']) or '[]')
+        names = [r['ref'][len('refs/heads/'):] for r in refs if isinstance(r, dict) and r.get('ref')]
+        vn = [b for b in names if re.fullmatch(re.escape(branch) + r'-v\d+', b) and b not in PROTECTED_BRANCHES]
+        if not vn:
+            return []
+        heads = set((self._sh(['gh', 'api', '--paginate', f'repos/{REPO}/pulls?state=open&per_page=100',
+                               '--jq', '.[].head.ref']) or '').split())
+        done = []
+        for b in vn:
+            if b in heads:
+                self.note(f"#{n}: kept {b}: it heads an open PR")
+                continue
+            self._sh(['gh', 'api', '-X', 'DELETE', f'repos/{REPO}/git/refs/heads/{b}'])
+            done.append(b)
+        if done:
+            self.note(f"#{n}: deleted {', '.join(done)}")
+        return done
 
     def do_closed(self, a):
         item, col = self.card(a.pr)
@@ -756,9 +771,61 @@ def flush_wakes(post=None, now=time.time):
     return True
 
 
+def wake_exception(n, why, key=None, now=time.time, dry=False, post=None, source='swarm-webhook', extra=None):
+    """An exception for swarmbot, from the webhook or any other swarm process (the daemon's
+    deploy-lag check): deduped by key for WAKE_DEDUPE s, at most one POST per WAKE_EVERY s
+    for all keys together. Returns a note line."""
+    key = key or why[:80]
+    t = now()
+    payload = {'source': source, 'kind': 'exception', 'pr': n or None, 'why': why,
+               'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'log': str(LOG), **(extra or {})}
+    with _lock:
+        st = _seen()
+        last = st.setdefault('wake', {})
+        if t - float(last.get(key, 0)) < WAKE_DEDUPE:
+            return f"exception already sent: {why[:120]}"
+        last[key] = t
+        if not dry:
+            st.setdefault('wake_pending', []).append(payload)
+            del st['wake_pending'][:-WAKE_PENDING_MAX]
+        _save_seen(st)
+    log(decision='wake', **payload)
+    if dry:
+        return f"would wake swarmbot: {why}"
+    if flush_wakes(post or post_wake, now=now):
+        return f"woke swarmbot: {why}"
+    return f"swarmbot wake queued (one POST per {WAKE_EVERY} s): {why}"
+
+
 # -- dedupe state ------------------------------------------------------------------------
 
-_lock = threading.Lock()
+_tlock = threading.Lock()
+
+
+class _SeenLock:
+    """The SEEN state is shared by swarm-webhook and swarm-promoted (the deploy-lag wake):
+    a thread lock plus an interprocess flock around every read-modify-write (Codex on PR #41)."""
+
+    def __enter__(self):
+        import fcntl
+        _tlock.acquire()
+        try:
+            SEEN.parent.mkdir(parents=True, exist_ok=True)
+            self.f = open(SEEN.with_name(SEEN.name + '.lock'), 'a')
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+        except Exception:
+            _tlock.release()
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.f.close()
+        finally:
+            _tlock.release()
+
+
+_lock = _SeenLock()
 
 
 def _seen():
@@ -770,7 +837,7 @@ def _seen():
 
 def _save_seen(d):
     SEEN.parent.mkdir(parents=True, exist_ok=True)
-    tmp = SEEN.with_suffix('.tmp')
+    tmp = SEEN.with_name(f'{SEEN.name}.{os.getpid()}.{threading.get_ident()}.tmp')  # one per writer
     tmp.write_text(json.dumps(d))
     os.replace(tmp, SEEN)
 
@@ -1001,6 +1068,7 @@ def serve(port=PORT, host='127.0.0.1'):
 
 
 def main(argv=None):
+    eventdb.set_source('webhook')
     ap = argparse.ArgumentParser(prog='swarm-webhook', description=__doc__.split('\n', 1)[0])
     ap.add_argument('--port', type=int, default=PORT)
     ap.add_argument('--classify', metavar='FILE', help='print the actions for a recorded {event, payload} file')

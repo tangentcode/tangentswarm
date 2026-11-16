@@ -122,6 +122,34 @@ def update_active(items, path=None):
     return act, prev
 
 
+def pick_key(item, active=None):
+    """The ONE pick order of the swarm (tangentswarm #35, Michal 2026-11-15 6:09 PM ET): every
+    picker (launch, fill Ready -> Staging, promote Staging -> Human Review, the MinBot check,
+    swarm-tick) sorts by this key. A pure function of {number, ft, labels, closes, due,
+    milestone}:
+      (1) fast-track first: item['ft'], the label "fast-track" (an issue), or the ONE active
+          fast-track ticket (`active`: this item or an issue it closes);
+      (2) then the milestone due date (YYYY-MM-DD), soonest first; a milestone without a due
+          date after every dated one; no milestone last;
+      (3) then the lowest number."""
+    labels = {str(l).lower() for l in item.get('labels') or ()}
+    ft = (item.get('ft') or 'fast-track' in labels or item.get('rank') == FAST_TRACK
+          or is_active_fast_track(item['number'], item.get('closes') or (), active))
+    due = (item.get('due') or '')[:10]
+    ms = 0 if due else 1 if item.get('milestone') else 2
+    return (0 if ft else 1, ms, due, item['number'])
+
+
+def soonest_due(milestones):
+    """(due YYYY-MM-DD or '', title or '') of the soonest dated milestone in [{title, dueOn}],
+    else the first undated title. A PR's milestones are its own and its closing issues'."""
+    dated = sorted(((m.get('dueOn') or '')[:10], m.get('title') or '') for m in milestones if m and m.get('dueOn'))
+    if dated:
+        return dated[0]
+    titles = [m.get('title') for m in milestones if m and m.get('title')]
+    return '', (titles[0] if titles else '')
+
+
 def is_active_fast_track(number, closes=(), active=None):
     """True if PR/issue `number`, or an issue it closes, is the active fast-track ticket."""
     return active is not None and (number == active or active in set(closes))
@@ -130,11 +158,23 @@ def is_active_fast_track(number, closes=(), active=None):
 HR_GATE_COLS = {IN_PROGRESS, AUTO_REVIEW, STAGING, HUMAN_REVIEW, DONE, BACKLOG}  # hr-gate's OPT names
 
 
-def move_card(g, item, col, sh=None):
+def move_card(g, item, col, sh=None, n=None):
     """Move a Project 4 card to column col, by option id. hr-gate's move() knows only its own
     OPT names (no Ready, Needs Input, Triage...): platform #537/#540/#542/#543 at 11:03 AM ET
     2026-11-15 got their MinBot pass comment, then KeyError 'Ready', and stayed in Auto
     Review. Every mover goes through here."""
+    from . import eventdb
+    try:
+        _move(g, item, col, sh)
+    except Exception as e:  # Codex on PR #33: the row says what happened, not what was tried
+        eventdb.log_event('move', source='board', action=col, pr=n, actor=eventdb.SOURCE or None,
+                          detail={'item': item, 'col': col}, error=f'{type(e).__name__}: {str(e)[:300]}')
+        raise
+    eventdb.log_event('move', source='board', action=col, pr=n, actor=eventdb.SOURCE or None,
+                      detail={'item': item, 'col': col})  # tangentswarm #32
+
+
+def _move(g, item, col, sh=None):
     if 'move' in g and col in (g.get('OPT') or HR_GATE_COLS):
         return g['move'](item, col)
     argv = ['gh', 'project', 'item-edit', '--id', item, '--project-id', g['project_id'](),

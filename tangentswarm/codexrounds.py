@@ -21,7 +21,7 @@ def _store():
 
 def rounds(n, store=None):
     """The request rows of PR n, oldest first."""
-    return (store or _store()).rows("stage=? AND pr=?", (ROUND, int(n)))
+    return (store or _store()).rows("stage='event' AND event=? AND pr=?", (ROUND, int(n)))
 
 
 def request(n, head, by, sh=None, state=None, store=None, now=None):
@@ -41,8 +41,8 @@ def log_round(n, head, by, store=None, now=None):
     store = store or _store()
     k = len(rounds(n, store)) + 1
     try:
-        store.add(ROUND, f"codex-round-{n}-{(head or '')[:12]}", ROUND, decisions=[f"round {k}"],
-                  notes=[json.dumps({'head': head, 'round': k, 'by': by})], pr=int(n), now=now)
+        store.add_event('codex', ROUND, action=f"round {k}", pr=int(n), actor=by,
+                        notes=[f"round {k} on {(head or '')[:8]}"], detail={'head': head, 'round': k, 'by': by}, now=now)
     except Exception:
         pass
     return k
@@ -51,9 +51,8 @@ def log_round(n, head, by, store=None, now=None):
 def result(n, head, status, detail='', store=None, now=None):
     """Log Codex's answer for a head (clean or findings, with the detail)."""
     try:
-        (store or _store()).add(RESULT, f"codex-result-{n}-{(head or '')[:12]}", RESULT, decisions=[status],
-                                notes=[json.dumps({'head': head, 'status': status, 'detail': detail})],
-                                pr=int(n), now=now)
+        (store or _store()).add_event('codex', RESULT, action=status, pr=int(n), notes=[detail or status],
+                                      detail={'head': head, 'status': status, 'detail': detail}, now=now)
     except Exception:
         pass
 
@@ -66,9 +65,9 @@ def report(days=7, top=10, store=None, now=None):
     store = store or _store()
     since = now - days * 86400
     by_pr = {}
-    for r in store.rows("stage IN (?, ?) AND received >= ?", (ROUND, RESULT, since)):
-        d = json.loads((json.loads(r['notes']) or ['{}'])[0])
-        by_pr.setdefault(r['pr'], []).append((r['stage'], d))
+    for r in store.rows("stage='event' AND event IN (?, ?) AND received >= ?", (ROUND, RESULT, since)):
+        d = json.loads(r['body'] or '{}')
+        by_pr.setdefault(r['pr'], []).append((r['event'], d))
     out = []
     for n, rows in by_pr.items():
         reqs = [d for s, d in rows if s == ROUND]

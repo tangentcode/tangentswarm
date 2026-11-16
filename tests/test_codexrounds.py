@@ -14,7 +14,7 @@ def test_every_round_is_posted_and_logged_with_no_cap():
     assert len(calls) == 12 and calls[0] == ['gh', 'pr', 'comment', '7', '-R', CR.REPO, '--body', '@codex review']
     assert st.done(f"codex-request:7@{12:040d}")
     rows = CR.rounds(7)
-    assert len(rows) == 12 and json.loads(json.loads(rows[-1]['notes'])[0])['round'] == 12
+    assert len(rows) == 12 and json.loads(rows[-1]['body'])['round'] == 12 and rows[-1]['source'] == 'codex'
 
 
 def test_the_report_lists_the_prs_with_most_rounds_and_what_round_1_missed():
@@ -41,8 +41,8 @@ def test_the_webhook_handoff_logs_a_round_and_codex_results_are_logged():
     ex = Fake(col=board.AUTO_REVIEW, full=codex_pr(findings=True))
     ex.run(W.Action('codex', 9))
     from tangentswarm import eventdb
-    res = eventdb.store().rows("stage=? AND pr=9", (CR.RESULT,))
-    assert len(res) == 1 and json.loads(res[0]['decisions']) == ['findings']
+    res = eventdb.store().rows("event=? AND pr=9", (CR.RESULT,))
+    assert len(res) == 1 and res[0]['action'] == 'findings'
 
 
 def test_an_edit_of_a_staging_pr_reruns_hr_gate_at_once():

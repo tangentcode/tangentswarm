@@ -288,13 +288,20 @@ class PaneWatch:
         self.exits.pop(top, None)
         return None
 
-    def once_key(self, key):
-        """True the first time for key (persisted)."""
-        if self.st.done(key):
-            return False
+    def seen(self, key):
+        """True when the action of key already succeeded (persisted)."""
+        return self.st.done(key)
+
+    def mark(self, key):
+        """Record key only after its action succeeded (Codex on PR #51: a key saved before a
+        failed route hid the question for good, so a failure is retried next pass)."""
         if not self.dry:
             self.st.mark(key)
-        return True
+
+    def keys(self, argv):
+        r = self.sh(argv)
+        if getattr(r, 'returncode', 0):
+            raise RuntimeError(f"{' '.join(argv[:3])}: {(getattr(r, 'stderr', '') or '').strip()[:120] or r.returncode}")
 
     def act(self, action, detail, p, pr, now):
         n = pr['number'] if pr else None
@@ -303,14 +310,18 @@ class PaneWatch:
         if self.dry:
             return f"would {action} {tag}{where}: {detail}".rstrip(': ')
         if action == 'submit':
-            if not self.once_key(f"watch-submit:{p['id']}:{p['hash']}"):
+            key = f"watch-submit:{p['id']}:{p['hash']}"
+            if self.seen(key):
                 return None
-            self.sh(['tmux', 'send-keys', '-t', p['id'], 'Enter'])
+            self.keys(['tmux', 'send-keys', '-t', p['id'], 'Enter'])
+            self.mark(key)
             return f"{tag}{where}: submitted the unsent prompt"
         if action == 'trust':
-            if not self.once_key(f"watch-trust:{p['id']}:{p['hash']}"):
+            key = f"watch-trust:{p['id']}:{p['hash']}"
+            if self.seen(key):
                 return self.diagnose('dialog', p, n, 'the trust dialog stayed after Enter')
-            self.sh(['tmux', 'send-keys', '-t', p['id'], 'Enter'])
+            self.keys(['tmux', 'send-keys', '-t', p['id'], 'Enter'])
+            self.mark(key)
             return f"{tag}{where}: accepted the trust dialog for its worktree"
         if action in ('menu', 'frozen'):
             what = ('a menu blocks the Claude: ' + self._menu(p['screen'])) if action == 'menu' else \
@@ -321,34 +332,41 @@ class PaneWatch:
         if action == 'ask':
             if not n:
                 return self.diagnose('asking', p, n, 'asks in its pane and has no open PR')
-            if not self.once_key(f"watch-ask:{n}:{screen_hash(detail)}"):
+            key = f"watch-ask:{n}:{screen_hash(detail)}"
+            if self.seen(key):
                 return None
             note = self.route(n, detail, p['wt']['top'], p['id'])
+            self.mark(key)
             self.incident(f"ask:{n}:{screen_hash(detail)}", f"#{n}: a worker asked in its pane",
                           f"The worker Claude of #{n} ({where}) asked in its pane instead of calling needs_input: "
                           f"{detail[:600]}", fix=f"The pane watcher routed it: {note}")
             return f"{tag}{where}: asked in the pane (a bug): {note}"
         if action == 'handoff':
             head = p['wt'].get('head') or ''
-            if not self.once_key(f"watch-handoff:{n}@{head}"):
+            key = f"watch-handoff:{n}@{head}"
+            if self.seen(key):
                 return None
             self.handoff(p['wt']['top'])
+            self.mark(key)
             self.incident(f"missed-handoff:{n}@{head[:12]}", f"#{n}: the Stop hook missed a finished worker",
                           f"The worker of #{n} ({where}) was idle with a clean, pushed head {head[:8]} and the card "
                           f"still {detail}.", fix='The pane watcher queued the handoff.')
             return f"{tag}{where}: finished but {detail}: queued the handoff (the Stop hook missed it)"
         if action == 'nudge':
-            if not self.once_key(f"watch-nudge:{p['id']}:{p['wt'].get('head')}:{detail}"):
+            key = f"watch-nudge:{p['id']}:{p['wt'].get('head')}:{detail}"
+            if self.seen(key):
                 return None
             self.tell(p['id'], NUDGE.format(n=n or '?', bits=detail))
+            self.mark(key)
             return f"{tag}{where}: idle with {detail}: nudged"
         return None
 
     def exit(self, p, tag, where, why):
         if not self.shell_root(p.get('pane_pid')):
-            if self.once_key(f"watch-noexit:{p['id']}"):
-                return f"{tag}{where}: idle ({why}), but Claude is the pane's own process: /exit would close the window"
-            return None
+            if self.seen(f"watch-noexit:{p['id']}"):
+                return None
+            self.mark(f"watch-noexit:{p['id']}")
+            return f"{tag}{where}: idle ({why}), but Claude is the pane's own process: /exit would close the window"
         self.tell(p['id'], '/exit')
         top = (p.get('wt') or {}).get('top')
         if top and top in self.exits:
@@ -358,12 +376,13 @@ class PaneWatch:
 
     def diagnose(self, kind, p, n, what):
         key = f"{kind}:{p['id']}:{p['hash']}"
-        if not self.once_key('watch-diagnose:' + key):
+        if self.seen('watch-diagnose:' + key):
             return None
         capture_tail = '\n'.join((p.get('screen') or '').rstrip('\n').split('\n')[-60:])
         why = f"pane {p['id']} {p['window']}{' #' + str(n) if n else ''}: {what}"
         self.wake(why, key, pr=n, detail={'pane': p['id'], 'window': p['window'], 'path': p.get('path'),
                                           'capture': capture_tail})
+        self.mark('watch-diagnose:' + key)
         self.incident(key, f"{kind} in {p['window']}", f"{why}.\n\nPane capture:\n```\n{capture_tail[-3000:]}\n```")
         return f"{why}: woke swarmbot to diagnose"
 

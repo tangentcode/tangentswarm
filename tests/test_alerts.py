@@ -7,8 +7,8 @@ def test_tell_michal_posts_once_per_key_and_logs_a_row():
     assert alerts.tell_michal('Codex outage', key='k1', post=sent.append)
     assert not alerts.tell_michal('Codex outage', key='k1', post=sent.append)
     assert len(sent) == 1 and sent[0]['to'] == 'michal' and sent[0]['text'] == 'Codex outage'
-    rows = eventdb.store().rows("stage='watch'")
-    assert len(rows) == 1 and 'Codex outage' in rows[0]['notes']
+    rows = eventdb.store().rows("source='watch'")
+    assert len(rows) == 1 and rows[0]['event'] == 'alert' and 'Codex outage' in rows[0]['notes']
 
 
 def test_the_alert_goes_to_the_methbot_url_not_the_swarmbot_url(monkeypatch):

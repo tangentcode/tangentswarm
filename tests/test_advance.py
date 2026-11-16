@@ -436,7 +436,7 @@ def test_a_fast_track_pr_that_does_not_merge_cleanly_is_not_pulled_past_the_floo
 
 def test_the_pull_order_puts_the_fast_track_pr_first():
     ready = [pr(5, board.READY, rank=board.NORMAL), pr(9, board.READY, rank=board.FAST_TRACK),
-             pr(7, board.READY, rank=board.MILESTONE)]
+             dict(pr(7, board.READY, rank=board.MILESTONE), due='2026-11-15', milestone='ptw 15')]
     assert [p['number'] for p in flow.ready_order(ready, {9: 3})] == [9, 7, 5]
 
 

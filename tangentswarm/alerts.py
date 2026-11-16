@@ -4,7 +4,7 @@ swarmbot wakes for a diagnosis, incident tickets (methodology #81) and event-log
 Michal gets a message only for the cases #40 names (a Codex outage, a stalled promote, a
 new Needs Input card). Each message is one POST to the URL in ALERT_URL_FILE (with an
 optional bearer key in ALERT_KEY_FILE), deduped by key. With no URL the message is logged
-only. Every alert, wake and incident is also a row in the event DB (stage 'watch').
+only. Every alert, wake and incident is also a row in the events DB (source 'watch').
 """
 import os
 import time
@@ -27,11 +27,11 @@ def state():
 
 
 def record(kind, text, pr=None, key=None, now=None):
-    """One 'watch' row in the event DB. Never raises."""
+    """One events DB row (source 'watch', event kind). Never raises."""
     from . import eventdb
     try:
-        eventdb.store().add('watch', f"watch-{kind}-{key or ''}", 'watch', decisions=[kind], notes=[text],
-                            pr=pr, now=now)
+        eventdb.store().add_event('watch', kind, action=kind, pr=pr, notes=[text],
+                                  detail={'key': key} if key else None, now=now)
     except Exception:
         pass
 

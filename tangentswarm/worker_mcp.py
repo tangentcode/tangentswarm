@@ -157,15 +157,22 @@ def via_daemon(op, **extra):
     """Run op for this worktree through the spool: the GitHub calls need sudo (the minbot gh
     shim), which fails inside swarm-workers.slice, so the swarm-promoted daemon runs them.
     Never raises: an error comes back as {'ok': False, 'error': '<the real text>'}."""
-    from . import spool
+    from . import eventdb, spool
     try:
         wt = worktree()
     except ToolError as e:
+        eventdb.log_event('mcp', source='mcp', action=op, error=str(e)[:300])
         return {'ok': False, 'error': str(e)}
     try:
-        return spool.submit(op, wt, wait=spool.WAIT, **extra)
+        res = spool.submit(op, wt, wait=spool.WAIT, **extra)
     except Exception as e:
-        return {'ok': False, 'error': f'{type(e).__name__}: {e}'}
+        res = {'ok': False, 'error': f'{type(e).__name__}: {e}'}
+    # tangentswarm #32: every worker MCP call is one events DB row (a Claude reporting done, ...)
+    pr = res.get('pr') if isinstance(res, dict) else None
+    eventdb.log_event('mcp', source='mcp', action=op, actor=Path(wt).name, pr=pr if isinstance(pr, int) else None,
+                      error=(res or {}).get('error') if isinstance(res, dict) and not res.get('ok', True) else None,
+                      detail=res if isinstance(res, dict) else {'result': str(res)[:500]})
+    return res
 
 
 async def worker_status() -> dict:

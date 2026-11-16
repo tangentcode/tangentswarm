@@ -57,5 +57,5 @@ def test_revive_refuses_when_another_claude_runs_in_the_worktree(wt):  # noqa: F
     slots.save({'parked': {'7': dict(session='sid-7', worktree=wt)}, 'rework': {}})
     sp, host, out = FakeSP(wt, live={'pane': '%50', 'agent': None}), FakeHost(), []
     rc = slots.revive('#7', 'go', out=out.append, sp=sp, host=host, claudes=[],
-                      refuse=lambda p: f'a Claude already runs in {p}')
-    assert rc == 1 and host.typed == [] and 'already runs' in out[-1]
+                      refuse=lambda p: f'another Claude is live in {p}')
+    assert rc == 1 and host.typed == [] and 'another Claude is live' in out[-1]

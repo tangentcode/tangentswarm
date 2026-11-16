@@ -86,5 +86,5 @@ def refuse_second_claude(worktree, find=None):
     found = (find or claudes_in)(worktree)
     if not found:
         return None
-    return (f"a Claude already runs in {worktree} (pid {', '.join(str(p) for p, _ in found)}): "
+    return (f"another Claude is live in {worktree} (pid {', '.join(str(p) for p, _ in found)}): "
             "one Claude per worktree; not starting another")

@@ -185,10 +185,12 @@ def gate_verdict(rows):
     return ('fail', hard) if hard else ('wait', wait)
 
 
-def ready_order(ready, conflicts):
-    """Ready PRs in pull order: milestone rank, fewest conflicts, then oldest (entry time when
-    known, else the lower PR number)."""
-    return sorted(ready, key=lambda p: (p['rank'], conflicts.get(p['number'], 0), p.get('entered') or 0, p['number']))
+def ready_order(ready, conflicts=None, active=None):
+    """Ready PRs in pull order: the shared pick order (board.pick_key: fast-track, the soonest
+    milestone due date, the lowest number; tangentswarm #35, Michal 2026-11-15 6:09 PM ET: MVP
+    PRs due Dec 1 went ahead of ptw 15 PRs due Nov 15). The pull still takes the first one in
+    this order that merges cleanly; conflicts no longer reorder them."""
+    return sorted(ready, key=lambda p: board.pick_key(p, active))
 
 
 def event_wants_step(name, payload):
@@ -394,12 +396,8 @@ class Flow:
                   'no Ready PR stacks cleanly on main + Human Review + Staging: one speculative rebase needed')
 
     def staging_order(self, staging):
-        try:
-            order = [r['pr'] for r in self.g['queue_from_board_or_file']()]
-        except Exception:
-            order = []
-        pos = {n: i for i, n in enumerate(order)}
-        return sorted(staging, key=lambda p: (pos.get(p['number'], len(pos)), p['number']))
+        """Staging in the shared pick order (board.pick_key; tangentswarm #35)."""
+        return sorted(staging, key=lambda p: board.pick_key(p, board.active_fast_track()))
 
     def fetch_work(self, scratch):
         """Fetch origin work into the scratch repo; return its commit."""
@@ -617,7 +615,7 @@ class Flow:
                 self.note(f"NEEDS_WORKER #{n}: retried the held handoff; still no worker ({said})")
                 continue
             unhold(n)
-            board.move_card(self.g, p['item'], board.IN_PROGRESS)
+            board.move_card(self.g, p['item'], board.IN_PROGRESS, n=n)
             from . import moves
             moves.log_move(n, board.READY, 'In Progress', p.get('head', ''), note=('held: ' + h.get('why', ''))[:120])
             self.change(f"#{n} -> In Progress: the held handoff reached its worker ({said})")
@@ -655,7 +653,7 @@ class Flow:
             self.note(f"NEEDS_WORKER #{n}: {reason[:160]}; the card stays in {p.get('col') or '?'} because no "
                       f"worker could be started ({said}); its head is held from new pulls")
             return False
-        board.move_card(self.g, p['item'], board.IN_PROGRESS)
+        board.move_card(self.g, p['item'], board.IN_PROGRESS, n=n)
         from . import moves
         moves.log_move(n, p.get('col') or '?', 'In Progress', p.get('head', ''), note=reason[:120])
         self.change(f"#{n} -> In Progress: {reason[:200]} (its worker has the relay: {said})")

@@ -233,3 +233,38 @@ def test_an_answer_clears_the_pending_exit_of_its_pr():
     ex.full = {'comments': {'nodes': []}, 'commits': {'nodes': [{'commit': {'committedDate': '0'}}]}}
     ex.run(webhook.Action('answered', 0, 'x', dict(node='N')))
     assert ex.relays and list(needsinput.pending_exits()) == ['/w/platform.b']
+
+
+@pytest.mark.parametrize('scr,blank,col,attr', [
+    (ASK, True, board.IN_PROGRESS, 'route'),
+    (IDLE, True, board.IN_PROGRESS, 'handoff'),
+    (screen(['● x'], typed='relay'), False, board.AUTO_REVIEW, 'sh'),
+    (MENU, True, board.AUTO_REVIEW, 'wake'),
+])
+def test_a_failed_action_is_retried_next_pass_not_marked_done(worker, scr, blank, col, attr):
+    """Codex on PR #51: the once-key is saved only after the action succeeds."""
+    r = Rig(worker, (scr, blank), pr=dict(AR, col=col, draft=False))
+    calls = []
+    real = getattr(r.w, attr)
+
+    def flaky(*a, **k):
+        calls.append(a)
+        if len(calls) == 1:
+            raise RuntimeError('GitHub 502')
+        return real(*a, **k)
+    setattr(r.w, attr, flaky)
+    r.run(0)
+    assert 'failed: RuntimeError: GitHub 502' in r.run(60)[0]
+    assert r.run(120) and len(calls) == 2  # retried, and done
+    r.run(180)
+    assert len(calls) == 2  # then never again
+
+
+def test_a_failed_tmux_send_keys_is_an_error_not_a_success(worker):
+    r = Rig(worker, (screen(['● x'], typed='relay'), False), pr=AR)
+
+    class Bad:
+        returncode, stdout, stderr = 1, '', "can't find pane %1"
+    r.w.sh = lambda argv, timeout=30: Bad()
+    r.run(0)
+    assert "can't find pane" in r.run(60)[0]
