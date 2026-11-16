@@ -166,3 +166,22 @@ def test_a_busy_lock_requeues_the_repo_and_board_arguments(monkeypatch, tmp_path
     A.main(['--minbot', '47', '--repo', TS])
     A.main(['--promote-board', '6'])
     assert queued == [['--minbot', '47', '--repo', TS], ['--promote-board', '6']]
+
+
+def test_a_board_pass_retries_unknown_mergeability(monkeypatch, tmp_path):
+    """Codex on PR #47: a promote that met UNKNOWN had no retry; the daemon queues a board
+    pass every BOARD_EVERY s, and the pass checks Auto Review and promotes."""
+    from tangentswarm import gatelock, promoted as P
+    queued = []
+    monkeypatch.setattr(gatelock, 'enqueue', lambda argv, by='', qdir=None: queued.append(argv[1:]))
+    monkeypatch.setattr(P, 'BOARD_EVERY', 300)
+    p = P.Promoter.__new__(P.Promoter)
+    assert p.board_passes(now=1000) == [6] and queued == [['--promote-board', '6', '--board-pass']]
+    assert p.board_passes(now=1000 + 10) == []  # not again before BOARD_EVERY
+    cols = {board.AUTO_REVIEW: [pr(47)], board.READY: [pr(30)]}
+    adv = Adv(cols)
+    monkeypatch.setattr(boards, 'open_prs', lambda gql, b: adv.cols)
+    checked = []
+    monkeypatch.setattr(boardflow, 'minbot_repo', lambda a, n, repo: checked.append((n, repo)))
+    monkeypatch.setattr(board, 'move_card', lambda *a, **k: None)
+    assert boardflow.board_pass(adv, B6) == [30] and checked == [(47, TS)]

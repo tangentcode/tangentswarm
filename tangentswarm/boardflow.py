@@ -96,13 +96,26 @@ def minbot_repo(adv, n, repo):
     return True
 
 
+def board_pass(adv, b):
+    """The periodic pass of a board without staging (swarm-promoted queues it every
+    BOARD_EVERY s): the MinBot check of each Auto Review PR, then promote. It retries what an
+    event could not finish, such as GitHub's mergeable still UNKNOWN (Codex on PR #47)."""
+    for p in boards.open_prs(adv.g['gql'], b).get(board.AUTO_REVIEW, []):
+        if not p['draft']:
+            minbot_repo(adv, p['number'], p['repo'])
+    return promote(adv, b)
+
+
 def main(a, adv):
     if a.promote_board:
         b = next((x for x in board.BOARDS if x.number == a.promote_board), None)
         if b is None:
             _say(adv, f"board {a.promote_board} is not configured")
             return 2
-        promote(adv, b)
+        if getattr(a, 'board_pass', False):
+            board_pass(adv, b)
+        else:
+            promote(adv, b)
         return 0
     minbot_repo(adv, a.minbot, a.repo)
     return 0

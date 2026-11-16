@@ -62,6 +62,8 @@ def isolated_state(tmp_path, monkeypatch):
     # a queued cascade would be run by a daemon test's drain as a REAL ~/bin/swarm-advance
     monkeypatch.setattr(advance, 'queue_cascade', lambda qdir=None: 'not queued (test)')
     monkeypatch.setattr(gatelock, 'QUEUE_DIR', tmp_path / 'gate-queue')
+    from tangentswarm import promoted as _promoted
+    monkeypatch.setattr(_promoted, 'BOARD_EVERY', float('inf'))  # no periodic board pass in a test
     from tangentswarm import slots, launches as _launches
     monkeypatch.setattr(_launches, 'QUEUE', tmp_path / 'swarm-held.json')  # never the real held queue
     monkeypatch.setattr(slots, 'STATE', tmp_path / 'slots.json')

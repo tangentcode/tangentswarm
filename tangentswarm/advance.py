@@ -1026,6 +1026,8 @@ def main(argv=None):
     ap.add_argument('--repo', help='--minbot: the PR\'s repository when it is not the platform repo (#45)')
     ap.add_argument('--promote-board', type=int, metavar='N',
                     help='a board without staging (Project 6, #45): Ready -> Human Review in pick order')
+    ap.add_argument('--board-pass', action='store_true',
+                    help='--promote-board: first the MinBot check of every Auto Review PR (the periodic pass)')
     a = ap.parse_args(argv)
     if a.floor is not None:
         FLOOR = a.floor
@@ -1055,7 +1057,8 @@ def main(argv=None):
     except gatelock.Busy as e:
         # No "busy, give up": the swarm-promoted daemon owns the queue and runs it under the lock.
         args = (['--minbot', str(a.minbot)] + (['--repo', a.repo] if a.repo else []) if a.minbot else []) + \
-            (['--promote-board', str(a.promote_board)] if a.promote_board else [])  # Codex on PR #47: keep them
+            (['--promote-board', str(a.promote_board)] if a.promote_board else []) + \
+            (['--board-pass'] if a.board_pass else [])  # Codex on PR #47: keep them
         print(f"busy: {e}; " + queue_self(args))
         return gatelock.EXIT_BUSY
     except CascadeTimeout as e:  # a dry run (no lock, no flag)
