@@ -255,7 +255,10 @@ class PaneWatch:
             p['pr'] = pr['number'] if pr else None
             seen[p['id']] = p
             for action, detail in decide(p, pr, self.pending_exit(p)):
-                line = self.act(action, detail, p, pr, now)
+                try:
+                    line = self.act(action, detail, p, pr, now)
+                except Exception as e:  # one pane failing never stops the others
+                    line = f"{p['id']} {p['window']}: {action} failed: {type(e).__name__}: {str(e)[:200]}"
                 if line:
                     done.append(line)
         self.latest = seen
