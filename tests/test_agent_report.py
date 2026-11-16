@@ -319,6 +319,22 @@ def test_a_revive_while_the_close_waits_keeps_the_worker_and_its_slot(monkeypatc
     assert slots.load(f.slots_path)['rework']['12']['feedback'] == 'Michal answered: 8080'
 
 
+def test_a_revive_right_after_the_exit_keeps_its_rework_slot(monkeypatch, tmp_path):
+    # Codex on PR #54: a revive that lands between /exit and the cleanup keeps its reservation
+    f = Fake(monkeypatch, tmp_path, statuses=('idle',))
+    with slots.update(f.slots_path) as st:
+        st['rework']['12'] = {'worktree': WT, 'feedback': 'old'}
+
+    def exit_then_revive(c, out):
+        f.exited.append(c['pane'])
+        with slots.update(f.slots_path) as st:
+            st['rework']['12'] = {'worktree': WT, 'feedback': 'Michal answered: 8080'}
+    f.reporter._exit = exit_then_revive
+    f.run('needs-input', question='Which?')
+    assert f.exited == ['%5']
+    assert slots.load(f.slots_path)['rework']['12']['feedback'] == 'Michal answered: 8080'
+
+
 def test_a_resume_holding_the_window_lock_delays_the_exit(monkeypatch, tmp_path):
     f = Fake(monkeypatch, tmp_path, statuses=('idle',))
     f.lock_free = False

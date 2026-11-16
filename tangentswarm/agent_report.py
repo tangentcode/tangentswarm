@@ -381,9 +381,11 @@ class Reporter:
                                                         reason=rep['state'])
                         why = ((self._park or slots._park)(c, self.say) if strict
                                else (self._exit or exit_idle)(c, self.say))
+                        if not why:  # Codex on PR #54: only once closed, under the lock, and only the
+                            with slots.update(self.slots_path) as st:  # entry it held (never a new revive's)
+                                if st['rework'].get(str(n)) == rework_before:
+                                    st['rework'].pop(str(n), None)
                 if not why:
-                    with slots.update(self.slots_path) as st:  # Codex on PR #54: only once it is closed
-                        st['rework'].pop(str(n), None)
                     self.say(f"#{n}: closed the Claude with /exit; window {rep['window']} stays; "
                              f"session {(c.get('session') or '?')[:8]} kept for swarm-revive")
                     return True
