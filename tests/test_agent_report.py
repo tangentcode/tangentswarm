@@ -110,15 +110,25 @@ class Fake:
         self.moves, self.sh, self.told, self.parked, self.exited, self.handoffs = [], [], [], [], [], []
         self.statuses, self.park_why = list(statuses), list(park_why)
         self.slots_path = tmp_path / 'slots.json'
-        monkeypatch.setattr(stophook, 'find_pr', lambda g, b, issues_=False, **k: (12, 'ITEM12', col, False,
-                                                                                    list(issues)))
-        monkeypatch.setattr(stophook, 'move_card', lambda g, item, c, sh: self.moves.append((item, c)))
+        self.col = col
+        monkeypatch.setattr(stophook, 'find_pr', lambda g, b, **k: (12, 'ITEM12', self.col, False, list(issues)))
+        monkeypatch.setattr(stophook, 'move_card', self.move)
         self.reporter = R.Reporter(
             g={}, sh=self.sh.append, resolve=lambda pr: ('mn-12-feat', WT, 'feat'),
             running=self.running, handoff=lambda wt: self.handoffs.append(wt) or '#12 handed off',
             park=lambda c, out: self.parked.append(c['pane']) or (self.park_why.pop(0) if self.park_why else None),
             exit_claude=lambda c, out: self.exited.append(c['pane']), tell=lambda n, t: self.told.append(t),
-            pushed_head=lambda wt: pushed, sleep=lambda s: None, slots_path=self.slots_path)
+            pushed_head=lambda wt: pushed, sleep=lambda s: None, slots_path=self.slots_path,
+            lock=self.lock)
+        self.lock_free = True
+
+    def lock(self, window):
+        import contextlib
+        return contextlib.nullcontext(self.lock_free)
+
+    def move(self, g, item, c, sh):
+        self.moves.append((item, c))
+        self.col = c
 
     def running(self):
         st = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
@@ -279,6 +289,45 @@ def test_pending_input_until_handled_or_superseded():
     assert R.pending_input(12) is None
     R.accept('blocked', 12, 'w', message='down', submit=noop)
     assert R.pending_input(12, now=10 ** 11) is None  # a report never handled stops holding after the TTL
+
+
+def test_an_answer_while_the_close_waits_cancels_the_close(monkeypatch, tmp_path):
+    # Codex on PR #54: Michal answered (card back to In Progress, swarm-revive told the worker)
+    # while the close waited for the Claude to go idle; the worker must not be closed
+    f = Fake(monkeypatch, tmp_path, statuses=('busy', 'idle'))
+    cols = [board.IN_PROGRESS, board.NEEDS_INPUT, board.IN_PROGRESS]  # post(), post() recheck, the close
+    monkeypatch.setattr(stophook, 'find_pr', lambda g, b, **k: (12, 'ITEM12', cols.pop(0) if len(cols) > 1 else cols[0],
+                                                                 False, [7]))
+    res = f.run('needs-input', question='Which?')
+    assert f.exited == [] and any('answered' in l for l in res['lines'])
+    assert '12' not in slots.load(f.slots_path)['parked']
+
+
+def test_a_revive_while_the_close_waits_keeps_the_worker_and_its_slot(monkeypatch, tmp_path):
+    f = Fake(monkeypatch, tmp_path, statuses=('busy', 'idle'))
+    real = f.running
+
+    def running():
+        out = real()
+        if out[0]['status'] == 'busy':  # the revive lands while the Claude is busy
+            with slots.update(f.slots_path) as st:
+                st['rework']['12'] = {'worktree': WT, 'feedback': 'Michal answered: 8080'}
+        return out
+    f.reporter._running = running
+    res = f.run('done')
+    assert f.parked == [] and any('swarm-revive gave the worker new work' in l for l in res['lines'])
+    assert slots.load(f.slots_path)['rework']['12']['feedback'] == 'Michal answered: 8080'
+
+
+def test_a_resume_holding_the_window_lock_delays_the_exit(monkeypatch, tmp_path):
+    f = Fake(monkeypatch, tmp_path, statuses=('idle',))
+    f.lock_free = False
+    t = [0.0]
+    f.reporter.clock = lambda: t[0]
+    f.reporter.sleep = lambda s: t.__setitem__(0, t[0] + s)
+    f.reporter.close_wait = 10
+    res = f.run('needs-input', question='Which?')
+    assert f.exited == [] and any('a resume of this window is running' in l for l in res['lines'])
 
 
 # -- the worker brief ----------------------------------------------------------------------

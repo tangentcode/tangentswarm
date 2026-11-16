@@ -181,12 +181,13 @@ class Reporter:
 
     def __init__(self, g=None, sh=None, resolve=None, running=None, handoff=None, park=None, exit_claude=None,
                  tell=None, pushed_head=None, sleep=time.sleep, clock=time.monotonic, close_wait=CLOSE_WAIT,
-                 slots_path=None):
+                 slots_path=None, lock=None):
         self._g, self.sh = g, sh
         self._resolve, self._running, self._handoff = resolve, running, handoff
         self._park, self._exit, self._tell, self._pushed = park, exit_claude, tell, pushed_head
         self.sleep, self.clock, self.close_wait = sleep, clock, close_wait
         self.slots_path = slots_path
+        self._lock = lock
         self.lines = []
 
     # outside calls
@@ -325,12 +326,38 @@ class Reporter:
         self.say(f"#{rep['pr']} working")
 
     # /exit, keeping the window
+    def resume_lock(self, window):
+        """The window's resume lock (slots.revive holds it while it resumes or tells the
+        Claude); a context manager that yields False when someone else holds it."""
+        if self._lock:
+            return self._lock(window)
+        from . import slots
+        sp = slots.parking()
+        return sp.flocked(sp.resume_lock(window), blocking=False)
+
+    def superseded(self, rep, branch, rework_before):
+        """Why the close is stale, or None (Codex on PR #54): an answer or a relay reached the
+        worker while the close waited for it to go idle (slots.revive records a rework entry),
+        or the needs-input card was moved out of Needs Input (Michal answered)."""
+        from . import board, slots
+        if slots.load(self.slots_path)['rework'].get(str(rep['pr'])) != rework_before:
+            return 'swarm-revive gave the worker new work while the close waited'
+        if rep['state'] == 'needs-input':
+            col = self.card(branch)[2]
+            if col != board.NEEDS_INPUT:
+                return f'the card moved to {col} (answered) while the close waited'
+        return None
+
     def close(self, rep, wt, branch, head, strict):
         """Wait until the Claude of wt is idle (its turn with the report_status call ended),
         record its session for swarm-revive, then /exit it. strict: through slots park
-        (clean and pushed worktree); else any idle Claude."""
+        (clean and pushed worktree; park_one refuses while a resume holds the window); else
+        any idle Claude, under the window's resume lock. A close made stale by an answer or
+        a revive while it waited is dropped."""
+        import contextlib
         from . import slots
         n = rep['pr']
+        rework_before = slots.load(self.slots_path)['rework'].get(str(n))
         end = self.clock() + self.close_wait
         while True:
             c = self.claude(wt)
@@ -339,12 +366,21 @@ class Reporter:
                 return False
             if c.get('status') in (None, '', 'idle'):
                 c['pr'] = n
-                with slots.update(self.slots_path) as st:  # first: the revive needs it even if /exit fails
-                    st['parked'][str(n)] = dict(session=c.get('session') or '', pane=c.get('pane') or '',
-                                                worktree=str(wt), branch=branch, head=head or '',
-                                                window=rep['window'], parked_at=slots.et_now(),
-                                                reason=rep['state'])
-                why = (self._park or slots._park)(c, self.say) if strict else (self._exit or exit_idle)(c, self.say)
+                with (contextlib.nullcontext(True) if strict else self.resume_lock(rep['window'])) as got:
+                    if not got:
+                        why = 'not idle: a resume of this window is running'
+                    else:
+                        stale = self.superseded(rep, branch, rework_before)
+                        if stale:
+                            self.say(f"#{n}: the Claude was not closed: {stale}")
+                            return False
+                        with slots.update(self.slots_path) as st:  # first: the revive needs it if /exit fails
+                            st['parked'][str(n)] = dict(session=c.get('session') or '', pane=c.get('pane') or '',
+                                                        worktree=str(wt), branch=branch, head=head or '',
+                                                        window=rep['window'], parked_at=slots.et_now(),
+                                                        reason=rep['state'])
+                        why = ((self._park or slots._park)(c, self.say) if strict
+                               else (self._exit or exit_idle)(c, self.say))
                 if not why:
                     with slots.update(self.slots_path) as st:  # Codex on PR #54: only once it is closed
                         st['rework'].pop(str(n), None)
