@@ -56,7 +56,7 @@ REGISTRY = {
     'grok': AgentSpec(
         # --trust records trust for the repo root; Grok 1.0.62 ignores a worktree-path entry
         'grok', ('~/.grok/bin/grok',), flags=('--trust',),
-        names=frozenset({'grok'}), prefixes=('grok-linux',), adapter='none'),
+        names=frozenset({'grok'}), prefixes=('grok-linux',), adapter='basic'),
     'gemini': AgentSpec(
         'gemini', ('~/.npm-global/bin/gemini', '~/workspace/.npm-global/bin/gemini', '~/.local/bin/gemini',
                    '/usr/local/bin/gemini', '/usr/bin/gemini'),

@@ -5,8 +5,10 @@ plus the agent detection from tell-worker.mts and local-status.mts. It also has 
 send sequence that every tell-worker handoff uses:
 
 1. Reach an empty prompt with the space probe.
-2. Optionally send /new, wait 500ms, press Enter and wait 10s.
-3. Type the text literally, wait 500ms and press Enter.
+2. Optionally send /new and submit it (see 3), then wait 10s.
+3. Type the text literally, wait until it shows in the input box, press Enter, and
+   check that the text left the box. Enter is pressed again with backoff while the
+   text is still sitting there; SubmitError if it never goes.
 
 The prompt-detection functions take screen text and return a bool, so the tests
 can run them without tmux.
@@ -23,8 +25,11 @@ from .workers import load_known_agents
 PROBE_SETTLE = 0.8       # after the space probe
 PROBE_RECHECK = 0.3
 PROBE_CLEANUP = 0.1      # after BSpace
-ENTER_DELAY = 0.5        # between the text and Enter, because TUIs drop an Enter sent too soon
-NEW_CONVERSATION_WAIT = 10.0   # after "/new" and Enter
+ENTER_DELAY = 0.5        # least wait between the text and Enter, because TUIs drop an Enter sent too soon
+TYPED_POLL = 0.25        # while waiting for typed text to show in the input box and settle
+TYPED_TIMEOUT = 8.0      # give up waiting for it after this long (a loaded box can be slow to draw)
+SUBMIT_BACKOFF = (0.5, 1.0, 2.0, 4.0)   # waits before each check that the text left the box
+NEW_CONVERSATION_WAIT = 10.0   # after "/new" is submitted
 STARTUP_WAIT = 5.0       # how long start_agent watches a new pane for a first-run screen
 STARTUP_POLL = 0.5
 
@@ -105,6 +110,13 @@ def muse_prompt_blank(screen):
     return claude_prompt_blank(screen)
 
 
+def grok_prompt_blank(screen):
+    """Return True if Grok's input box is blank. Grok draws the ❯ input line inside a
+    rounded box (│ ❯ ... │), so this goes by input_box()."""
+    box = input_box(screen, '❯', framed=True)
+    return box is not None and box.strip() == ''
+
+
 def is_muse_screen(screen):
     """Match Muse's footer line, '<model> · <effort> · <path> · <approval mode>'."""
     lines = [l for l in screen.split('\n') if l.strip()]
@@ -116,7 +128,98 @@ PROMPT_DETECTORS = {
     'codex': codex_prompt_blank,
     'gemini': gemini_prompt_blank,
     'muse': muse_prompt_blank,
+    'grok': grok_prompt_blank,
 }
+
+
+_BAR_RUN = '─' * 10
+_BORDER = '│┃'
+
+
+def _indent(line):
+    """The column of the line's first character that is not a blank or a │ ┃ border."""
+    return len(line) - len(line.lstrip(' ' + _BORDER))
+
+
+def _is_frame_bar(line, col):
+    """True if the line is a ─ bar that is not indented past column col. Typed text is
+    drawn indented under the glyph, so a bar in it (a quoted screen) sits further right."""
+    return _BAR_RUN in line and _indent(line) <= col
+
+
+def input_box(screen, glyph, framed=False):
+    """Return what is typed in the input box, or None if no input box is on screen.
+
+    The input box starts at a line whose first character (after spaces and a │ border)
+    is the prompt glyph. Box borders are dropped.
+
+    With framed=True (Claude, Muse, Grok, Gemini) a ─ bar must sit right above the glyph
+    line and another must close the box, so a transcript line or a dialog's menu
+    ('❯ No, exit') never passes for the box. Only a bar that is not indented past the
+    glyph counts as the frame: typed lines are drawn indented under the glyph, so a
+    quoted screen in the text (a bar, '❯ old request', a bar) is box content. A glyph
+    line that sits inside another candidate box is such a quote, so the lowest glyph line
+    that is not inside another box is the input box.
+
+    Codex's box has no frame: its glyph sits in column 0 and its continuation lines are
+    indented, so a typed line that starts with the glyph is not taken for the prompt. The
+    box ends at the first blank line, above the footer. Codex's dialogs' menus
+    ('› 3. Cancel') also start in column 0, so callers compare the box with what they
+    typed rather than only asking if it is blank."""
+    lines = screen.split('\n')
+    boxes = []      # (start, end): the glyph line and the line that ends the box
+    for start, line in enumerate(lines):
+        if not line.lstrip(' ' + _BORDER).startswith(glyph):
+            continue
+        if not framed:
+            if not line.startswith(glyph):
+                continue    # Codex indents continuation lines, so a '› ...' in the text is not the prompt
+            end = next((j for j in range(start + 1, len(lines))
+                        if not lines[j].strip(' ' + _BORDER)), len(lines))
+            boxes.append((start, end))
+            continue
+        col = _indent(line)
+        if start == 0 or not _is_frame_bar(lines[start - 1], col):
+            continue
+        end = next((j for j in range(start + 1, len(lines)) if _is_frame_bar(lines[j], col)), None)
+        if end is not None:
+            boxes.append((start, end))
+    for start, end in reversed(boxes):
+        if framed and any(s < start and e >= end for s, e in boxes):
+            continue        # a quoted prompt inside the real box
+        out = [lines[start].lstrip(' ' + _BORDER)[len(glyph):]] + lines[start + 1:end]
+        return '\n'.join(l.strip(' ' + _BORDER) for l in out)
+    return None
+
+
+# Long pastes collapse to a placeholder: Claude and Muse '[Pasted text #1 +40 lines]',
+# Codex '[Pasted Content 2048 chars]'.
+_PASTE_RE = re.compile(r'\[Pasted (text|content)\b', re.I)
+_LEADING_BLANK_RE = re.compile(r'\A(?:[ \t]*\n)+')
+_FLAT_RE = re.compile(r'[\s│┃]+')
+FINGERPRINT_CHARS = 24
+
+
+def _flat(s):
+    """The text with all whitespace and box side borders (│ ┃) removed. Typed text and the
+    box are both compared in this form: a box wraps, indents and frames lines, and the
+    message itself can hold a │ that input_box() cannot tell from a border."""
+    return _FLAT_RE.sub('', s)
+
+
+def fingerprint(text):
+    """The first FINGERPRINT_CHARS characters of _flat() of the text's first line that is
+    not blank in that form. Codex's box ends at a blank line, so stay on the first line."""
+    first = next((l for l in text.split('\n') if _flat(l)), '')
+    return _flat(first)[:FINGERPRINT_CHARS]
+
+
+def holds_text(box, text):
+    """Return True if the input box (from input_box()) shows `text`, or a paste placeholder."""
+    if box is None:
+        return False
+    fp = fingerprint(text)
+    return bool(fp and fp in _flat(box)) or bool(_PASTE_RE.search(box))
 
 
 def detector_for(agent):
@@ -432,13 +535,17 @@ def screen_hash(screen):
 
 
 # ---------------------------------------------------------------------------
-# TUI agent wrapper (TuiAgent / ClaudeTui / CodexTui / GeminiTui)
+# TUI agent wrapper (TuiAgent / ClaudeTui / CodexTui / GeminiTui / MuseTui / GrokTui)
 
 class TuiAgent:
-    """A TUI agent in a tmux pane. Subclasses set `detect`."""
+    """A TUI agent in a tmux pane. Subclasses set `detect`, `glyph` (the prompt character
+    that starts the input box) and `framed` (see input_box()). Without a glyph, send_text
+    cannot see the box, so it presses Enter once and cannot verify the submission."""
 
     name = 'tui'
     detect = staticmethod(lambda screen: False)
+    glyph = None
+    framed = True       # see input_box()
 
     def __init__(self, target, capture=None, send_literal=None, send_key=None, sleep=time.sleep):
         self.target = target
@@ -475,14 +582,97 @@ class TuiAgent:
         return now_blank
 
     def send_text(self, text, enter=True):
-        """Type text literally, pause ENTER_DELAY, then press Enter separately."""
+        """Type text literally and, with enter, submit it and check that it was submitted.
+
+        1. Wait at least ENTER_DELAY, and until the text shows in the input box and the
+           box stops changing (up to TYPED_TIMEOUT). If it never shows, a dialog or menu
+           probably took the keystrokes: raise SubmitError without pressing Enter.
+        2. Press Enter, then check the box after each SUBMIT_BACKOFF wait. A blank box
+           means the text was submitted. If the text is still in the box, the Enter was
+           lost (TUIs drop them under load): press Enter again. Anything else (no box, or
+           a dialog's menu) never gets an Enter, since it could pick a menu item.
+        3. Raise SubmitError if the text is still in the box at the end, or if the box
+           never came back blank.
+
+        Returns {'enter_presses': n, 'submit_verified': bool}.
+        """
+        text = text.replace('\r\n', '\n').replace('\r', '\n')   # a CR is Enter: it would submit part-way
+        if fingerprint(text):
+            # Leading blank lines carry nothing, and Codex's box ends at the first blank
+            # line, so the text after them would never show in the box.
+            text = _LEADING_BLANK_RE.sub('', text)
         self._send_literal(self.target, text)
-        if enter:
+        if not enter:
+            return {'enter_presses': 0, 'submit_verified': False}
+        if self.glyph is None or not fingerprint(text):
             self._sleep(ENTER_DELAY)
             self._send_key(self.target, 'Enter')
+            return {'enter_presses': 1, 'submit_verified': False}
+        typed = self._wait_until_typed(text)
+        self._send_key(self.target, 'Enter')
+        presses, state, screen = 1, None, ''
+        for i, wait in enumerate(SUBMIT_BACKOFF):
+            self._sleep(wait)
+            screen = self.screen()
+            state = self._submit_state(screen, text, typed)
+            if state == 'sent':
+                return {'enter_presses': presses, 'submit_verified': True}
+            if state == 'pending' and i < len(SUBMIT_BACKOFF) - 1:
+                self._send_key(self.target, 'Enter')
+                presses += 1
+        waited = sum(SUBMIT_BACKOFF)
+        if state == 'pending':
+            raise SubmitError('pending', screen,
+                              f"{self.target}: the text is still in {self.name}'s input box after "
+                              f"{presses} Enter presses over {waited:g}s; it was not submitted")
+        raise SubmitError('unconfirmed', screen,
+                          f"{self.target}: pressed Enter {presses} time(s) but {self.name}'s input box "
+                          f"never came back blank within {waited:g}s (a dialog or menu may be open), so "
+                          "Enter was not pressed again; the text may or may not have been submitted")
+
+    def _submit_state(self, screen, text, typed=None):
+        """'pending' if the text is still in the input box, 'sent' if the box is blank,
+        else 'unknown' (no box, or something else in it, such as a dialog's menu).
+
+        typed is the box as it was just before Enter. A lost Enter leaves the box as it
+        was, so with typed given the box is 'pending' only if it still reads the same.
+        A box that changed, such as a Codex menu whose selected option ('› 3. Skip until
+        next version') holds the text, is 'unknown' and never gets another Enter."""
+        box = input_box(screen, self.glyph, self.framed)
+        if box is None:
+            return 'unknown'
+        if holds_text(box, text):
+            return 'pending' if typed is None or _flat(box) == _flat(typed) else 'unknown'
+        return 'sent' if box.strip() == '' else 'unknown'
+
+    def _wait_until_typed(self, text):
+        """Wait at least ENTER_DELAY, then until the input box shows the text and stays the
+        same for one TYPED_POLL. Only the box is compared, so a spinner elsewhere on a busy
+        agent's screen does not hold this up. Returns the box as it was before Enter."""
+        self._sleep(ENTER_DELAY)
+        waited, last, screen = ENTER_DELAY, None, ''
+        while True:
+            screen = self.screen()
+            box = input_box(screen, self.glyph, self.framed)
+            if holds_text(box, text):
+                if box == last:
+                    return box
+                last = box
+            else:
+                last = None
+            if waited >= TYPED_TIMEOUT:
+                break
+            self._sleep(TYPED_POLL)
+            waited += TYPED_POLL
+        if last is not None:        # in the box, but still being redrawn: go ahead
+            return last
+        raise SubmitError('not_typed', screen,
+                          f"{self.target}: the typed text never showed up in {self.name}'s input box "
+                          f"within {TYPED_TIMEOUT:g}s (a dialog or menu may have taken the keystrokes), "
+                          "so Enter was not pressed")
 
     def new_conversation(self):
-        """Send '/new', wait 500ms, press Enter, then wait 10s for the fresh session."""
+        """Send '/new' and submit it as send_text does, then wait 10s for the fresh session."""
         self.send_text('/new')
         self._sleep(NEW_CONVERSATION_WAIT)
 
@@ -490,22 +680,34 @@ class TuiAgent:
 class ClaudeTui(TuiAgent):
     name = 'claude'
     detect = staticmethod(claude_prompt_blank)
+    glyph = '❯'
 
 
 class CodexTui(TuiAgent):
     name = 'codex'
     detect = staticmethod(codex_prompt_blank)
+    glyph = '›'
+    framed = False
 
 
 class GeminiTui(TuiAgent):
     name = 'gemini'
     detect = staticmethod(gemini_prompt_blank)
+    glyph = '>'
 
 
 class MuseTui(TuiAgent):
     """Muse Code. Enter submits, and /new or /clear starts a fresh session."""
     name = 'muse'
     detect = staticmethod(muse_prompt_blank)
+    glyph = '❯'
+
+
+class GrokTui(TuiAgent):
+    """Grok. The ❯ input line sits inside a rounded box; Enter submits."""
+    name = 'grok'
+    detect = staticmethod(grok_prompt_blank)
+    glyph = '❯'
 
 
 def tui_for(agent, target, **kw):
@@ -519,6 +721,8 @@ def tui_for(agent, target, **kw):
         return GeminiTui(target, **kw)
     if a == 'muse':
         return MuseTui(target, **kw)
+    if a == 'grok':
+        return GrokTui(target, **kw)
     return None
 
 
@@ -626,6 +830,17 @@ class AgentNotReady(RuntimeError):
 class NotAnAgentPane(AgentNotReady):
     """The pane's foreground process is not a registered coding agent."""
 
+
+class SubmitError(AgentNotReady):
+    """Typed text could not be confirmed as submitted. `state` is 'not_typed' (it never
+    showed in the input box; Enter was not pressed), 'pending' (still in the box after
+    every retry) or 'unconfirmed' (the box never came back blank, e.g. a dialog opened).
+    The message ends with the screen's last lines, so the caller sees what happened."""
+
+    def __init__(self, state, screen, message):
+        self.state = state
+        self.last_lines = [l.rstrip() for l in screen.rstrip('\n').split('\n')][-8:]
+        super().__init__(message + '. Last lines on screen:\n' + '\n'.join(self.last_lines))
 
 class AgentBlocked(AgentNotReady):
     """The agent is on a first-run or other blocking screen, which typed text would answer."""
@@ -789,8 +1004,10 @@ def tell_agent(target, text, new_conversation=False, require_empty_prompt=True,
     """Run tell-worker's send sequence on any pane.
 
     1. Optionally reach an empty prompt with the space probe, and refuse if that fails.
-    2. Optionally send '/new', wait 500ms, press Enter and wait 10s.
-    3. Type the text literally, wait 500ms and press Enter.
+    2. Optionally send '/new', submit it and wait 10s.
+    3. Type the text literally and submit it: press Enter once it shows in the input box,
+       and again with backoff while it stays there (TuiAgent.send_text). Raises
+       SubmitError, which the caller sees, if it was not submitted.
     """
     info = require_agent_pane(target)          # never type into a shell
     agent = (agent or info['agent']).lower()
@@ -808,9 +1025,9 @@ def tell_agent(target, text, new_conversation=False, require_empty_prompt=True,
         raise AgentNotReady(f"{target}: never reached an empty prompt (the user may be typing); nothing sent")
     if new_conversation:
         tui.new_conversation()
-    tui.send_text(text)
+    sent = tui.send_text(text)
     return {'target': target, 'pane_id': pane, 'agent': agent, 'sent_chars': len(text),
-            'new_conversation': bool(new_conversation)}
+            'new_conversation': bool(new_conversation), **sent}
 
 
 def wait_for_idle(target, timeout=120.0, poll=1.0, settle=3.0, agent=None, cdir=None,
