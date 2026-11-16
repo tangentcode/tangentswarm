@@ -276,7 +276,7 @@ def test_real_bash_pending_input_or_a_moved_shell_is_refused_not_run(fake_bins, 
 
 @pytest.mark.parametrize('ps1, columns', [('p' * 150, 152),
                                           ('\u754c' * 39 + 'x/' + '\u76ee\u5f55' * 5, 102),   # wide chars
-                                          ('\u754c' * 39 + 'x' + '\u76ee\u5f55' * 5, 102)])   # one at the edge
+                                          ('\u754c' * 39 + 'x' + '\u76ee\u5f55' * 5, 101)])   # one at the edge
 def test_real_bash_with_a_wrapping_prompt_and_a_full_history(fake_bins, root, tmp_path, monkeypatch,  # noqa: F811
                                                              ps1, columns):
     """Codex P2 x3 against real tmux and bash: a login prompt wider than the pane (also one of
@@ -310,8 +310,7 @@ def test_real_bash_with_a_wrapping_prompt_and_a_full_history(fake_bins, root, tm
                               capture_output=True, text=True).stdout.strip()
         assert hist == '5'
         prompt = registry.known_prompts(target, tmux.run_checked)[0]
-        # readline's pad before a wide character that does not fit is part of the recorded prompt
-        assert prompt.replace(' ', '') == ps1 + '$' and registry._columns(prompt) == columns
+        assert prompt == ps1 + '$ ' and registry._columns(prompt) == columns   # no readline pad
         for _ in range(100):                                    # the agent ran and exited
             if (tmp_path / 'scope.log').exists() and registry.shell_problem(target, cwd, tmux.run_checked) is None:
                 break

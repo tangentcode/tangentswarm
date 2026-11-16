@@ -221,12 +221,14 @@ def _join_wide_breaks(lines, width):
     the last column, readline pads the row and starts a new line, so tmux does not mark the
     row as wrapped and capture-pane -J does not join it. A break is joined back when the next
     line starts with a wide character and the line before ends within 2 columns of the edge
-    (the pad is trimmed by the capture). Joining too much only makes a match fail (closed)."""
+    (the pad is trimmed by the capture). The pad is not put back: the joined text is what was
+    printed, so it does not depend on the pane width (_end_column puts the wide character on
+    the next row again). Only at width - 2 is a literal space restored, the one the capture
+    trimmed with the pad. Joining too much only makes a match fail (closed)."""
     out = []
     for line in lines:
         if out and line and _char_columns(line[0]) == 2 and _end_column(out[-1], width) >= width - 2:
-            pad = width - _end_column(out[-1], width)
-            out[-1] += ' ' * pad + line
+            out[-1] += ' ' * (width - 1 - _end_column(out[-1], width)) + line
         else:
             out.append(line)
     return out
@@ -278,21 +280,6 @@ def _end_column(text, width):
     return col
 
 
-def _rendered(text, width):
-    """text as the capture reads it back after _join_wide_breaks(): before a wide character
-    that does not fit in the row, readline's pad is put in as spaces up to the edge. Literal
-    spaces in text are kept. Text that is already rendered does not change."""
-    out, col = [], 0
-    for ch in text:
-        c = _char_columns(ch)
-        if c and col + c > width:
-            out.append(' ' * max(width - col, 0))
-            col = 0
-        out.append(ch)
-        col += c
-    return ''.join(out)
-
-
 def _cursor_at_end(st, text):
     """True if the cursor is right after the logical line `text` that starts at column 0,
     counted in terminal columns (a line that exactly fills its last row leaves the cursor at
@@ -337,8 +324,6 @@ def shell_problem(target, cwd, run):
             return why
     except tmux.TmuxError as e:
         return f"{target}: {e.stderr or 'no such pane'}"
-    if st['pane_width'] > 0:
-        known = [_rendered(k, st['pane_width']) for k in known]
     if not any(row.rstrip(' ') == k.rstrip(' ') and _cursor_at_end(st, k) for k in known):
         return (f"input buffer not positively empty (cursor line {row.strip()[-40:]!r}, column "
                 f"{st['cursor_x']}; expected exactly {' or '.join(repr(k) for k in known)})")
@@ -385,7 +370,7 @@ def first_prompt_problem(target, cwd, run):
 def type_launch_line(target, line, run, sleep=time.sleep, wait=None):
     """Type line into a shell that shell_problem() just passed, then press Enter only after the
     echoed input buffer reads back as exactly prompt + line on one logical line ending at the
-    cursor (as drawn: with readline's pad before a wide character that does not fit a row). Raises AgentError (Enter not pressed) otherwise."""
+    cursor (readline's pad before a wide character that does not fit a row is not text). Raises AgentError (Enter not pressed) otherwise."""
     st0 = shell_state(target, run)
     known = known_prompts(target, run)
     want = [k + line for k in known]
@@ -397,9 +382,8 @@ def type_launch_line(target, line, run, sleep=time.sleep, wait=None):
         got = None
         if st['pane_current_command'] in SHELL_NAMES and st['pane_id'] == st0['pane_id']:
             got, _ = _cursor_line(run, st, max(_columns(x) for x in want))
-            shown = [_rendered(x, st['pane_width']) for x in want]   # with readline's pads
             if got is not None and any(got.rstrip(' ') == x.rstrip(' ') and _cursor_at_end(st, x)
-                                       for x in shown):
+                                       for x in want):
                 run([tmux.TMUX, 'send-keys', '-t', target, 'Enter'])
                 return
         if time.monotonic() >= deadline:

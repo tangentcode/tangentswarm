@@ -265,13 +265,17 @@ LONG_PROMPT = 'me@host:/tmp/pytest-of-me/pytest-1/' + 'deep/' * 30 + 'proj$ '   
 @pytest.mark.parametrize('tail', [LONG_PROMPT, 'p' * 158 + '$ ', 'p' * 78 + '$ ',
                                   # Codex P2: wide and combining characters count in columns
                                   'me@host:~/界$ ', 'me@host:~/' + '目录/' * 30 + '$ ', 'cafe\u0301$ ',
-                                  '界' * 39 + 'x$ ', '界' * 39 + 'x' + '目录' * 5 + '$ '])
+                                  '界' * 39 + 'x$ ', '界' * 39 + 'x' + '目录' * 5 + '$ ',
+                                  'x' * 79 + '界$ ', 'x' * 78 + ' 界$ '])
 def test_a_prompt_that_wraps_is_accepted_and_recorded(fake_bins, root, monkeypatch, tail):
     monkeypatch.setattr(tmux, 'has_session', lambda s: True)
     monkeypatch.setattr(tmux, 'ENTER_DELAY', 0)
     rec = Recorder(tail=tail)
     out = registry.launch_agent('claude', 'proj', run=rec, wait=1)
-    assert rec.options[registry.PROMPT_OPTION].replace(' ', '') == tail.replace(' ', '')
+    assert rec.options[registry.PROMPT_OPTION] == tail
+    for width in (100, 60, 80):                       # the pane is resized: still the same prompt
+        rec.width = width
+        assert registry.shell_problem('%99', out['cwd'], rec) is None
     assert rec.entered == [out['launch_line']] and out['shell_reused'] is False
     rec.windows = [('@5', out['window_name'], '%99')]              # the agent exited: reuse it
     out2 = registry.launch_agent('claude', 'proj', run=rec, wait=1)
