@@ -65,6 +65,7 @@ class Adv:
 
 
 def pr(n, **kw):
+    kw.setdefault('mergeable', 'MERGEABLE')
     return dict(number=n, repo=TS, head='h' * 40, item=f'I{n}', draft=False, closes=[], **kw)
 
 
@@ -134,3 +135,12 @@ def test_same_number_findings_in_two_repos_both_wake():
     keys = [k for k in W._seen()['wake'] if k.startswith('tangentcode/')]
     assert sorted(k.split(':')[0] for k in keys) == ['tangentcode/methodology', TS]  # both kept, none deduped
     assert wakes[0]['why'].startswith(TS + ':')
+
+
+def test_a_ready_pr_that_conflicts_now_is_not_promoted(monkeypatch):
+    """Codex on PR #47: a merge after its MinBot pass made it conflict with main."""
+    cols = {board.READY: [pr(20, due='2026-11-20', milestone='m', mergeable='CONFLICTING'), pr(30)]}
+    adv = Adv(cols)
+    monkeypatch.setattr(boards, 'open_prs', lambda gql, b: adv.cols)
+    monkeypatch.setattr(board, 'move_card', lambda *a, **k: None)
+    assert boardflow.promote(adv, B6) == [30] and any('#20 stays in Ready' in l for l in adv.lines)

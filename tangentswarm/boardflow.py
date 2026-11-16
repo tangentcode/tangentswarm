@@ -37,6 +37,10 @@ def promote(adv, b):
     for p in ready:
         if hr >= HR_TARGET:
             break
+        if p.get('mergeable') != 'MERGEABLE':  # Codex on PR #47: a merge since its pass may conflict now
+            _say(adv, f"{p['repo']}#{p['number']} stays in Ready: GitHub mergeable is {p.get('mergeable')} "
+                      "(a merge of main is needed, or GitHub has not computed it yet)")
+            continue
         if adv.dry:
             _say(adv, f"would move {p['repo']}#{p['number']} Ready -> Human Review (board {b.number})")
         else:
