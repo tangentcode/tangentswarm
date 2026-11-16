@@ -215,27 +215,35 @@ def test_full_staging_pulls_nothing_and_touches_no_ready_pr(monkeypatch):
     assert f.did == [] and g.moves == []
 
 
-def test_pull_takes_the_top_fitting_ready_pr_only(monkeypatch):
+def premerged(monkeypatch, f, tips):
+    """Stub the pre-merge: tips {PR: tip or None}; returns the PRs asked, in order."""
+    asked = []
+    monkeypatch.setattr(f, 'future_main', lambda scratch, cols: ('key', 'fm', None))
+    monkeypatch.setattr(f, 'premerge_one', lambda p, scratch, fm: asked.append(p['number']) or tips.get(p['number']))
+    return asked
+
+
+def test_pull_takes_only_the_next_ready_pr_in_the_pick_order(monkeypatch):
+    """tangentswarm #65 (Codex on PR #66: swarm-flow step too): #8 is next and not merge-ready
+    (it conflicts with the queue: its worker resolves its -vN), so #7 does not jump it."""
     prs = {1: card(1, HR), 2: card(2, HR), 3: card(3, ST), 7: card(7, RD), 8: card(8, RD, rank=0), 9: card(9, RD)}
     f, g = make_flow(prs)
-    monkeypatch.setattr(flow, 'stack_conflict', lambda s, m, bases, head: '#2' if head == prs[8]['head'] else None)
+    asked = premerged(monkeypatch, f, {7: 'v7', 9: 'v9'})
     started = []
-    monkeypatch.setattr(f, 'start_pull', lambda p, s: started.append(p['number']))
+    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False: started.append(p['number']))
     f.step()
-    assert started == []  # tangentswarm #65: #8 is next in the pick order, so #7 does not jump it
-    assert any('#8 is next in the pick order and conflicts with #2: nothing behind it is pulled' in n for n in f.notes)
-
+    assert started == [] and asked == [8]
+    assert '#8 is next in the pick order and is not merge-ready: nothing behind it is pulled' in f.notes
 
 def test_pr_that_does_not_merge_onto_main_goes_back_with_a_relay(monkeypatch, tmp_path):
     prs = {1: card(1, HR), 2: card(2, HR), 7: card(7, RD, rank=0), 9: card(9, RD)}
     f, g = make_flow(prs, dry=False, clean=lambda a, b: not (a == 'main' and b == prs[7]['head']))
-    monkeypatch.setattr(flow, 'stack_conflict', lambda *a: None)
+    premerged(monkeypatch, f, {9: 'v9'})
     started = []
-    monkeypatch.setattr(f, 'start_pull', lambda p, s: started.append(p['number']))
+    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False: started.append((p['number'], tip, pre_merged)))
     f.step()
-    assert g.moves == [('I7', IP)] and started == [9]
+    assert g.moves == [('I7', IP)] and started == [(9, 'v9', True)]
     assert 'merge origin/main' in (flow.RELAY_DIR / 'relay-7-merge-main.md').read_text()
-
 
 def test_empty_ready_is_a_refill_note():
     f, _ = make_flow({1: card(1, HR), 2: card(2, HR)})
@@ -314,19 +322,16 @@ def test_main_busy_exits_75(monkeypatch):
     assert flow.main(['step']) == flow.gatelock.EXIT_BUSY
 
 
-def test_fast_track_takes_the_first_staging_slot_and_jumps_ready(monkeypatch):
+def test_fast_track_goes_first_in_the_pick_order(monkeypatch):
     monkeypatch.setattr(flow, 'STAGING_MIN', 3)
     prs = {1: card(1, HR), 2: card(2, HR), 3: card(3, ST), 4: card(4, ST),
            7: card(7, RD, rank=0), 8: card(8, RD, rank=board.FAST_TRACK)}
     f, g = make_flow(prs)
-    seen = {}
-    monkeypatch.setattr(flow, 'stack_conflict', lambda s, m, bases, head: seen.setdefault(head, bases) and None)
+    asked = premerged(monkeypatch, f, {7: 'v7', 8: 'v8'})
     started = []
-    monkeypatch.setattr(f, 'start_pull', lambda p, s: started.append(p['number']))
+    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False: started.append((p['number'], tip)))
     f.step()
-    assert started == [8]
-    assert [n for n, _ in seen[prs[8]['head']]] == ['#1', '#2']  # Human Review only, not Staging
-
+    assert started == [(8, 'v8')] and asked == [8]
 
 def test_step_without_promote_never_runs_pending_promote(monkeypatch):
     calls = []

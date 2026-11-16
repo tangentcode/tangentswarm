@@ -400,10 +400,11 @@ class Flow:
     def _pull(self, prs, cols, scratch, limit=None, strict=False):
         """Start one pull. Returns the pulled PR, or None. limit: pull only while Staging has
         fewer PRs than this (default STAGING_MIN).
-        strict (the swarm-advance cascade): no rework to fill Staging. A Ready PR is pulled
-        only if it merges cleanly with main, with work, and with each Human Review and Staging
-        head (one pair at a time), and stacks cleanly on all of them. Any other PR is skipped
-        with a note: it is not moved, and no relay is written."""
+        tangentswarm #65: only the NEXT Ready PR in the pick order is pulled, as its
+        pre-merged tip (premerge_one: <branch>-vN = future main + head); when it is not
+        merge-ready, nothing behind it is pulled. Not strict (swarm-flow step): a PR that
+        does not merge onto main first goes back to its worker with a merge-main relay.
+        strict (the swarm-advance cascade): no such relay (main_check does it)."""
         staging = cols.get(board.STAGING, [])
         if len(staging) >= (STAGING_MIN if limit is None else limit):
             return None
@@ -421,28 +422,20 @@ class Flow:
         for p in ready:
             conflicts[p['number']] = sum(not self.clean(scratch, sha, p['head'])
                                          for sha in [main] + [s for _, s in bases])
-        fm = self.future_main(scratch, cols) if strict else None
+        fm = self.future_main(scratch, cols)
         for p in ready_order(ready, conflicts, board.active_fast_track()):
             n = p['number']
-            if strict:  # tangentswarm #65: strict order; the next PR must be pre-merged first
-                tip = self.premerge_one(p, scratch, fm)
-                if not tip:
-                    self.note(f"#{n} is next in the pick order and is not merge-ready: nothing behind it is pulled")
-                    return None
-                return p if self.start_pull(p, scratch, tip, pre_merged=True) else None
-            if not self.clean(scratch, main, p['head']):
+            if not strict and not self.clean(scratch, main, p['head']):
                 self.fail(p, 'does not merge cleanly onto main: merge origin/main into the branch (no rebase)',
                           relay='merge-main')
                 continue  # it left Ready (In Progress with its worker)
-            # A fast-track PR takes the FIRST Staging slot (methodology#60): it stacks on main +
-            # Human Review only; the Staging PRs behind it are re-stacked at their own promotion.
-            mine = bases[:len(hr)] if board.item_fast_track(p) else bases
-            bad = self.cmap.stack(main, mine, p['head'], lambda: stack_conflict(scratch, main, mine, p['head']))
-            if bad:  # tangentswarm #65: no queue-jumping; nothing behind it is pulled
-                self.note(f"#{n} is next in the pick order and conflicts with {bad}: nothing behind it is pulled "
-                          "(one speculative -vN branch needed)")
+            # tangentswarm #65: strict order; the next PR must be pre-merged onto future main
+            # (Codex on PR #66: also for swarm-flow step, so a queue conflict gets its -vN worker)
+            tip = self.premerge_one(p, scratch, fm)
+            if not tip:
+                self.note(f"#{n} is next in the pick order and is not merge-ready: nothing behind it is pulled")
                 return None
-            return p if self.start_pull(p, scratch) else None
+            return p if self.start_pull(p, scratch, tip, pre_merged=True) else None
         self.note('no Ready PR merges cleanly onto main: each one went back to its worker')
 
     def staging_order(self, staging):
