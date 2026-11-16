@@ -59,9 +59,10 @@ RERUN = Path(os.environ.get('SWARM_CASCADE_RERUN', str(gatelock.LOCK.with_name('
 REDEPLOY_LATE = int(os.environ.get('SWARM_REDEPLOY_LATE', '600'))  # lag warning only after this (Michal 2026-11-15)
 DEPLOY_FALLBACK = int(os.environ.get('SWARM_DEPLOY_FALLBACK', '180'))  # then accept a .deploy-sha that contains the head
 
-CODEX_FIELDS = """number state isDraft headRefOid mergeable body
+CODEX_FIELDS = """number state isDraft headRefOid baseRefName mergeable body
  closingIssuesReferences(first:3){nodes{number comments(last:1){nodes{body}}}}
- comments(last:40){nodes{author{login} body}}
+ comments(last:40){nodes{author{login} body createdAt}}
+ commits(last:1){nodes{commit{committedDate}}}
  reviews(last:30){nodes{author{login} commit{oid} comments{totalCount}}}
  reviewThreads(last:60){nodes{id isResolved isOutdated comments(first:1){nodes{author{login} originalCommit{oid}}}}}"""
 
@@ -184,11 +185,11 @@ def minbot_order(prs, active=None):
 CI_BAD = ('failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale')
 
 
-def check_runs(head):
+def check_runs(head, repo=None):
     """[{name, status, conclusion}] of the latest check runs on the exact head (REST, the
     minbot App quota through the gh shim)."""
     r = proc.sh('gh', 'api', '--paginate', '--slurp',
-                f'repos/{REPO}/commits/{head}/check-runs?per_page=100&filter=latest',
+                f'repos/{repo or REPO}/commits/{head}/check-runs?per_page=100&filter=latest',
                 check=False, who='swarm-advance')
     if r.returncode:
         raise RuntimeError(f"check runs of {head[:8]}: {(r.stderr or r.stdout).strip()[:160]}")
@@ -1041,6 +1042,11 @@ def main(argv=None):
     ap.add_argument('--minbot', type=int, metavar='N',
                     help='the MinBot check of one Auto Review PR, under the lock (the Stop hook)')
     ap.add_argument('--floor', type=int, help=f'--cascade: Staging floor (default {FLOOR}, env SWARM_STAGING_FLOOR)')
+    ap.add_argument('--repo', help='--minbot: the PR\'s repository when it is not the platform repo (#45)')
+    ap.add_argument('--promote-board', type=int, metavar='N',
+                    help='a board without staging (Project 6, #45): Ready -> Human Review in pick order')
+    ap.add_argument('--board-pass', action='store_true',
+                    help='--promote-board: first the MinBot check of every Auto Review PR (the periodic pass)')
     a = ap.parse_args(argv)
     from . import eventdb
     eventdb.set_source('cascade')
@@ -1048,6 +1054,13 @@ def main(argv=None):
         FLOOR = a.floor
         os.environ['SWARM_STAGING_FLOOR'] = str(a.floor)  # the move log records it
     try:
+        if (a.minbot and a.repo and a.repo != REPO) or a.promote_board:
+            from . import boardflow
+            lock = f"swarm-advance {'--minbot ' + str(a.minbot) + ' --repo ' + a.repo if a.minbot else '--promote-board ' + str(a.promote_board)}"
+            if a.dry_run:
+                return boardflow.main(a, Advance(dry_run=True))
+            with gatelock.gate_lock(lock):
+                return boardflow.main(a, Advance())
         if a.minbot:
             if a.dry_run:
                 return Advance(dry_run=True).minbot_one(a.minbot)
@@ -1064,7 +1077,10 @@ def main(argv=None):
             return Advance().step()
     except gatelock.Busy as e:
         # No "busy, give up": the swarm-promoted daemon owns the queue and runs it under the lock.
-        print(f"busy: {e}; " + queue_self(['--minbot', str(a.minbot)] if a.minbot else []))
+        args = (['--minbot', str(a.minbot)] + (['--repo', a.repo] if a.repo else []) if a.minbot else []) + \
+            (['--promote-board', str(a.promote_board)] if a.promote_board else []) + \
+            (['--board-pass'] if a.board_pass else [])  # Codex on PR #47: keep them
+        print(f"busy: {e}; " + queue_self(args))
         return gatelock.EXIT_BUSY
     except CascadeTimeout as e:  # a dry run (no lock, no flag)
         _say(f"stopped: {e}")

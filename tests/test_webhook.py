@@ -27,8 +27,8 @@ def pr(n=7, draft=False, base='main', head='a' * 40, merged=False):
 
 @pytest.mark.parametrize('event, payload, why', [
     ('ping', {'zen': 'x'}, 'ping'),
-    ('pull_request', {'action': 'opened', 'repository': {'full_name': 'tangentcode/methodology'},
-                      'pull_request': pr()}, 'not tangentcode/platform'),
+    ('pull_request', {'action': 'opened', 'repository': {'full_name': 'tangentcode/other'},
+                      'pull_request': pr()}, 'not a swarm repo'),
     ('check_run', {'action': 'completed', 'repository': REPO}, 'check_run'),
     ('workflow_job', {'action': 'queued', 'repository': REPO}, 'workflow_job'),
     ('pull_request', {'action': 'labeled', 'repository': REPO, 'pull_request': pr()}, 'labeled'),
@@ -144,7 +144,7 @@ def test_no_worker_means_no_demote_and_one_wake():
 
 def test_red_ci_on_the_head_goes_back_to_the_worker(monkeypatch):
     from tangentswarm import advance
-    monkeypatch.setattr(advance, 'check_runs', lambda sha: [{'name': 'Linux mna tests', 'status': 'completed',
+    monkeypatch.setattr(advance, 'check_runs', lambda sha, repo=None: [{'name': 'Linux mna tests', 'status': 'completed',
                                                               'conclusion': 'failure'}])
     ex = Fake(col=board.READY, full=codex_pr(head='c' * 40))
     ex.run(W.Action('ci', 9, args={'sha': 'c' * 40, 'conclusion': 'failure'}))
@@ -156,7 +156,7 @@ def test_red_ci_on_the_head_goes_back_to_the_worker(monkeypatch):
 
 def test_green_ci_in_auto_review_runs_minbot_and_in_staging_the_cascade(monkeypatch):
     from tangentswarm import advance
-    monkeypatch.setattr(advance, 'check_runs', lambda sha: [{'name': 'x', 'status': 'completed', 'conclusion': 'success'}])
+    monkeypatch.setattr(advance, 'check_runs', lambda sha, repo=None: [{'name': 'x', 'status': 'completed', 'conclusion': 'success'}])
     ex = Fake(col=board.AUTO_REVIEW, full=codex_pr(head='c' * 40))
     ex.run(W.Action('ci', 9, args={'sha': 'c' * 40}))
     assert ex.queued == [['--minbot', '9']]
@@ -260,7 +260,7 @@ def test_replay_plan_gives_the_live_actions_for_the_head():
 def test_replay_runs_the_handlers(monkeypatch, tmp_path):
     from tangentswarm import advance
     monkeypatch.setattr(W, 'LOG', tmp_path / 'log')
-    monkeypatch.setattr(advance, 'check_runs', lambda sha: [{'name': 'x', 'status': 'completed', 'conclusion': 'success'}])
+    monkeypatch.setattr(advance, 'check_runs', lambda sha, repo=None: [{'name': 'x', 'status': 'completed', 'conclusion': 'success'}])
     ex = Fake(col=board.AUTO_REVIEW, full=codex_pr(clean=True))
     acts, done = W.replay(541, ex)
     assert ex.queued == [['--minbot', '541']] and ex.cascades == [1]
