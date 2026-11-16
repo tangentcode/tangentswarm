@@ -75,6 +75,7 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(_promoted, 'BOARD_EVERY', float('inf'))  # no periodic board pass in a test
     from tangentswarm import slots, launches as _launches
     monkeypatch.setattr(_launches, 'OLD_HELD', tmp_path / 'swarm-held.json')  # never the real retired list
+    monkeypatch.setattr(_launches, 'pr_of_branch', lambda branch: None)  # no real gh in a test
     monkeypatch.setattr(slots, 'worker_memory', lambda: None)  # never the real systemd slice in a test
     monkeypatch.setattr(slots, 'STATE', tmp_path / 'slots.json')
     monkeypatch.setattr(slots, 'SESSIONS', tmp_path / 'claude-sessions')

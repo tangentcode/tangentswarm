@@ -143,11 +143,37 @@ def test_rows_of_the_retired_held_list_become_unstarted_records_once(tmp_path):
     import json as _json
     from tangentswarm import slots
     old = tmp_path / 'swarm-held.json'
-    old.write_text(_json.dumps([{'branch': 'b486', 'pr': 486, 'brief': '/b/486.txt'}, {'branch': 'nopr'}]))
+    old.write_text(_json.dumps([{'branch': 'b486', 'pr': 486, 'brief': '/b/486.txt'}]))
     assert L.migrate_held(old) == [486] and not old.exists()
     rec = slots.load()['unstarted']['486']
     assert rec['branch'] == 'b486' and rec['brief'] == '/b/486.txt'
     assert L.migrate_held(old) == []  # no file: nothing
+
+
+def test_a_held_row_with_no_pr_gets_its_branchs_pr_or_stays_and_is_reported(tmp_path):
+    """Codex on PR #46: the old hold() took pr=None; such a row was deleted with the file."""
+    import json as _json
+    from tangentswarm import slots
+    old = tmp_path / 'swarm-held.json'
+    old.write_text(_json.dumps([{'branch': 'found', 'brief': '/b/f.txt'}, {'branch': 'lost'}, 'junk']))
+    said = []
+    prs = {'found': 77}
+    assert L.migrate_held(old, find_pr=prs.get, warn=said.append) == [77]
+    assert slots.load()['unstarted']['77']['branch'] == 'found'
+    assert _json.loads(old.read_text()) == [{'branch': 'lost'}, 'junk']  # kept, not deleted
+    assert len(said) == 1 and 'lost' in said[0]
+    prs['lost'] = 78  # its PR shows up: the next daemon start moves it
+    assert L.migrate_held(old, find_pr=prs.get, warn=said.append) == [78]
+    assert _json.loads(old.read_text()) == ['junk']
+
+
+def test_an_unreadable_held_list_is_kept_and_reported(tmp_path):
+    old = tmp_path / 'swarm-held.json'
+    old.write_text('{not json')
+    said = []
+    assert L.migrate_held(old, warn=said.append) == [] and old.exists() and 'unreadable' in said[0]
+    old.write_text('{}')
+    assert L.migrate_held(old, warn=said.append) == [] and old.exists() and 'not a list' in said[1]
 
 
 def test_the_scaffold_fallback_restores_the_retry_record(monkeypatch, tmp_path):

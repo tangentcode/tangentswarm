@@ -683,7 +683,7 @@ def main(argv=None):
     eventdb.set_source('daemon')
     if not a.dry_run:
         from . import launches
-        moved = launches.migrate_held()
+        moved = launches.migrate_held(warn=say)
         if moved:
             say('held-launch list retired: unstarted records for ' + ', '.join(f'#{n}' for n in moved))
     p = Promoter(dry_run=a.dry_run)

@@ -100,30 +100,60 @@ def old_held():
     return OLD_HELD or Path(os.environ.get('SWARM_HELD', str(HOME / 'var' / 'swarm-held.json')))
 
 
-def migrate_held(path=None, add=None):
-    """Once, at daemon start: each row of the retired held-launch list with a PR becomes that
-    PR's unstarted record (the cascade's start retry starts it), then the file goes (Codex
-    on PR #46: a launch held before the upgrade had its retry only in that file). Returns
-    the PR numbers moved."""
+def pr_of_branch(branch):
+    """The open launch PR whose head is branch, or None (gh failed or no such PR)."""
+    from .launcher import REPO
+    try:
+        r = subprocess.run(['gh', 'pr', 'list', '-R', REPO, '--head', branch, '--state', 'open',
+                            '--json', 'number', '--jq', '.[0].number'],
+                           capture_output=True, text=True, timeout=60)
+        out = r.stdout.strip()
+        return int(out) if r.returncode == 0 and out.isdigit() else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def migrate_held(path=None, add=None, find_pr=None, warn=lambda s: None):
+    """Once, at daemon start: each row of the retired held-launch list becomes its PR's
+    unstarted record (the cascade's start retry starts it) (Codex on PR #46: a launch held
+    before the upgrade had its retry only in that file). A row with no PR gets the open PR
+    of its branch. A row that cannot be moved (no PR found, a bad row) stays in the file and
+    is reported (warn) at every daemon start; the file goes only when nothing is left. An
+    unreadable file is kept and reported. Returns the PR numbers moved."""
     path = path or old_held()
     try:
         rows = json.loads(path.read_text())
     except FileNotFoundError:
         return []
-    except (OSError, ValueError):
-        rows = []
+    except (OSError, ValueError) as e:
+        warn(f"retired held-launch list {path} is unreadable ({e}); kept, nothing migrated")
+        return []
+    if not isinstance(rows, list):
+        warn(f"retired held-launch list {path} is not a list; kept, nothing migrated")
+        return []
     if add is None:
         from . import slots
         add = slots.unstarted_add
-    moved = []
-    for r in rows if isinstance(rows, list) else []:
-        if r.get('pr') and r.get('branch'):
-            add(int(r['pr']), branch=r['branch'], brief=r.get('brief') or '', issue=r.get('issue'))
-            moved.append(int(r['pr']))
+    find_pr = find_pr or pr_of_branch
+    moved, kept = [], []
+    for r in rows:
+        pr = None
+        if isinstance(r, dict) and r.get('branch'):
+            pr = r.get('pr') or find_pr(r['branch'])
+        if not pr:
+            kept.append(r)
+            continue
+        add(int(pr), branch=r['branch'], brief=r.get('brief') or '', issue=r.get('issue'))
+        moved.append(int(pr))
     try:
-        path.unlink()
-    except OSError:
-        pass
+        if kept:
+            path.write_text(json.dumps(kept, indent=1))
+            warn(f"retired held-launch list {path}: {len(kept)} row(s) with no open PR kept for a "
+                 "person: " + ', '.join(str(r.get('branch') if isinstance(r, dict) else r) for r in kept))
+        else:
+            path.unlink()
+    except OSError as e:
+        warn(f"retired held-launch list {path}: could not update it ({e})")
     return moved
 
 

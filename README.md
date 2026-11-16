@@ -907,7 +907,9 @@ while memory holds starts) before it makes a branch or a PR. A start that memory
 after the PR exists keeps the PR's unstarted record, and the cascade retries it. At
 daemon start, swarm-promoted moves each row of an old held list (`$SWARM_HELD`, or
 `~/var/swarm-held.json`) into an
-unstarted record and removes the file.
+unstarted record. A row with no PR gets the open PR of its branch. A row it cannot
+move, or an unreadable file, stays and is reported at each daemon start; the file goes
+only when it is empty.
 
 ```sh
 swarm-launch BRANCH [WINDOW] --pr N --brief FILE   # start now; exit 3 on a memory hold
