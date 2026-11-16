@@ -968,6 +968,28 @@ open in tmux:
 Private ids, hosts and secret paths are in `~/.config/tangentswarm/config.toml`, never in
 the repo. `tangentswarm/config.example.toml` shows the shape.
 
+## swarm-tmux-status: which swarm windows are working
+
+`swarm-tmux-status` is a standalone console table of the windows in the swarm tmux session
+(default `agents`, or `--session` / `$SWARM_TMUX_SESSION`). It reads tmux only. Each window
+gets one class from its foreground command and its screen:
+
+- `WORKING`: Claude runs and is busy ("esc to interrupt" under its input box)
+- `idle`: Claude runs but does no work
+- `shell`: no Claude, a shell prompt
+- a program name (such as `python`): no Claude, another program in the foreground
+
+A row also shows the window index, the ticket from the window name (`mn-458-...` is
+`mn #458`) and the last activity line (Claude's last transcript entry, or the shell's last
+line that is not a prompt). The default view lists only the working windows. Keys: `a`
+toggles all windows, up/down or `j`/`k` select, Enter or `z` zooms into the window's recent
+output, Esc or `q` goes back, `r` refreshes now. It refreshes every `--interval` s (default 2).
+
+    swarm-tmux-status                    # the interactive table
+    swarm-tmux-status --once [--all]     # print the table once
+    swarm-tmux-status --zoom 41          # print the recent output of window 41
+    ln -sf "$PWD/bin/swarm-tmux-status" ~/bin/swarm-tmux-status   # this checkout, no install
+
 ## License
 
 MIT
