@@ -262,13 +262,16 @@ LONG_PROMPT = 'me@host:/tmp/pytest-of-me/pytest-1/' + 'deep/' * 30 + 'proj$ '   
 
 
 # Codex P2 (wrapped prompt): a prompt wider than the pane is still one empty prompt
-@pytest.mark.parametrize('tail', [LONG_PROMPT, 'p' * 158 + '$ ', 'p' * 78 + '$ '])
+@pytest.mark.parametrize('tail', [LONG_PROMPT, 'p' * 158 + '$ ', 'p' * 78 + '$ ',
+                                  # Codex P2: wide and combining characters count in columns
+                                  'me@host:~/界$ ', 'me@host:~/' + '目录/' * 30 + '$ ', 'cafe\u0301$ ',
+                                  '界' * 39 + 'x$ ', '界' * 39 + 'x' + '目录' * 5 + '$ '])
 def test_a_prompt_that_wraps_is_accepted_and_recorded(fake_bins, root, monkeypatch, tail):
     monkeypatch.setattr(tmux, 'has_session', lambda s: True)
     monkeypatch.setattr(tmux, 'ENTER_DELAY', 0)
     rec = Recorder(tail=tail)
     out = registry.launch_agent('claude', 'proj', run=rec, wait=1)
-    assert rec.options[registry.PROMPT_OPTION] == tail
+    assert rec.options[registry.PROMPT_OPTION].replace(' ', '') == tail.replace(' ', '')
     assert rec.entered == [out['launch_line']] and out['shell_reused'] is False
     rec.windows = [('@5', out['window_name'], '%99')]              # the agent exited: reuse it
     out2 = registry.launch_agent('claude', 'proj', run=rec, wait=1)
@@ -277,6 +280,20 @@ def test_a_prompt_that_wraps_is_accepted_and_recorded(fake_bins, root, monkeypat
     with pytest.raises(registry.AgentError, match='not positively empty'):
         registry.launch_agent('claude', 'proj', run=rec, wait=1)
     assert len(rec.entered) == 2 and len(rec.new_windows()) == 1
+
+
+def test_pending_input_split_by_a_readline_break_is_refused(fake_bins, root, monkeypatch):
+    """Typed text 'yyy...界$ ' puts a wide character at the last column, so readline starts a
+    new row that reads exactly the recorded prompt '界$ ' and is not marked as wrapped. That
+    row must not be taken for an empty prompt."""
+    monkeypatch.setattr(tmux, 'has_session', lambda s: True)
+    rec = Recorder(cwd=str((root / 'proj').resolve()), pane='%7', tail='界$ ', pending='y' * 75 + '界$ ')
+    rec.options[registry.PROMPT_OPTION] = '界$ '
+    with pytest.raises(registry.AgentError, match='not positively empty'):
+        registry.launch_agent('claude', 'proj', run=rec, shell_pane='%7')
+    assert rec.typed() == [] and rec.entered == []
+    rec.pending = ''
+    assert registry.shell_problem('%7', str((root / 'proj').resolve()), rec) is None
 
 
 # Codex P2 (history limit): a full history must not hide the start of the typed line

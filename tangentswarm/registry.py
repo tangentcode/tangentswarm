@@ -25,6 +25,7 @@ import os
 import re
 import shlex
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
@@ -215,16 +216,32 @@ def _logical_lines(run, pane, start, end):
     return lines[:-1] if lines and lines[-1] == '' else lines
 
 
+def _join_wide_breaks(lines, width):
+    """Join the line breaks that readline makes itself. When a wide character does not fit in
+    the last column, readline pads the row and starts a new line, so tmux does not mark the
+    row as wrapped and capture-pane -J does not join it. A break is joined back when the next
+    line starts with a wide character and the line before ends within 2 columns of the edge
+    (the pad is trimmed by the capture). Joining too much only makes a match fail (closed)."""
+    out = []
+    for line in lines:
+        if out and line and _char_columns(line[0]) == 2 and _end_column(out[-1], width) >= width - 2:
+            pad = width - _end_column(out[-1], width)
+            out[-1] += ' ' * pad + line
+        else:
+            out.append(line)
+    return out
+
+
 def _cursor_line(run, st, need=0):
     """(line, why): the whole logical line that ends at the cursor row and None, or None and
     why that line cannot be read whole or is not the last thing drawn. A prompt or an input
     line may wrap across rows: the rows from the cursor back to the previous logical line are
     read and joined. This does not use history_size as a scroll counter, so it also works when
-    the history is full and old rows are discarded. need is the expected length of the line."""
+    the history is full and old rows are discarded. need is the expected width of the line."""
     pane, y = st['pane_id'], st['cursor_y']
-    back = max(LOOK_BACK, need // max(st['pane_width'], 1) + 2)
+    back = max(LOOK_BACK, need // max(st['pane_width'], 1) + 2)   # need is in columns
     first = max(-st['history_size'], y - back)
-    lines = _logical_lines(run, pane, first, y)
+    lines = _join_wide_breaks(_logical_lines(run, pane, first, y), st['pane_width'])
     below = _logical_lines(run, pane, y + 1, st['pane_height'] - 1) if y + 1 < st['pane_height'] else []
     # whole only if an earlier logical line was read too, or the read starts at the very top
     # of a pane that has no history (so nothing came before it)
@@ -235,12 +252,41 @@ def _cursor_line(run, st, need=0):
     return lines[-1], None
 
 
-def _cursor_at_end(st, length):
-    """True if the cursor is right after a logical line of `length` columns that starts at
-    column 0 (a line that exactly fills its last row leaves the cursor at column 0 or width)."""
-    w = st['pane_width']
-    col = length % w if w > 0 else length
-    return st['cursor_x'] == col or (length > 0 and col == 0 and st['cursor_x'] == w)
+def _char_columns(ch):
+    """Terminal columns of one character: 0 for combining and format marks, 2 for wide
+    (East Asian W/F) characters, else 1."""
+    if unicodedata.combining(ch) or unicodedata.category(ch) in ('Mn', 'Me', 'Cf'):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+
+
+def _columns(text):
+    return sum(_char_columns(ch) for ch in text)
+
+
+def _end_column(text, width):
+    """The cursor column after text is drawn from column 0 of a pane `width` wide. A character
+    that does not fit on the row starts the next row (a wide character is never split; the
+    blank left before it is drawn as a space, which the text may also hold). A line that
+    exactly fills its last row ends at column `width`."""
+    col = 0
+    for ch in text:
+        c = _char_columns(ch)
+        if c and col + c > width:
+            col = 0
+        col += c
+    return col
+
+
+def _cursor_at_end(st, text):
+    """True if the cursor is right after the logical line `text` that starts at column 0,
+    counted in terminal columns (a line that exactly fills its last row leaves the cursor at
+    column 0 or width)."""
+    w, x = st['pane_width'], st['cursor_x']
+    if w <= 0:
+        return False
+    end = _end_column(text, w)
+    return x == end or (end == w and x in (0, w))
 
 
 def known_prompts(target, run):
@@ -271,12 +317,12 @@ def shell_problem(target, cwd, run):
         if why:
             return why
         known = known_prompts(target, run)
-        row, why = _cursor_line(run, st, max(len(k) for k in known))
+        row, why = _cursor_line(run, st, max(_columns(k) for k in known))
         if why:
             return why
     except tmux.TmuxError as e:
         return f"{target}: {e.stderr or 'no such pane'}"
-    if not any(row.rstrip(' ') == k.rstrip(' ') and _cursor_at_end(st, len(k)) for k in known):
+    if not any(row.rstrip(' ') == k.rstrip(' ') and _cursor_at_end(st, k) for k in known):
         return (f"input buffer not positively empty (cursor line {row.strip()[-40:]!r}, column "
                 f"{st['cursor_x']}; expected exactly {' or '.join(repr(k) for k in known)})")
     return None
@@ -284,15 +330,17 @@ def shell_problem(target, cwd, run):
 
 def _prompt_at_cursor(row, st):
     """The text of the logical line `row` up to the cursor, with trailing blanks that the
-    capture trimmed put back, or None if there is text after the cursor. The line may wrap:
-    its length is the shortest k * width + cursor_x that holds all of its text."""
+    capture trimmed put back, or None if no such text ends at the cursor column. The line may
+    wrap, and it is measured in terminal columns (wide and combining characters count as
+    they are drawn): the fewest blanks are added so that the text ends at the cursor. Text
+    after the cursor is not checked here; shell_problem() then refuses it."""
     w, x, text = st['pane_width'], st['cursor_x'], row.rstrip(' ')
     if w <= 0 or x > w:
         return None
-    length = x
-    while length < len(text):
-        length += w
-    return (row + ' ' * length)[:length]
+    for pad in range(w + 1):
+        if _cursor_at_end(st, text + ' ' * pad):
+            return text + ' ' * pad
+    return None
 
 
 def first_prompt_problem(target, cwd, run):
@@ -331,8 +379,8 @@ def type_launch_line(target, line, run, sleep=time.sleep, wait=None):
         st = shell_state(target, run)
         got = None
         if st['pane_current_command'] in SHELL_NAMES and st['pane_id'] == st0['pane_id']:
-            got, _ = _cursor_line(run, st, max(len(x) for x in want))
-            if got is not None and any(got.rstrip(' ') == x.rstrip(' ') and _cursor_at_end(st, len(x))
+            got, _ = _cursor_line(run, st, max(_columns(x) for x in want))
+            if got is not None and any(got.rstrip(' ') == x.rstrip(' ') and _cursor_at_end(st, x)
                                        for x in want):
                 run([tmux.TMUX, 'send-keys', '-t', target, 'Enter'])
                 return

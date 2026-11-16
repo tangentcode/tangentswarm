@@ -274,9 +274,14 @@ def test_real_bash_pending_input_or_a_moved_shell_is_refused_not_run(fake_bins, 
         subprocess.run(['tmux', 'kill-server'], capture_output=True)
 
 
-def test_real_bash_with_a_wrapping_prompt_and_a_full_history(fake_bins, root, tmp_path, monkeypatch):  # noqa: F811
-    """Codex P2 x2 against real tmux and bash: a login prompt wider than the pane is an empty
-    prompt, and a full history (old rows discarded) does not break the read-back."""
+@pytest.mark.parametrize('ps1, columns', [('p' * 150, 152),
+                                          ('\u754c' * 39 + 'x/' + '\u76ee\u5f55' * 5, 102),   # wide chars
+                                          ('\u754c' * 39 + 'x' + '\u76ee\u5f55' * 5, 102)])   # one at the edge
+def test_real_bash_with_a_wrapping_prompt_and_a_full_history(fake_bins, root, tmp_path, monkeypatch,  # noqa: F811
+                                                             ps1, columns):
+    """Codex P2 x3 against real tmux and bash: a login prompt wider than the pane (also one of
+    wide characters) is an empty prompt, and a full history (old rows discarded) does not
+    break the read-back."""
     if not shutil.which('tmux') or not os.path.exists('/bin/bash'):
         pytest.skip('tmux or bash not installed')
     claude = Path(fake_bins['claude'])
@@ -287,7 +292,8 @@ def test_real_bash_with_a_wrapping_prompt_and_a_full_history(fake_bins, root, tm
     (sbin / 'systemd-run').chmod(0o755)
     home = tmp_path / 'home'
     home.mkdir(exist_ok=True)
-    (home / '.bash_profile').write_text("seq 60\nPS1='" + 'p' * 150 + "\\$ '\nPROMPT_COMMAND=\n")
+    (home / '.bash_profile').write_text("seq 60\nPS1='" + ps1 + "\\$ '\nPROMPT_COMMAND=\n", encoding='utf-8')
+    monkeypatch.setenv('LC_ALL', 'C.UTF-8')
     monkeypatch.setenv('HOME', str(home))
     monkeypatch.setenv('PATH', f"{sbin}:{os.environ['PATH']}")
     monkeypatch.setenv('SCOPE_LOG', str(tmp_path / 'scope.log'))
@@ -295,7 +301,7 @@ def test_real_bash_with_a_wrapping_prompt_and_a_full_history(fake_bins, root, tm
     monkeypatch.delenv('TMUX', raising=False)
     cwd = str((root / 'proj').resolve())
     try:
-        subprocess.run(['tmux', '-f', '/dev/null', 'new-session', '-d', '-s', 'scoped', '-n', 'other',
+        subprocess.run(['tmux', '-u', '-f', '/dev/null', 'new-session', '-d', '-s', 'scoped', '-n', 'other',
                         '-x', '80', '-y', '10', 'sleep 300'], check=True)
         subprocess.run(['tmux', 'set-option', '-g', 'history-limit', '5'], check=True)
         out = registry.launch_agent('claude', 'proj', session='scoped')
@@ -303,7 +309,9 @@ def test_real_bash_with_a_wrapping_prompt_and_a_full_history(fake_bins, root, tm
         hist = subprocess.run(['tmux', 'display-message', '-p', '-t', target, '#{history_limit}'],
                               capture_output=True, text=True).stdout.strip()
         assert hist == '5'
-        assert len(registry.known_prompts(target, tmux.run_checked)[0]) == 152
+        prompt = registry.known_prompts(target, tmux.run_checked)[0]
+        # readline's pad before a wide character that does not fit is part of the recorded prompt
+        assert prompt.replace(' ', '') == ps1 + '$' and registry._columns(prompt) == columns
         for _ in range(100):                                    # the agent ran and exited
             if (tmp_path / 'scope.log').exists() and registry.shell_problem(target, cwd, tmux.run_checked) is None:
                 break

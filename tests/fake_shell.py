@@ -1,12 +1,14 @@
 """A tmux stand-in with one bash pane, for the start_agent shell tests.
 
-It models what the launcher reads: the screen rows (with soft wraps), the cursor, the
-history size (capped at history_limit, if set) and the pending input buffer. send-keys -l appends to the buffer (when echo
-is on) and Enter submits it. It can be passed as `run` or patched over subprocess.run.
+It models what the launcher reads: the screen rows (with soft wraps, laid out in terminal
+columns: wide characters take 2), the cursor, the history size (capped at history_limit, if
+set) and the pending input buffer. send-keys -l appends to the buffer (when echo is on) and
+Enter submits it. It can be passed as `run` or patched over subprocess.run.
 """
 import re
 import shlex
 import subprocess
+import unicodedata
 
 
 class FakeShell:
@@ -23,12 +25,23 @@ class FakeShell:
     def rows(self):
         """[(text, wrapped)] of every row, history first; the cursor ends the input line."""
         out = [(h, False) for h in self.header.split('\n')]
-        line = self.tail + self.pending
-        chunks = [line[i:i + self.width] for i in range(0, len(line), self.width)] or ['']
-        if len(chunks[-1]) == self.width:
-            chunks.append('')
-        out += [(c, i < len(chunks) - 1) for i, c in enumerate(chunks)]
-        self.cursor = (len(out) - 1, len(chunks[-1]))
+        # lay the input line out in columns. A wide character that does not fit starts a new
+        # line the way readline does it: the row is padded and NOT marked as wrapped
+        chunks, col = [['', True]], 0
+        for ch in self.tail + self.pending:
+            c = 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 0 if unicodedata.combining(ch) else 1
+            if c and col + c > self.width:
+                chunks[-1][1] = col == self.width
+                chunks.append(['', True])
+                col = 0
+            chunks[-1][0] += ch
+            col += c
+        if col == self.width:
+            chunks.append(['', True])
+            col = 0
+        chunks[-1][1] = False
+        out += [(t, w) for t, w in chunks]
+        self.cursor = (len(out) - 1, col)
         out += [(b, False) for b in self.below.split('\n')] if self.below else []
         return out
 
