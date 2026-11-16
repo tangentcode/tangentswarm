@@ -5,8 +5,11 @@
 
 [project]
 # GitHub Projects v2 node ids of the board (gh project view N --owner ORG --format json).
+number = 4
 id = "PVT_example"
 status_field = "PVTSSF_example"
+repos = ["tangentcode/platform"]
+staging = true
 
 [project.options]
 # Status column (internal key) -> single-select option id. Columns are matched by id only.
@@ -32,3 +35,28 @@ sites = { work = "work.example.test", minavo = "minavo.example.test" }
 [webhook]
 # swarm-webhook HMAC secrets (any one may match). "~" is the home directory.
 secret_files = ["~/.config/tangentswarm/webhook-secret"]
+
+[[boards]]
+# More boards that run the same flow (tangentswarm #45). No staging site: Ready goes to
+# Human Review directly.
+number = 6
+id = "PVT_example6"
+status_field = "PVTSSF_example6"
+repos = ["tangentcode/tangentswarm", "tangentcode/methodology"]
+staging = false
+
+[boards.options]
+"Inbox" = "opt6-inbox"
+"Triage" = "opt6-triage"
+"Discuss" = "opt6-discuss"
+"Backlog" = "opt6-backlog"
+"Active" = "opt6-active"
+"In Progress" = "opt6-in-progress"
+"Auto Review" = "opt6-auto-review"
+"Needs Input" = "opt6-needs-input"
+"Ready" = "opt6-ready"
+"Pending" = "opt6-staging"
+"Human Review" = "opt6-human-review"
+"Done" = "opt6-done"
+"Canceled" = "opt6-canceled"
+"Parked" = "opt6-parked"

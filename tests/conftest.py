@@ -11,9 +11,18 @@ os.environ['TANGENTSWARM_CONFIG'] = os.path.join(os.path.dirname(os.path.dirname
 
 @pytest.fixture(autouse=True)
 def isolated_state(tmp_path, monkeypatch):
-    """Keep logs, auth db and config out of the real home directory."""
+    """Keep logs, auth db and config out of the real home directory. HOME points at an
+    empty temp dir, so a launch in a test can never pre-trust anything in the real
+    ~/.claude.json or ~/.codex/config.toml, and nothing watches a real tmux pane."""
     monkeypatch.setenv('TANGENTSWARM_STATE_DIR', str(tmp_path / 'state'))
     monkeypatch.setenv('TANGENTSWARM_CONFIG_DIR', str(tmp_path / 'config'))
+    (tmp_path / 'home').mkdir(exist_ok=True)
+    monkeypatch.setenv('HOME', str(tmp_path / 'home'))
+    for var in ('CLAUDE_CONFIG_DIR', 'CODEX_HOME'):
+        monkeypatch.delenv(var, raising=False)
+    from tangentswarm import worktrees
+    monkeypatch.setattr(worktrees, '_watch_startup',
+                        lambda pane, agent, wait=None: {'state': 'unwatched', 'blocked': None})
     for var in list(os.environ):
         if var.startswith(('TANGENTSWARM_AUTH_', 'TANGENTSWARM_API_KEY', 'TANGENTSWARM_AGENT_')):
             monkeypatch.delenv(var, raising=False)
@@ -50,7 +59,7 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(_events, 'EVENTS', tmp_path / 'github-events.jsonl')
     monkeypatch.setattr(_events, 'OFFSET', tmp_path / 'events.offset')
     monkeypatch.setattr(spool, 'SPOOL', tmp_path / 'spool')
-    monkeypatch.setattr(advance, 'check_runs', lambda head: [])  # no real GitHub read in a test
+    monkeypatch.setattr(advance, 'check_runs', lambda head, repo=None: [])  # no real GitHub read in a test
     from tangentswarm import tick as _tick
     monkeypatch.setattr(_tick, 'STATE_DIR', tmp_path / 'tick-state')
     monkeypatch.setattr(stophook, 'LOG', tmp_path / 'stop-hook.log')
@@ -62,9 +71,17 @@ def isolated_state(tmp_path, monkeypatch):
     # a queued cascade would be run by a daemon test's drain as a REAL ~/bin/swarm-advance
     monkeypatch.setattr(advance, 'queue_cascade', lambda qdir=None: 'not queued (test)')
     monkeypatch.setattr(gatelock, 'QUEUE_DIR', tmp_path / 'gate-queue')
-    from tangentswarm import slots
+    from tangentswarm import promoted as _promoted
+    monkeypatch.setattr(_promoted, 'BOARD_EVERY', float('inf'))  # no periodic board pass in a test
+    from tangentswarm import slots, launches as _launches
+    monkeypatch.setattr(_launches, 'OLD_HELD', tmp_path / 'swarm-held.json')  # never the real retired list
     monkeypatch.setattr(slots, 'worker_memory', lambda: None)  # never the real systemd slice in a test
     monkeypatch.setattr(slots, 'STATE', tmp_path / 'slots.json')
     monkeypatch.setattr(slots, 'SESSIONS', tmp_path / 'claude-sessions')
     monkeypatch.setattr(slots, 'PROJECTS', tmp_path / 'claude-projects')
+    from tangentswarm import alerts, panewatch
+    monkeypatch.setattr(alerts, 'STATE', tmp_path / 'watch.json')
+    monkeypatch.setattr(alerts, 'ALERT_URL_FILE', tmp_path / 'alert-url')
+    monkeypatch.setattr(alerts, 'ALERT_KEY_FILE', tmp_path / 'alert-key')
+    monkeypatch.setattr(panewatch, 'REPORT', tmp_path / 'panes.json')
     yield tmp_path

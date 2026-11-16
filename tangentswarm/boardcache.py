@@ -35,8 +35,8 @@ REPO = 'tangentcode/platform'
 
 STATUS = '{...on ProjectV2ItemFieldSingleSelectValue{name optionId}}'
 PR_FIELDS = """number state title isDraft headRefName headRefOid updatedAt body repository{nameWithOwner}
- milestone{title} labels(first:15){nodes{name}}
- closingIssuesReferences(first:5){nodes{number repository{nameWithOwner} milestone{title} labels(first:10){nodes{name}}}}
+ milestone{title dueOn} labels(first:15){nodes{name}}
+ closingIssuesReferences(first:5){nodes{number repository{nameWithOwner} milestone{title dueOn} labels(first:10){nodes{name}}}}
  timelineItems(last:30,itemTypes:[PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]){nodes{__typename
    ...on ProjectV2ItemStatusChangedEvent{createdAt status}}}"""
 ISSUE_FIELDS = 'number title state repository{nameWithOwner} milestone{title dueOn} labels(first:10){nodes{name}}'
@@ -127,6 +127,12 @@ def open_issues(snap):
 
 def col(it):
     return board.column(it.get('fieldValueByName'))
+
+
+def pr_due(c):
+    """(due, milestone title) of a PR: the soonest dated milestone of the PR and the issues it
+    closes (board.soonest_due)."""
+    return board.soonest_due([c.get('milestone') or {}] + [i.get('milestone') or {} for i in closes(c)])
 
 
 def closes(c):

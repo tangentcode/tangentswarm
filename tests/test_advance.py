@@ -209,7 +209,7 @@ def test_a_failed_job_on_the_head_blocks_the_minbot_pass_and_says_why(board_read
     runs = [{'name': 'Linux mna tests', 'status': 'completed', 'conclusion': 'failure'},
             {'name': 'Linux rs tests', 'status': 'completed', 'conclusion': 'success'},
             {'name': 'docs', 'status': 'completed', 'conclusion': 'skipped'}]
-    monkeypatch.setattr(A, 'check_runs', lambda head: runs)
+    monkeypatch.setattr(A, 'check_runs', lambda head, repo=None: runs)
     g = Gate(cols, details={7: codex_pr()})
     out, calls = run(g)
     assert g.moves == [] and len(calls) == 1
@@ -436,7 +436,7 @@ def test_a_fast_track_pr_that_does_not_merge_cleanly_is_not_pulled_past_the_floo
 
 def test_the_pull_order_puts_the_fast_track_pr_first():
     ready = [pr(5, board.READY, rank=board.NORMAL), pr(9, board.READY, rank=board.FAST_TRACK),
-             pr(7, board.READY, rank=board.MILESTONE)]
+             dict(pr(7, board.READY, rank=board.MILESTONE), due='2026-11-15', milestone='ptw 15')]
     assert [p['number'] for p in flow.ready_order(ready, {9: 3})] == [9, 7, 5]
 
 

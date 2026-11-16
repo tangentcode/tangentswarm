@@ -1,4 +1,4 @@
-"""swarm-launch: live memory limits, the held-launch queue, one launch per pass, the pressure flag."""
+"""swarm-launch: live memory limits, no held-launch list, one launch per pass, the pressure flag."""
 import pytest
 
 from tangentswarm import launches as L, tick
@@ -21,13 +21,14 @@ def mem(current, high=4608 * MB, mx=5120 * MB, avail=4 * GB):
 
 
 def test_memory_reads_the_live_limits_not_a_fixed_size():
-    m = L.memory(show=show(3347681280), meminfo=meminfo(4000000))
-    assert m == dict(current=3347681280, high=4831838208, max=5368709120, avail=4000000 * 1024)
+    m = L.memory(show=show(3347681280), meminfo=meminfo(4000000), loadavg=lambda: (0.5, 0.4, 0.3), cpus=lambda: 4)
+    assert m == dict(current=3347681280, high=4831838208, max=5368709120, avail=4000000 * 1024,
+                     load=[0.5, 0.4, 0.3], cpus=4)
     assert L.headroom(m) == 4831838208 - 3347681280
 
 
 def test_memory_handles_unset_limits():
-    m = L.memory(show=show(100, high='infinity', mx='infinity'), meminfo=meminfo(4000000))
+    m = L.memory(show=show(100, high='infinity', mx='infinity'), meminfo=meminfo(4000000), loadavg=lambda: (0, 0, 0))
     assert m['high'] is None and m['max'] is None and L.headroom(m) is None and L.admits(m)
     m = L.memory(show=show(100, high='infinity', mx=str(1000 * MB)), meminfo=meminfo(4000000))
     assert L.headroom(m) == 1000 * MB - 100
@@ -36,6 +37,13 @@ def test_memory_handles_unset_limits():
 def test_memory_refuses_unreadable_slice():
     with pytest.raises(RuntimeError):
         L.memory(show=lambda s: "MemoryCurrent=[not set]\n", meminfo=meminfo(1))
+
+
+def test_admits_needs_cpu_load_under_the_per_cpu_limit():
+    """tangentswarm #44: starts are decided on the live CPU load too (the 5-minute average)."""
+    assert L.admits(dict(mem(3000 * MB), load=[9.0, 5.9, 3.0], cpus=4))
+    assert not L.admits(dict(mem(3000 * MB), load=[1.0, 6.0, 3.0], cpus=4))
+    assert not L.cpu_admits(dict(load=[0, 2.0, 0], cpus=1)) and L.cpu_admits({})
 
 
 def test_admits_needs_slice_headroom_and_host_memory():

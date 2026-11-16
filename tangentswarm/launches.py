@@ -28,6 +28,7 @@ MB = 1024 ** 2
 FLOOR = 700 * MB              # headroom under MemoryHigh (swarm-start-scoped's rule)
 AVAIL_MIN = int(1.5 * 1024 ** 3)  # host MemAvailable must exceed this (same rule)
 HELD = 3
+LOAD_PER_CPU = float(os.environ.get('SWARM_LOAD_PER_CPU', '1.5'))  # 5-min load per CPU that holds starts
 
 
 # ---------------------------------------------------------------------------
@@ -48,8 +49,9 @@ def parse_limit(v):
     return int(v) if v and v.isdigit() else None
 
 
-def memory(show=_systemctl_show, meminfo=_meminfo):
-    """{current, high, max, avail} in bytes; high/max are None when unlimited."""
+def memory(show=_systemctl_show, meminfo=_meminfo, loadavg=os.getloadavg, cpus=os.cpu_count):
+    """{current, high, max, avail} in bytes (high/max are None when unlimited), and the host
+    {load, cpus} (tangentswarm #44: starts are admitted on CPU load too)."""
     vals = dict(line.split('=', 1) for line in show(SLICE).splitlines() if '=' in line)
     info = {line.split(':')[0]: int(line.split()[1]) * 1024 for line in meminfo().splitlines()
             if line.startswith('MemAvailable:')}
@@ -57,7 +59,7 @@ def memory(show=_systemctl_show, meminfo=_meminfo):
     if cur is None:
         raise RuntimeError(f"cannot read {SLICE} MemoryCurrent: {vals.get('MemoryCurrent')!r}")
     return dict(current=cur, high=parse_limit(vals.get('MemoryHigh')), max=parse_limit(vals.get('MemoryMax')),
-                avail=info.get('MemAvailable', 0))
+                avail=info.get('MemAvailable', 0), load=list(loadavg()), cpus=cpus() or 1)
 
 
 def headroom(m):
@@ -65,9 +67,19 @@ def headroom(m):
     return None if limit is None else limit - m['current']
 
 
+def load_max(cpus):
+    return LOAD_PER_CPU * (cpus or 1)
+
+
+def cpu_admits(m):
+    """The 5-minute load average is under LOAD_PER_CPU per CPU (True when m has no load)."""
+    load = m.get('load')
+    return not load or load[1] < load_max(m.get('cpus'))
+
+
 def admits(m):
     room = headroom(m)
-    return (room is None or room >= FLOOR) and m['avail'] > AVAIL_MIN
+    return (room is None or room >= FLOOR) and m['avail'] > AVAIL_MIN and cpu_admits(m)
 
 
 def describe(m):
@@ -121,8 +133,13 @@ def clean_env(env=None):
     return env
 
 
-def start_scoped(branch, window=None):
-    """Run swarm-start-scoped. Returns (rc, json dict or {'refused': text})."""
+def start_scoped(branch, window=None, refuse=None):
+    """Run swarm-start-scoped. Returns (rc, json dict or {'refused': text}). A worktree that
+    already has a live Claude is refused before anything runs (tangentswarm #40 item 8)."""
+    from . import workerprocs
+    why = (refuse or workerprocs.refuse_second_claude)(HOME / 'ver' / ('platform.' + branch.replace('/', '-')))
+    if why:
+        return 1, {'refused': why}
     r = subprocess.run([str(BIN / 'swarm-start-scoped'), branch, *([window] if window else [])],
                        capture_output=True, text=True, timeout=300, env=clean_env())
     try:

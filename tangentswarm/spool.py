@@ -15,7 +15,8 @@ worker MCP tools) gets a result file, which the worker side waits for.
   <id>.run.json   claimed by the daemon (rename), being served
   <id>.res.json   the answer {ok, ...} or {ok: false, error: "<real error text>"}
 
-ops: stophook (the Stop hook; no answer), handoff, status, request_review (worker MCP).
+ops: stophook (the Stop hook; no answer), handoff, status, request_review, needs_input (worker MCP),
+report (an agent's report_status from swarm-agent, tangentswarm #53; no answer).
 """
 import json
 import os
@@ -25,7 +26,7 @@ import time
 from pathlib import Path
 
 SPOOL = Path(os.environ.get('SWARM_HANDOFF_SPOOL', str(Path.home() / '.cache' / 'swarm-handoff-spool')))
-OPS = ('stophook', 'handoff', 'status', 'request_review', 'launch', 'start')
+OPS = ('stophook', 'handoff', 'status', 'request_review', 'launch', 'start', 'report', 'needs_input')
 WAIT = int(os.environ.get('SWARM_SPOOL_WAIT', '120'))  # s a worker MCP tool waits for its answer
 MAX_AGE = 3600  # s: an unclaimed request or an unread answer older than this is dropped
 NO_DAEMON = ("no answer from the swarm-promoted daemon in {wait}s; it runs the GitHub calls outside "
@@ -63,6 +64,18 @@ def submit(op, cwd, transcript=None, wait=0, spool=None, sleep=time.sleep, clock
     for stale in (spool / f'{rid}.req.json',):  # never claimed: take it back
         stale.unlink(missing_ok=True)
     return {'ok': False, 'error': NO_DAEMON.format(wait=wait)}
+
+
+def peek(rid, spool=None):
+    """The answer of a request queued with wait=0, or None while there is none yet (read
+    once: the answer file is removed)."""
+    res = (spool or SPOOL) / f'{rid}.res.json'
+    try:
+        out = json.loads(res.read_text())
+    except (OSError, ValueError):
+        return None
+    res.unlink(missing_ok=True)
+    return out
 
 
 RUN_STALE = 900  # s: a claimed request older than this lost its serve process: queue it again
@@ -156,12 +169,17 @@ def execute(req):
         return dict(worker_mcp.status(cwd), ok=True)
     if op == 'request_review':
         return dict(worker_mcp.do_request_review(cwd), ok=True)
+    if op == 'needs_input':
+        return dict(worker_mcp.do_needs_input(cwd, req.get('pr'), req.get('question') or ''), ok=True)
     if op == 'launch':
         from . import launcher
         return launcher.execute(req)
     if op == 'start':
         from . import launcher
         return launcher.execute_start(req)
+    if op == 'report':
+        from . import agent_report
+        return agent_report.execute(req)
     return {'ok': False, 'error': f'unknown op {op!r}'}
 
 
@@ -180,11 +198,13 @@ def serve(run_path):
         out = execute(req)
     except Exception as e:
         out = {'ok': False, 'error': f'{type(e).__name__}: {str(e)[:600]}'}
-    if req.get('op') in ('stophook', 'launch', 'start'):
+    if req.get('op') in ('stophook', 'launch', 'start', 'report'):
         if not out.get('ok'):
             from .stophook import say
             what = (f"launch #{req.get('issue')}" if req.get('op') == 'launch' else
-                    f"start #{req.get('pr')}" if req.get('op') == 'start' else Path(req.get('cwd') or '').name)
+                    f"start #{req.get('pr')}" if req.get('op') == 'start' else
+                    f"report #{req.get('pr')} {req.get('state')}" if req.get('op') == 'report' else
+                    Path(req.get('cwd') or '').name)
             say(f"{what}: {req.get('op')} failed: {out['error']}")
     else:
         _write(run_path.with_name(run_path.name.replace('.run.json', '.res.json')), out)

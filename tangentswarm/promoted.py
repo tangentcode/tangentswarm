@@ -64,8 +64,12 @@ CASCADE_EMPTY_HR = int(os.environ.get('SWARM_CASCADE_EMPTY_HR', '900'))
 PULL = os.environ.get('SWARM_PROMOTE_PULL') == '1'  # also run the Staging pull
 REPO = 'tangentcode/platform'
 BACKSTOP = int(os.environ.get('SWARM_PROMOTE_BACKSTOP', '900'))  # retry a leftover head at most this often
+BOARD_EVERY = int(os.environ.get('SWARM_BOARD_EVERY', '300'))  # s between passes of a board without staging (#45)
+DEPLOY_LAG = int(os.environ.get('SWARM_DEPLOY_LAG', '600'))  # s before a staging deploy lag wakes swarmbot (#37)
+LAG_EVERY = 60  # s between deploy-lag checks
 MAIN_RETRY = int(os.environ.get('SWARM_MAIN_RETRY', '300'))  # s between retries of a held merge-main handoff
 HR_TARGET = int(os.environ.get('SWARM_PROMOTE_HR_TARGET', '2'))  # only raise it for a dry-run proof
+WATCH = os.environ.get('SWARM_WATCH', '1') != '0'  # the watchdog thread (tangentswarm.watchdog)
 
 
 
@@ -88,8 +92,9 @@ def read_board(gql, max_age=None):
         col = boardcache.col(it)
         closes = [dict(number=i['number'], labels=_names(i)) for i in boardcache.closes(c)]
         ft.append(dict(number=c['number'], kind='PullRequest', state='OPEN', col=col, labels=_names(c), closes=closes))
+        due, ms = boardcache.pr_due(c)
         cols.setdefault(col, []).append(dict(number=c['number'], head=c['headRefOid'], item=it['id'],
-                                             closes=[i['number'] for i in closes]))
+                                             closes=[i['number'] for i in closes], due=due, milestone=ms))
     for it, c in boardcache.open_issues(snap):
         ft.append(dict(number=c['number'], kind='Issue', state='OPEN', col=boardcache.col(it),
                        labels=_names(c), closes=[]))
@@ -149,7 +154,7 @@ def gated_heads(log_text):
 
 
 DETAIL_FIELDS = """number state headRefOid headRefName isDraft baseRefName body files(first:100){nodes{path}}
- labels(first:20){nodes{name}} closingIssuesReferences(first:10){nodes{number labels(first:20){nodes{name}}}}
+ labels(first:20){nodes{name}} closingIssuesReferences(first:10){nodes{number repository{nameWithOwner} labels(first:20){nodes{name}}}}
  comments(last:30){nodes{createdAt author{__typename login}}}
  reviews(last:30){nodes{submittedAt author{__typename login}}}"""
 
@@ -202,15 +207,15 @@ def pr_labels(pr):
 
 
 def staging_order(staging, details, queue, active=None):
-    """The ONE active fast-track first, then hr-gate's queue file order, then the lowest number."""
-    pos = {r['pr']: i for i, r in enumerate(queue)}
+    """The promote order: the shared pick order (board.pick_key: the ONE active fast-track,
+    the soonest milestone due date, the lowest number; tangentswarm #35). It replaces hr-gate's
+    queue file order (queue is kept for the callers)."""
     def key(p):
         closes = p.get('closes')
         if closes is None:
-            closes = [i.get('number') for i in ((details.get(p['number'], {}).get('closingIssuesReferences') or {})
-                                                 .get('nodes') or [])]
-        ft = board.is_active_fast_track(p['number'], closes, active)
-        return (0 if ft else 1, pos.get(p['number'], len(pos)), p['number'])
+            from . import boardcache
+            closes = [i.get('number') for i in boardcache.closes(details.get(p['number'], {}))]
+        return board.pick_key(dict(p, closes=closes), active)
     return sorted(staging, key=key)
 
 
@@ -244,6 +249,9 @@ class Promoter:
         self.last_hr = None    # Human Review count at the last check
         self.cascade_at = 0.0  # when this daemon last queued a cascade for an empty Human Review
         self.last_deploy = None  # the staging .deploy-sha values at the last check
+        self.work_seen = (None, 0.0)  # (origin work SHA, when this daemon first saw it)
+        self.lag_woken = set()  # work SHAs whose lag already woke swarmbot (once per SHA)
+        self.lag_checked = 0.0
         self.events = None       # tangentswarm.events reader (made on first use)
 
     def main_sha(self):
@@ -269,6 +277,48 @@ class Promoter:
         if main_moved and self.last_main is not None:
             return "main moved"
         return None
+
+    def work_sha(self):
+        """origin work's SHA via git ls-remote (no API quota), or None on an error."""
+        try:
+            r = self.g['sh']('git', 'ls-remote', self.g['origin_url'](), 'refs/heads/work', check=False)
+            sha = (r.stdout or '').split()[0] if r.returncode == 0 and r.stdout.strip() else ''
+            return sha if len(sha) == 40 else None
+        except Exception:
+            return None
+
+    def deploy_lag(self, now=None, wake=None):
+        """tangentswarm #37 (it replaces part of the deleted swarm tick): when a staging
+        .deploy-sha has not reached origin work for DEPLOY_LAG s, one swarm-webhook exception
+        wake per work SHA. Checked every LAG_EVERY s: one git ls-remote and file reads, no
+        GraphQL. Returns the lagging sites, or []."""
+        now = time.time() if now is None else now
+        if now - self.lag_checked < LAG_EVERY:
+            return []
+        self.lag_checked = now
+        work = self.work_sha()
+        if not work:
+            return []
+        if work != self.work_seen[0]:
+            self.work_seen = (work, now)
+            return []
+        try:
+            sites = self.g['served_all']()
+        except Exception:
+            return []
+        behind = [(k, host, sha) for k, host, sha, _ in sites if sha != work]
+        age = now - self.work_seen[1]
+        if not behind or age < DEPLOY_LAG or work in self.lag_woken:
+            return []
+        self.lag_woken = {work}  # Codex on PR #41: once per work SHA, not again after the dedupe window
+        why = (f"staging deploy lag: origin work {work[:8]} is {int(age // 60)} min old and not served by "
+               + ', '.join(f"{host} ({(sha or '-')[:8]})" for _, host, sha in behind))
+        if wake is None:
+            from . import webhook
+            wake = webhook.wake_exception
+        note = wake(None, why, key=f'deploy-lag:{work}', source='swarm-promoted')
+        say(note)
+        return behind
 
     def deploy_due(self):
         """Why to queue a cascade for the pulls in flight, or None (Michal 2026-11-15). The
@@ -438,7 +488,7 @@ class Promoter:
                 if self.dry:
                     say(f"would move #{n} Staging -> Human Review (cheap check passed at {head[:8]})")
                 else:
-                    board.move_card(self.g, p['item'], board.HUMAN_REVIEW)
+                    board.move_card(self.g, p['item'], board.HUMAN_REVIEW, n=p['number'])
                     self.g['log']('apply', n, head[:8], 'PASS', [])
                     from . import moves
                     moves.log_move(n, 'Staging', 'Human Review', head, note='cheap check')
@@ -482,11 +532,30 @@ class Promoter:
                 if str((held.get(p['number']) or {}).get('why', '')).startswith('conflicts with main')
                 and held[p['number']].get('head') == p.get('head')]
 
+    def board_passes(self, now=None):
+        """Every BOARD_EVERY s, queue the pass of each board without staging (#45: Project 6):
+        its MinBot checks and promote, for what no event finished (Codex on PR #47: a promote
+        that met GitHub's mergeable UNKNOWN had no retry). Returns the boards queued."""
+        now = time.time() if now is None else now
+        if now - getattr(self, 'boards_at', 0.0) < BOARD_EVERY:
+            return []
+        self.boards_at = now
+        out = []
+        for b in board.BOARDS:
+            if not b.staging:
+                gatelock.enqueue([str(BIN / 'swarm-advance'), '--promote-board', str(b.number), '--board-pass'],
+                                 by='swarm-promoted')
+                out.append(b.number)
+        return out
+
     def once(self, retry=False):
         """One check. Returns 'idle', 'busy' or 'promoted'. A retry after busy goes straight
         to the lock (the read under the lock is fresh), so a long busy spell costs no reads."""
         main = self.main_sha()
         main_moved = main is not None and main != self.last_main
+        if not self.dry:
+            self.board_passes()
+            self.deploy_lag()
         waiting = gatelock.queued()
         if not retry:
             cols = read_columns(self.g['gql'], max_age=IDLE_AGE)
@@ -582,6 +651,9 @@ def run(p, poll=POLL, retry=RETRY, sleep=time.sleep):
     signal.signal(signal.SIGUSR1, lambda *a: wake.update(now=True))
     say(f"swarm-promoted: polling every {poll}s (SIGUSR1 wakes it)")
     start_spool_thread(p)
+    if WATCH:
+        from . import watchdog
+        watchdog.start_thread(p)  # tangentswarm #40: the pane watcher and the watchdog checks
     what = 'idle'
     while True:
         limited = None
@@ -607,6 +679,8 @@ def main(argv=None):
     ap.add_argument('--once', action='store_true')
     ap.add_argument('--dry-run', action='store_true')
     a = ap.parse_args(argv)
+    from . import eventdb
+    eventdb.set_source('daemon')
     if not a.dry_run:
         from . import launches
         moved = launches.migrate_held()

@@ -59,9 +59,10 @@ RERUN = Path(os.environ.get('SWARM_CASCADE_RERUN', str(gatelock.LOCK.with_name('
 REDEPLOY_LATE = int(os.environ.get('SWARM_REDEPLOY_LATE', '600'))  # lag warning only after this (Michal 2026-11-15)
 DEPLOY_FALLBACK = int(os.environ.get('SWARM_DEPLOY_FALLBACK', '180'))  # then accept a .deploy-sha that contains the head
 
-CODEX_FIELDS = """number state isDraft headRefOid mergeable body
+CODEX_FIELDS = """number state isDraft headRefOid baseRefName mergeable body
  closingIssuesReferences(first:3){nodes{number comments(last:1){nodes{body}}}}
- comments(last:40){nodes{author{login} body}}
+ comments(last:40){nodes{author{login} body createdAt}}
+ commits(last:1){nodes{commit{committedDate}}}
  reviews(last:30){nodes{author{login} commit{oid} comments{totalCount}}}
  reviewThreads(last:60){nodes{id isResolved isOutdated comments(first:1){nodes{author{login} originalCommit{oid}}}}}"""
 
@@ -177,21 +178,18 @@ def open_question(pr):
 
 
 def minbot_order(prs, active=None):
-    """Auto Review PRs to try: the active fast-track first, then the lowest number."""
-    def key(p):
-        ft = active is not None and (p['number'] == active or active in (p.get('closes') or ()))
-        return (0 if ft else 1, p['number'])
-    return sorted(prs, key=key)
+    """Auto Review PRs to try, in the shared pick order (board.pick_key; tangentswarm #35)."""
+    return sorted(prs, key=lambda p: board.pick_key(p, active))
 
 
 CI_BAD = ('failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale')
 
 
-def check_runs(head):
+def check_runs(head, repo=None):
     """[{name, status, conclusion}] of the latest check runs on the exact head (REST, the
     minbot App quota through the gh shim)."""
     r = proc.sh('gh', 'api', '--paginate', '--slurp',
-                f'repos/{REPO}/commits/{head}/check-runs?per_page=100&filter=latest',
+                f'repos/{repo or REPO}/commits/{head}/check-runs?per_page=100&filter=latest',
                 check=False, who='swarm-advance')
     if r.returncode:
         raise RuntimeError(f"check runs of {head[:8]}: {(r.stderr or r.stdout).strip()[:160]}")
@@ -332,9 +330,14 @@ class Advance:
         if not ar:
             self.out(f"#{n} is not in Auto Review: no MinBot check")
             return 0
+        from . import eventdb
         if not self.minbot_pass({board.AUTO_REVIEW: ar}):
             self.out(f"#{n} stays in Auto Review: " + (self.why[-1] if self.why else 'no MinBot pass'))
+            if not self.dry:
+                eventdb.log_event('minbot-check', source='cascade', action='no pass', pr=n, notes=self.why[-1:])
             return 0
+        if not self.dry:
+            eventdb.log_event('minbot-check', source='cascade', action='pass', pr=n, notes=['Auto Review -> Ready'])
         if not self.dry:  # Codex on PR #26: a new Ready PR may fill Staging now, not at the next tick
             flag_rerun(by=f'MinBot pass #{n}')
             self.out(f"#{n} reached Ready: cascade {queue_cascade()}")
@@ -390,7 +393,7 @@ class Advance:
             self.minbot('evidence', n, '--repo', REPO, '--title', 'MinBot pass', '--commit', head,
                         '--body', pass_text(head))
         if not self.dry:
-            board.move_card(self.g, p['item'], board.READY)
+            board.move_card(self.g, p['item'], board.READY, n=n)
             from . import moves
             moves.log_move(n, 'Auto Review', 'Ready', head, note='swarm-advance MinBot pass')
         self.out(f"{'would ' if self.dry else ''}MinBot-pass #{n} at {head[:8]}: pass comment, "
@@ -803,13 +806,27 @@ class Cascade(Advance):
         mark = dict(gqlmeter.TALLY)
         self.out(f"cascade: start{' (dry run)' if self.dry else ''}; budget {BUDGET}s; "
                  f"pass {os.environ[gqlmeter.PASS_ENV]}")
+        lines, out, error = [], self.out, None
+
+        def keep(line):
+            lines.append(str(line))
+            out(line)
+        self.out = keep
         try:
             return self._run(t0)
+        except Exception as e:
+            error = f'{type(e).__name__}: {str(e)[:300]}'
+            raise
         finally:
+            self.out = out
             calls, pts = gqlmeter.since_mark(mark)
             self.out(f"graphql: {pts} points in {calls} queries in this process "
                      f"(remaining {gqlmeter.TALLY['remaining']}); per pass with hr-gate: "
                      f"python -m tangentswarm.gqlmeter --passes")
+            if not self.dry:  # one events DB row per cascade pass (tangentswarm #32)
+                from . import eventdb
+                eventdb.log_event('cascade', source='cascade', actor=os.environ[gqlmeter.PASS_ENV],
+                                  notes=[l for l in lines if not l.endswith('reading the board')][:80], error=error)
 
     def _run(self, t0):
         from .promoted import read_columns
@@ -1020,11 +1037,25 @@ def main(argv=None):
     ap.add_argument('--minbot', type=int, metavar='N',
                     help='the MinBot check of one Auto Review PR, under the lock (the Stop hook)')
     ap.add_argument('--floor', type=int, help=f'--cascade: Staging floor (default {FLOOR}, env SWARM_STAGING_FLOOR)')
+    ap.add_argument('--repo', help='--minbot: the PR\'s repository when it is not the platform repo (#45)')
+    ap.add_argument('--promote-board', type=int, metavar='N',
+                    help='a board without staging (Project 6, #45): Ready -> Human Review in pick order')
+    ap.add_argument('--board-pass', action='store_true',
+                    help='--promote-board: first the MinBot check of every Auto Review PR (the periodic pass)')
     a = ap.parse_args(argv)
+    from . import eventdb
+    eventdb.set_source('cascade')
     if a.floor is not None:
         FLOOR = a.floor
         os.environ['SWARM_STAGING_FLOOR'] = str(a.floor)  # the move log records it
     try:
+        if (a.minbot and a.repo and a.repo != REPO) or a.promote_board:
+            from . import boardflow
+            lock = f"swarm-advance {'--minbot ' + str(a.minbot) + ' --repo ' + a.repo if a.minbot else '--promote-board ' + str(a.promote_board)}"
+            if a.dry_run:
+                return boardflow.main(a, Advance(dry_run=True))
+            with gatelock.gate_lock(lock):
+                return boardflow.main(a, Advance())
         if a.minbot:
             if a.dry_run:
                 return Advance(dry_run=True).minbot_one(a.minbot)
@@ -1041,7 +1072,10 @@ def main(argv=None):
             return Advance().step()
     except gatelock.Busy as e:
         # No "busy, give up": the swarm-promoted daemon owns the queue and runs it under the lock.
-        print(f"busy: {e}; " + queue_self(['--minbot', str(a.minbot)] if a.minbot else []))
+        args = (['--minbot', str(a.minbot)] + (['--repo', a.repo] if a.repo else []) if a.minbot else []) + \
+            (['--promote-board', str(a.promote_board)] if a.promote_board else []) + \
+            (['--board-pass'] if a.board_pass else [])  # Codex on PR #47: keep them
+        print(f"busy: {e}; " + queue_self(args))
         return gatelock.EXIT_BUSY
     except CascadeTimeout as e:  # a dry run (no lock, no flag)
         _say(f"stopped: {e}")

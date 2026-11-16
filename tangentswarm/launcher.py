@@ -55,14 +55,29 @@ def slug(title, n=None):
     return out or f"issue-{n}"
 
 
+# tangentswarm #53: the worker tells the swarm its state over MCP HTTP (swarm-agent), not by
+# leaving a screen for the watchdog to read.
+REPORT_RULE = (
+    "Report your state to the swarm with the report_status tool of the swarm-agent MCP server "
+    "(HTTP): pr={pr}; window is your tmux window name (tmux display-message -p '#W'). "
+    "state='done' when your work is committed and pushed (the swarm hands off the PR and closes you "
+    "with /exit; the window stays), 'needs-input' with question='...' when only Michal can decide (the "
+    "question goes on the ticket and you are closed until he answers), 'blocked' with message='...' "
+    "when you cannot go on, 'working' with message='...' for progress. End your turn right after "
+    "done or needs-input. If the tool is missing, end with the question as your last line or push "
+    "and stop: the Stop hook is the fallback.")
+
+
 def brief_text(n, title, branch, pr):
     from .gatechecks import SHOTS_RULE
     return (
         f"Task #{n}: {title}\n\n"
         f"Read the issue first, with its comments: gh issue view {n} --comments --repo {REPO}. "
         "Follow the issue as written. If it leaves a real choice open that only Michal can make, "
-        "stop and ask one clear question as your last line (the Stop hook moves the card to Needs "
-        "Input); do not guess.\n\n"
+        f"call report_status(state='needs-input', pr={pr}, window=<your window>, question='<one clear "
+        "question>') (or needs_input(pr, question) of the tangentswarm MCP server) and end your turn; do "
+        "not guess. Never ask Michal in your pane.\n\n"
+        f"{REPORT_RULE.format(pr=pr)}\n\n"
         f"Rules: you are in your own worktree on branch {branch}, cut from origin/main; draft PR #{pr} "
         f"(base main, 'Fixes #{n}') already exists and is in In Progress. Never post on GitHub: no gh "
         f"comments, reviews, or PR edits; just commit and push to {branch}. Do not rebase and do not "
@@ -72,9 +87,9 @@ def brief_text(n, title, branch, pr):
         f"from staging or a local run of the real app, never an isolated component page. {SHOTS_RULE} "
         "Before your final push, stop every dev server, watcher and background test run you started "
         "(kill the pids you started): the handoff does not run while one is left in your worktree. "
-        "When you are done, commit and push: the Stop hook marks the PR ready and asks Codex for a "
-        "review. Then reply with: what changed, the tests you ran and their result, and a short PR "
-        "body draft (Before, After, how to see it).\n")
+        "When you are done, commit and push, reply with: what changed, the tests you ran and their "
+        f"result, and a short PR body draft (Before, After, how to see it); then call "
+        f"report_status(state='done', pr={pr}, window=<your window>) and end your turn.\n")
 
 
 class Launcher:
@@ -282,11 +297,15 @@ def execute_start(req):
     rec = slots.load()['unstarted'].get(str(pr))
     if not rec:
         return {'ok': True, 'pr': pr, 'note': 'not in the unstarted list'}
+    from . import eventdb
     try:
         note = Launcher().start_existing(pr, rec)
-    except Exception:
+    except Exception as e:
         slots.unstarted_retry(pr)
+        eventdb.log_event('start', source='launcher', pr=pr, actor=rec.get('branch'),
+                          error=f'{type(e).__name__}: {str(e)[:300]}')
         raise
+    eventdb.log_event('start', source='launcher', pr=pr, actor=rec.get('branch'), notes=[note])  # tangentswarm #32
     from .stophook import say
     say(f"start #{pr} (issue #{rec.get('issue')}): {note}")
     return {'ok': True, 'pr': pr, 'note': note}
@@ -300,6 +319,7 @@ def execute(req):
     """The spool op 'launch' (daemon side): {issue, title}."""
     from . import slots
     n, title = int(req['issue']), req.get('title') or f'Issue #{req["issue"]}'
+    from . import eventdb
     try:
         steps = Launcher().launch(n, title)
     except Deferred as e:
@@ -307,9 +327,14 @@ def execute(req):
         from .stophook import say
         say(f"launch #{n}: {e}")
         return {'ok': True, 'issue': n, 'deferred': str(e)}
-    except Exception:
+    except Exception as e:
         slots.launch_done(n)  # free it for the picker: a later pass may try again
+        eventdb.log_event('launch', source='launcher', action=f'issue #{n}', actor=title[:80],
+                          error=f'{type(e).__name__}: {str(e)[:300]}')
         raise
+    m = next((re.search(r'PR #(\d+)', s) for s in steps if re.search(r'PR #(\d+)', s)), None)
+    eventdb.log_event('launch', source='launcher', action=f'issue #{n}', pr=int(m.group(1)) if m else None,
+                      actor=title[:80], notes=steps)  # tangentswarm #32
     from .stophook import say
     say(f"launch #{n}: " + '; '.join(steps))
     return {'ok': True, 'issue': n, 'steps': steps}
