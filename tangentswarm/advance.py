@@ -538,11 +538,12 @@ class Cascade(Advance):
     # -- 2. fill ------------------------------------------------------------------
     def fill(self):
         """Staging stocking (Michal 2026-11-15). (A) gate the pulls in flight that staging
-        serves (no wait). (B) Pre-merge the top Ready PRs onto future main (Flow.premerge,
-        every pass; tangentswarm #65). (C) While Staging + pulls in flight < FLOOR (the WIP
-        target, default 2), pull Ready PRs in strict pick order, up to the target, in ONE
-        work push, so one redeploy covers them; the first one that is not merge-ready stops
-        the pull (no queue-jumping, never past the target, also for fast-track). The promote ran
+        serves (no wait). (C) While Staging + pulls in flight < FLOOR (the WIP target,
+        default 2), pull Ready PRs in strict pick order, up to the target, in ONE work push,
+        so one redeploy covers them; the first one that is not merge-ready stops the pull
+        (no queue-jumping, never past the target, also for fast-track). (B) Then pre-merge
+        the top Ready PRs onto future main (Flow.premerge, every pass; tangentswarm #65), on
+        the queue with this pass's pulls in it (tangentswarm #69). The promote ran
         first in this pass, so a promote frees a slot and the next pull starts in the same
         pass; the pull's redeploy never holds the lock."""
         from . import flow
@@ -565,47 +566,54 @@ class Cascade(Advance):
             fl = f" + {len(flying)} in flight ({', '.join('#' + str(n) for n in sorted(flying))})" if flying else ''
             ready = [p for p in cols.get(board.READY, []) if not p.get('draft') and p['number'] not in flying]
             have = len(st) + len(flying)
+            cols = self._fill_pull(prs, cols, scratch, st, fl, ready, have)
             # tangentswarm #65 (Michal 2026-11-16 3:22 PM ET): every pass keeps the top Ready
-            # PRs pre-merged onto future main, so a freed Staging slot refills at once. Fixed
-            # WIP: never past the target, also for a fast-track PR (it goes first in the order).
+            # PRs pre-merged onto future main, so a freed Staging slot refills at once.
+            # tangentswarm #69: AFTER the pull, so the pre-merge uses the queue with the pulled
+            # PRs in it, never the queue from before the pull (a -vN that is stale at once).
             try:
                 self.f.premerge(cols, scratch)
             finally:
                 self.flush()
-            if have >= FLOOR:
-                self.out(f"fill: Staging {len(st)}{fl}, target {FLOOR}: no pull needed")
-                return cols
-            if not ready:
-                self.out(f"fill: Staging {len(st)}{fl}, Ready 0: Ready is empty")
-                return cols
-            pick, room = dict(cols, **{board.READY: ready}), FLOOR - have
-            batch = self.f.pull_batch(prs, pick, scratch, room)
-            self.flush()
-            if not batch:
-                self.out(f"fill: Staging {len(st)}{fl}: the next Ready PR is not merge-ready; nothing is pulled "
-                         "past it (strict order)")
-                return cols
-            nums = [p['number'] for p in batch]
-            getattr(self, 'pulled', []).extend(nums)
-            ft = ' (fast-track)' if any(board.item_fast_track(p, board.active_fast_track()) for p in batch) else ''
-            self.out(f"fill: {', '.join('#' + str(n) for n in nums)} pulled in one work merge{ft}: "
-                     f"Staging {len(st)}{fl} + {len(batch)}, target {FLOOR}")
-            if self.dry:  # nothing was pushed: show the rest of the chain, then count them in Staging
-                work = getattr(self.f, 'last_work', None)
-                served = [p for p in batch if self.touches_served(p['number'])]
-                if served:
-                    p = served[0]
-                    lag = self.lagging(dict(pr=p['number'], head=p['head'], work=work))
-                    self.out("would gate each one when every staging site serves the batch (no wait; the "
-                             "daemon queues a cascade on a .deploy-sha change)"
-                             + (f" (now lagging: {', '.join(h for _, h, _, _ in lag)})" if lag else ''))
-                for n in nums:
-                    self.out(f"would run hr-gate --apply {n} (Ready -> Staging when it passes)")
-                return dict(cols, **{board.READY: [q for q in cols.get(board.READY, []) if q not in batch],
-                                     board.STAGING: st + batch})
-            # one check now, no wait (a PR without served files is gated at once)
-            if self.gate_pulls(prs, scratch, only=set(nums)):
-                prs, cols = self.columns()
+        return cols
+
+    def _fill_pull(self, prs, cols, scratch, st, fl, ready, have):
+        """(C) of fill: the pull. Fixed WIP: never past the target, also for a fast-track PR
+        (it goes first in the order). Returns the columns after it."""
+        if have >= FLOOR:
+            self.out(f"fill: Staging {len(st)}{fl}, target {FLOOR}: no pull needed")
+            return cols
+        if not ready:
+            self.out(f"fill: Staging {len(st)}{fl}, Ready 0: Ready is empty")
+            return cols
+        pick, room = dict(cols, **{board.READY: ready}), FLOOR - have
+        batch = self.f.pull_batch(prs, pick, scratch, room)
+        self.flush()
+        if not batch:
+            self.out(f"fill: Staging {len(st)}{fl}: the next Ready PR is not merge-ready; nothing is pulled "
+                     "past it (strict order)")
+            return cols
+        nums = [p['number'] for p in batch]
+        getattr(self, 'pulled', []).extend(nums)
+        ft = ' (fast-track)' if any(board.item_fast_track(p, board.active_fast_track()) for p in batch) else ''
+        self.out(f"fill: {', '.join('#' + str(n) for n in nums)} pulled in one work merge{ft}: "
+                 f"Staging {len(st)}{fl} + {len(batch)}, target {FLOOR}")
+        if self.dry:  # nothing was pushed: show the rest of the chain, then count them in Staging
+            work = getattr(self.f, 'last_work', None)
+            served = [p for p in batch if self.touches_served(p['number'])]
+            if served:
+                p = served[0]
+                lag = self.lagging(dict(pr=p['number'], head=p['head'], work=work))
+                self.out("would gate each one when every staging site serves the batch (no wait; the "
+                         "daemon queues a cascade on a .deploy-sha change)"
+                         + (f" (now lagging: {', '.join(h for _, h, _, _ in lag)})" if lag else ''))
+            for n in nums:
+                self.out(f"would run hr-gate --apply {n} (Ready -> Staging when it passes)")
+            return dict(cols, **{board.READY: [q for q in cols.get(board.READY, []) if q not in batch],
+                                 board.STAGING: st + batch})
+        # one check now, no wait (a PR without served files is gated at once)
+        if self.gate_pulls(prs, scratch, only=set(nums)):
+            prs, cols = self.columns()
         return cols
 
     # -- rework: Ready PRs that cannot be pulled (Michal 2026-11-14 9:10 PM ET deadlock) ------
