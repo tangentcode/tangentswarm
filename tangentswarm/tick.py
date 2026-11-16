@@ -450,8 +450,8 @@ BOARD_Q = """query($c:String){organization(login:"tangentcode"){projectV2(number
  nodes{id fieldValueByName(name:"Status"){...on ProjectV2ItemFieldSingleSelectValue{name optionId}}
   content{__typename
    ...on PullRequest{number state isDraft headRefName headRefOid title repository{nameWithOwner}
-     body milestone{title} labels(first:20){nodes{name}}
-     closingIssuesReferences(first:10){nodes{number milestone{title} labels(first:20){nodes{name}}}}}}}}}}}"""
+     body milestone{title dueOn} labels(first:20){nodes{name}}
+     closingIssuesReferences(first:10){nodes{number milestone{title dueOn} labels(first:20){nodes{name}}}}}}}}}}}"""
 
 
 def board_prs_open(g, max_age=None):
@@ -470,6 +470,8 @@ def board_prs_open(g, max_age=None):
                                 branch=c['headRefName'], head=c['headRefOid'], title=c['title'],
                                 body=c.get('body') or '', updated=c.get('updatedAt'),
                                 col=boardcache.col(it), item=it['id'], closes=nums,
+                                due=boardcache.pr_due(c)[0], milestone=boardcache.pr_due(c)[1],
+                                ft=board.is_active_fast_track(c['number'], nums, active),
                                 rank=board.priority_rank(board.is_active_fast_track(c['number'], nums, active),
                                                          milestone_rank(miles) == 0),
                                 parked=c['number'] in g['PARKED'] | EXTRA_PARKED or 'parked' in labels)
@@ -496,6 +498,12 @@ def board_prs(g):
                                     body=c.get('body') or '',
                                     col=col, item=it['id'],
                                     closes=[i.get('number') for i in c['closingIssuesReferences']['nodes']],
+                                    due=board.soonest_due([c.get('milestone') or {}] + [
+                                        i.get('milestone') or {} for i in c['closingIssuesReferences']['nodes']])[0],
+                                    milestone=board.soonest_due([c.get('milestone') or {}] + [
+                                        i.get('milestone') or {} for i in c['closingIssuesReferences']['nodes']])[1],
+                                    ft=board.is_active_fast_track(
+                                        c['number'], [i.get('number') for i in c['closingIssuesReferences']['nodes']], active),
                                     rank=board.priority_rank(
                                         board.is_active_fast_track(
                                             c['number'], [i.get('number') for i in c['closingIssuesReferences']['nodes']],
@@ -681,7 +689,7 @@ class Tick:
 
     # step 2 + pane judgment -------------------------------------------------
     def panes_pass(self, scratch):
-        for n, pr in sorted(self.prs.items(), key=lambda kv: (kv[1]['rank'], kv[0])):
+        for n, pr in sorted(self.prs.items(), key=lambda kv: board.pick_key(kv[1])):
             if pr['state'] != 'OPEN' or pr['parked'] or pr['col'] not in WORKING_COLS:
                 continue
             mine = [p for p in self.panes if p['pr'] == n]
@@ -821,8 +829,8 @@ class Tick:
             if codex_status(full)[0] != 'clean':
                 continue
             entered = self.g['entered_col'](full, (pr['col'],))
-            cands.append((pr['rank'], entered or datetime(1970, 1, 1, tzinfo=timezone.utc), n, full))
-        cands.sort(key=lambda t: t[:3])
+            cands.append((board.pick_key(pr), entered or datetime(1970, 1, 1, tzinfo=timezone.utc), n, full))
+        cands.sort(key=lambda t: t[:3])  # the shared pick order (tangentswarm #35)
         hr_peers = self.g['list_hr_prs'](refresh=True)
         for _, _, n, full in cands:
             mine = sorted((p for p in self.panes if p['pr'] == n), key=lambda p: not p['claude'])
