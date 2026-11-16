@@ -190,14 +190,17 @@ def done_target(state, merged, base, on_main):
 
 
 def head_on_main(head, n, git=None):
-    """True/False: is head an ancestor of origin/main; None when it cannot be told."""
+    """True/False: is head an ancestor of GitHub's main; None when it cannot be told. Only a
+    yes is trusted from the local origin/main: a no (or a missing object) is checked again
+    after a fetch of main and the PR head (Codex on PR #51: a stale origin/main sent a
+    merged PR back to In Progress). A failed fetch is None: the card stays."""
     def run(*args):
         return subprocess.run(['git', '-C', str(PLATFORM_GIT), *args], capture_output=True, text=True, timeout=120)
     git = git or run
-    r = git('merge-base', '--is-ancestor', head, 'origin/main')
-    if r.returncode in (0, 1):
-        return r.returncode == 0
-    git('fetch', '-q', 'origin', 'main', f'pull/{int(n)}/head')
+    if git('merge-base', '--is-ancestor', head, 'origin/main').returncode == 0:
+        return True
+    if git('fetch', '-q', 'origin', 'main', f'pull/{int(n)}/head').returncode != 0:
+        return None
     r = git('merge-base', '--is-ancestor', head, 'origin/main')
     return r.returncode == 0 if r.returncode in (0, 1) else None
 

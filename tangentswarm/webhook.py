@@ -287,6 +287,10 @@ CARD_QUERY = """query($owner:String!,$name:String!,$n:Int!){repository(owner:$ow
     fieldValueByName(name:"Status"){...on ProjectV2ItemFieldSingleSelectValue{name optionId}}}}}}}}"""
 
 
+ANSWERS_Q = ('query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){pullRequest(number:$n)'
+             '{closingIssuesReferences(first:3){nodes{comments(last:30){nodes{author{login} body createdAt}}}}}}}')
+
+
 # -- the executor ------------------------------------------------------------------------
 
 class Executor:
@@ -544,9 +548,11 @@ class Executor:
         there (needs_input posts the question on the ticket, so he answers there)."""
         from .stophook import QUESTION_MARK
         owner, name = REPO.split('/')
-        d = self.g['gql'](f'query{{repository(owner:"{owner}",name:"{name}"){{pullRequest(number:{int(n)})'
-                          '{closingIssuesReferences(first:3){nodes{comments(last:30){nodes{author{login} body '
-                          'createdAt}}}}}}}}')
+        try:  # Codex on PR #51: a failed read must never stop the resume
+            d = self.g['gql'](ANSWERS_Q, owner=owner, name=name, n=int(n))
+        except Exception as e:
+            self.note(f"#{n}: the answer on the ticket was not read ({type(e).__name__}: {str(e)[:120]})")
+            return []
         pr = ((d or {}).get('repository') or {}).get('pullRequest') or {}
         out = []
         for i in (pr.get('closingIssuesReferences') or {}).get('nodes') or []:

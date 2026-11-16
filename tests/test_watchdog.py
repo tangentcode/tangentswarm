@@ -114,7 +114,7 @@ def test_the_watchdog_sends_the_promote_alert_once_per_staging_set(monkeypatch):
 
 # -- item 4d: hung processes ------------------------------------------------------------------
 
-def test_hung_needs_age_and_flat_cpu_or_the_hard_limit():
+def test_hung_needs_age_and_a_flat_process_tree():
     cur = {1: dict(cmd='pytest', cwd='/w', cpu=10, started=T0, ppid=0),
            2: dict(cmd='vitest', cwd='/w', cpu=10, started=T0, ppid=0),
            3: dict(cmd='pytest worker', cwd='/w', cpu=10, started=T0, ppid=1)}
@@ -123,13 +123,13 @@ def test_hung_needs_age_and_flat_cpu_or_the_hard_limit():
     tr = hung.track(tr, {**cur, 2: dict(cur[2], cpu=99)}, T0 + 2500)
     got = hung.hung(tr, T0 + 2500, hung_min=1800, flat_min=600)
     assert [p for p, _ in got] == [1]  # 2 still uses CPU; 3 is a child of 1 (its kill takes it)
-    assert hung.hung(tr, T0 + 9000, hung_min=1800, flat_min=99999, hard_min=7200)[0][0] == 1
+    assert hung.hung(tr, T0 + 99999, hung_min=1800, flat_min=99999) == []  # no CPU-blind age limit
 
 
 def fake_proc(tmp_path, procs):
     """A /proc with stat, cmdline, comm and a cwd symlink per pid."""
     root = tmp_path / 'proc'
-    root.mkdir()
+    root.mkdir(parents=True)
     (root / 'stat').write_text('cpu 1 2 3\nbtime 1000\n')
     for pid, (cmd, cwd, ppid, cpu, start) in procs.items():
         d = root / str(pid)
@@ -151,6 +151,22 @@ def test_sample_finds_test_runs_in_worker_worktrees_only(tmp_path):
                                 14: ('/usr/bin/claude', w, 1, 5, 300)})
     got = hung.sample(lambda cwd: w if cwd.startswith(w) else None, proc=root, uid=os.getuid(), hz=100, btime=1000)
     assert list(got) == [10] and got[10]['cpu'] == 50 and got[10]['started'] == 1003 and got[10]['cwd'] == w
+
+
+def test_a_launcher_that_waits_on_busy_workers_is_not_hung(tmp_path):
+    """Codex on PR #51: the CPU of the whole process tree counts, not the launcher's own."""
+    w = str(tmp_path / 'platform.feat')
+    worker = lambda cpu: {20: ('npm test', w, 1, 0, 300), 21: ('node worker.js', w, 20, cpu, 300),  # noqa: E731
+                          22: ('node leaf.js', w, 21, cpu, 300)}
+    in_w = lambda cwd: w if cwd.startswith(w) else None  # noqa: E731
+    s1 = hung.sample(in_w, proc=fake_proc(tmp_path / 'a', worker(100)), uid=os.getuid(), hz=100, btime=0)
+    assert s1[20]['cpu'] == 200  # its own 0 plus both descendants
+    tr = hung.track({}, s1, T0)
+    s2 = hung.sample(in_w, proc=fake_proc(tmp_path / 'b', worker(900)), uid=os.getuid(), hz=100, btime=0)
+    tr = hung.track(tr, s2, T0 + 5000)
+    assert tr[20]['flat_since'] == T0 + 5000 and hung.hung(tr, T0 + 5000, hung_min=1800, flat_min=600) == []
+    tr = hung.track(tr, s2, T0 + 6000)
+    assert [p for p, _ in hung.hung(tr, T0 + 6000, hung_min=0, flat_min=600)] == [20]
 
 
 def test_kill_terms_the_process_and_its_children_then_kills_survivors(tmp_path):
@@ -214,16 +230,24 @@ def test_the_sweep_moves_cards_out_of_done_and_issues_to_backlog():
     assert len(out) == 4 and len(r.incidents) == 4
 
 
-def test_head_on_main_fetches_once_when_the_object_is_missing():
-    calls = []
+class _R:
+    def __init__(self, rc):
+        self.returncode = rc
 
-    class R:
-        def __init__(self, rc):
-            self.returncode = rc
 
-    rcs = iter([128, 0])
-    got = WD.head_on_main('abc', 7, git=lambda *a: calls.append(a) or (R(next(rcs)) if a[0] == 'merge-base' else R(0)))
-    assert got is True and calls[1] == ('fetch', '-q', 'origin', 'main', 'pull/7/head')
+def head_check(ancestor_rcs, fetch_rc=0):
+    calls, rcs = [], iter(ancestor_rcs)
+    got = WD.head_on_main('abc', 7, git=lambda *a: calls.append(a[0]) or _R(next(rcs) if a[0] == 'merge-base'
+                                                                          else fetch_rc))
+    return got, calls
+
+
+def test_head_on_main_trusts_only_a_yes_before_a_fetch():
+    assert head_check([0]) == (True, ['merge-base'])
+    assert head_check([1, 0]) == (True, ['merge-base', 'fetch', 'merge-base'])  # origin/main was stale
+    assert head_check([1, 1]) == (False, ['merge-base', 'fetch', 'merge-base'])
+    assert head_check([128, 0]) == (True, ['merge-base', 'fetch', 'merge-base'])  # the object was missing
+    assert head_check([1], fetch_rc=1) == (None, ['merge-base', 'fetch'])  # cannot tell: the card stays
 
 
 def test_worker_root(tmp_path, monkeypatch):

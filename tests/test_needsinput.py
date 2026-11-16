@@ -90,3 +90,43 @@ def test_a_pending_exit_from_the_tool_survives_the_daemons_state_save():
     daemon.data['codex_outage'] = {'since': 1}
     daemon.save()
     assert '/w/platform.feat' in NI.pending_exits()
+
+
+def balanced(q):
+    depth = {'{': 0, '(': 0}
+    for ch in q:
+        if ch in '{(':
+            depth[ch] += 1
+        elif ch in '})':
+            depth['{' if ch == '}' else '('] -= 1
+            if min(depth.values()) < 0:
+                return False
+    return depth == {'{': 0, '(': 0}
+
+
+def test_every_query_the_new_code_sends_is_balanced():
+    """Codex on PR #51: the answer query had one closing brace too many."""
+    from tangentswarm import watchdog
+    for q in (webhook.ANSWERS_Q, watchdog.CLOSED_Q, watchdog.CODEX_Q.format(n=7)):
+        assert balanced(q), q
+    from test_webhook import Fake
+    ex, sent = Fake(col=board.IN_PROGRESS), []
+    ex._g['gql'] = lambda q, **v: sent.append(q) or {}
+    ex.issue_answers(7)
+    assert sent and all(balanced(q) for q in sent)
+
+
+def test_a_failed_answer_read_still_resumes_the_worker():
+    from test_webhook import Fake
+    ex = Fake(col=board.IN_PROGRESS)
+    ex.pr_of = lambda node: 7
+    ex.full = {'comments': {'nodes': []}, 'commits': {'nodes': [{'commit': {'committedDate': '0'}}]}}
+    real = ex._g['gql']
+
+    def gql(q, **v):
+        if 'closingIssuesReferences' in q:
+            raise RuntimeError('GraphQL: parse error')
+        return real(q, **v)
+    ex._g['gql'] = gql
+    ex.run(webhook.Action('answered', 0, 'x', dict(node='N')))
+    assert ex.relays and ex.errors == [] and any('not read' in d for d in ex.done)
