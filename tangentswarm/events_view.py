@@ -14,20 +14,27 @@ follows new rows. One row per event:
 - Age shading: the screen is redrawn every --redraw s (default 10). Rows from the last 2
   minutes are bright; each older minute is a darker gray (256 colors).
 
+- The Agents screen (tangentswarm #44; agents_view, livestate): each tmux pane of the swarm,
+  with its Claude, active or idle, tests and other processes, memory, CPU, PR and card, under
+  the host load and the start capacity. In a terminal the keys are: a agents, e events, q quit.
+
   swarm-events [--since today|all|YYYY-MM-DD] [-v] [--once] [--db PATH] [--color|--no-color]
-               [--redraw S]
+               [--redraw S] [--agents]
 """
 import argparse
 import json
 import os
 import re
+import select
 import shutil
 import sqlite3
 import sys
+import termios
 import time
+import tty as _tty
 from datetime import datetime
 
-from . import eventdb
+from . import agents_view, eventdb, livestate
 
 RED, BOLD, RESET = '\033[31m', '\033[1m', '\033[0m'
 SIG_BAD = '\033[1;37;41m'  # white on red: a signature failure
@@ -263,29 +270,112 @@ def blocks(rows, now=None, color=True, verbose=False):
     return out
 
 
-def render(rows, now=None, color=True, verbose=False, height=None):
-    """The lines of one screen: the newest events that fit in height (all when None)."""
+def render(rows, now=None, color=True, verbose=False, height=None, width=None):
+    """The lines of one screen: the newest events that fit in height (all when None), each cut
+    to width so that none wraps (Codex on PR #48)."""
     out = [l for _, _, text in blocks(rows, now, color, verbose) for l in text.split('\n')]
+    if width:
+        out = [agents_view.clip(l, width) for l in out]
     return out[-height:] if height else out
 
 
+class TermKeys:
+    """The keys pressed on a terminal stdin, read without Enter (cbreak) while in a with block."""
+
+    def __init__(self, stream=None, sleep=time.sleep):
+        self.stream, self.sleep = stream or sys.stdin, sleep
+        self.saved = None
+
+    def __enter__(self):
+        try:
+            fd = self.stream.fileno()
+            if os.isatty(fd):
+                self.saved = termios.tcgetattr(fd)
+                _tty.setcbreak(fd)
+        except (OSError, ValueError, termios.error):
+            self.saved = None
+        return self
+
+    def __exit__(self, *exc):
+        if self.saved is not None:
+            termios.tcsetattr(self.stream.fileno(), termios.TCSADRAIN, self.saved)
+
+    def __call__(self, timeout):
+        """The keys pressed in the next timeout s ('' when none; waits the whole time)."""
+        if self.saved is None:
+            self.sleep(timeout)
+            return ''
+        r, _, _ = select.select([self.stream], [], [], timeout)
+        return os.read(self.stream.fileno(), 32).decode(errors='replace') if r else ''
+
+
+def agents_screen(sample, color=True, height=None, top=0):
+    """(the lines of the Agents screen, the first row shown after clamping top)."""
+    width = shutil.get_terminal_size((200, 40)).columns
+    st = sample()
+    top = agents_view.clamp(top, len(st['agents']), height) if height else 0
+    return agents_view.render(st, color, width, height, top), top
+
+
+SCROLL = {'j': 1, 'k': -1, '\x1b[B': 1, '\x1b[A': -1}  # a row; space, b, PgDn, PgUp: a page
+PAGE = {' ': 1, 'b': -1, '\x1b[6~': 1, '\x1b[5~': -1}
+
+
+def key_list(pressed):
+    """The keys in what was read: an escape sequence (arrow, PgUp/PgDn) is one key."""
+    out, i = [], 0
+    while i < len(pressed):
+        m = re.match(r'\x1b\[[0-9;]*[~A-Za-z]', pressed[i:])
+        out.append(m.group(0) if m else pressed[i])
+        i += len(out[-1])
+    return out
+
+
 def run(path, since='today', verbose=False, once=False, color=None, out=sys.stdout, sleep=time.sleep,
-        polls=None, redraw=10.0, clock=time.time, tty=None):
+        polls=None, redraw=10.0, clock=time.time, tty=None, screen='events', keys=None, sample=None):
     """--once or a pipe: print the events, then append new ones. A terminal: redraw the screen
-    on a new event and every `redraw` s, so the age shading stays true."""
+    on a new event and every `redraw` s, so the age shading stays true. screen='agents' shows
+    the Agents screen (once on a pipe); in a terminal, keys(timeout) switches the screen."""
     tty = out.isatty() if tty is None else tty
     color = tty if color is None else color
     lower = since_iso(since)
-    while not os.path.exists(path):  # the server makes it on its first request
+    if screen == 'agents' and (once or not tty):
+        sample = sample or livestate.primed(sleep=sleep)  # Codex on PR #48: measure the CPU
+        out.write('\n'.join(agents_screen(sample, color)[0]) + '\n')
+        out.flush()
+        return 0
+    if sample is None:
+        watch = livestate.PaneWatch()
+        sample = lambda: livestate.collect(watch, now=clock())  # noqa: E731
+    if tty and keys is None:
+        with TermKeys(sleep=sleep) as k:
+            return run(path, since, verbose, once, color, out, sleep, polls, redraw, clock, tty, screen, k, sample)
+    # the server makes the DB on its first request; a terminal waits for it in the main loop
+    # (Codex on PR #48: the keys must work before it exists)
+    while not os.path.exists(path) and not keys:
         if once:
             print(f"swarm-events: no event DB at {path} yet", file=out)
             return 1
         sleep(1)
-    db = connect(path)
-    rows, last, n, shown, drawn = [], 0, 0, None, None
+    db = None
+    rows, last, n, shown, drawn, pressed, top = [], 0, 0, None, None, '', 0
     while True:
+        switched = False
+        height = shutil.get_terminal_size((120, 40)).lines - 1
+        for ch in key_list(pressed):
+            if ch in ('q', 'Q'):
+                return 0
+            want = {'a': 'agents', 'e': 'events'}.get(ch.lower())
+            if want and want != screen:
+                screen, switched = want, True
+            elif screen == 'agents' and (ch in SCROLL or ch in PAGE):
+                # Codex on PR #48: every pane row must be reachable in a short terminal
+                top = max(0, top + SCROLL.get(ch, 0) + PAGE.get(ch, 0) * agents_view.page(height))
+                switched = True
+        if db is None and os.path.exists(path):
+            db = connect(path)
         try:
-            got = rows_after(db, last, lower)
+            got = rows_after(db, last, lower) if db is not None else []
         except sqlite3.OperationalError as e:  # e.g. a busy WAL checkpoint: try again
             got = []
             print(f"swarm-events: {e}", file=sys.stderr)
@@ -301,15 +391,23 @@ def run(path, since='today', verbose=False, once=False, color=None, out=sys.stdo
                 if shown.get(key) != stable:  # Codex on PR #36: a new shade is not a change
                     print(text, file=out)
                     shown[key] = stable
-        elif got or drawn is None or now - drawn >= redraw:
-            height = shutil.get_terminal_size((120, 40)).lines - 1
-            out.write(CLEAR + '\n'.join(render(rows, now, color, verbose, height)) + '\n')
+        elif screen == 'agents':
+            if switched or drawn is None or now - drawn >= redraw:
+                lines, top = agents_screen(sample, color, height, top)
+                out.write(CLEAR + '\n'.join(lines) + '\n')
+                drawn = now
+        elif got or switched or drawn is None or now - drawn >= redraw:
+            width = shutil.get_terminal_size((120, 40)).columns
+            out.write(CLEAR + '\n'.join(render(rows, now, color, verbose, height, width)) + '\n')
             drawn = now
         out.flush()
         n += 1
         if once or (polls is not None and n >= polls):
             return 0
-        sleep(1)
+        if keys:
+            pressed = keys(1.0)
+        else:
+            sleep(1)
 
 
 def main(argv=None):
@@ -321,13 +419,15 @@ def main(argv=None):
     ap.add_argument('--redraw', type=float, default=10.0, help='seconds between redraws in a terminal (age shading)')
     ap.add_argument('--color', dest='color', action='store_true', default=None)
     ap.add_argument('--no-color', dest='color', action='store_false')
+    ap.add_argument('--agents', action='store_true', help='start on the Agents screen (a pipe or --once: print it once)')
     a = ap.parse_args(argv)
     try:
         since_iso(a.since)
     except ValueError:
         ap.error('--since: today, all or YYYY-MM-DD')
     try:
-        return run(a.db, a.since, a.verbose, a.once, a.color, redraw=a.redraw)
+        return run(a.db, a.since, a.verbose, a.once, a.color, redraw=a.redraw,
+                   screen='agents' if a.agents else 'events')
     except KeyboardInterrupt:
         return 0
 
