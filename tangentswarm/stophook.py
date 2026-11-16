@@ -305,6 +305,10 @@ def _run(cwd, g, dry, out, sh, sleep, merges, minbot, transcript, procs, tell):
     if not found:
         return say(f"{branch} head {head[:7]} pushed, but no open PR on the board has this branch", out)
     n, item, col, _ = found
+    from . import agent_report
+    if agent_report.pending_input(n):  # tangentswarm #53: the report goes first; not marked seen
+        return say(f"#{n} head {head[:7]} pushed, but its worker reported needs-input or blocked and the "
+                   "report is not handled yet: no handoff", out)
     if col not in (board.IN_PROGRESS, board.AUTO_REVIEW):
         mark_seen(key)
         return say(f"#{n} head {head[:7]} pushed; the card is in {col}: nothing to do", out)
