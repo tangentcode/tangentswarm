@@ -1,0 +1,62 @@
+# tangentswarm private infra config (example with placeholders).
+# This file ships in the package (tangentswarm/config.example.toml).
+# Copy to ~/.config/tangentswarm/config.toml (or $TANGENTSWARM_CONFIG) and fill in the real
+# values. The real file is never committed. The tests run with this example file.
+
+[project]
+# GitHub Projects v2 node ids of the board (gh project view N --owner ORG --format json).
+number = 4
+id = "PVT_example"
+status_field = "PVTSSF_example"
+repos = ["tangentcode/platform"]
+staging = true
+
+[project.options]
+# Status column (internal key) -> single-select option id. Columns are matched by id only.
+"Inbox" = "opt-inbox"
+"Triage" = "opt-triage"
+"Discuss" = "opt-discuss"
+"Backlog" = "opt-backlog"
+"Active" = "opt-active"
+"In Progress" = "opt-in-progress"
+"Auto Review" = "opt-auto-review"
+"Needs Input" = "opt-needs-input"
+"Ready" = "opt-ready"
+"Pending" = "opt-staging"          # shown as "Staging" on the board
+"Human Review" = "opt-human-review"
+"Done" = "opt-done"
+"Canceled" = "opt-canceled"
+"Parked" = "opt-parked"
+
+[staging]
+# The staging sites that must serve a PR's head (key = host).
+sites = { work = "work.example.test", minavo = "minavo.example.test" }
+
+[webhook]
+# swarm-webhook HMAC secrets (any one may match). "~" is the home directory.
+secret_files = ["~/.config/tangentswarm/webhook-secret"]
+
+[[boards]]
+# More boards that run the same flow (tangentswarm #45). No staging site: Ready goes to
+# Human Review directly.
+number = 6
+id = "PVT_example6"
+status_field = "PVTSSF_example6"
+repos = ["tangentcode/tangentswarm", "tangentcode/methodology"]
+staging = false
+
+[boards.options]
+"Inbox" = "opt6-inbox"
+"Triage" = "opt6-triage"
+"Discuss" = "opt6-discuss"
+"Backlog" = "opt6-backlog"
+"Active" = "opt6-active"
+"In Progress" = "opt6-in-progress"
+"Auto Review" = "opt6-auto-review"
+"Needs Input" = "opt6-needs-input"
+"Ready" = "opt6-ready"
+"Pending" = "opt6-staging"
+"Human Review" = "opt6-human-review"
+"Done" = "opt6-done"
+"Canceled" = "opt6-canceled"
+"Parked" = "opt6-parked"

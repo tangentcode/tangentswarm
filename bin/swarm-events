@@ -1,0 +1,6 @@
+#!/bin/sh
+# swarm-events: console viewer of the swarm-webhook event DB (tangentswarm.events_view).
+# Runs this checkout's tangentswarm with the Python in $TANGENTSWARM_PYTHON (default: python3).
+# Install: ln -sf "$PWD/bin/swarm-events" ~/bin/swarm-events   (see README, "swarm-events").
+here=$(dirname "$(readlink -f "$0")")
+PYTHONPATH="$here/..${PYTHONPATH:+:$PYTHONPATH}" exec "${TANGENTSWARM_PYTHON:-python3}" -m tangentswarm.events_view "$@"

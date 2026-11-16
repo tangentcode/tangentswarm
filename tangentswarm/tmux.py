@@ -38,13 +38,30 @@ def _key(name):
     return 'c-' + k[1] if len(k) == 2 and k[0] == '^' else k
 
 
+def _ctrl_byte(name):
+    """The control character a C-x key name types (C-r -> 0x12, C-Space -> 0x00), or None."""
+    k = _key(name)
+    if k == 'c-space':
+        return '\x00'
+    if len(k) == 3 and k.startswith('c-') and k[2] in '@abcdefghijklmnopqrstuvwxyz[\\]^_':
+        return chr(ord(k[2].upper()) & 0x1f)
+    return None
+
+
 def refused_key(keys, target, literal=False):
     """Why send_keys should not send `keys` to `target`, or None. 'ctrl_b': a raw 0x02 byte,
-    or C-b as a key name. 'prefix': a prefix key of the target's session as a key name (only
-    checked when literal=False, since literal text can't press one)."""
+    or C-b as a key name. 'prefix': a prefix key of the target's session, as a key name
+    (literal=False) or as the raw control character it types (either mode: send-keys never
+    reaches tmux's key tables, so both arrive in the pane as the same stray byte)."""
     if '\x02' in keys or (not literal and _key(keys) == 'c-b'):
         return 'ctrl_b'
-    if not literal and _key(keys) in {_key(p) for p in prefix_keys(target)}:
+    has_ctrl = any(ord(c) < 0x20 or c == '\x7f' for c in keys)
+    if literal and not has_ctrl:
+        return None                     # plain text: no need to ask tmux
+    prefixes = prefix_keys(target)
+    if not literal and _key(keys) in {_key(p) for p in prefixes}:
+        return 'prefix'
+    if has_ctrl and any(b and b in keys for b in map(_ctrl_byte, prefixes)):
         return 'prefix'
     return None
 
@@ -201,12 +218,18 @@ def capture_pane(target, history_lines=None, escapes=False):
 # Muse, etc.) can drop an Enter that arrives in the same burst as the text.
 ENTER_DELAY = 0.5
 
+# tmux refuses a command over about 16KB ("command too long"), so long text goes in
+# pieces. 2048 characters stay under that even when every one is 4 bytes of UTF-8.
+LITERAL_CHUNK = 2048
+
 
 def send_keys_literal(target, text, enter=True, enter_delay=ENTER_DELAY):
-    """Type text literally into a pane (send-keys -l), then press Enter
-    in a separate send-keys call so the text is never interpreted as keys.
-    Waits enter_delay seconds before the Enter."""
-    _run([TMUX, 'send-keys', '-t', target, '-l', '--', text], check=True)
+    """Type text literally into a pane (send-keys -l, in LITERAL_CHUNK pieces), then press
+    Enter in a separate send-keys call so the text is never interpreted as keys.
+    Waits enter_delay seconds before the Enter. This does not check that the agent took
+    the Enter; agents.TuiAgent.send_text does."""
+    for i in range(0, max(len(text), 1), LITERAL_CHUNK):
+        _run([TMUX, 'send-keys', '-t', target, '-l', '--', text[i:i + LITERAL_CHUNK]], check=True)
     if enter:
         if enter_delay:
             time.sleep(enter_delay)
