@@ -251,49 +251,49 @@ class Reporter:
         self.say(f"#{n} done at {head[:7]}: " + (line or 'the handoff had nothing to do (already handed off)'))
         self.close(rep, wt, branch, head, strict=True)
 
-    def do_needs_input(self, rep, wt, branch, item, col, issues):
+    def post(self, rep, wt, branch, item, issues, kind, text, body):
+        """Post text on the ticket once (keyed by its hash, never by the card column: Codex on
+        PR #54) and move the card to Needs Input unless it is there already. Returns False when
+        the card is in another column (nothing done)."""
         from . import board, stophook
-        n, q = rep['pr'], rep['question']
-        key = f"q:{branch}:{hashlib.sha1(q.encode()).hexdigest()[:12]}"
+        n = rep['pr']
+        key = f"{kind[0]}:{branch}:{hashlib.sha1(text.encode()).hexdigest()[:12]}"
+        where = (issues or [n])[0]
+        on = f"{'issue ' if issues else ''}#{where}"
         with stophook.branch_lock(wt):  # the Stop hook's own question path holds it too
-            col = self.card(branch)[2]  # again, under the lock: the Stop hook may have moved it
+            col = self.card(branch)[2]  # under the lock: the Stop hook may have moved it
             if stophook.seen(key):
-                self.say(f"#{n}: this question was already posted")
-            elif col == board.NEEDS_INPUT:
-                self.say(f"#{n}: the card is already in Needs Input: the question is not posted again")
-            elif col not in (board.IN_PROGRESS, board.AUTO_REVIEW):
-                self.say(f"#{n} asks a question, but its card is in {col}: not moved")
-                return
-            else:
-                body = (f"{stophook.QUESTION_MARK}\nQuestion from the worker on #{n} (the card is in Needs "
-                        f"Input; reported with report_status):\n\n" + quote(q))
-                where = (issues or [n])[0]
+                self.say(f"#{n}: this {kind} was already posted")
+                return True
+            if col not in (board.IN_PROGRESS, board.AUTO_REVIEW, board.NEEDS_INPUT):
+                self.say(f"#{n} reported {rep['state']}, but its card is in {col}: not moved, not posted")
+                return False
+            moved = col != board.NEEDS_INPUT
+            if moved:
                 stophook.move_card(self.g, item, board.NEEDS_INPUT, self.run_sh)
-                self.run_sh(['gh', 'issue', 'comment', str(where), '-R', stophook.REPO, '--body', body])
-                stophook._mark_seen(key)
-                self.say(f"#{n} needs input: moved the card to Needs Input and posted the question on "
-                         f"{'issue ' if issues else ''}#{where}")
+            self.run_sh(['gh', 'issue', 'comment', str(where), '-R', stophook.REPO, '--body', body])
+            stophook._mark_seen(key)
+        self.say(f"#{n} {rep['state']}: " + ('moved the card to Needs Input and ' if moved else
+                                             'the card was already in Needs Input; ') + f"posted the {kind} on {on}")
+        return True
+
+    def do_needs_input(self, rep, wt, branch, item, col, issues):
+        from . import stophook
+        n, q = rep['pr'], rep['question']
+        body = (f"{stophook.QUESTION_MARK}\nQuestion from the worker on #{n} (the card is in Needs "
+                f"Input; reported with report_status):\n\n" + quote(q))
+        if not self.post(rep, wt, branch, item, issues, 'question', q, body):
+            return
         _, head = self.pushed_head(wt)
         self.close(rep, wt, branch, head if len(head or '') == 40 else '', strict=False)
 
     def do_blocked(self, rep, wt, branch, item, col, issues):
-        from . import board, stophook
+        from . import stophook
         n = rep['pr']
-        key = f"b:{branch}:{hashlib.sha1(rep['message'].encode()).hexdigest()[:12]}"
-        where = (issues or [n])[0]
         body = (f"{stophook.QUESTION_MARK}\n{BLOCKED_MARK}\nThe worker on #{n} is blocked (the card is in Needs "
                 f"Input; reported with report_status):\n\n" + quote(rep['message']))
-        with stophook.branch_lock(wt):
-            col = self.card(branch)[2]
-            if stophook.seen(key):
-                return self.say(f"#{n}: this blocker was already posted")
-            if col not in (board.IN_PROGRESS, board.AUTO_REVIEW):
-                return self.say(f"#{n} is blocked, but its card is in {col}: not moved")
-            stophook.move_card(self.g, item, board.NEEDS_INPUT, self.run_sh)
-            self.run_sh(['gh', 'issue', 'comment', str(where), '-R', stophook.REPO, '--body', body])
-            stophook._mark_seen(key)
-        self.say(f"#{n} blocked: moved the card to Needs Input and posted the blocker on "
-                 f"{'issue ' if issues else ''}#{where}; the Claude keeps running")
+        if self.post(rep, wt, branch, item, issues, 'blocker', rep['message'], body):
+            self.say(f"#{n}: the Claude keeps running")
 
     def do_working(self, rep, *_):
         self.say(f"#{rep['pr']} working")
@@ -318,9 +318,10 @@ class Reporter:
                                                 worktree=str(wt), branch=branch, head=head or '',
                                                 window=rep['window'], parked_at=slots.et_now(),
                                                 reason=rep['state'])
-                    st['rework'].pop(str(n), None)
                 why = (self._park or slots._park)(c, self.say) if strict else (self._exit or exit_idle)(c, self.say)
                 if not why:
+                    with slots.update(self.slots_path) as st:  # Codex on PR #54: only once it is closed
+                        st['rework'].pop(str(n), None)
                     self.say(f"#{n}: closed the Claude with /exit; window {rep['window']} stays; "
                              f"session {(c.get('session') or '?')[:8]} kept for swarm-revive")
                     return True

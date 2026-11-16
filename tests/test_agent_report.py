@@ -165,10 +165,56 @@ def test_needs_input_posts_the_question_moves_the_card_and_closes_the_claude(mon
     assert f.sh == []
 
 
-def test_needs_input_on_a_card_already_in_needs_input_is_not_posted_again(monkeypatch, tmp_path):
+def test_a_new_question_on_a_card_already_in_needs_input_is_posted_without_a_move(monkeypatch, tmp_path):
+    # Codex on PR #54: after a blocked report the card is in Needs Input; a later question must still reach Michal
     f = Fake(monkeypatch, tmp_path, col=board.NEEDS_INPUT)
+    res = f.run('needs-input', question='Which?')
+    assert f.moves == [] and len(f.sh) == 1 and '> Which?' in f.sh[0][-1] and f.exited == ['%5']
+    assert any('already in Needs Input; posted the question' in l for l in res['lines'])
+    f.sh.clear()
     f.run('needs-input', question='Which?')
-    assert f.moves == [] and f.sh == [] and f.exited == ['%5']
+    assert f.sh == []  # the same question once only
+    f.run('blocked', message='new blocker')
+    assert f.moves == [] and len(f.sh) == 1 and R.BLOCKED_MARK in f.sh[0][-1]
+
+
+def test_a_failed_post_is_posted_on_retry(monkeypatch, tmp_path):
+    # Codex on PR #54: the move went through, the comment failed; the retry must post it
+    f = Fake(monkeypatch, tmp_path)
+    calls = []
+
+    def sh(argv):
+        calls.append(argv)
+        if len(calls) == 1:
+            raise RuntimeError('gh: 502')
+    f.reporter.sh = sh
+    with pytest.raises(RuntimeError, match='502'):  # spool.serve turns it into a logged failure
+        f.run('needs-input', question='Which?')
+    assert f.moves == [('ITEM12', board.NEEDS_INPUT)] and 'failed' in rows()[-1]['notes'] + str(rows()[-1].get('action'))
+    col = {'v': board.NEEDS_INPUT}
+    monkeypatch.setattr(stophook, 'find_pr', lambda g, b, **k: (12, 'ITEM12', col['v'], False, [7]))
+    f.run('needs-input', question='Which?')
+    assert len(calls) == 2 and '> Which?' in calls[1][-1]
+
+
+def test_a_card_in_another_column_is_left_alone(monkeypatch, tmp_path):
+    f = Fake(monkeypatch, tmp_path, col=board.READY)
+    for state, kw in (('needs-input', {'question': 'Which?'}), ('blocked', {'message': 'x'})):
+        res = f.run(state, **kw)
+        assert any('in Ready: not moved, not posted' in l for l in res['lines'])
+    assert f.moves == [] and f.sh == [] and f.exited == []
+
+
+def test_the_rework_slot_is_kept_until_the_claude_is_closed(monkeypatch, tmp_path):
+    # Codex on PR #54: a refused close must not free the rework slot of a still-running Claude
+    f = Fake(monkeypatch, tmp_path, park_why=['worktree has leftover processes'])
+    with slots.update(f.slots_path) as st:
+        st['rework']['12'] = {'worktree': WT}
+    res = f.run('done')
+    assert any('was not closed' in l for l in res['lines'])
+    assert '12' in slots.load(f.slots_path)['rework']
+    f.run('needs-input', question='Which?')  # exit_idle succeeds
+    assert '12' not in slots.load(f.slots_path)['rework']
 
 
 def test_blocked_posts_and_moves_but_keeps_the_claude(monkeypatch, tmp_path):
