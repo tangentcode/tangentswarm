@@ -52,14 +52,13 @@ def tell_michal(text, key, pr=None, st=None, post=None, now=time.time):
     return True
 
 
-def wake_swarmbot(why, key, pr=None, detail=None, ex=None):
+def wake_swarmbot(why, key, pr=None, detail=None, post=None, dry=False):
     """Wake swarmbot to diagnose (the webhook's deduped, rate-limited wake), with detail
-    (process facts, a pane capture) in the payload."""
+    (process facts, a pane capture) in the payload. Returns the wake's note line."""
     from . import webhook
-    ex = ex or webhook.Executor()
     record('wake', why, pr=pr, key=key)
-    ex.wake(pr or 0, why, key=key, extra={'detail': detail} if detail else None)
-    return ex.done[-1] if ex.done else ''
+    return webhook.wake_exception(pr or 0, why, key=key, dry=dry, post=post, source='swarm-watch',
+                                  extra={'detail': detail} if detail else None)
 
 
 def incident_body(what, why, fix, prevent=None):

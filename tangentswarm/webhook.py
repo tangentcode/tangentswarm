@@ -409,12 +409,12 @@ class Executor:
             self.move(n, item, board.IN_PROGRESS)
         self.note(f"#{n} relayed to its worker ({said})")
 
-    def wake(self, n, why, key=None, now=time.time, extra=None):
+    def wake(self, n, why, key=None, now=time.time):
         """An exception for swarmbot: deduped by key for WAKE_DEDUPE s, and at most one POST
         per WAKE_EVERY s for all keys together (Codex on PR #26: a burst of distinct failures
         woke the LLM once per delivery). Exceptions inside the interval wait in the pending
         list; the next POST carries them in "also"."""
-        self.note(wake_exception(n, why, key=key, now=now, dry=self.dry, post=self.wake_post, extra=extra))
+        self.note(wake_exception(n, why, key=key, now=now, dry=self.dry, post=self.wake_post))
 
     # -- handlers -----------------------------------------------------------------------
     def run(self, a):

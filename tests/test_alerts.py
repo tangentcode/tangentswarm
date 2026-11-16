@@ -20,9 +20,9 @@ def test_the_alert_goes_to_the_methbot_url_not_the_swarmbot_url(monkeypatch):
 
 def test_a_swarmbot_wake_carries_the_detail():
     posts = []
-    ex = webhook.Executor(wake_post=posts.append)
-    alerts.wake_swarmbot('hung pytest killed', 'hung:1', pr=7, detail={'capture': 'screen'}, ex=ex)
+    alerts.wake_swarmbot('hung pytest killed', 'hung:1', pr=7, detail={'capture': 'screen'}, post=posts.append)
     assert posts and posts[0]['detail'] == {'capture': 'screen'} and posts[0]['why'] == 'hung pytest killed'
+    assert posts[0]['source'] == 'swarm-watch'
 
 
 def test_an_incident_ticket_is_opened_once_per_key_and_capped_per_hour(monkeypatch):
