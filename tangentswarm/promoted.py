@@ -88,8 +88,9 @@ def read_board(gql, max_age=None):
         col = boardcache.col(it)
         closes = [dict(number=i['number'], labels=_names(i)) for i in boardcache.closes(c)]
         ft.append(dict(number=c['number'], kind='PullRequest', state='OPEN', col=col, labels=_names(c), closes=closes))
+        due, ms = boardcache.pr_due(c)
         cols.setdefault(col, []).append(dict(number=c['number'], head=c['headRefOid'], item=it['id'],
-                                             closes=[i['number'] for i in closes]))
+                                             closes=[i['number'] for i in closes], due=due, milestone=ms))
     for it, c in boardcache.open_issues(snap):
         ft.append(dict(number=c['number'], kind='Issue', state='OPEN', col=boardcache.col(it),
                        labels=_names(c), closes=[]))
@@ -149,7 +150,7 @@ def gated_heads(log_text):
 
 
 DETAIL_FIELDS = """number state headRefOid headRefName isDraft baseRefName body files(first:100){nodes{path}}
- labels(first:20){nodes{name}} closingIssuesReferences(first:10){nodes{number labels(first:20){nodes{name}}}}
+ labels(first:20){nodes{name}} closingIssuesReferences(first:10){nodes{number repository{nameWithOwner} labels(first:20){nodes{name}}}}
  comments(last:30){nodes{createdAt author{__typename login}}}
  reviews(last:30){nodes{submittedAt author{__typename login}}}"""
 
@@ -202,15 +203,15 @@ def pr_labels(pr):
 
 
 def staging_order(staging, details, queue, active=None):
-    """The ONE active fast-track first, then hr-gate's queue file order, then the lowest number."""
-    pos = {r['pr']: i for i, r in enumerate(queue)}
+    """The promote order: the shared pick order (board.pick_key: the ONE active fast-track,
+    the soonest milestone due date, the lowest number; tangentswarm #35). It replaces hr-gate's
+    queue file order (queue is kept for the callers)."""
     def key(p):
         closes = p.get('closes')
         if closes is None:
-            closes = [i.get('number') for i in ((details.get(p['number'], {}).get('closingIssuesReferences') or {})
-                                                 .get('nodes') or [])]
-        ft = board.is_active_fast_track(p['number'], closes, active)
-        return (0 if ft else 1, pos.get(p['number'], len(pos)), p['number'])
+            from . import boardcache
+            closes = [i.get('number') for i in boardcache.closes(details.get(p['number'], {}))]
+        return board.pick_key(dict(p, closes=closes), active)
     return sorted(staging, key=key)
 
 

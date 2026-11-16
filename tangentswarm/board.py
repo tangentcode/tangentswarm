@@ -122,6 +122,34 @@ def update_active(items, path=None):
     return act, prev
 
 
+def pick_key(item, active=None):
+    """The ONE pick order of the swarm (tangentswarm #35, Michal 2026-11-15 6:09 PM ET): every
+    picker (launch, fill Ready -> Staging, promote Staging -> Human Review, the MinBot check,
+    swarm-tick) sorts by this key. A pure function of {number, ft, labels, closes, due,
+    milestone}:
+      (1) fast-track first: item['ft'], the label "fast-track" (an issue), or the ONE active
+          fast-track ticket (`active`: this item or an issue it closes);
+      (2) then the milestone due date (YYYY-MM-DD), soonest first; a milestone without a due
+          date after every dated one; no milestone last;
+      (3) then the lowest number."""
+    labels = {str(l).lower() for l in item.get('labels') or ()}
+    ft = (item.get('ft') or 'fast-track' in labels or item.get('rank') == FAST_TRACK
+          or is_active_fast_track(item['number'], item.get('closes') or (), active))
+    due = (item.get('due') or '')[:10]
+    ms = 0 if due else 1 if item.get('milestone') else 2
+    return (0 if ft else 1, ms, due, item['number'])
+
+
+def soonest_due(milestones):
+    """(due YYYY-MM-DD or '', title or '') of the soonest dated milestone in [{title, dueOn}],
+    else the first undated title. A PR's milestones are its own and its closing issues'."""
+    dated = sorted(((m.get('dueOn') or '')[:10], m.get('title') or '') for m in milestones if m and m.get('dueOn'))
+    if dated:
+        return dated[0]
+    titles = [m.get('title') for m in milestones if m and m.get('title')]
+    return '', (titles[0] if titles else '')
+
+
 def is_active_fast_track(number, closes=(), active=None):
     """True if PR/issue `number`, or an issue it closes, is the active fast-track ticket."""
     return active is not None and (number == active or active in set(closes))

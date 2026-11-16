@@ -208,11 +208,7 @@ def launch_key(issue):
       (2) then the milestone due date, nearest first; a milestone without a due date after
           every dated one; no milestone last;
       (3) then the lowest issue number."""
-    labels = {str(l).lower() for l in issue.get('labels') or ()}
-    ft = 0 if ('fast-track' in labels or issue.get('ft')) else 1
-    due = (issue.get('due') or '')[:10]
-    ms = 0 if due else 1 if issue.get('milestone') else 2
-    return (ft, ms, due, issue['number'])
+    return board.pick_key(issue)  # the one shared pick order (tangentswarm #35)
 
 
 def key_text(issue):
