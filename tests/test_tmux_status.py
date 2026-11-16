@@ -183,7 +183,48 @@ def test_selected_row_is_marked():
 def test_lines_fit_the_width():
     v = view(show_all=True)
     v.windows[0].activity = 'x' * 500
-    assert all(len(line) <= 60 for line, _ in v.render(60, 40))
+    assert all(ts.width_of(line) <= 60 for line, _ in v.render(60, 40))
+
+
+def test_wide_characters_are_clipped_by_terminal_cells():
+    v = view(show_all=True)
+    v.windows[0].activity = '界' * 100
+    assert all(ts.width_of(line) <= 80 for line, _ in v.render(80, 24))
+    v.key('z')
+    v.zoom_lines = ['界' * 100, 'e\u0301' * 100, 'tab\there\x07bell\x1b'] * 10
+    out = [line for line, _ in v.render(80, 24)]
+    assert all(ts.width_of(line) <= 80 for line in out)
+    assert out[-1] == 'tab herebell'
+
+
+def test_fit_and_pad_count_cells():
+    assert ts._fit('界界界', 4) == '界…'
+    assert ts.width_of(ts._fit('界界界', 5)) <= 5
+    assert ts._pad('界a', 5) == '界a  '
+    assert ts._fit('abc', 3) == 'abc' and ts._fit('abcd', 3) == 'ab…'
+
+
+def test_wide_window_names_keep_columns_aligned():
+    v = ts.View(show_all=True)
+    v.set_windows([W(1, 'working', name='mn-1-界面', activity='A'), W(2, 'working', name='mn-2-ab', activity='B')])
+    a, b = v.table(120)
+    assert ts.width_of(a[:a.index('A')]) == ts.width_of(b[:b.index('B')])
+
+
+def test_table_scrolls_to_keep_the_selection_visible():
+    v = ts.View()
+    v.set_windows([W(i, 'working') for i in range(1, 41)])
+    for _ in range(25):
+        v.key('j')
+    out = v.render(120, 24)
+    sel = [line for line, s in out if s]
+    assert len(sel) == 1 and 'mn-26-t' in sel[0]
+    assert len(out) == 24 and '[' in out[-1][0] and 'of 40]' in out[-1][0]
+    for _ in range(25):
+        v.key('k')
+    out = v.render(120, 24)
+    assert [line for line, s in out if s][0].split()[1] == '1' and 'mn-1-t' in out[1][0]
+    assert v.key('enter') == 'zoom' and v.zoomed.index == 1
 
 
 def test_quit():

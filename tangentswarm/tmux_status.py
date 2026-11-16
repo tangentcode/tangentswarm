@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass, field
 
 from . import tmux
@@ -184,9 +185,36 @@ def read_zoom(pane, history=ZOOM_HISTORY):
 LABEL = {'working': 'WORKING', 'idle': 'idle', 'shell': 'shell', 'program': 'program'}
 
 
+def _cells(ch):
+    """Terminal cells one character takes: 0 for a combining mark, 2 for a wide one."""
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+
+
+def width_of(text):
+    return sum(_cells(ch) for ch in text)
+
+
 def _fit(text, width):
-    text = text.replace('\t', ' ')
-    return text if len(text) <= width else text[:max(0, width - 1)] + '…'
+    """Text clipped to `width` terminal cells (wide characters take 2), with '…' when cut.
+    Tabs become spaces and other control characters are dropped, so a line never wraps."""
+    text = ''.join(' ' if ch == '\t' else ch for ch in text if ch == '\t' or ch.isprintable())
+    if width_of(text) <= width:
+        return text
+    out, used = [], 0
+    for ch in text:
+        if used + _cells(ch) > width - 1:
+            break
+        out.append(ch)
+        used += _cells(ch)
+    return ''.join(out) + ('…' if width > 0 else '')
+
+
+def _pad(text, width):
+    """Text clipped and padded to exactly `width` terminal cells."""
+    text = _fit(text, width)
+    return text + ' ' * (width - width_of(text))
 
 
 @dataclass
@@ -196,6 +224,7 @@ class View:
     selected: int = 0           # a tmux window index, kept across refreshes
     zoomed: object = None       # the Window being zoomed, or None
     zoom_lines: list = field(default_factory=list)
+    top: int = 0                # the first table row on screen (the table scrolls)
     session: str = SESSION
     error: str = ''
 
@@ -262,11 +291,11 @@ class View:
         if not rows:
             return ['(no working windows; press a to show all)' if not self.show_all
                     else '(no windows)']
-        name_w = min(36, max(len(w.name) for w in rows))
+        name_w = min(36, max(width_of(w.name) for w in rows))
         out = []
         for w in rows:
-            label = LABEL[w.cls] if w.cls != 'program' else _fit(w.command, 8)
-            head = f"{label:<8} {w.index:>3} {w.ticket:<9} {_fit(w.name, name_w):<{name_w}}  "
+            label = LABEL[w.cls] if w.cls != 'program' else w.command
+            head = f"{_pad(label, 8)} {w.index:>3} {_pad(w.ticket, 9)} {_pad(w.name, name_w)}  "
             out.append(_fit(head + w.activity, width))
         return out
 
@@ -281,13 +310,24 @@ class View:
         lines = [(_fit(self.header(), width), False)]
         if self.error:
             lines.append((_fit(self.error, width), False))
-        cursor = self._cursor()
-        for i, line in enumerate(self.table(width)):
-            lines.append((line, bool(self.visible()) and i == cursor))
+        table = self.table(width)
         if not keys:
-            return lines[:height]
+            return lines + [(line, False) for line in table]
+        room = max(1, height - len(lines) - 1)
+        cursor = self._cursor() if self.visible() else -1
+        if cursor >= 0:
+            if cursor < self.top:
+                self.top = cursor
+            elif cursor >= self.top + room:
+                self.top = cursor - room + 1
+        self.top = max(0, min(self.top, len(table) - room))
+        for i in range(self.top, min(len(table), self.top + room)):
+            lines.append((table[i], i == cursor))
+        help_line = 'a all/working  up/down select  enter zoom  q quit'
+        if len(table) > room:
+            help_line += f'  [{self.top + 1}-{min(len(table), self.top + room)} of {len(table)}]'
         lines = lines[:max(0, height - 1)]
-        lines.append((_fit('a all/working  up/down select  enter zoom  q quit', width), False))
+        lines.append((_fit(help_line, width), False))
         return lines
 
 
@@ -329,7 +369,10 @@ def run_curses(view, interval, reader=read_windows, zoom_reader=read_zoom):
             h, w = scr.getmaxyx()
             scr.erase()
             for y, (line, sel) in enumerate(view.render(w - 1, h)):
-                scr.addnstr(y, 0, line, w - 1, curses.A_REVERSE if sel else curses.A_NORMAL)
+                try:
+                    scr.addstr(y, 0, line, curses.A_REVERSE if sel else curses.A_NORMAL)
+                except curses.error:   # a terminal that measures a character wider than we do
+                    pass
             scr.refresh()
             ch = scr.getch()
             if ch == -1:
