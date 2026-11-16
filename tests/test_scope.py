@@ -176,7 +176,7 @@ def test_start_agent_through_the_real_runner_is_scoped(fake_bins, root, monkeypa
     assert typed[0][:5] == ['tmux', 'send-keys', '-t', '%99', '-l'] and typed[1][-1] == 'Enter'
     line = shlex.split(typed[0][-1])
     head2, unit2, command2 = scope_of(['--', *line])
-    assert command2 == ['/usr/bin/env', '--', fake_bins['claude']]
+    assert command2 == ['/usr/bin/env', '--', 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0', fake_bins['claude']]
     assert unit2.startswith('swarm-swarm-selftest-') and unit2 != unit
     assert shell.entered == [typed[0][-1]]
 
@@ -215,7 +215,7 @@ def test_tell_agent_still_detects_claude_in_a_scoped_pane(fake_bins, root, tmp_p
         assert log[0] == f'XDG_RUNTIME_DIR=/run/user/{os.getuid()}'
         assert log[1:5] == ['--user', '--slice=swarm-workers.slice', '--scope', '--expand-environment=no']
         assert log[5].startswith('--unit=swarm-claude-proj-')
-        assert log[6:] == ['--', '/usr/bin/env', '--', str(claude)]
+        assert log[6:] == ['--', '/usr/bin/env', '--', 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0', str(claude)]
         # the window is the bash shell the agent was typed into; it is still there
         assert subprocess.run(['tmux', 'display-message', '-p', '-t', target, '#{pane_current_path}'],
                               capture_output=True, text=True).stdout.strip() == str((root / 'proj').resolve())

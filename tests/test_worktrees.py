@@ -368,7 +368,7 @@ def test_spawn_starts_the_agent_in_its_worktree(w, claude_bin):
     assert argv[argv.index('-n') + 1] == 'claude-minavo-feat'
     assert argv[argv.index('--') + 1:] == ['/bin/bash', '-l']
     line, = rec.typed()
-    assert line[-4:] == ['--', '/usr/bin/env', '--', claude_bin] and '--slice=swarm-workers.slice' in line
+    assert line[-5:] == ['--', '/usr/bin/env', '--', 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0', claude_bin] and '--slice=swarm-workers.slice' in line
     assert out['reused'] is False and out['worktree']['branch'] == 'minavo/feat'
 
 
@@ -436,7 +436,7 @@ def test_mcp_tools_round_trip(w, claude_bin, monkeypatch):
     assert argv[argv.index('-c') + 1] == os.path.join(w.top, 'proj.feat')
     assert argv[argv.index('--') + 1:] == ['/bin/bash', '-l']
     line, = rec.typed()
-    assert line[-4:] == ['--', '/usr/bin/env', '--', claude_bin]
+    assert line[-5:] == ['--', '/usr/bin/env', '--', 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0', claude_bin]
     assert not any('bash -c id' in a or a == 'id' for call in rec.calls for a in call)
     call_tool('list_worktrees', repo='proj')
     call_tool('remove_worktree', repo='proj', branch='feat')
