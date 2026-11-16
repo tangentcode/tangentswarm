@@ -37,21 +37,13 @@ def promote(adv, b):
     for p in ready:
         if hr >= HR_TARGET:
             break
-        if p.get('mergeable') != 'MERGEABLE':  # Codex on PR #47: a merge since its pass may conflict now
-            _say(adv, f"{p['repo']}#{p['number']} stays in Ready: GitHub mergeable is {p.get('mergeable')} "
-                      "(a merge of main is needed, or GitHub has not computed it yet)")
-            continue
         from . import advance as A
-        try:  # Codex on PR #47: the head, base and Codex result may have changed since its pass
-            d = A.codex_details(adv.g['gql'], p['number'], p['repo'])
-            ci = (f"head moved to {(d.get('headRefOid') or '')[:8]}" if d.get('headRefOid') != p['head']
-                  else f"targets {d.get('baseRefName')}, not main" if d.get('baseRefName') != 'main'
-                  else f"not Codex-clean on {p['head'][:8]}" if not A.codex_clean(d)
-                  else A.ci_problem(A.check_runs(p['head'], p['repo'])))  # a CI rerun may have failed
+        try:  # the whole MinBot gate again, on a fresh read: anything may have changed since the pass
+            why = gate_problem(A.codex_details(adv.g['gql'], p['number'], p['repo']), p['head'], p['repo'])
         except Exception as e:
-            ci = f"not readable now: {type(e).__name__}"
-        if ci:
-            _say(adv, f"{p['repo']}#{p['number']} stays in Ready: {ci}")
+            why = f"not readable now: {type(e).__name__}"
+        if why:
+            _say(adv, f"{p['repo']}#{p['number']} stays in Ready: {why}")
             continue
         if adv.dry:
             _say(adv, f"would move {p['repo']}#{p['number']} Ready -> Human Review (board {b.number})")
@@ -63,6 +55,30 @@ def promote(adv, b):
     if not moved:
         _say(adv, f"board {b.number}: Human Review {hr}/{HR_TARGET}, Ready {len(ready)}: nothing to promote")
     return moved
+
+
+def gate_problem(d, head, repo):
+    """Why PR d (advance.codex_details) does not pass the MinBot gate at this head, or None.
+    The ONE gate of a board without staging: the MinBot check runs it to reach Ready, and
+    promote() runs it again on a fresh read before Human Review (Codex on PR #47 found, one
+    round at a time, each condition promote() did not repeat)."""
+    from . import advance as A
+    now = d.get('headRefOid') or ''
+    if now != head:
+        return f"head moved to {now[:8]}"
+    if d.get('baseRefName') != 'main':  # mergeable is against the PR's own base
+        return f"targets {d.get('baseRefName')}, not main"
+    if d.get('isDraft'):
+        return 'is a draft'
+    q = A.open_question(d)
+    if q:
+        return q
+    if d.get('mergeable') != 'MERGEABLE':  # UNKNOWN is not a pass
+        return ('conflicts with main (GitHub mergeable)' if d.get('mergeable') == 'CONFLICTING'
+                else f"GitHub has not confirmed it merges cleanly yet (mergeable {d.get('mergeable')})")
+    if not A.codex_clean(d):
+        return f"not Codex-clean on {head[:8]}"
+    return A.ci_problem(A.check_runs(head, repo))
 
 
 def minbot_repo(adv, n, repo, promote_after=True):
@@ -80,22 +96,7 @@ def minbot_repo(adv, n, repo, promote_after=True):
         return False
     d = A.codex_details(adv.g['gql'], n, repo)
     head = d.get('headRefOid') or ''
-    why = None
-    if head != card['head']:
-        why = f"head moved to {head[:8]}"
-    elif d.get('baseRefName') != 'main':  # Codex on PR #47: mergeable is against the PR's own base
-        why = f"targets {d.get('baseRefName')}, not main"
-    elif d.get('isDraft'):
-        why = 'is a draft'
-    elif A.open_question(d):
-        why = A.open_question(d)
-    elif d.get('mergeable') != 'MERGEABLE':  # Codex on PR #47: UNKNOWN is not a pass
-        why = ('conflicts with main (GitHub mergeable)' if d.get('mergeable') == 'CONFLICTING'
-               else f"GitHub has not confirmed it merges cleanly yet (mergeable {d.get('mergeable')})")
-    elif not A.codex_clean(d):
-        why = f"not Codex-clean on {head[:8]}"
-    else:
-        why = A.ci_problem(A.check_runs(head, repo))
+    why = gate_problem(d, card['head'], repo)
     if why:
         _say(adv, f"{repo}#{n} stays in Auto Review: {why}")
         return False

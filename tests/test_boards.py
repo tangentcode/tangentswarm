@@ -60,6 +60,8 @@ def clean_now(monkeypatch):
     from tangentswarm import advance as A
     monkeypatch.setattr(A, 'codex_details', lambda gql, n, repo=None: dict(
         codex_pr('h' * 40, clean=True), isDraft=False, mergeable='MERGEABLE', body='', baseRefName='main'))
+    monkeypatch.setattr(A, 'check_runs', lambda h, repo=None: [{'name': 't', 'status': 'completed',
+                                                               'conclusion': 'success'}])
 
 
 class Adv:
@@ -154,7 +156,10 @@ def test_a_ready_pr_that_conflicts_now_is_not_promoted(monkeypatch, clean_now):
     adv = Adv(cols)
     monkeypatch.setattr(boards, 'open_prs', lambda gql, b: adv.cols)
     monkeypatch.setattr(board, 'move_card', lambda *a, **k: None)
-    assert boardflow.promote(adv, B6) == [30] and any('#20 stays in Ready' in l for l in adv.lines)
+    from tangentswarm import advance as A
+    monkeypatch.setattr(A, 'codex_details', lambda gql, n, repo=None: dict(
+        codex_pr('h' * 40, clean=True), baseRefName='main', mergeable='CONFLICTING' if n == 20 else 'MERGEABLE'))
+    assert boardflow.promote(adv, B6) == [30] and any('#20 stays in Ready: conflicts' in l for l in adv.lines)
 
 
 def test_a_busy_lock_requeues_the_repo_and_board_arguments(monkeypatch, tmp_path):
@@ -205,7 +210,7 @@ def test_a_ready_pr_with_red_ci_now_is_not_promoted(monkeypatch):
     cols[board.READY][0]['head'] = 'r' * 40
     adv = Adv(cols)
     monkeypatch.setattr(A, 'codex_details', lambda gql, n, repo=None: dict(
-        codex_pr('r' * 40 if n == 20 else 'h' * 40, clean=True), baseRefName='main'))
+        codex_pr('r' * 40 if n == 20 else 'h' * 40, clean=True), baseRefName='main', mergeable='MERGEABLE'))
     monkeypatch.setattr(boards, 'open_prs', lambda gql, b: adv.cols)
     monkeypatch.setattr(board, 'move_card', lambda *a, **k: None)
     monkeypatch.setattr(A, 'check_runs', lambda h, repo=None: [{'name': 't', 'status': 'completed',
@@ -219,10 +224,22 @@ def test_promote_and_the_pass_need_base_main_and_codex_clean_now(monkeypatch):
     monkeypatch.setattr(board, 'move_card', lambda *a, **k: None)
     adv = Adv({board.READY: [pr(20, due='2026-11-20', milestone='m'), pr(30)]})
     monkeypatch.setattr(boards, 'open_prs', lambda gql, b: adv.cols)
-    det = {20: dict(codex_pr('h' * 40, findings=True), baseRefName='main'),
-           30: dict(codex_pr('h' * 40, clean=True), baseRefName='main')}
+    det = {20: dict(codex_pr('h' * 40, findings=True), baseRefName='main', mergeable='MERGEABLE'),
+           30: dict(codex_pr('h' * 40, clean=True), baseRefName='main', mergeable='MERGEABLE')}
     monkeypatch.setattr(A, 'codex_details', lambda gql, n, repo=None: det[n])
     assert boardflow.promote(adv, B6) == [30] and any('#20 stays in Ready: not Codex-clean' in l for l in adv.lines)
     det[30] = dict(det[30], baseRefName='deploy')
     adv.lines.clear()
     assert boardflow.promote(adv, B6) == [] and any('targets deploy, not main' in l for l in adv.lines)
+
+
+def test_promote_runs_the_same_gate_as_the_minbot_check(monkeypatch, clean_now):
+    """Codex on PR #47: an open question for Michal added in Ready must keep the PR there."""
+    from tangentswarm import advance as A
+    monkeypatch.setattr(board, 'move_card', lambda *a, **k: None)
+    adv = Adv({board.READY: [pr(30)]})
+    monkeypatch.setattr(boards, 'open_prs', lambda gql, b: adv.cols)
+    monkeypatch.setattr(A, 'codex_details', lambda gql, n, repo=None: dict(
+        codex_pr('h' * 40, clean=True), baseRefName='main', mergeable='MERGEABLE',
+        body='## Question for Michal\nOld or new colors?'))
+    assert boardflow.promote(adv, B6) == [] and any('open question for Michal' in l for l in adv.lines)
