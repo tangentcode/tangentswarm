@@ -686,9 +686,7 @@ class Executor:
             err = flow.label_write(n, 'remove', [name])
             if err and 'not found' not in err.lower() and '404' not in err:
                 self.note(f"#{n}: label remove {name}: {err}")
-        recs = flow.load_premerge()
-        if recs.pop(str(n), None) is not None:
-            flow.save_premerge(recs)
+        flow.set_premerge(n, None)  # under the pre-merge lock (Codex on PR #66)
 
     def delete_vn(self, n, branch):
         """tangentswarm #39 (Michal 2026-11-15 6:27 PM ET): on a platform merge, delete the

@@ -217,8 +217,9 @@ def launch_key(issue):
 
 def key_text(issue):
     """The sort key as START_CLAUDE prints it, e.g. #507=(ft:no,due:2026-11-20 ptw 15,n:507)."""
-    ft, ms, due, n = launch_key(issue)
-    when = f"{due} {issue.get('milestone')}" if ms == 0 else f"none {issue.get('milestone')}" if ms == 1 else 'none'
+    ft, _, _, n = launch_key(issue)
+    due = (issue.get('due') or '')[:10]  # from the issue: a fast-track key holds no due date
+    when = f"{due} {issue.get('milestone')}" if due else f"none {issue.get('milestone')}" if issue.get('milestone') else 'none'
     return f"#{n}=(ft:{'yes' if ft == 0 else 'no'},due:{when},n:{n})"
 
 

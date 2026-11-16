@@ -34,6 +34,7 @@ Only the pulled PR is merged, deployed or gated. No -vN copies, no re-merge of t
 Exit 0 = step done, 75 = busy (another merge/gate step runs), 2 = error.
 """
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -124,10 +125,39 @@ def load_premerge():
 
 
 def save_premerge(d):
+    """Write the whole state (a tmp file of this process and thread, then a rename). Writers
+    that change records use premerge_update, which holds the lock."""
+    import threading
     PREMERGE_STATE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = PREMERGE_STATE.with_suffix('.tmp')
+    tmp = PREMERGE_STATE.with_name(f'{PREMERGE_STATE.name}.{os.getpid()}.{threading.get_ident()}.tmp')
     tmp.write_text(json.dumps(d, indent=1))
     os.replace(tmp, PREMERGE_STATE)
+
+
+@contextlib.contextmanager
+def premerge_update():
+    """One locked read-modify-write of PREMERGE_STATE (Codex on PR #66: the webhook and the
+    cascade both write it). Yields the records; they are saved on a normal exit."""
+    import fcntl
+    PREMERGE_STATE.parent.mkdir(parents=True, exist_ok=True)
+    with open(PREMERGE_STATE.with_name(PREMERGE_STATE.name + '.lock'), 'a') as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        recs = load_premerge()
+        yield recs
+        save_premerge(recs)
+
+
+def set_premerge(n, rec, only_if=None):
+    """Put (or with rec None, drop) the record of PR n under the lock. only_if(old record)
+    must be true for the change (a check against a newer writer)."""
+    with premerge_update() as recs:
+        if only_if is not None and not only_if(recs.get(str(n)) or {}):
+            return False
+        if rec is None:
+            recs.pop(str(n), None)
+        else:
+            recs[str(n)] = rec
+        return True
 
 
 def label_write(n, op, names):
@@ -685,7 +715,7 @@ class Flow:
                     and self.ancestor(scratch, rec.get('seed') or '', tip)):
                 if not self.dry:
                     rec.update(status='ready', tip=tip)
-                    save_premerge(dict(recs, **{str(n): rec}))
+                    set_premerge(n, rec)
                 self.set_labels(p, MERGE_READY)
                 self.change(f"#{n} merge-ready: its worker resolved the pre-merge on {rec['vbranch']} ({tip[:8]})")
                 self._premerged[n] = tip
@@ -704,8 +734,7 @@ class Flow:
         if merged is not None:
             if not self.dry:
                 git(scratch, 'push', '--quiet', self.g['origin_url'](), f'{merged}:refs/heads/{vn}')
-                recs[str(n)] = dict(head=head, base=key, vbranch=vn, tip=merged, status='ready')
-                save_premerge(recs)
+                set_premerge(n, dict(head=head, base=key, vbranch=vn, tip=merged, status='ready'))
             self.set_labels(p, MERGE_READY)
             self.change(f"#{n} pre-merged onto future main ({key}): {vn} {merged[:8]} is merge-ready")
             self._premerged[n] = merged
@@ -714,8 +743,7 @@ class Flow:
         rec = dict(head=head, base=key, vbranch=vn, seed=base, status='conflict', files=files, relayed='')
         if not self.dry:
             git(scratch, 'push', '--quiet', self.g['origin_url'](), f'{base}:refs/heads/{vn}')
-            recs[str(n)] = rec
-            save_premerge(recs)
+            set_premerge(n, rec)
         self.set_labels(p, PRE_MERGING)
         self.change(f"#{n} conflicts with future main ({key}) in {', '.join(files) or 'files unknown'}: "
                     f"{vn} holds future main for its worker")
@@ -792,10 +820,9 @@ class Flow:
             self.note(f"NEEDS_WORKER #{n}: its pre-merge on {rec['vbranch']} conflicts; no worker took the relay "
                       f"({said}); the next pass tries again")
             return False
-        recs = load_premerge()
-        if (recs.get(str(n)) or {}).get('vbranch') == rec['vbranch']:
-            recs[str(n)]['relayed'] = rec['vbranch']
-            save_premerge(recs)
+        with premerge_update() as recs:  # only the record of this -vN (a newer one may exist)
+            if (recs.get(str(n)) or {}).get('vbranch') == rec['vbranch']:
+                recs[str(n)]['relayed'] = rec['vbranch']
         rec['relayed'] = rec['vbranch']
         self.change(f"#{n}: worker assigned to resolve {rec['vbranch']} ({said})")
         return True

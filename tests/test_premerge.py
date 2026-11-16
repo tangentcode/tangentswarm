@@ -391,3 +391,31 @@ def test_a_queued_tip_built_on_a_pr_that_left_the_queue_is_not_used(world):
     f, _ = make(world)  # with A still ahead of it, B's tip is used as is
     key, fm, why = f.future_main(s, {ST: [card(5, ST, a), card(9, ST, h['z'])]})
     assert subprocess.run(['git', '--git-dir', s.dir, 'merge-base', '--is-ancestor', tips[9], fm]).returncode == 0
+
+
+def test_fast_tracked_items_sort_by_number_alone():
+    """Codex on PR #66: fast-track #9 with a dated milestone went ahead of fast-track #7."""
+    items = [dict(number=9, labels=['fast-track'], due='2026-11-17', milestone='soon'),
+             dict(number=7, labels=['fast-track']), dict(number=3, due='2026-11-17', milestone='soon')]
+    assert [p['number'] for p in sorted(items, key=board.pick_key)] == [7, 9, 3]
+    assert slots.key_text(dict(number=9, labels=['fast-track'], due='2026-11-17', milestone='soon')) \
+        == '#9=(ft:yes,due:2026-11-17 soon,n:9)'
+
+
+def test_pre_merge_state_writes_are_locked_and_never_lose_another_record(tmp_path):
+    """Codex on PR #66: the webhook's cleanup and the cascade's save raced on one file."""
+    import threading
+    flow.save_premerge({'7': {'head': 'h'}})
+    with flow.premerge_update() as recs:
+        done = []
+        t = threading.Thread(target=lambda: done.append(flow.set_premerge(9, {'head': 'g'})))
+        t.start()
+        t.join(0.3)
+        assert t.is_alive() and not done  # the second writer waits for the lock
+        recs['8'] = {'head': 'x'}
+    t.join(5)
+    assert done == [True] and sorted(flow.load_premerge()) == ['7', '8', '9']
+    assert flow.set_premerge(9, {'head': 'z'}, only_if=lambda old: old.get('head') == 'nope') is False
+    flow.set_premerge(7, None)
+    assert sorted(flow.load_premerge()) == ['8', '9'] and flow.load_premerge()['9'] == {'head': 'g'}
+    assert not list(tmp_path.glob('premerge.json.*.tmp'))

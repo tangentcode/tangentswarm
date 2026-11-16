@@ -167,10 +167,11 @@ def pick_key(item, active=None):
       (2) then the milestone due date (YYYY-MM-DD), soonest first; a milestone without a due
           date after every dated one; no milestone last;
       (3) then the lowest number."""
-    ft = item_fast_track(item, active)
+    if item_fast_track(item, active):  # Codex on PR #66: fast-track by the number alone
+        return (0, 0, '', item['number'])
     due = (item.get('due') or '')[:10]
     ms = 0 if due else 1 if item.get('milestone') else 2
-    return (0 if ft else 1, ms, due, item['number'])
+    return (1, ms, due, item['number'])
 
 
 def item_fast_track(item, active=None):
