@@ -42,6 +42,8 @@ SHELLS = {'bash', 'sh', 'zsh', 'fish', 'dash'}
 PANE_FMT = '\t'.join(['#{pane_id}', '#{window_index}', '#{window_name}', '#{pane_current_command}',
                       '#{pane_current_path}', '#{pane_dead}', '#{pane_pid}'])
 TRUST_RE = re.compile(r'Do you trust the files in this folder|trust this folder', re.I)
+EXIT_GRACE = int(os.environ.get('SWARM_EXIT_GRACE', '300'))  # s for the board to show Needs Input
+WAIT = 'wait'
 NUDGE = ("Coordinator: #{n}: you stopped with {bits} in your worktree. Commit and push your work. "
          "If you need a decision from Michal, call the needs_input tool of the tangentswarm MCP server "
          "instead of asking here.")
@@ -116,7 +118,7 @@ def dirty_bits(wt):
 
 def decide(p, pr, pending_exit=None):
     """[(action, detail)] for one pane. p: the pane (cls, wt, screen); pr: its open board PR
-    {number, col, draft, head} or None; pending_exit: why it must /exit (needs_input)."""
+    {number, col, draft, head} or None; pending_exit: why it must /exit (needs_input), or WAIT."""
     cls, wt = p.get('cls'), p.get('wt') or {}
     if not is_worker(p) or cls in ('shell', 'new', 'working'):
         return []
@@ -126,6 +128,8 @@ def decide(p, pr, pending_exit=None):
         return [('trust', '')]
     if cls in ('menu', 'frozen'):
         return [(cls, '')]
+    if pending_exit == WAIT:  # the card is moving to Needs Input: no handoff, no exit yet
+        return []
     if pending_exit:  # the question is on the ticket already (needs_input)
         return [('exit', pending_exit)]
     if cls == 'asking':
@@ -254,7 +258,7 @@ class PaneWatch:
             pr = prs.get((p['wt'] or {}).get('branch'))
             p['pr'] = pr['number'] if pr else None
             seen[p['id']] = p
-            for action, detail in decide(p, pr, self.pending_exit(p)):
+            for action, detail in decide(p, pr, self.pending_exit(p, pr, now)):
                 try:
                     line = self.act(action, detail, p, pr, now)
                 except Exception as e:  # one pane failing never stops the others
@@ -265,10 +269,24 @@ class PaneWatch:
         self.save_report(now)
         return done
 
-    def pending_exit(self, p):
+    def pending_exit(self, p, pr, now):
+        """Why the worker must /exit, WAIT, or None. A pending exit holds only while its card
+        is in Needs Input (Codex on PR #51: an answer that came before the /exit must not close
+        the resumed worker). A card not yet shown there waits EXIT_GRACE s, then the pending
+        exit is dropped."""
         top = (p.get('wt') or {}).get('top')
         rec = self.exits.get(top or '')
-        return rec.get('why') if rec else None
+        if not rec:
+            return None
+        if pr and pr.get('col') == board.NEEDS_INPUT:
+            return rec.get('why')
+        if now - float(rec.get('at') or 0) < EXIT_GRACE:
+            return WAIT
+        if not self.dry:
+            from . import needsinput
+            needsinput.clear_exit(top)
+        self.exits.pop(top, None)
+        return None
 
     def once_key(self, key):
         """True the first time for key (persisted)."""

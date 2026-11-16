@@ -118,6 +118,13 @@ def clear_exit(wt):
         d['exit'].pop(str(wt), None)
 
 
+def clear_exits_of(n):
+    """Drop the pending exits of PR n (Michal answered: its worker is resumed)."""
+    with _locked() as d:
+        for wt in [w for w, r in d['exit'].items() if r.get('pr') == int(n)]:
+            d['exit'].pop(wt)
+
+
 def mark_pinged(n, t):
     with _locked() as d:
         d['pinged'][str(n)] = t

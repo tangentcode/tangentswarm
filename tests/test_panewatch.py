@@ -209,3 +209,27 @@ def test_a_dry_run_writes_no_report_and_no_once_key(worker):
     r.run(0)
     r.run(60)
     assert PW.read_report() == {'at': None, 'panes': {}} and alerts.state().data['done'] == {}
+
+
+def test_a_pending_exit_holds_only_while_the_card_is_in_needs_input(worker):
+    """Codex on PR #51: Michal answered before the /exit; the resumed worker must not be closed."""
+    from tangentswarm import needsinput
+    r = Rig(worker, (IDLE, True), pr=dict(AR, col=board.IN_PROGRESS))
+    needsinput.mark_exit(worker['top'], 7, 'asked Michal (needs_input)', now=lambda: 1000)
+    r.run(1000)
+    assert r.run(1060) == [] and r.handoffs == [] and r.told == []  # the board may lag: wait
+    r.run(1000 + PW.EXIT_GRACE + 1)
+    assert needsinput.pending_exits() == {} and r.told == []  # the stale exit is dropped
+    assert r.handoffs == [worker['top']]  # and the normal rules apply again
+
+
+def test_an_answer_clears_the_pending_exit_of_its_pr():
+    from tangentswarm import needsinput, webhook
+    from test_webhook import Fake
+    needsinput.mark_exit('/w/platform.a', 7, 'asked')
+    needsinput.mark_exit('/w/platform.b', 8, 'asked')
+    ex = Fake(col=board.IN_PROGRESS)
+    ex.pr_of = lambda node: 7
+    ex.full = {'comments': {'nodes': []}, 'commits': {'nodes': [{'commit': {'committedDate': '0'}}]}}
+    ex.run(webhook.Action('answered', 0, 'x', dict(node='N')))
+    assert ex.relays and list(needsinput.pending_exits()) == ['/w/platform.b']
