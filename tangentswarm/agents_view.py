@@ -104,7 +104,7 @@ def row(r, width=200):
     if state == 'idle' and r.get('idle_s') is not None:
         state = f"idle {ago(r['idle_s'])}"
     cols = [f"{r['index']!s:>3}", f"{r['window'][:30]:<30}", f"{r['claude'] or '-'!s:>8}", f"{state:<10}",
-            f"{ago(r.get('screen_s')):>6}", f"{mb(r['mem']):>6}", f"{r['cpu']:>5.0f}%",
+            f"{ago(r.get('screen_s')):>6}", f"{mb(r['mem']):>6}", f"{r['cpu']:>5.0f}%" if r.get('cpu') is not None else f"{'-':>6}",
             f"{('#' + str(r['pr'])) if r.get('pr') else '':<6}",
             f"{CARD_NAMES.get(r.get('card'), r.get('card') or '')[:13]:<13}", procs_text(r)]
     return ' '.join(cols).rstrip()[:width]

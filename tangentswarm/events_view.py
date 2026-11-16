@@ -339,13 +339,14 @@ def run(path, since='today', verbose=False, once=False, color=None, out=sys.stdo
     tty = out.isatty() if tty is None else tty
     color = tty if color is None else color
     lower = since_iso(since)
-    if sample is None:
-        watch = livestate.PaneWatch()
-        sample = lambda: livestate.collect(watch, now=clock())  # noqa: E731
     if screen == 'agents' and (once or not tty):
+        sample = sample or livestate.primed(sleep=sleep)  # Codex on PR #48: measure the CPU
         out.write('\n'.join(agents_screen(sample, color)[0]) + '\n')
         out.flush()
         return 0
+    if sample is None:
+        watch = livestate.PaneWatch()
+        sample = lambda: livestate.collect(watch, now=clock())  # noqa: E731
     if tty and keys is None:
         with TermKeys(sleep=sleep) as k:
             return run(path, since, verbose, once, color, out, sleep, polls, redraw, clock, tty, screen, k, sample)

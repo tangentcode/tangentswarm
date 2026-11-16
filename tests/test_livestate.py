@@ -82,7 +82,7 @@ def test_pane_watch_captures_once_a_minute_and_tracks_changes():
 
 def test_pane_watch_cpu_is_a_share_of_one_cpu_between_samples():
     w = LS.PaneWatch(capture=lambda p: None)
-    assert w.cpu({1: dict(ticks=0)}, 0) == {}
+    assert w.cpu({1: dict(ticks=0)}, 0) is None
     got = w.cpu({1: dict(ticks=LS.TICK), 2: dict(ticks=5)}, 2.0)
     assert got == {1: 50.0}
 
@@ -291,3 +291,31 @@ def test_events_lines_are_cut_to_the_width():
         st.add_received('d1', 'pull_request', body, {}, b'{}', True, decisions=['codex'], now=NOW - 5)
         lines = V.render(st.rows(), NOW, color=True, width=40, height=10)
     assert lines and all(len(AV.ANSI.sub('', l)) <= 40 for l in lines)
+
+
+def test_cpu_is_unknown_not_zero_without_an_earlier_sample(monkeypatch):
+    """Codex on PR #48: one sample has no CPU; it shows '-', never a false 0%."""
+    monkeypatch.setattr(LS, 'branch_of', BRANCH.get)
+    w = LS.PaneWatch(capture=lambda p: None)
+    st = LS.collect(w, now=NOW, panes=PANES, table=TABLE, sess=SESS, cards=CARDS, hst=h())
+    assert st['agents'][0]['cpu'] is None and all(r['cpu'] is None for r in st['agents'])
+    line = next(l for l in AV.render(st, color=False) if 'mn-1-busy' in l)
+    assert '%' not in line.split('mn-1-busy')[1].split('#601')[0] and ' - ' in line
+    assert LS.agent_rows(PANES, TABLE, SESS, CARDS, cpu={}, now=NOW, branch=BRANCH.get)[0]['cpu'] == 0.0
+
+
+def test_a_one_shot_agents_screen_measures_the_cpu(monkeypatch, tmp_path):
+    """Codex on PR #48: --agents --once (or a pipe) samples twice, 1 s apart."""
+    monkeypatch.setattr(LS, 'branch_of', BRANCH.get)
+    tables = iter([{101: dict(TABLE[101], ticks=0)}, {101: dict(TABLE[101], ticks=LS.TICK // 2)}])
+    clock = iter([0.0, 1.0])
+    monkeypatch.setattr(LS, 'procs', lambda: {**TABLE, 101: next(tables)[101]})
+    monkeypatch.setattr(LS.time, 'time', lambda: next(clock))
+    monkeypatch.setattr(LS, 'tmux_panes', lambda: PANES[:1])
+    monkeypatch.setattr(LS, 'sessions', lambda: SESS)
+    monkeypatch.setattr(LS, 'board_cards', lambda: CARDS)
+    monkeypatch.setattr(LS, 'host', lambda: h())
+    slept, out = [], io.StringIO()
+    assert V.run(str(tmp_path / 'none.sqlite'), once=True, out=out, screen='agents', sleep=slept.append) == 0
+    assert slept == [1.0]
+    assert '50%' in next(l for l in out.getvalue().split('\n') if 'mn-1-busy' in l)

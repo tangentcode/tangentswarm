@@ -183,13 +183,13 @@ class PaneWatch:
         return None if s is None or s['changed'] is None else now - s['changed']
 
     def cpu(self, table, now):
-        """{pid: percent of one CPU} since the last call ({} on the first)."""
+        """{pid: percent of one CPU} since the last call, or None (unknown, never 0%) on the
+        first call: one sample has no CPU (Codex on PR #48)."""
         dt = None if self.at is None else now - self.at
-        out = {}
+        out = None
         if dt and dt > 0:
-            for pid, p in table.items():
-                if pid in self.ticks:
-                    out[pid] = max(0.0, (p['ticks'] - self.ticks[pid]) / TICK / dt * 100)
+            out = {pid: max(0.0, (p['ticks'] - self.ticks[pid]) / TICK / dt * 100)
+                   for pid, p in table.items() if pid in self.ticks}
         self.ticks, self.at = {pid: p['ticks'] for pid, p in table.items()}, now
         return out
 
@@ -210,9 +210,10 @@ def state_of(claude, sess, screen_age, every=CAPTURE_EVERY):
 
 def agent_rows(panes, table, sess, cards, cpu=None, screen=None, now=None, branch=None):
     """[row] for each pane: {pane, index, window, cwd, branch, claude, status, state, idle_s,
-    screen_s, tests, other, mem, cpu, pr, card}. tests and other: [(pid, command)]."""
+    screen_s, tests, other, mem, cpu, pr, card}. tests and other: [(pid, command)]. cpu is
+    None (unknown) when cpu is None: no earlier sample."""
     now = time.time() if now is None else now
-    cpu, branch = cpu or {}, branch or branch_of
+    branch = branch or branch_of
     rows = []
     for p in panes:
         pids = tree(table, p['pid'])
@@ -232,7 +233,7 @@ def agent_rows(panes, table, sess, cards, cpu=None, screen=None, now=None, branc
             state=state_of(claude, s, age), idle_s=idle_s, screen_s=None if age is None else int(age),
             tests=[(pid, table[pid]['cmd'][:120]) for pid in pids if work[pid] == 'test'],
             other=[(pid, table[pid]['cmd'][:120]) for pid in pids if work[pid] == 'other'],
-            mem=sum(table[pid]['rss'] for pid in pids), cpu=round(sum(cpu.get(pid, 0.0) for pid in pids), 1),
+            mem=sum(table[pid]['rss'] for pid in pids), cpu=None if cpu is None else round(sum(cpu.get(pid, 0.0) for pid in pids), 1),
             pr=pr, card=card))
     return rows
 
@@ -273,10 +274,11 @@ def capacity(h):
 
 def collect(watch=None, now=None, panes=None, table=None, sess=None, cards=None, hst=None):
     """One sample of the live state: {at, host, capacity: {free, why}, agents: [row]}. JSON-safe,
-    for the Agents screen and the sanity check (#43)."""
+    for the Agents screen and the sanity check (#43). A row's cpu is None until the watch
+    has an earlier sample (see primed())."""
     now = time.time() if now is None else now
     table = procs() if table is None else table
-    cpu = watch.cpu(table, now) if watch else {}
+    cpu = watch.cpu(table, now) if watch else None
     h = host() if hst is None else hst
     free, why = capacity(h)
     rows = agent_rows(tmux_panes() if panes is None else panes, table, sessions() if sess is None else sess,
@@ -284,14 +286,20 @@ def collect(watch=None, now=None, panes=None, table=None, sess=None, cards=None,
     return dict(at=now, host=h, capacity=dict(free=free, why=why), agents=rows)
 
 
+def primed(watch=None, sleep=time.sleep, interval=1.0):
+    """A sample() for a one-shot view: a first sample, interval s, then each call samples,
+    so the CPU of the first view is measured (Codex on PR #48)."""
+    watch = watch or PaneWatch()
+    collect(watch)
+    sleep(interval)
+    return lambda: collect(watch)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog='swarm-livestate', description=__doc__.split('\n', 1)[0])
     ap.add_argument('--json', action='store_true', help='print the sample as JSON')
     a = ap.parse_args(argv)
-    watch = PaneWatch()
-    collect(watch)  # the first CPU sample
-    time.sleep(1)
-    st = collect(watch)
+    st = primed()()
     if a.json:
         print(json.dumps(st, indent=1, default=str))
     else:
