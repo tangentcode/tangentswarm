@@ -156,3 +156,18 @@ def test_the_scaffold_fallback_restores_the_retry_record(monkeypatch, tmp_path):
     t.dry = False
     t.no_claude(7, t.prs[7], t.panes)
     assert slots.load()['unstarted']['7']['branch'] == 'b'
+
+
+def test_the_migration_reads_the_old_swarm_held_path(tmp_path, monkeypatch):
+    """Codex on PR #46: the old code wrote the list to $SWARM_HELD when it was set."""
+    import json as _json
+    from tangentswarm import slots
+    old = tmp_path / 'custom-held.json'
+    old.write_text(_json.dumps([{'branch': 'b9', 'pr': 9, 'brief': '/b/9.txt'}]))
+    monkeypatch.setattr(L, 'OLD_HELD', None)
+    monkeypatch.setenv('SWARM_HELD', str(old))
+    assert L.old_held() == old
+    assert L.migrate_held() == [9] and not old.exists()
+    assert slots.load()['unstarted']['9']['branch'] == 'b9'
+    monkeypatch.delenv('SWARM_HELD')
+    assert L.old_held() == L.HOME / 'var' / 'swarm-held.json'

@@ -905,7 +905,8 @@ idle shell. `swarm-launch` runs it and returns `held`. There is no held-launch l
 minus the Claudes running now and the launch and start requests in the spool, and 0
 while memory holds starts) before it makes a branch or a PR. A start that memory holds
 after the PR exists keeps the PR's unstarted record, and the cascade retries it. At
-daemon start, swarm-promoted moves each row of an old `~/var/swarm-held.json` into an
+daemon start, swarm-promoted moves each row of an old held list (`$SWARM_HELD`, or
+`~/var/swarm-held.json`) into an
 unstarted record and removes the file.
 
 ```sh

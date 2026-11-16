@@ -92,7 +92,12 @@ def describe(m):
 # ---------------------------------------------------------------------------
 # starting a worker
 
-OLD_HELD = HOME / 'var' / 'swarm-held.json'  # the retired held-launch list (#40)
+OLD_HELD = None  # the retired held-launch list (#40); None: the path the old code used (old_held())
+
+
+def old_held():
+    """Codex on PR #46: the old code wrote the list to $SWARM_HELD when it was set."""
+    return OLD_HELD or Path(os.environ.get('SWARM_HELD', str(HOME / 'var' / 'swarm-held.json')))
 
 
 def migrate_held(path=None, add=None):
@@ -100,7 +105,7 @@ def migrate_held(path=None, add=None):
     PR's unstarted record (the cascade's start retry starts it), then the file goes (Codex
     on PR #46: a launch held before the upgrade had its retry only in that file). Returns
     the PR numbers moved."""
-    path = path or OLD_HELD
+    path = path or old_held()
     try:
         rows = json.loads(path.read_text())
     except FileNotFoundError:
