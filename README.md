@@ -858,11 +858,10 @@ idle-dirty, asking, input, menu, exited). It then does the safe mechanical moves
 - An open In Progress or Auto Review PR whose body has no brief section gets the
   coordinator's brief file (`$SWARM_BRIEF_DIR/<PR>.txt`) added at the end of its body.
   A PR with no brief file is reported for judgment.
-- A held launch is started when the worker slice has room: one per pass, priority
-  milestone first, then the oldest hold (see `swarm-launch` below). An idle shell whose
-  head is still the `Start #N` scaffold commit, with a brief file, is a held launch that
-  was left behind; the pass queues it. Memory pressure that lasts 10 minutes or more is
-  reported with the live slice numbers and the held launches.
+- There is no held-launch list (tangentswarm #40): the Backlog column is the queue. An
+  idle shell whose head is still the `Start #N` scaffold commit, with a brief file, is
+  reported, not queued. Memory pressure that lasts 10 minutes or more is reported with
+  the live slice numbers.
 - A draft In Progress PR whose Claude is finished (idle, clean worktree, local HEAD is
   the pushed PR head, no open Codex findings, head merges cleanly onto origin/main) is
   marked ready and moved to Auto Review, with one `@codex review` per head.
@@ -898,18 +897,23 @@ The section starts with `<!-- swarm-brief:start -->` and ends with
 where-to-see line, the served commit, code-only) must skip this section, because a
 brief names those things before they exist. `tangentswarm.brief.strip_brief()` does that.
 
-### swarm-launch: held launches
+### swarm-launch: start a worker
 
 `swarm-start-scoped` exits 3 when the worker slice is short of memory and leaves an
-idle shell. `swarm-launch` runs it and puts a held launch in a queue
-(`$SWARM_HELD`); swarm-tick starts queued launches as memory frees and sends each new
-Claude one line that points to its brief file.
+idle shell. `swarm-launch` runs it and returns `held`. There is no held-launch list
+(tangentswarm #40). The launcher checks live capacity (`slots.capacity()`: `MAX_CLAUDES`
+minus the Claudes running now and the launch and start requests in the spool, and 0
+while memory holds starts) before it makes a branch or a PR. A start that memory holds
+after the PR exists keeps the PR's unstarted record, and the cascade retries it. At
+daemon start, swarm-promoted moves each row of an old held list (`$SWARM_HELD`, or
+`~/var/swarm-held.json`) into an
+unstarted record. A row with no PR gets the open PR of its branch. A row it cannot
+move, or an unreadable file, stays and is reported at each daemon start; the file goes
+only when it is empty.
 
 ```sh
-swarm-launch BRANCH [WINDOW] --pr N --brief FILE   # start now, or queue on a hold
-swarm-launch --list                                # live memory and the queue
-swarm-launch --next                                # start the first queued launch if memory admits it
-swarm-launch --drop BRANCH
+swarm-launch BRANCH [WINDOW] --pr N --brief FILE   # start now; exit 3 on a memory hold
+swarm-launch --memory                              # print the live worker memory
 ```
 
 Memory is read live each time: the slice's MemoryCurrent, MemoryHigh and MemoryMax,
@@ -947,7 +951,7 @@ GitHub hook runs `swarm-flow event` on `projects_v2_item` and merge events.
 
 First keep the flow full (Human Review 2, Staging 3-5, more Ready). Within that, a PR
 labeled `fast-track` or `high priority` (on the PR or on an issue it closes) jumps the
-queue at every step: held launches and pane order in swarm-tick, the Ready head, the
+queue at every step: pane order in swarm-tick, the Ready head, the
 FIRST Staging slot (it stacks on main + Human Review only; the Staging PRs behind it are
 re-stacked at their own promotion), and the next free Human Review slot. The serial lock
 and every gate still apply. `tangentswarm.board.priority_rank()` is the rule; the live

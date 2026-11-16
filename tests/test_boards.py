@@ -117,7 +117,7 @@ def test_minbot_repo_passes_a_clean_pr_to_ready_then_promotes(monkeypatch):
 def test_every_read_and_cleanup_of_another_repo_uses_that_repo(monkeypatch):
     """Codex on PR #47: do_codex read the same-number platform PR; a tangentswarm close
     cleared a platform PR's launch records."""
-    from tangentswarm import advance, launches, slots
+    from tangentswarm import advance, slots
     seen = []
     real = advance.codex_details
     monkeypatch.setattr(advance, 'codex_details', lambda gql, n, repo=None: seen.append(repo) or real(gql, n, repo))
@@ -125,9 +125,8 @@ def test_every_read_and_cleanup_of_another_repo_uses_that_repo(monkeypatch):
     ex.run(W.Action('codex', 47, args={'repo': TS}))
     assert seen and set(seen) == {TS}
     slots.unstarted_add(47, branch='platform-47', brief='', issue=1)
-    launches.hold('platform-47', pr=47)
     Fake6(col=board.IN_PROGRESS).run(W.Action('closed', 47, args={'repo': TS}))
-    assert '47' in slots.load()['unstarted'] and launches.read_queue()
+    assert '47' in slots.load()['unstarted']
 
 
 def test_a_project_6_pr_is_fast_track_by_its_own_labels(monkeypatch, clean_now):

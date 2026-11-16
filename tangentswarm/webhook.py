@@ -702,11 +702,10 @@ class Executor:
         item, col = self.card(a.pr)
         if item and col != board.CANCELED:
             self.move(a.pr, item, board.CANCELED)
-        if not self.dry:  # a canceled launch must not be started again (start retry, held queue)
-            from . import launches, slots
+        if not self.dry:  # a canceled launch must not be started again by the start retry
+            from . import slots
             if self.platform():  # Codex on PR #47: launch records are platform PR numbers
                 slots.unstarted_done(a.pr)
-                launches.drop_pr(a.pr)
 
     def do_card(self, a):
         """A new PR (draft -> In Progress, ready -> Auto Review) or issue (Triage) gets its card.

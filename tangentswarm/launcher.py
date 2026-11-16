@@ -201,16 +201,16 @@ class Launcher:
     def start(self, branch, pr, path, issue=None):
         """Start the worker. Done only when a claude process runs in its pane (MethBot
         2026-11-15 3:55 AM ET: #537-#542 got a window with only a bash prompt) and has the
-        brief line; then the unstarted record goes. A memory hold is queued for swarm-tick
-        (the held queue holds its capacity). A Claude that runs without the brief line keeps
+        brief line; then the unstarted record goes. A memory hold keeps the record (no held
+        list, tangentswarm #40). A Claude that runs without the brief line keeps
         the record (slots.brief_pending) for the retry. Raises otherwise."""
         if self.dry:
             return f"would start the worker: swarm-start-scoped {branch}, then send the brief line"
         from . import launches, slots
-        what, detail = (self._launch or launches.launch)(branch, pr=pr, brief=str(path))
-        if what == 'held':
-            slots.unstarted_done(pr)
-            return f"worker held (memory): queued for swarm-tick ({detail.get('window') if isinstance(detail, dict) else ''})"
+        what, detail = (self._launch or launches.launch)(branch, pr=pr, brief=str(path) if path else None)
+        if what == 'held':  # no held list (#40): the unstarted record stays, and the cascade retries it
+            return (f"worker held (memory): the cascade starts it when memory frees "
+                    f"({detail.get('window') if isinstance(detail, dict) else ''})")
         if what == 'refused':
             raise RuntimeError(f"swarm-start-scoped refused: {str(detail)[-300:]}")
         pane = detail.get('pane') if isinstance(detail, dict) else None
@@ -228,8 +228,14 @@ class Launcher:
         return self.sh('tmux', 'display-message', '-p', '-t', pane, '#{pane_current_command}', check=False)
 
     def launch(self, n, title):
-        """Launch issue n. Returns the steps done; raises with the failed step's text."""
+        """Launch issue n. Returns the steps done; raises with the failed step's text, or
+        Deferred when there is no live capacity (then nothing is made, and the issue stays in
+        Backlog, which is the queue: tangentswarm #40)."""
         from . import slots
+        if not self.dry:
+            free, why = slots.capacity(mine=1)  # this launch's own spool request is counted
+            if free <= 0:
+                raise Deferred(f"no capacity for issue #{n}: {why}; it stays in Backlog")
         branch = self.pick_branch(n, title)
         steps = [self.branch(n, branch)]
         pr, note = self.draft_pr(n, title, branch)
@@ -278,9 +284,16 @@ class Launcher:
                 return f"brief line sent to the running Claude in {rec['brief_pane']}"
             with slots.update() as d:  # its Claude is gone: start a worker again
                 d['unstarted'].get(str(pr), {}).pop('brief_pane', None)
-        path = rec.get('brief')
+        path = rec.get('brief') or None
         if rec.get('setup', 'done') != 'done' or not path:
-            path, _ = self.setup(int(rec['issue']), rec.get('title') or f"Issue #{rec['issue']}", rec['branch'], pr)
+            if rec.get('issue') is None:
+                # Codex on PR #46: a row of the retired held list may have no brief and no
+                # issue (swarm-launch never needed them); start it with no brief, as before
+                if rec.get('setup', 'done') != 'done':
+                    raise RuntimeError(f"PR #{pr}: setup is not done and the record names no issue")
+            else:
+                path, _ = self.setup(int(rec['issue']), rec.get('title') or f"Issue #{rec['issue']}",
+                                     rec['branch'], pr)
         return self.start(rec['branch'], pr, path, issue=rec.get('issue'))
 
 
@@ -305,6 +318,10 @@ def execute_start(req):
     return {'ok': True, 'pr': pr, 'note': note}
 
 
+class Deferred(Exception):
+    """No live capacity: the launch made nothing, and the issue stays in Backlog."""
+
+
 def execute(req):
     """The spool op 'launch' (daemon side): {issue, title}."""
     from . import slots
@@ -312,6 +329,11 @@ def execute(req):
     from . import eventdb
     try:
         steps = Launcher().launch(n, title)
+    except Deferred as e:
+        slots.launch_done(n)  # the picker may name it again when capacity is free
+        from .stophook import say
+        say(f"launch #{n}: {e}")
+        return {'ok': True, 'issue': n, 'deferred': str(e)}
     except Exception as e:
         slots.launch_done(n)  # free it for the picker: a later pass may try again
         eventdb.log_event('launch', source='launcher', action=f'issue #{n}', actor=title[:80],
