@@ -284,6 +284,22 @@ def test_text_with_box_borders(agent, text):
     assert pane.submitted == [text]
 
 
+@pytest.mark.parametrize('agent', ['claude', 'codex', 'grok'])
+@pytest.mark.parametrize('text', ['Explain this transcript:\n› original user prompt',
+                                  'Explain this transcript:\n❯ original user prompt\n> more'])
+def test_glyph_in_a_continuation_line_is_not_the_prompt(agent, text):
+    # a quoted transcript line starting with the glyph was read as the prompt, so the
+    # box looked like it held only that line (Codex on PR #17)
+    pane = BoxPane(style=agent, drop=1)
+    assert tui(pane, agent).send_text(text) == {'enter_presses': 2, 'submit_verified': True}
+    assert pane.submitted == [text]
+
+
+def test_codex_box_needs_the_glyph_in_column_zero():
+    screen = '› Explain this:\n  › quoted\n\n  ⏎ send\n'
+    assert agents.input_box(screen, '›') == 'Explain this:\n› quoted'
+
+
 def test_fingerprint_matches_flat_box():
     assert agents.fingerprint('\n │ \n a │ b') == 'ab'
     assert agents.holds_text('a\n│ b', 'a │ b')

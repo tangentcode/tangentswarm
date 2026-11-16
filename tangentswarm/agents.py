@@ -143,14 +143,17 @@ def input_box(screen, glyph, framed=False):
     │ border) is the prompt glyph, and runs down to the next ─ bar. Box borders are
     dropped. With framed=True (Claude, Muse, Grok, Gemini) a ─ bar must sit right above
     the glyph line and another must close the box, so a transcript line or a dialog's
-    menu ('❯ No, exit') never passes for the box. Codex's box has no frame: it ends at
-    the first blank line, above the footer, and its dialogs' menus ('› 3. Cancel') start
-    with the glyph, so callers compare the box with what they typed rather than only
-    asking if it is blank."""
+    menu ('❯ No, exit') never passes for the box. Codex's box has no frame: its glyph
+    sits in column 0 and its continuation lines are indented, so a typed line that starts
+    with the glyph is not taken for the prompt. The box ends at the first blank line,
+    above the footer. Codex's dialogs' menus ('› 3. Cancel') also start in column 0, so
+    callers compare the box with what they typed rather than only asking if it is blank."""
     lines = screen.split('\n')
     for start in range(len(lines) - 1, -1, -1):
         if not lines[start].lstrip(' ' + _BORDER).startswith(glyph):
             continue
+        if not framed and not lines[start].startswith(glyph):
+            continue        # Codex indents continuation lines, so a '› ...' in the text is not the prompt
         if framed and (start == 0 or _BAR_RUN not in lines[start - 1]):
             continue
         out = [lines[start].lstrip(' ' + _BORDER)[len(glyph):]]
