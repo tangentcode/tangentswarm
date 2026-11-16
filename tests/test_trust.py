@@ -465,6 +465,32 @@ def test_codex_unparsable_or_unappendable_config_is_left_alone(codex_toml, wt, t
     assert codex_toml.read_text() == text and no_temp_files(codex_toml.parent)
 
 
+@pytest.mark.parametrize('agent', ['claude', 'codex'])
+@pytest.mark.parametrize('content', [b'\xff{"projects": {}}', b'[' * 100000 + b']' * 100000],
+                         ids=['invalid_utf8', 'deeply_nested'])
+def test_an_unreadable_config_is_skipped_and_untouched(home, wt, agent, content):
+    # invalid UTF-8 (UnicodeDecodeError) and a deeply nested config (RecursionError in the
+    # parser) are not ValueErrors the helpers expect; the launch must still go ahead
+    if agent == 'codex' and content.startswith(b'['):
+        content = b'a = ' + content
+    p = home / '.claude.json' if agent == 'claude' else home / '.codex' / 'config.toml'
+    p.parent.mkdir(exist_ok=True)
+    p.write_bytes(content)
+    out = trust.pretrust(agent, str(wt))
+    assert out['status'] == 'skipped' and out['warning'] and out['agent'] == agent
+    assert trust.is_trusted(agent, str(wt)) is None       # the after-launch check copes too
+    assert p.read_bytes() == content and no_temp_files(p.parent)
+
+
+def test_pretrust_reports_an_unexpected_helper_error(claude_json, wt, monkeypatch):
+    def boom(workdir):
+        raise RuntimeError('surprise')
+    monkeypatch.setattr(trust, 'trust_claude', boom)
+    out = trust.pretrust('claude', str(wt))
+    assert out['status'] == 'skipped' and 'RuntimeError: surprise' in out['warning']
+    assert out['config'] == str(claude_json) and out['key'] == os.path.realpath(wt)
+
+
 def test_codex_quotes_odd_paths(codex_toml, tmp_path):
     d = tmp_path / 'ver' / 'we"ird\\name'
     d.mkdir(parents=True)

@@ -203,11 +203,15 @@ def _replace(real, text, st, held):
 
 
 def _read(path):
-    """Return (realpath, stat, text). Raises FileNotFoundError."""
+    """Return (realpath, stat, text). Raises FileNotFoundError, or TrustError if the file
+    is not valid UTF-8 (then it is left untouched)."""
     real = os.path.realpath(path)
     with open(real, encoding='utf-8') as f:
         st = os.fstat(f.fileno())
-        return real, st, f.read()
+        try:
+            return real, st, f.read()
+        except UnicodeDecodeError as e:
+            raise TrustError(f"{path} is not valid UTF-8 ({e}); left untouched") from None
 
 
 def _result(agent, path, key, status, **kw):
@@ -338,7 +342,7 @@ def is_trusted(agent, workdir):
             with open(codex_config_path(), 'rb') as f:
                 entry = tomllib.load(f).get('projects', {}).get(key, {})
             return entry.get('trust_level') == 'trusted'
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, AttributeError, RecursionError):   # ValueError covers bad UTF-8
         return None
     return None
 
@@ -367,11 +371,17 @@ def trust_state(agent, workdir):
 
 def pretrust(agent, workdir):
     """Trust workdir for `agent` before it starts. Never raises: a config that cannot be
-    updated safely is reported in the result's 'warning' and the launch goes ahead."""
-    if agent == 'claude':
-        return trust_claude(workdir)
-    if agent == 'codex':
-        return trust_codex(workdir)
+    updated safely is reported in the result's 'warning' and the launch goes ahead. Any
+    error the config helpers do not expect (say a RecursionError from a deeply nested
+    config) is reported the same way, so trust never stops a launch."""
+    if agent in ('claude', 'codex'):
+        helper = trust_claude if agent == 'claude' else trust_codex
+        try:
+            return helper(workdir)
+        except Exception as e:
+            config = claude_config_path() if agent == 'claude' else codex_config_path()
+            return _result(agent, config, os.path.realpath(workdir), 'skipped',
+                           warning=f"could not update {config}: {type(e).__name__}: {e}")
     if agent in TRUST_FLAGS:
         return _flag_result(agent, 'trusted')
     return {'agent': agent, 'method': None, 'status': 'unsupported'}
