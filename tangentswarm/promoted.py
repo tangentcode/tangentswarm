@@ -19,7 +19,10 @@ it retries every RETRY seconds) and:
        - it merges cleanly with main, and with main plus each Human Review head
          (local merge-tree, no API call).
      The reads are one GraphQL query for the Staging PRs. The card moves and an hr-gate
-     PASS line is written. This repeats until Human Review is full.
+     PASS line is written. The board is read again after each move, and this repeats
+     until Human Review is full (tangentswarm #67: a merge during the pass is filled in the
+     same pass). The scratch merge is skipped for a PR labelled merge-ready whose
+     pre-merge was built on the current future main (Promoter.premerge_current).
   2. When main moved (git ls-remote each poll, no API quota): recheck ONLY "merges
      cleanly with main" for each Staging PR left (tangentswarm.mainmerge). A conflict
      goes to In Progress with a merge-main relay; a clean PR is left alone.
@@ -457,47 +460,133 @@ class Promoter:
         ok, why = gatechecks.check_served_sites(paths, True, sites, lambda s: self.g['contains'](head, s))
         return None if ok else why
 
-    def fast_path(self, cols):
-        """Fill Human Review from Staging with the cheap check only. Returns the moved PRs."""
+    def fast_path(self, cols, reread=None):
+        """Fill Human Review from Staging with the cheap check only. Returns the moved PRs.
+        tangentswarm #67: after each move the board is read again (reread), and the pass goes
+        on while Human Review has a free slot and Staging has a candidate, so a merge that
+        lands during the pass is filled in the same pass. A PR moved in this pass counts in
+        Human Review even when the re-read does not show it there yet (board lag)."""
         from . import flow
-        hr = list(cols.get(board.HUMAN_REVIEW, []))
-        staging = cols.get(board.STAGING, [])
-        if len(hr) >= HR_TARGET or not staging:
+        if len(cols.get(board.HUMAN_REVIEW, [])) >= HR_TARGET or not cols.get(board.STAGING):
             return []
-        details = read_details(self.g['gql'], [p['number'] for p in staging])
+        reread = reread or (lambda: read_columns(self.g['gql'], max_age=0))
         gated = gate_times(self.log_text())
-        moved, self.left = [], []
+        moved, done = [], {}  # done: {n: the Staging card moved in this pass}
         with self.g['ScratchRepo']() as scratch:
-            main = None
+            state = {'main': None, 'tip': None}  # the scratch main ref and the origin main SHA it is for
 
-            def merge(head):
-                nonlocal main
-                if main is None:
-                    main = scratch.ensure_main()
-                scratch.ensure(head, *[q['head'] for q in hr])
-                return merge_problem(flow.merge_commit, scratch, main,
-                                     [(q['number'], q['head']) for q in hr], head)
+            def tip():
+                if state['tip'] is None:
+                    state['tip'] = self.main_sha() or ''
+                return state['tip'] or None
 
-            for p in staging_order(staging, details, self.queue(), board.active_fast_track()):
-                if len(hr) >= HR_TARGET:
+            def main_ref():
+                if state['main'] is None:
+                    seen = self.g.get('_main_seen')
+                    if isinstance(seen, dict) and tip() and seen.get('sha') != tip():
+                        seen.clear()  # main moved in the last minute: hr-gate's cache would keep the old one
+                    state['main'] = scratch.ensure_main()
+                return state['main']
+
+            while True:
+                hr = [q for q in cols.get(board.HUMAN_REVIEW, []) if q['number'] not in done]
+                hr += list(done.values())
+                staging = [q for q in cols.get(board.STAGING, []) if q['number'] not in done]
+                if len(hr) >= HR_TARGET or not staging:
                     break
-                n, head = p['number'], p['head']
-                why = self.cheap_check(p, details.get(n), gated, merge)
-                if why:
-                    say(f"#{n} stays in Staging: {why}")
-                    self.left.append((n, head, why))
-                    continue
+                details = read_details(self.g['gql'], [q['number'] for q in staging])
+                order = staging_order(staging, details, self.queue(), board.active_fast_track())
+                self.left, pick = [], None
+                for i, p in enumerate(order):
+                    n, head = p['number'], p['head']
+                    ahead = [(q['number'], q['head']) for q in staging_order(hr, details, [], board.active_fast_track())]
+                    ahead += [(q['number'], q['head']) for q in order[:i]]
+
+                    def merge(head, p=p, ahead=ahead):
+                        if self.premerge_current(p, details.get(p['number']), ahead, tip, scratch, main_ref):
+                            say(f"#{p['number']}: merge-ready on the current future main: no scratch merge")
+                            return None
+                        main = main_ref()
+                        scratch.ensure(head, *[q['head'] for q in hr])
+                        return merge_problem(flow.merge_commit, scratch, main,
+                                             [(q['number'], q['head']) for q in hr], head)
+                    why = self.cheap_check(p, details.get(n), gated, merge)
+                    if why:
+                        say(f"#{n} stays in Staging: {why}")
+                        self.left.append((n, head, why))
+                        continue
+                    pick = p
+                    break
+                if pick is None:
+                    break
+                n, head = pick['number'], pick['head']
                 if self.dry:
                     say(f"would move #{n} Staging -> Human Review (cheap check passed at {head[:8]})")
                 else:
-                    board.move_card(self.g, p['item'], board.HUMAN_REVIEW, n=p['number'])
+                    board.move_card(self.g, pick['item'], board.HUMAN_REVIEW, n=n)
                     self.g['log']('apply', n, head[:8], 'PASS', [])
                     from . import moves
                     moves.log_move(n, 'Staging', 'Human Review', head, note='cheap check')
                     say(f"moved #{n} Staging -> Human Review (cheap check passed at {head[:8]})")
-                hr.append(p)
+                done[n] = pick
                 moved.append(n)
+                try:  # the board again: a merge during this pass frees one more slot
+                    cols = reread()
+                except Exception as e:  # go on with the last read (this pass's moves are in done)
+                    say(f"re-read after #{n} failed: {type(e).__name__}: {e}; the last read is used")
+                state.update(main=None, tip=None)  # main may have moved with that merge
         return moved
+
+    def premerge_current(self, p, d, ahead, tip, scratch, main_ref):
+        """tangentswarm #67 (c): True if Staging PR p carries merge-ready and its pre-merge
+        record (flow.PREMERGE_STATE) was built for its current head on the current future main
+        ahead of it: main and the PRs `ahead` ([(n, head)]: Human Review, then Staging before
+        p). Then the scratch merge is skipped. A PR of the record's base that is no longer
+        queued must be merged into main since (each new first-parent commit of main is the
+        merge of one such head, nothing else), and every queued PR ahead must be in the base.
+        Else False: the full scratch merge runs."""
+        from . import flow
+        labels = set(p.get('own_labels') or []) | {l['name'] for l in ((d or {}).get('labels') or {}).get('nodes') or []}
+        if flow.MERGE_READY not in labels or flow.PRE_MERGING in labels:
+            return False
+        rec = flow.load_premerge().get(str(p['number'])) or {}
+        if not (rec.get('status') == 'ready' and rec.get('head') == p['head'] and rec.get('tip')
+                and isinstance(rec.get('base'), str) and rec['base'].split()):
+            return False
+        base_main, *deps = rec['base'].split()
+        want = [f"#{n}@{h[:12]}" for n, h in ahead]
+        if len(set(deps)) != len(deps) or not set(want) <= set(deps):
+            return False
+        gone = [x for x in deps if x not in want]
+        main = tip()
+        if not main:
+            return False
+        if not gone:
+            return main.startswith(base_main)
+        try:
+            return self.merged_onto(scratch, main_ref(), base_main, [x.split('@', 1)[-1] for x in gone])
+        except Exception:
+            return False
+
+    def merged_onto(self, scratch, main, base_main, heads):
+        """True if main is base_main plus one merge commit per head (first parent: the main
+        before it; second parent: that head), in any order, and nothing else."""
+        r = scratch.git('merge-base', '--is-ancestor', base_main, main, check=False)
+        if r.returncode != 0:
+            return False
+        r = scratch.git('rev-list', '--first-parent', '--parents', f'{base_main}..{main}', check=False)
+        if r.returncode != 0:
+            return False
+        rows = [line.split() for line in (r.stdout or '').splitlines() if line.strip()]
+        left = list(heads)
+        for row in rows:
+            if len(row) != 3:
+                return False
+            hit = next((h for h in left if row[2].startswith(h)), None)
+            if hit is None:
+                return False
+            left.remove(hit)
+        return not left
 
     def slow_path(self, run=None):
         """After the fast move, Human Review still short: hr-gate --apply for each leftover head
@@ -587,7 +676,11 @@ class Promoter:
                     self.queue_cascade(f"promoted {', '.join('#' + str(n) for n in moved)}: restock Staging")
                 drained = self.drain()
                 if drained:  # a queued run may have moved cards: read again before the rest
-                    cols, moved = read_columns(self.g['gql'], max_age=0), []  # the new read already has our moves
+                    cols = read_columns(self.g['gql'], max_age=0)  # the new read already has our moves
+                    # tangentswarm #67: a slot freed during the drain (a merge) is filled in this pass
+                    moved = self.fast_path(cols) if needs_promotion(cols) else []
+                    if moved:
+                        self.queue_cascade(f"promoted {', '.join('#' + str(n) for n in moved)}: restock Staging")
                 if main and (main_moved or self.main_retry_due(cols)):
                     self.main_pass(cols, moved, main)
                     self.last_main = main
