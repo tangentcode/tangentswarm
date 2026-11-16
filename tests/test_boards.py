@@ -74,7 +74,8 @@ def test_promote_fills_human_review_in_pick_order(monkeypatch):
     monkeypatch.setattr(boards, 'open_prs', lambda gql, b: adv.cols)
     moved = []
     monkeypatch.setattr(board, 'move_card', lambda g, item, col, sh=None, b=None: moved.append((item, col, b.number)))
-    assert boardflow.promote(adv, B6) == [20]  # one slot: the soonest due date first
+    monkeypatch.setattr(board, 'active_fast_track', lambda path=None: 30)  # a platform ticket number
+    assert boardflow.promote(adv, B6) == [20]  # one slot: the soonest due date first, not platform's #30
     assert moved == [('I20', board.HUMAN_REVIEW, 6)]
     assert boardflow.promote(adv, board.DEFAULT) == []  # a staging board: the cascade's job
 
@@ -111,3 +112,11 @@ def test_every_read_and_cleanup_of_another_repo_uses_that_repo(monkeypatch):
     launches.hold('platform-47', pr=47)
     Fake6(col=board.IN_PROGRESS).run(W.Action('closed', 47, args={'repo': TS}))
     assert '47' in slots.load()['unstarted'] and launches.read_queue()
+
+
+def test_a_project_6_pr_is_fast_track_by_its_own_labels(monkeypatch):
+    cols = {board.READY: [pr(30), pr(40, ft=True)]}
+    adv = Adv(cols)
+    monkeypatch.setattr(boards, 'open_prs', lambda gql, b: adv.cols)
+    monkeypatch.setattr(board, 'move_card', lambda *a, **k: None)
+    assert boardflow.promote(adv, B6) == [40, 30]

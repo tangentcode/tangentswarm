@@ -10,8 +10,9 @@ ITEMS_Q = """query($org:String!,$n:Int!,$c:String){organization(login:$org){proj
  items(first:100, after:$c){pageInfo{hasNextPage endCursor} nodes{id
   fieldValueByName(name:"Status"){...on ProjectV2ItemFieldSingleSelectValue{name optionId}}
   content{__typename ...on PullRequest{number state isDraft headRefOid mergeable
-   repository{nameWithOwner} milestone{title dueOn}
-   closingIssuesReferences(first:5){nodes{number repository{nameWithOwner} milestone{title dueOn}}}}}}}}}}"""
+   repository{nameWithOwner} milestone{title dueOn} labels(first:15){nodes{name}}
+   closingIssuesReferences(first:5){nodes{number repository{nameWithOwner} milestone{title dueOn}
+    labels(first:10){nodes{name}}}}}}}}}}}"""
 
 
 def open_prs(gql, b, org='tangentcode'):
@@ -29,9 +30,11 @@ def open_prs(gql, b, org='tangentcode'):
             cl = [i for i in (c.get('closingIssuesReferences') or {}).get('nodes') or []
                   if (i.get('repository') or {}).get('nameWithOwner') == repo]
             due, ms = board.soonest_due([c.get('milestone') or {}] + [i.get('milestone') or {} for i in cl])
+            names = [l['name'] for x in [c] + cl for l in (x.get('labels') or {}).get('nodes') or []]
             cols.setdefault(board.column(it.get('fieldValueByName')), []).append(dict(
                 number=c['number'], repo=repo, head=c['headRefOid'], item=it['id'], draft=c['isDraft'],
-                mergeable=c.get('mergeable'), closes=[i['number'] for i in cl], due=due, milestone=ms))
+                mergeable=c.get('mergeable'), closes=[i['number'] for i in cl], due=due, milestone=ms,
+                ft=board.is_fast_track(names)))  # this repo's own labels (Codex on PR #47)
         if not items['pageInfo']['hasNextPage']:
             return cols
         cursor = items['pageInfo']['endCursor']

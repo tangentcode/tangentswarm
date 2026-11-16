@@ -29,8 +29,10 @@ def promote(adv, b):
         return []
     cols = boards.open_prs(adv.g['gql'], b)
     hr = len(cols.get(board.HUMAN_REVIEW, []))
+    # Codex on PR #47: the active fast-track ticket is a Project 4 number; on this board a
+    # PR is fast-track by its own labels (or its issues'), never by a matching number
     ready = sorted((p for p in cols.get(board.READY, []) if not p['draft']),
-                   key=lambda p: board.pick_key(p, board.active_fast_track()))
+                   key=lambda p: board.pick_key(p, None))
     moved = []
     for p in ready:
         if hr >= HR_TARGET:
