@@ -66,6 +66,7 @@ REPO = 'tangentcode/platform'
 BACKSTOP = int(os.environ.get('SWARM_PROMOTE_BACKSTOP', '900'))  # retry a leftover head at most this often
 MAIN_RETRY = int(os.environ.get('SWARM_MAIN_RETRY', '300'))  # s between retries of a held merge-main handoff
 HR_TARGET = int(os.environ.get('SWARM_PROMOTE_HR_TARGET', '2'))  # only raise it for a dry-run proof
+WATCH = os.environ.get('SWARM_WATCH', '1') != '0'  # the watchdog thread (tangentswarm.watchdog)
 
 
 
@@ -582,6 +583,9 @@ def run(p, poll=POLL, retry=RETRY, sleep=time.sleep):
     signal.signal(signal.SIGUSR1, lambda *a: wake.update(now=True))
     say(f"swarm-promoted: polling every {poll}s (SIGUSR1 wakes it)")
     start_spool_thread(p)
+    if WATCH:
+        from . import watchdog
+        watchdog.start_thread(p)  # tangentswarm #40: the pane watcher and the watchdog checks
     what = 'idle'
     while True:
         limited = None

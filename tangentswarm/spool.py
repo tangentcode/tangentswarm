@@ -15,7 +15,7 @@ worker MCP tools) gets a result file, which the worker side waits for.
   <id>.run.json   claimed by the daemon (rename), being served
   <id>.res.json   the answer {ok, ...} or {ok: false, error: "<real error text>"}
 
-ops: stophook (the Stop hook; no answer), handoff, status, request_review (worker MCP).
+ops: stophook (the Stop hook; no answer), handoff, status, request_review, needs_input (worker MCP).
 """
 import json
 import os
@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 SPOOL = Path(os.environ.get('SWARM_HANDOFF_SPOOL', str(Path.home() / '.cache' / 'swarm-handoff-spool')))
-OPS = ('stophook', 'handoff', 'status', 'request_review', 'launch', 'start')
+OPS = ('stophook', 'handoff', 'status', 'request_review', 'launch', 'start', 'needs_input')
 WAIT = int(os.environ.get('SWARM_SPOOL_WAIT', '120'))  # s a worker MCP tool waits for its answer
 MAX_AGE = 3600  # s: an unclaimed request or an unread answer older than this is dropped
 NO_DAEMON = ("no answer from the swarm-promoted daemon in {wait}s; it runs the GitHub calls outside "
@@ -141,6 +141,8 @@ def execute(req):
         return dict(worker_mcp.status(cwd), ok=True)
     if op == 'request_review':
         return dict(worker_mcp.do_request_review(cwd), ok=True)
+    if op == 'needs_input':
+        return dict(worker_mcp.do_needs_input(cwd, req.get('pr'), req.get('question') or ''), ok=True)
     if op == 'launch':
         from . import launcher
         return launcher.execute(req)

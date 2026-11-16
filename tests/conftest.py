@@ -67,4 +67,9 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(slots, 'STATE', tmp_path / 'slots.json')
     monkeypatch.setattr(slots, 'SESSIONS', tmp_path / 'claude-sessions')
     monkeypatch.setattr(slots, 'PROJECTS', tmp_path / 'claude-projects')
+    from tangentswarm import alerts, panewatch
+    monkeypatch.setattr(alerts, 'STATE', tmp_path / 'watch.json')
+    monkeypatch.setattr(alerts, 'ALERT_URL_FILE', tmp_path / 'alert-url')
+    monkeypatch.setattr(alerts, 'ALERT_KEY_FILE', tmp_path / 'alert-key')
+    monkeypatch.setattr(panewatch, 'REPORT', tmp_path / 'panes.json')
     yield tmp_path

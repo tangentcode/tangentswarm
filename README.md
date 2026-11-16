@@ -901,6 +901,37 @@ swarm-promoted --once --dry-run      # one check; print what it would move
 systemctl --user kill -s USR1 swarm-promoted   # wake it now
 ```
 
+### swarm-watch: the pane watcher and watchdog (tangentswarm #40)
+
+A thread of swarm-promoted (`SWARM_WATCH=0` turns it off), with no LLM. Once a minute it
+runs `tmux capture-pane` on every pane of session `agents`, keeps the latest capture, and
+compares it with the last one. A working Claude shows a running timer, so a screen that
+did not change for a minute has finished or stopped. It then acts on a worker pane:
+
+- unsent text in the prompt: Enter
+- idle with the work handed off (or a pending `needs_input` exit): `/exit`; the window stays
+- idle, clean and pushed, but the card is still In Progress or the PR is a draft: the
+  handoff the Stop hook missed, through the spool
+- a question in the pane: routed like `needs_input` (a worker never asks in its pane)
+- a menu, a frozen busy screen, or a trust dialog that stays: swarmbot diagnoses
+
+It also pings Michal in MethBot's chat (POST to `~/.config/tangentswarm/methbot-alert-url`)
+for a new Needs Input card, a Codex outage (one alert per outage) and Human Review empty
+while Staging holds PRs (with the reason and a suggested fix). It kills hung test runs in
+worker worktrees and wakes swarmbot with the process and the pane capture. Every hour it
+sweeps issue cards with no PR back to Backlog and moves Done PRs whose head is not on main
+out of Done. Each failure opens an incident ticket on Project 6 (methodology #81).
+
+The worker MCP tool `needs_input(pr, question)` posts the question on the ticket, moves
+the card to Needs Input and closes the Claude; Michal's move back to In Progress resumes
+it with his answer. Every `@codex review` round is logged to the event DB, with no cap.
+
+```sh
+swarm-watch --panes              # the latest capture class of every pane
+swarm-watch --once --dry-run     # one pass of every check; print what it would do
+swarm-codex-rounds --days 7      # the PRs with the most Codex rounds, round by round
+```
+
 ### swarm-lock: one gate operation at a time
 
 Only one merge or gate operation may run at a time: `hr-gate --apply`, `hr-gate

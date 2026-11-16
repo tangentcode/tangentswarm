@@ -509,7 +509,7 @@ def _live_agents(path):
     return found
 
 
-def spawn_agent(agent, repo, branch, session='agents', window_name=None, top=None, run=None):
+def spawn_agent(agent, repo, branch, session='agents', window_name=None, top=None, run=None, refuse=None):
     """Start a registered agent in its own worktree of repo on branch (see module doc).
     The window name defaults to '<agent>-<branch slug>'."""
     argv = registry.launch_argv(agent)
@@ -530,6 +530,11 @@ def spawn_agent(agent, repo, branch, session='agents', window_name=None, top=Non
         if live:
             raise WorktreeError(f"{live[0]['agent']} is already working in {wt['path']} "
                                 f"({live[0]['pane_id']}); one agent per worktree")
+        if agent == 'claude':  # tangentswarm #40: also a Claude outside tmux (started by hand)
+            from . import workerprocs
+            why = (refuse or workerprocs.refuse_second_claude)(wt['path'])
+            if why:
+                raise WorktreeError(why)
         out = registry.launch_agent(agent, wt['path'], session=session, window_name=name, run=run)
     return {**out, 'reused': False, 'worktree': wt}
 

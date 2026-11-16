@@ -20,6 +20,9 @@ Tools:
                    Codex-clean head gets the MinBot check.
   request_review   post "@codex review" for the current head (once per head; the key is
                    shared with swarm-tick and the Stop hook).
+  needs_input      a question only Michal can answer (tangentswarm #40): it goes on the
+                   ticket, the card moves to Needs Input, and this Claude is closed with
+                   /exit; it is resumed with his answer. Never ask Michal in the pane.
 
 Install (user scope, every Claude on the host):
     claude mcp add --scope user tangentswarm -- ~/bin/swarm-worker-mcp
@@ -42,7 +45,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 INSTRUCTIONS = """Tools about your own swarm worktree and its pull request. Call worker_status
 to see your PR, card, Codex and CI state. When your work is committed and pushed, call
 handoff: it marks the PR ready, asks Codex for a review and moves the card to Auto Review
-(the same as the Stop hook). request_review only posts "@codex review" for your head."""
+(the same as the Stop hook). request_review only posts "@codex review" for your head.
+Never ask Michal a question in your pane: call needs_input(pr, question), then end your turn."""
 
 REPO = 'tangentcode/platform'
 _G = {}
@@ -130,13 +134,26 @@ def do_request_review(wt=None, sh=None):
     key = f"codex-request:{n}@{head}"
     if state.done(key) or tick.codex_requested(full):
         return {'posted': False, 'why': f"#{n}: a Codex review was already asked for {head[:8]}"}
-    (sh or (lambda argv: tick.sh(argv, check=True)))(['gh', 'pr', 'comment', str(n), '-R', REPO,
-                                                      '--body', '@codex review'])
-    state.mark(key)
+    from . import codexrounds
+    codexrounds.request(n, head, 'worker request_review', sh=sh, state=state)
     return {'posted': True, 'pr': n, 'head': head}
 
 
-def via_daemon(op):
+def do_needs_input(wt, pr, question, route=None, g=None):
+    """The needs_input tool, daemon side: the PR must be this worktree's own open PR."""
+    from . import needsinput, stophook
+    branch, _ = stophook.pushed_head(wt)
+    found = stophook.find_pr(g or gate(), branch) if branch else None
+    if not found:
+        return {'posted': False, 'why': 'no open PR on the board has this branch'}
+    if int(pr) != found[0]:
+        return {'posted': False, 'why': f"#{pr} is not your PR; yours is #{found[0]}"}
+    note = (route or needsinput.route)(found[0], question, wt=str(wt), source='the needs_input tool', g=g or gate())
+    return {'posted': True, 'pr': found[0], 'note': note,
+            'next': 'End your turn now. The server closes this session with /exit and resumes it with the answer.'}
+
+
+def via_daemon(op, **extra):
     """Run op for this worktree through the spool: the GitHub calls need sudo (the minbot gh
     shim), which fails inside swarm-workers.slice, so the swarm-promoted daemon runs them.
     Never raises: an error comes back as {'ok': False, 'error': '<the real text>'}."""
@@ -146,7 +163,7 @@ def via_daemon(op):
     except ToolError as e:
         return {'ok': False, 'error': str(e)}
     try:
-        return spool.submit(op, wt, wait=spool.WAIT)
+        return spool.submit(op, wt, wait=spool.WAIT, **extra)
     except Exception as e:
         return {'ok': False, 'error': f'{type(e).__name__}: {e}'}
 
@@ -172,7 +189,15 @@ async def request_review() -> dict:
     return await anyio.to_thread.run_sync(via_daemon, 'request_review')
 
 
-TOOLS = [worker_status, handoff, request_review]
+async def needs_input(pr: int, question: str) -> dict:
+    """Ask Michal a question only he can answer, instead of asking in your pane. The
+    question goes on the ticket, the card moves to Needs Input and Michal is pinged. Then end
+    your turn: the server closes this session with /exit (the window stays) and resumes it
+    with his answer. On a problem: {'ok': false, 'error': '...'}."""
+    return await anyio.to_thread.run_sync(lambda: via_daemon('needs_input', pr=int(pr), question=question))
+
+
+TOOLS = [worker_status, handoff, request_review, needs_input]
 
 
 def build_server(**kwargs):

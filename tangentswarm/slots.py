@@ -621,7 +621,7 @@ def one_line(text):
     return t
 
 
-def revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, path=None):
+def revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, path=None, refuse=None):
     """(b) Resume PR n's Claude (claude --resume SESSION) in its window, in a rework slot,
     and send the feedback. 0 done, 1 refused or failed, 3 held (no rework slot or memory)."""
     n = int(str(n).lstrip('#'))
@@ -673,6 +673,10 @@ def revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, path
                 return 0
             if existing and existing['agent']:
                 raise sp.Refused(f"{window}: runs {existing['agent']}, not Claude; not launching into it")
+            from . import workerprocs  # tangentswarm #40: never a second Claude in one worktree
+            second = (refuse or workerprocs.refuse_second_claude)(wt)
+            if second:
+                raise sp.Refused(f"{window}: {second}")
             if not Path(wt).is_dir():
                 raise sp.Refused(f"{window}: worktree {wt} is gone")
             cur = _git(wt, 'symbolic-ref', '--short', '-q', 'HEAD')

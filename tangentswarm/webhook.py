@@ -241,7 +241,7 @@ def classify(event, p):
             return [Action('handoff', n, f"new head {(pr.get('head') or {}).get('sha', '')[:8]}",
                            dict(head=(pr.get('head') or {}).get('sha'), push=True))]
         if action == 'edited':
-            return [Action('cascade', n, 'PR body edited (a Staging gate may pass now)')]
+            return [Action('edited', n, 'PR body edited (a Staging gate may pass now)')]
         return [Action('skip', pr=n, why=f'pull_request {action}')]
 
     if event == 'issues':
@@ -385,7 +385,7 @@ class Executor:
             self.move(n, item, board.IN_PROGRESS)
         self.note(f"#{n} relayed to its worker ({said})")
 
-    def wake(self, n, why, key=None, now=time.time):
+    def wake(self, n, why, key=None, now=time.time, extra=None):
         """An exception for swarmbot: deduped by key for WAKE_DEDUPE s, and at most one POST
         per WAKE_EVERY s for all keys together (Codex on PR #26: a burst of distinct failures
         woke the LLM once per delivery). Exceptions inside the interval wait in the pending
@@ -393,7 +393,7 @@ class Executor:
         key = key or why[:80]
         t = now()
         payload = {'source': 'swarm-webhook', 'kind': 'exception', 'pr': n or None, 'why': why,
-                   'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'log': str(LOG)}
+                   'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'log': str(LOG), **(extra or {})}
         with _lock:
             st = _seen()
             last = st.setdefault('wake', {})
@@ -442,6 +442,9 @@ class Executor:
         if a.args.get('commit') and a.args['commit'] != full.get('headRefOid'):
             return self.note(f"#{a.pr}: Codex reviewed an older head: skip")
         status, detail = advance.codex_decision(full)  # exact head, like the MinBot pass
+        if status in ('findings', 'clean') and not self.dry:
+            from . import codexrounds
+            codexrounds.result(a.pr, full.get('headRefOid'), status, detail)
         if status == 'findings':
             text = (f"Coordinator: #{a.pr}: Codex found issues on your head {full['headRefOid'][:8]} ({detail}). "
                     f"Read them with: gh pr view {a.pr} --comments (and the review threads). {ROOT_CAUSE}")
@@ -488,8 +491,8 @@ class Executor:
         key = f"codex-request:{a.pr}@{head}"
         if not (state.done(key) or tick.codex_requested(full) or tick.codex_reviewed_head(full)):
             if not self.dry:
-                self._sh(['gh', 'pr', 'comment', str(a.pr), '-R', REPO, '--body', '@codex review'])
-                state.mark(key)
+                from . import codexrounds
+                codexrounds.request(a.pr, head, 'swarm-webhook', sh=self._sh, state=state)
             self.note(f'#{a.pr}: posted "@codex review" for {head[:8]}')
         if col in (board.READY, board.STAGING, board.HUMAN_REVIEW):
             self.cascade(f'#{a.pr} left {col} with a new head')
@@ -533,6 +536,23 @@ class Executor:
         return [c for c in (full.get('comments') or {}).get('nodes') or []
                 if login(c.get('author')) == MICHAL and (c.get('createdAt') or '') > head_at and not ours(c.get('body'))]
 
+    def issue_answers(self, n):
+        """Michal's comments on the issues PR n closes, after the last needs_input question
+        there (needs_input posts the question on the ticket, so he answers there)."""
+        from .stophook import QUESTION_MARK
+        owner, name = REPO.split('/')
+        d = self.g['gql'](f'query{{repository(owner:"{owner}",name:"{name}"){{pullRequest(number:{int(n)})'
+                          '{closingIssuesReferences(first:3){nodes{comments(last:30){nodes{author{login} body '
+                          'createdAt}}}}}}}}')
+        pr = ((d or {}).get('repository') or {}).get('pullRequest') or {}
+        out = []
+        for i in (pr.get('closingIssuesReferences') or {}).get('nodes') or []:
+            cs = (i.get('comments') or {}).get('nodes') or []
+            asked = [k for k, c in enumerate(cs) if QUESTION_MARK in (c.get('body') or '')]
+            if asked:
+                out += [c for c in cs[asked[-1] + 1:] if login(c.get('author')) == MICHAL and not ours(c.get('body'))]
+        return out
+
     def do_reject(self, a):
         n = self.pr_of(a.args['node'])
         if not n:
@@ -548,7 +568,7 @@ class Executor:
         n = self.pr_of(a.args['node'])
         if not n:
             return self.wake(0, 'Needs Input answered on an issue with no PR: TRIAGE handoff', key=f"answered:{a.args['node']}")
-        cs = self.comments_since_head(n)
+        cs = self.comments_since_head(n) + self.issue_answers(n)
         said = ' | '.join(' '.join((c.get('body') or '').split())[:600] for c in cs) or '(see the issue)'
         ok, note = self.to_worker(n, f"Coordinator: #{n}: Michal answered: {said} Build it, then push.")
         if not ok:
@@ -615,6 +635,19 @@ class Executor:
                 self._sh([str(BIN / 'swarm-label-sync'), str(a.pr), '--apply'])
             except Exception as e:
                 self.note(f"label sync: {str(e)[:120]}")
+
+    def do_edited(self, a):
+        """An edit of a Staging PR's body or screenshots: hr-gate --apply again at once (#40
+        item 5), queued under the serial lock. Any other column: a cascade, as before."""
+        from . import gatelock
+        from .promoted import BIN
+        _, col = self.card(a.pr)
+        if col != board.STAGING:
+            return self.cascade(a.why)
+        if self.dry:
+            return self.note(f"would queue hr-gate --apply {a.pr} (Staging PR edited)")
+        (self.enqueue or gatelock.enqueue)([str(BIN / 'hr-gate'), '--apply', str(a.pr)], by='swarm-webhook')
+        self.note(f"queued hr-gate --apply {a.pr}: the Staging PR was edited")
 
     def do_wake(self, a):
         self.wake(a.pr, a.why, key=a.args.get('key'))
