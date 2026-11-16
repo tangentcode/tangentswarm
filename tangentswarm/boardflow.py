@@ -52,7 +52,7 @@ def promote(adv, b):
         if adv.dry:
             _say(adv, f"would move {p['repo']}#{p['number']} Ready -> Human Review (board {b.number})")
         else:
-            board.move_card(adv.g, p['item'], board.HUMAN_REVIEW, b=b)
+            board.move_card(adv.g, p['item'], board.HUMAN_REVIEW, n=p['number'], b=b)
             _say(adv, f"{p['repo']}#{p['number']} Ready -> Human Review (board {b.number}, {hr + 1}/{HR_TARGET})")
         moved.append(p['number'])
         hr += 1
@@ -99,7 +99,7 @@ def minbot_repo(adv, n, repo, promote_after=True):
     mark = A.pass_text(head).split(' (')[0]
     if not any(mark in (c.get('body') or '') for c in (d.get('comments') or {}).get('nodes') or []):
         adv.minbot('evidence', n, '--repo', repo, '--title', 'MinBot pass', '--commit', head, '--body', A.pass_text(head))
-    board.move_card(adv.g, card['item'], board.READY, b=b)
+    board.move_card(adv.g, card['item'], board.READY, n=n, b=b)
     _say(adv, f"MinBot-pass {repo}#{n} at {head[:8]}: pass comment, Auto Review -> Ready")
     if promote_after:
         promote(adv, b)

@@ -398,3 +398,32 @@ def test_a_reopened_pr_leaves_canceled_for_its_working_column():
     ex = Fake(col=board.AUTO_REVIEW)  # a plain "opened" never moves an existing card
     ex.run(W.Action('card', 9, args=dict(draft=True, what='pr', reopened=False)))
     assert ex.calls == [] and 'already has a card' in ex.done[0]
+
+
+def test_a_merge_deletes_the_vn_siblings_but_not_one_that_heads_an_open_pr():
+    """tangentswarm #39 (Michal 2026-11-15 6:27 PM ET)."""
+    p = {'action': 'closed', 'repository': REPO,
+         'pull_request': dict(pr(540, merged=True), head={'sha': 'a' * 40, 'ref': 'ptw-quiz'})}
+    (a,) = W.classify('pull_request', p)
+    assert a.kind == 'merged' and a.args['branch'] == 'ptw-quiz'
+    fork = dict(p, pull_request=dict(p['pull_request'], head={'sha': 'a' * 40, 'ref': 'ptw-quiz',
+                                                              'repo': {'full_name': 'someone/platform'}}))
+    assert W.classify('pull_request', fork)[0].args['branch'] is None  # Codex on PR #42: a fork's branch
+    refs = [{'ref': f'refs/heads/{b}'} for b in ('ptw-quiz-v1', 'ptw-quiz-v2', 'ptw-quiz-v10', 'ptw-quiz-vx',
+                                                 'ptw-quiz-v1-old')]
+    calls = []
+
+    def sh(argv):
+        calls.append(argv)
+        if 'matching-refs' in argv[2]:
+            return json.dumps(refs)
+        if 'pulls?state=open' in ' '.join(argv):
+            return 'ptw-quiz-v2\nother-branch'
+        return '{}'
+    ex = Fake(col=board.HUMAN_REVIEW)
+    ex.sh = sh
+    assert ex.delete_vn(540, 'ptw-quiz') == ['ptw-quiz-v1', 'ptw-quiz-v10']
+    deletes = [c[-1] for c in calls if c[:4] == ['gh', 'api', '-X', 'DELETE']]
+    assert deletes == [f'repos/{W.REPO}/git/refs/heads/ptw-quiz-v1', f'repos/{W.REPO}/git/refs/heads/ptw-quiz-v10']
+    assert any('kept ptw-quiz-v2' in d for d in ex.done)
+    assert Fake().delete_vn(1, 'main') == [] and Fake().delete_vn(1, '') == []

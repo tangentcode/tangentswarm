@@ -42,8 +42,10 @@ Each run writes one line to LOG, for example:
   the card to Auto Review.
 """
 import argparse
+import contextvars
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -65,6 +67,9 @@ def bin_dir():
     return BIN
 
 
+_LINES = contextvars.ContextVar('stophook_lines', default=None)
+
+
 def say(line, out=None):
     from datetime import datetime
     try:
@@ -72,6 +77,8 @@ def say(line, out=None):
         now = datetime.now(ZoneInfo('America/New_York'))
     except Exception:
         now = datetime.now()
+    if _LINES.get() is not None:
+        _LINES.get().append(line)  # the events DB row of this hook run (tangentswarm #32)
     line = f"{now.strftime('%Y-%m-%d %H:%M:%S')} {line}"
     if out:
         out(line)
@@ -193,8 +200,8 @@ def last_question(transcript):
     return None
 
 
-def move_card(g, item, col, sh):
-    board.move_card(g, item, col, sh)
+def move_card(g, item, col, sh, n=None):
+    board.move_card(g, item, col, sh, n=n)
 
 
 def needs_input(cwd, branch, transcript, g=None, dry=False, out=None, sh=None):
@@ -221,7 +228,7 @@ def needs_input(cwd, branch, transcript, g=None, dry=False, out=None, sh=None):
     body = (f"{QUESTION_MARK}\nQuestion from the worker on #{n} (the card is in Needs Input):\n\n"
             + '\n'.join('> ' + l for l in q.strip()[-1500:].splitlines()))
     if not dry:
-        move_card(g, item, board.NEEDS_INPUT, sh)
+        move_card(g, item, board.NEEDS_INPUT, sh, n=n)
         for i in (issues or [n])[:1]:
             sh(['gh', 'issue', 'comment', str(i), '-R', REPO, '--body', body])
         _mark_seen(key)
@@ -246,8 +253,21 @@ def run(cwd, g=None, dry=False, out=None, sh=None, sleep=time.sleep, merges=merg
     cwd = Path(cwd)
     if not slots.is_platform_worktree(cwd):
         return None
-    with branch_lock(cwd):  # platform #541: two hook runs for one PR must never race
-        return _run(cwd, g, dry, out, sh, sleep, merges, minbot, transcript, procs, tell)
+    from . import eventdb
+    lines, error, token = [], None, _LINES.set([])
+    lines = _LINES.get()
+    try:
+        with branch_lock(cwd):  # platform #541: two hook runs for one PR must never race
+            return _run(cwd, g, dry, out, sh, sleep, merges, minbot, transcript, procs, tell)
+    except Exception as e:
+        error = f'{type(e).__name__}: {str(e)[:300]}'
+        raise
+    finally:
+        _LINES.reset(token)
+        if not dry and (lines or error):  # one row per hook run with its decision
+            m = re.search(r'#(\d+)', ' '.join(lines))
+            eventdb.log_event('stop', source='stop-hook', actor=cwd.name, pr=int(m.group(1)) if m else None,
+                              notes=lines, error=error)
 
 
 def branch_lock(cwd):
@@ -320,7 +340,7 @@ def _run(cwd, g, dry, out, sh, sleep, merges, minbot, transcript, procs, tell):
         did.append('marked the pull request ready')
     if status == 'clean':
         if col == board.IN_PROGRESS and not dry:
-            move_card(g, item, board.AUTO_REVIEW, sh)
+            move_card(g, item, board.AUTO_REVIEW, sh, n=n)
         last = minbot(n) if not dry else f'would run swarm-advance --minbot {n}'
         what = (', '.join(did) + ', and ' if did else '') + 'ran the MinBot check'
         line = f"#{n} head {head[:7]} is already Codex-clean. {what[0].upper() + what[1:]}: {last}"
@@ -334,7 +354,7 @@ def _run(cwd, g, dry, out, sh, sleep, merges, minbot, transcript, procs, tell):
             did.append('posted "@codex review"')
         if col == board.IN_PROGRESS:
             if not dry:
-                move_card(g, item, board.AUTO_REVIEW, sh)
+                move_card(g, item, board.AUTO_REVIEW, sh, n=n)
             did.append('moved the card to Auto Review')
         if not did:
             mark_seen(key)
@@ -432,6 +452,8 @@ def hook(stdin=sys.stdin, submit=None):
 
 
 def main(argv=None):
+    from . import eventdb
+    eventdb.set_source('stop-hook')
     argv = sys.argv[1:] if argv is None else argv
     if not argv:
         return hook()

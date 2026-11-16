@@ -74,7 +74,7 @@ def test_promote_fills_human_review_in_pick_order(monkeypatch):
     adv = Adv(cols)
     monkeypatch.setattr(boards, 'open_prs', lambda gql, b: adv.cols)
     moved = []
-    monkeypatch.setattr(board, 'move_card', lambda g, item, col, sh=None, b=None: moved.append((item, col, b.number)))
+    monkeypatch.setattr(board, 'move_card', lambda g, item, col, sh=None, n=None, b=None: moved.append((item, col, b.number)))
     monkeypatch.setattr(board, 'active_fast_track', lambda path=None: 30)  # a platform ticket number
     assert boardflow.promote(adv, B6) == [20]  # one slot: the soonest due date first, not platform's #30
     assert moved == [('I20', board.HUMAN_REVIEW, 6)]
@@ -92,7 +92,7 @@ def test_minbot_repo_passes_a_clean_pr_to_ready_then_promotes(monkeypatch):
     monkeypatch.setattr(A, 'check_runs', lambda h, repo=None: [{'name': 'tests', 'status': 'completed',
                                                                'conclusion': 'success'}])
     moved = []
-    monkeypatch.setattr(board, 'move_card', lambda g, item, col, sh=None, b=None: moved.append((item, col)))
+    monkeypatch.setattr(board, 'move_card', lambda g, item, col, sh=None, n=None, b=None: moved.append((item, col)))
     assert boardflow.minbot_repo(adv, 47, TS)
     assert adv.minbots[0][:4] == ('evidence', 47, '--repo', TS) and moved[0] == ('I47', board.READY)
     d['mergeable'] = 'CONFLICTING'

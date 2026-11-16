@@ -40,6 +40,7 @@ swarm-stop-hook = "tangentswarm.stophook:main"
 swarm-worker-mcp = "tangentswarm.worker_mcp:main"
 swarm-webhook = "tangentswarm.webhook:main"
 swarm-events = "tangentswarm.events_view:main"
+swarm-tmux-status = "tangentswarm.tmux_status:main"
 
 [tool.setuptools]
 packages = ["tangentswarm", "tangentswarm.cloud", "tangentswarm.queue"]

@@ -192,12 +192,25 @@ def is_active_fast_track(number, closes=(), active=None):
 HR_GATE_COLS = {IN_PROGRESS, AUTO_REVIEW, STAGING, HUMAN_REVIEW, DONE, BACKLOG}  # hr-gate's OPT names
 
 
-def move_card(g, item, col, sh=None, b=None):
+def move_card(g, item, col, sh=None, n=None, b=None):
     """Move a card to column col, by option id. hr-gate's move() knows only its own
     OPT names (no Ready, Needs Input, Triage...): platform #537/#540/#542/#543 at 11:03 AM ET
     2026-11-15 got their MinBot pass comment, then KeyError 'Ready', and stayed in Auto
     Review. Every mover goes through here. b: the card's board (default: Project 4, the
     only one hr-gate knows)."""
+    from . import eventdb
+    try:
+        _move(g, item, col, sh, b)
+    except Exception as e:  # Codex on PR #33: the row says what happened, not what was tried
+        eventdb.log_event('move', source='board', action=col, pr=n, actor=eventdb.SOURCE or None,
+                          detail={'item': item, 'col': col, 'board': (b or DEFAULT).number},
+                          error=f'{type(e).__name__}: {str(e)[:300]}')
+        raise
+    eventdb.log_event('move', source='board', action=col, pr=n, actor=eventdb.SOURCE or None,
+                      detail={'item': item, 'col': col, 'board': (b or DEFAULT).number})  # tangentswarm #32
+
+
+def _move(g, item, col, sh=None, b=None):
     if b is not None and b is not DEFAULT:
         argv = ['gh', 'project', 'item-edit', '--id', item, '--project-id', b.id,
                 '--field-id', b.status_field, '--single-select-option-id', b.option[col]]

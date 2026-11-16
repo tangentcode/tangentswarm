@@ -366,6 +366,8 @@ def gate_reasons(rows):
 
 def sh(argv, check=False, timeout=300):
     r = subprocess.run([str(a) for a in argv], capture_output=True, text=True, timeout=timeout)
+    from . import eventdb
+    eventdb.log_command(argv, r.returncode, '', r.stderr or r.stdout)  # tangentswarm #32: minbot calls, gh writes
     if check and r.returncode:
         raise RuntimeError(f"{' '.join(str(a) for a in argv[:3])}...: {(r.stderr or r.stdout).strip()[:200]}")
     return r
@@ -451,7 +453,7 @@ BOARD_Q = """query($c:String){organization(login:"tangentcode"){projectV2(number
   content{__typename
    ...on PullRequest{number state isDraft headRefName headRefOid title repository{nameWithOwner}
      body milestone{title dueOn} labels(first:20){nodes{name}}
-     closingIssuesReferences(first:10){nodes{number milestone{title dueOn} labels(first:20){nodes{name}}}}}}}}}}}"""
+     closingIssuesReferences(first:10){nodes{number repository{nameWithOwner} milestone{title dueOn} labels(first:20){nodes{name}}}}}}}}}}}"""
 
 
 def board_prs_open(g, max_age=None):
@@ -479,6 +481,7 @@ def board_prs_open(g, max_age=None):
 
 
 def board_prs(g):
+    from . import boardcache
     out, cursor = {}, None
     active = board.active_fast_track()  # the ONE active fast-track ticket (kept by swarm-promoted)
     while True:
@@ -488,27 +491,17 @@ def board_prs(g):
             if c.get('__typename') != 'PullRequest' or (c.get('repository') or {}).get('nameWithOwner') != REPO:
                 continue
             col = board.column(it.get('fieldValueByName'))
-            miles = [(c.get('milestone') or {}).get('title')]
-            miles += [(i.get('milestone') or {}).get('title') for i in c['closingIssuesReferences']['nodes']]
+            cl = boardcache.closes(c)  # this repo's issues only, as in board_prs_open
+            nums = [i.get('number') for i in cl]
+            miles = [(c.get('milestone') or {}).get('title')] + [(i.get('milestone') or {}).get('title') for i in cl]
             labels = {l['name'] for l in c['labels']['nodes']}
-            issue_labels = {l['name'] for i in c['closingIssuesReferences']['nodes']
-                            for l in ((i.get('labels') or {}).get('nodes') or [])}
+            ft = board.is_active_fast_track(c['number'], nums, active)
+            due, milestone = boardcache.pr_due(c)
             out[c['number']] = dict(number=c['number'], state=c['state'], draft=c['isDraft'],
                                     branch=c['headRefName'], head=c['headRefOid'], title=c['title'],
-                                    body=c.get('body') or '',
-                                    col=col, item=it['id'],
-                                    closes=[i.get('number') for i in c['closingIssuesReferences']['nodes']],
-                                    due=board.soonest_due([c.get('milestone') or {}] + [
-                                        i.get('milestone') or {} for i in c['closingIssuesReferences']['nodes']])[0],
-                                    milestone=board.soonest_due([c.get('milestone') or {}] + [
-                                        i.get('milestone') or {} for i in c['closingIssuesReferences']['nodes']])[1],
-                                    ft=board.is_active_fast_track(
-                                        c['number'], [i.get('number') for i in c['closingIssuesReferences']['nodes']], active),
-                                    rank=board.priority_rank(
-                                        board.is_active_fast_track(
-                                            c['number'], [i.get('number') for i in c['closingIssuesReferences']['nodes']],
-                                            active),
-                                                             milestone_rank(miles) == 0),
+                                    body=c.get('body') or '', col=col, item=it['id'], closes=nums,
+                                    due=due, milestone=milestone, ft=ft,
+                                    rank=board.priority_rank(ft, milestone_rank(miles) == 0),
                                     parked=c['number'] in g['PARKED'] | EXTRA_PARKED or 'parked' in labels)
         if not data['pageInfo']['hasNextPage']:
             return out
@@ -809,7 +802,7 @@ class Tick:
                 sh(['gh', 'pr', 'ready', str(n), '-R', REPO], check=True)
             self.change(f"#{n} marked ready (Claude finished, head {head[:8]} pushed)")
         if not self.dry:
-            board.move_card(self.g, pr['item'], board.AUTO_REVIEW)
+            board.move_card(self.g, pr['item'], board.AUTO_REVIEW, n=pr.get('number'))
         self.change(f"#{n} card In Progress -> Auto Review")
         key = f"codex-request:{n}@{head}"
         if codex_clean or self.state.done(key) or codex_requested(full):
