@@ -74,8 +74,9 @@ def test_decide(worker):
 class Rig:
     """A PaneWatch over fake panes, with every effect recorded."""
 
-    def __init__(self, worker, screens, pr=None, shell_root=True):
+    def __init__(self, worker, screens, pr=None, shell_root=True, transcript='/t/s.jsonl'):
         self.worker, self.screens = worker, screens
+        self.transcripts = []
         self.calls, self.told, self.handoffs, self.routes, self.wakes, self.incidents = [], [], [], [], [], []
         self.results = {}
         self.st = alerts.state()
@@ -88,7 +89,8 @@ class Rig:
                                 pane_pid='100')],
             cap=lambda pid: (self.screens[0], self.screens[1]), facts=lambda path: dict(self.worker),
             is_claude=lambda p: True, reported=lambda n: False, tell=lambda p, t: self.told.append((p, t)),
-            handoff=lambda wt: self.handoffs.append(wt) or f'r{len(self.handoffs)}',
+            handoff=lambda wt, t: self.transcripts.append(t) or self.handoffs.append(wt) or f'r{len(self.handoffs)}',
+            transcript=lambda wt: transcript,
             result=lambda rid: self.results.get(rid, {'ok': True}),
             route=lambda *a: self.routes.append(a) or 'routed',
             wake=lambda why, key, pr=None, detail=None: self.wakes.append((why, detail)),
@@ -133,6 +135,41 @@ def test_a_missed_stop_hook_handoff_runs_once_with_an_incident(worker):
     r.run(120)
     assert r.handoffs == [worker['top']]
     assert len(r.incidents) == 1 and 'Stop hook missed' in r.incidents[0][1]
+
+
+def test_the_missed_handoff_carries_the_workers_transcript(worker):
+    """Codex on PR #52: the Stop hook's question check (partial scope, a pending decision goes
+    to Needs Input, never ready) needs the transcript, also on a retry."""
+    r = Rig(worker, (IDLE, True), pr=dict(AR, col=board.IN_PROGRESS))
+    r.results = {'r1': {'ok': False, 'error': 'x'}}
+    r.run(0)
+    r.run(60)
+    r.run(120)
+    assert r.transcripts == ['/t/s.jsonl', '/t/s.jsonl']
+
+
+def test_no_transcript_means_a_wake_never_a_handoff(worker):
+    r = Rig(worker, (IDLE, True), pr=dict(AR, col=board.IN_PROGRESS), transcript=None)
+    r.run(0)
+    out = r.run(60)
+    r.run(120)
+    assert r.handoffs == [] and 'no transcript' in out[0]
+    assert len(r.wakes) == 1 and 'no transcript was found' in r.wakes[0][0]
+    r.w.transcript = lambda wt: '/t/late.jsonl'  # the transcript shows up: the handoff runs
+    r.run(180)
+    assert r.handoffs == [worker['top']] and r.transcripts == ['/t/late.jsonl']
+
+
+def test_transcript_of_finds_the_newest_session(tmp_path):
+    import os
+    wt = '/home/x/ver/repo.feat'
+    d = tmp_path / '-home-x-ver-repo-feat'
+    d.mkdir()
+    (d / 'old.jsonl').write_text('{}')
+    (d / 'new.jsonl').write_text('{}')
+    os.utime(d / 'old.jsonl', (1, 1))
+    assert PW.transcript_of(wt, tmp_path) == str(d / 'new.jsonl')
+    assert PW.transcript_of('/home/x/none', tmp_path) is None
 
 
 def test_unsent_input_is_submitted_once(worker):

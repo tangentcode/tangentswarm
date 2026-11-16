@@ -46,3 +46,14 @@ def test_handoff_refuses_an_unpushed_head(wt, monkeypatch):  # noqa: F811
     monkeypatch.setitem(W._G, 'g', G(run(wt, 'rev-parse', 'HEAD')))
     r = W.do_handoff(wt)
     assert r['done'] is False and 'is not pushed' in r['why']
+
+
+def test_the_spool_handoff_passes_the_transcript_to_the_stop_hook(wt, monkeypatch):  # noqa: F811
+    """Codex on PR #52: the pane watcher's recovered handoff runs the hook's question check."""
+    from tangentswarm import spool, stophook
+    seen = []
+    monkeypatch.setitem(W._G, 'g', G(run(wt, 'rev-parse', 'HEAD')))
+    monkeypatch.setattr(stophook, 'run', lambda cwd, **k: seen.append(k.get('transcript')) or 'ran')
+    assert spool.execute({'op': 'handoff', 'cwd': str(wt), 'transcript': '/t/s.jsonl'})['done'] is True
+    assert spool.execute({'op': 'handoff', 'cwd': str(wt)})['done'] is True  # the worker's own tool
+    assert seen == ['/t/s.jsonl', None]
