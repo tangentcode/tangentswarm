@@ -21,8 +21,9 @@ it retries every RETRY seconds) and:
      The reads are one GraphQL query for the Staging PRs. The card moves and an hr-gate
      PASS line is written. The board is read again after each move, and this repeats
      until Human Review is full (tangentswarm #67: a merge during the pass is filled in the
-     same pass). The scratch merge is skipped for a PR labelled merge-ready whose
-     pre-merge was built on the current future main (Promoter.premerge_current).
+     same pass). For a PR labelled merge-ready whose pre-merge was built on the current
+     future main (Promoter.premerge_current), only the main probe runs, not the pairwise
+     merges with each Human Review head.
   2. When main moved (git ls-remote each poll, no API quota): recheck ONLY "merges
      cleanly with main" for each Staging PR left (tangentswarm.mainmerge). A conflict
      goes to In Progress with a merge-main relay; a clean PR is left alone.
@@ -516,7 +517,15 @@ class Promoter:
 
                     def merge(head, p=p, ahead=ahead, proof=proof):
                         if proof and self.premerge_current(p, details.get(p['number']), ahead, tip, scratch, main_ref):
-                            say(f"#{p['number']}: merge-ready on the current future main: no scratch merge")
+                            # Codex on PR #68: the main-only probe always runs (a queued head can
+                            # revert an edit on main). The pre-merge stands in only for the
+                            # pairwise probes with each Human Review head.
+                            main = main_ref()
+                            scratch.ensure(head)
+                            if flow.merge_commit(scratch, main, head, 'probe main') is None:
+                                return 'conflicts with main'
+                            say(f"#{p['number']}: merge-ready on the current future main: "
+                                "no pairwise Human Review merges")
                             return None
                         main = main_ref()
                         scratch.ensure(head, *[q['head'] for q in hr])
@@ -551,14 +560,13 @@ class Promoter:
 
     def premerge_current(self, p, d, ahead, tip, scratch, main_ref):
         """tangentswarm #67 (c): True if Staging PR p carries merge-ready and its pre-merge
-        record (flow.PREMERGE_STATE) was built for its current head on the current future main
-        ahead of it: main and the PRs `ahead` ([(n, head)]: Human Review, then Staging before
-        p, each in the shared pick order), as a mechanical merge of its head (no seed), with
-        every PR ahead in it as its head. Then the scratch merge is skipped. The ordered
-        (PR, head) list must match: the base is the PRs merged since (first in it; each new
-        first-parent commit of main is the merge of one such head, nothing else), then
-        exactly `ahead`, in queue order.
-        Else False: the full scratch merge runs."""
+        record (flow.PREMERGE_STATE) is a mechanical merge (no seed) of its current head onto
+        the current future main ahead of it: main and the PRs `ahead` ([(n, head)], Human
+        Review in the shared pick order), each in it as its head. The ordered (PR, head) list
+        must match: the base is the PRs merged since (first in it; each new first-parent
+        commit of main is the merge of one such head, nothing else), then exactly `ahead`.
+        Then the pairwise merges with each Human Review head are skipped; the main probe
+        still runs. Else False: the full scratch merge runs."""
         from . import flow
         labels = set(p.get('own_labels') or []) | {l['name'] for l in ((d or {}).get('labels') or {}).get('nodes') or []}
         if flow.MERGE_READY not in labels or flow.PRE_MERGING in labels:

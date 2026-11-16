@@ -667,7 +667,7 @@ def premerged(tmp_path, monkeypatch, base, labels=('merge-ready',), d=None, scra
 def test_a_merge_ready_pr_on_the_current_future_main_skips_the_scratch_merge(tmp_path, monkeypatch):
     p, g, merges, cols = premerged(tmp_path, monkeypatch, f'{MAIN[:12]} #1@a')
     assert p.fast_path(cols, reread=lambda: cols) == [5]
-    assert merges == [] and g.moves == [('I5', board.HUMAN_REVIEW)]
+    assert merges == [(MAIN, H5)] and g.moves == [('I5', board.HUMAN_REVIEW)]
 
 
 @pytest.mark.parametrize('base, labels, rec', [
@@ -680,7 +680,7 @@ def test_a_merge_ready_pr_on_the_current_future_main_skips_the_scratch_merge(tmp
 def test_without_a_current_pre_merge_the_full_scratch_merge_runs(tmp_path, monkeypatch, base, labels, rec):
     p, g, merges, cols = premerged(tmp_path, monkeypatch, base, labels=labels, rec=rec)
     assert p.fast_path(cols, reread=lambda: cols) == [5]
-    assert merges  # the full check ran (and passed)
+    assert len(merges) > 1  # the full check ran (and passed)
 
 
 def test_a_new_head_since_the_pre_merge_runs_the_full_check(tmp_path, monkeypatch):
@@ -688,7 +688,7 @@ def test_a_new_head_since_the_pre_merge_runs_the_full_check(tmp_path, monkeypatc
     p, g, merges, cols = premerged(tmp_path, monkeypatch, f'{MAIN[:12]} #1@a')
     flow.set_premerge(5, dict(head='e' * 40, base=f'{MAIN[:12]} #1@a', vbranch='b-v1', tip='t' * 40, status='ready'))
     p.fast_path(cols, reread=lambda: cols)
-    assert merges
+    assert len(merges) > 1
 
 
 def test_a_merge_ready_pr_that_fails_another_cheap_check_is_refused(tmp_path, monkeypatch):
@@ -705,15 +705,15 @@ def test_a_queued_pr_merged_since_the_pre_merge_still_matches(tmp_path, monkeypa
     graph = premerge_graph(base)
     graph[MAIN] = [full(old), 'b' * 40]
     p, g, merges, cols = premerged(tmp_path, monkeypatch, base, scratch=GitScratch(graph))
-    assert p.fast_path(cols, reread=lambda: cols) == [5] and merges == []
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and merges == [(MAIN, H5)]
     # main also has a commit that is not one of those merges: the full check runs
     g2 = dict(graph, **{'e' * 40: [full(old), '1' * 40], MAIN: ['e' * 40, 'b' * 40]})
     p, g, merges, cols = premerged(tmp_path, monkeypatch, base, scratch=GitScratch(g2))
-    assert p.fast_path(cols, reread=lambda: cols) == [5] and merges
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and len(merges) > 1
     # the old main is not an ancestor of main: the full check runs
     g3 = dict(graph, **{MAIN: ['9' * 40, 'b' * 40], '9' * 40: []})
     p, g, merges, cols = premerged(tmp_path, monkeypatch, base, scratch=GitScratch(g3))
-    assert p.fast_path(cols, reread=lambda: cols) == [5] and merges
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and len(merges) > 1
 
 
 def test_the_pre_merge_base_must_match_the_queue_in_order(tmp_path, monkeypatch):
@@ -786,13 +786,13 @@ def test_a_resolved_pre_merge_never_skips_the_scratch_merge(tmp_path, monkeypatc
     base = f'{MAIN[:12]} #1@a'
     p, g, merges, cols = premerged(tmp_path, monkeypatch, base)
     flow.set_premerge(5, dict(head=H5, base=base, vbranch='b-v2', seed='s' * 40, tip='t' * 40, status='ready'))
-    assert p.fast_path(cols, reread=lambda: cols) == [5] and merges
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and len(merges) > 1
     p, g, merges, cols = premerged(tmp_path, monkeypatch, base)
     flow.set_premerge(1, dict(head='a', base=MAIN[:12], vbranch='a-v1', seed='s' * 40, tip='u' * 40, status='ready'))
-    assert p.fast_path(cols, reread=lambda: cols) == [5] and merges
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and len(merges) > 1
     flow.set_premerge(1, dict(head='a', base=MAIN[:12], vbranch='a-v1', tip='u' * 40, status='ready'))
     p, g, merges, cols = premerged(tmp_path, monkeypatch, base)
-    assert p.fast_path(cols, reread=lambda: cols) == [5] and merges == []  # mechanical: skipped
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and merges == [(MAIN, H5)]  # mechanical: skipped
 
 
 def test_a_pre_merge_built_on_a_resolved_tip_ahead_never_skips(tmp_path, monkeypatch):
@@ -802,10 +802,10 @@ def test_a_pre_merge_built_on_a_resolved_tip_ahead_never_skips(tmp_path, monkeyp
     base = f'{MAIN[:12]} #1@a'
     p, g, merges, cols = premerged(tmp_path, monkeypatch, base,
                                    scratch=GitScratch(premerge_graph(base, second={0: 'r' * 40})))
-    assert p.fast_path(cols, reread=lambda: cols) == [5] and merges
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and len(merges) > 1
     p, g, merges, cols = premerged(tmp_path, monkeypatch, base,
                                    scratch=GitScratch(premerge_graph(base, head='9' * 40)))
-    assert p.fast_path(cols, reread=lambda: cols) == [5] and merges
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and len(merges) > 1
 
 
 def test_a_pre_merge_that_holds_a_refused_staging_pr_never_skips(tmp_path, monkeypatch):
@@ -817,7 +817,7 @@ def test_a_pre_merge_that_holds_a_refused_staging_pr_never_skips(tmp_path, monke
     p, g, merges, cols = premerged(tmp_path, monkeypatch, base)
     g['gql'] = lambda q, **v: {'repository': {'p4': detail(4, H4), 'p5': detail(5, H5)}}
     cols[board.STAGING] = [dict(number=4, head=H4, item='I4')] + cols[board.STAGING]
-    assert p.fast_path(cols, reread=lambda: cols) == [5] and merges
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and len(merges) > 1
     assert p.left == [(4, H4, 'head 44444444 has no gate pass')]
 
 
@@ -844,3 +844,14 @@ def test_the_slow_path_sees_the_slots_freed_during_the_fast_path(tmp_path, monke
     monkeypatch.setattr(P.gatelock, 'gate_lock', lambda name: L())
     assert p.once() == 'promoted'
     assert g.moves == [('I5', board.HUMAN_REVIEW)] and p.hr_count == 0 and slow == [[7]]
+
+
+def test_a_current_pre_merge_still_runs_the_main_probe(tmp_path, monkeypatch):
+    """Codex on PR #68: a Human Review head can revert an edit on main, so #5 merges onto
+    future main but conflicts with main alone. The main probe runs and refuses it; the
+    pairwise Human Review merges are the only ones the pre-merge replaces."""
+    from tangentswarm import flow
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, f'{MAIN[:12]} #1@a')
+    monkeypatch.setattr(flow, 'merge_commit', lambda s, a, b, m: merges.append((a, b)) or (None if a == MAIN else 'x'))
+    assert p.fast_path(cols, reread=lambda: cols) == [] and g.moves == []
+    assert merges == [(MAIN, H5)] and p.left == [(5, H5, 'conflicts with main')]
