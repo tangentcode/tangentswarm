@@ -150,7 +150,7 @@ def gated_heads(log_text):
 
 
 DETAIL_FIELDS = """number state headRefOid headRefName isDraft baseRefName body files(first:100){nodes{path}}
- labels(first:20){nodes{name}} closingIssuesReferences(first:10){nodes{number labels(first:20){nodes{name}}}}
+ labels(first:20){nodes{name}} closingIssuesReferences(first:10){nodes{number repository{nameWithOwner} labels(first:20){nodes{name}}}}
  comments(last:30){nodes{createdAt author{__typename login}}}
  reviews(last:30){nodes{submittedAt author{__typename login}}}"""
 
@@ -209,8 +209,8 @@ def staging_order(staging, details, queue, active=None):
     def key(p):
         closes = p.get('closes')
         if closes is None:
-            closes = [i.get('number') for i in ((details.get(p['number'], {}).get('closingIssuesReferences') or {})
-                                                 .get('nodes') or [])]
+            from . import boardcache
+            closes = [i.get('number') for i in boardcache.closes(details.get(p['number'], {}))]
         return board.pick_key(dict(p, closes=closes), active)
     return sorted(staging, key=key)
 
