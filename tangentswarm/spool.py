@@ -149,7 +149,7 @@ def execute(req):
     if op == 'stophook':
         return {'ok': True, 'log': stophook.run(cwd, transcript=req.get('transcript'))}
     if op == 'handoff':
-        return dict(worker_mcp.do_handoff(cwd), ok=True)
+        return dict(worker_mcp.do_handoff(cwd, transcript=req.get('transcript')), ok=True)
     if op == 'status':
         return dict(worker_mcp.status(cwd), ok=True)
     if op == 'request_review':

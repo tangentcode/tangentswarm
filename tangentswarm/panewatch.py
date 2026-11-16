@@ -194,6 +194,15 @@ def root_is_shell(pane_pid):
         return False
 
 
+def transcript_of(worktree, projects=None):
+    """The newest Claude transcript (JSONL) of a worktree, or None (slots.latest_session)."""
+    from . import slots
+    sid = slots.latest_session(worktree, projects)
+    if not sid:
+        return None
+    return str((projects or slots.PROJECTS) / re.sub(r'[^A-Za-z0-9]', '-', str(worktree)) / f'{sid}.jsonl')
+
+
 # -- the watcher -------------------------------------------------------------------------
 
 class PaneWatch:
@@ -201,7 +210,7 @@ class PaneWatch:
 
     def __init__(self, dry=False, sh=_sh, panes=None, cap=None, facts=worktree, is_claude=None, tell=None,
                  handoff=None, result=None, route=None, reported=None, wake=None, incident=None, st=None, shell_root=root_is_shell,
-                 report=None):
+                 report=None, transcript=None):
         from . import alerts
         self.dry, self.sh = dry, sh
         self.panes_fn = panes or (lambda: list_panes(self.sh))
@@ -210,8 +219,9 @@ class PaneWatch:
         self.is_claude = is_claude or self._is_claude
         self.tell = tell or self._tell
         self.handoff = handoff or self._handoff
+        self.transcript = transcript or transcript_of
         self.result = result or self._result
-        self.inflight = {}  # once-key -> (spool request id, queued at): handoffs not answered yet
+        self.inflight = {}  # once-key -> (spool request id, queued at, transcript): handoffs not answered yet
         self.route = route or self._route
         self.reported = reported or self._reported
         self.wake = wake or alerts.wake_swarmbot
@@ -231,10 +241,12 @@ class PaneWatch:
         from . import agents
         agents.tell_agent(pane, text)
 
-    def _handoff(self, wt):
-        """Queue the handoff in the spool; returns the request id (the daemon serves it)."""
+    def _handoff(self, wt, transcript):
+        """Queue the handoff in the spool; returns the request id (the daemon serves it). The
+        transcript lets the Stop hook's own check run: a question, partial scope or a pending
+        decision goes to Needs Input, never ready (Codex on PR #52)."""
         from . import spool
-        return spool.submit('handoff', wt)['queued']
+        return spool.submit('handoff', wt, transcript=transcript)['queued']
 
     @staticmethod
     def _result(rid):
@@ -349,7 +361,7 @@ class PaneWatch:
             if self.seen(key):
                 return None
             if key in self.inflight:  # Codex on PR #51: done only when the spool says it succeeded
-                rid, at = self.inflight[key]
+                rid, at, t = self.inflight[key]
                 res = self.result(rid)
                 if res is None and now - at < HANDOFF_WAIT:
                     return None
@@ -358,9 +370,19 @@ class PaneWatch:
                     self.mark(key)
                     return f"{tag}{where}: the missed handoff ran: {str(res.get('log') or res.get('why') or 'done')[:160]}"
                 why = (res or {}).get('error') or f'no answer in {HANDOFF_WAIT} s'
-                self.inflight[key] = (self.handoff(p['wt']['top']), now)
+                self.inflight[key] = (self.handoff(p['wt']['top'], t), now, t)
                 return f"{tag}{where}: the missed handoff failed ({str(why)[:160]}): queued it again"
-            self.inflight[key] = (self.handoff(p['wt']['top']), now)
+            t = self.transcript(p['wt']['top'])
+            if not t:  # Codex on PR #52: no handoff without the Stop hook's question check
+                nt = f"watch-handoff-nt:{n}@{head}"  # a later pass with a transcript still hands off
+                if self.seen(nt):
+                    return None
+                self.wake(f"#{n}: the worker is idle with its card {detail}, but no transcript was found for "
+                          "the Stop hook's question check", nt, pr=n,
+                          detail={'pane': p['id'], 'window': p['window'], 'path': p.get('path')})
+                self.mark(nt)
+                return f"{tag}{where}: finished but {detail}: no transcript for the question check: woke swarmbot"
+            self.inflight[key] = (self.handoff(p['wt']['top'], t), now, t)
             self.incident(f"missed-handoff:{n}@{head[:12]}", f"#{n}: the Stop hook missed a finished worker",
                           f"The worker of #{n} ({where}) was idle with a clean, pushed head {head[:8]} and the card "
                           f"still {detail}.", fix='The pane watcher queued the handoff.')

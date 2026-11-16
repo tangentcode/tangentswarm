@@ -105,7 +105,9 @@ def status(wt=None, g=None, checks_of=checks):
                     'passed': len([1 for _, b in cis if b == 'pass'])})
 
 
-def do_handoff(wt=None):
+def do_handoff(wt=None, transcript=None):
+    """With transcript (the pane watcher's recovered Stop hook), the hook's question check runs
+    first: a question, partial scope or a pending decision goes to Needs Input, never ready."""
     from . import stophook
     wt = wt or worktree()
     branch, head = stophook.pushed_head(wt)
@@ -113,7 +115,7 @@ def do_handoff(wt=None):
         return {'done': False, 'why': f"not finished: {head}"}
     if stophook.seen(f"{branch}@{head}"):
         return {'done': True, 'why': f"head {head[:8]} was already handed off"}
-    line = stophook.run(wt, g=gate())
+    line = stophook.run(wt, g=gate(), transcript=transcript)
     return {'done': line is not None, 'log': line}
 
 
