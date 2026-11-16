@@ -473,3 +473,13 @@ def test_claude_load_counts_live_and_reserved_starts():
                                                                          '602': {'brief_pane': '%1'}}})
     launches.hold('held-b', pr=700)
     assert slots.claude_load() == slots.live_claudes() + 1 + 1 + 1
+
+
+def test_a_revive_is_one_events_row(wt):
+    """tangentswarm #32: resuming an agent and feedback to a running one are logged."""
+    from tangentswarm import eventdb
+    host = FakeHost()
+    slots.revive(7, 'more', out=lambda s: None, sp=FakeSP(wt, live={'pane': '%5', 'agent': 'claude'}),
+                 host=host, claudes=[claude(1, wt, 'b7', 's7')])
+    (r,) = eventdb.store().rows("source='slots'")
+    assert r['event'] == 'feedback' and r['action'] == 'done' and r['pr'] == 7

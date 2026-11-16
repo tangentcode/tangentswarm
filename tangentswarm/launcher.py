@@ -276,11 +276,15 @@ def execute_start(req):
     rec = slots.load()['unstarted'].get(str(pr))
     if not rec:
         return {'ok': True, 'pr': pr, 'note': 'not in the unstarted list'}
+    from . import eventdb
     try:
         note = Launcher().start_existing(pr, rec)
-    except Exception:
+    except Exception as e:
         slots.unstarted_retry(pr)
+        eventdb.log_event('start', source='launcher', pr=pr, actor=rec.get('branch'),
+                          error=f'{type(e).__name__}: {str(e)[:300]}')
         raise
+    eventdb.log_event('start', source='launcher', pr=pr, actor=rec.get('branch'), notes=[note])  # tangentswarm #32
     from .stophook import say
     say(f"start #{pr} (issue #{rec.get('issue')}): {note}")
     return {'ok': True, 'pr': pr, 'note': note}
@@ -290,11 +294,17 @@ def execute(req):
     """The spool op 'launch' (daemon side): {issue, title}."""
     from . import slots
     n, title = int(req['issue']), req.get('title') or f'Issue #{req["issue"]}'
+    from . import eventdb
     try:
         steps = Launcher().launch(n, title)
-    except Exception:
+    except Exception as e:
         slots.launch_done(n)  # free it for the picker: a later pass may try again
+        eventdb.log_event('launch', source='launcher', action=f'issue #{n}', actor=title[:80],
+                          error=f'{type(e).__name__}: {str(e)[:300]}')
         raise
+    m = next((re.search(r'PR #(\d+)', s) for s in steps if re.search(r'PR #(\d+)', s)), None)
+    eventdb.log_event('launch', source='launcher', action=f'issue #{n}', pr=int(m.group(1)) if m else None,
+                      actor=title[:80], notes=steps)  # tangentswarm #32
     from .stophook import say
     say(f"launch #{n}: " + '; '.join(steps))
     return {'ok': True, 'issue': n, 'steps': steps}

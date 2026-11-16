@@ -329,9 +329,14 @@ class Advance:
         if not ar:
             self.out(f"#{n} is not in Auto Review: no MinBot check")
             return 0
+        from . import eventdb
         if not self.minbot_pass({board.AUTO_REVIEW: ar}):
             self.out(f"#{n} stays in Auto Review: " + (self.why[-1] if self.why else 'no MinBot pass'))
+            if not self.dry:
+                eventdb.log_event('minbot-check', source='cascade', action='no pass', pr=n, notes=self.why[-1:])
             return 0
+        if not self.dry:
+            eventdb.log_event('minbot-check', source='cascade', action='pass', pr=n, notes=['Auto Review -> Ready'])
         if not self.dry:  # Codex on PR #26: a new Ready PR may fill Staging now, not at the next tick
             flag_rerun(by=f'MinBot pass #{n}')
             self.out(f"#{n} reached Ready: cascade {queue_cascade()}")
@@ -387,7 +392,7 @@ class Advance:
             self.minbot('evidence', n, '--repo', REPO, '--title', 'MinBot pass', '--commit', head,
                         '--body', pass_text(head))
         if not self.dry:
-            board.move_card(self.g, p['item'], board.READY)
+            board.move_card(self.g, p['item'], board.READY, n=n)
             from . import moves
             moves.log_move(n, 'Auto Review', 'Ready', head, note='swarm-advance MinBot pass')
         self.out(f"{'would ' if self.dry else ''}MinBot-pass #{n} at {head[:8]}: pass comment, "
@@ -805,13 +810,27 @@ class Cascade(Advance):
         mark = dict(gqlmeter.TALLY)
         self.out(f"cascade: start{' (dry run)' if self.dry else ''}; budget {BUDGET}s; "
                  f"pass {os.environ[gqlmeter.PASS_ENV]}")
+        lines, out, error = [], self.out, None
+
+        def keep(line):
+            lines.append(str(line))
+            out(line)
+        self.out = keep
         try:
             return self._run(t0)
+        except Exception as e:
+            error = f'{type(e).__name__}: {str(e)[:300]}'
+            raise
         finally:
+            self.out = out
             calls, pts = gqlmeter.since_mark(mark)
             self.out(f"graphql: {pts} points in {calls} queries in this process "
                      f"(remaining {gqlmeter.TALLY['remaining']}); per pass with hr-gate: "
                      f"python -m tangentswarm.gqlmeter --passes")
+            if not self.dry:  # one events DB row per cascade pass (tangentswarm #32)
+                from . import eventdb
+                eventdb.log_event('cascade', source='cascade', actor=os.environ[gqlmeter.PASS_ENV],
+                                  notes=[l for l in lines if not l.endswith('reading the board')][:80], error=error)
 
     def _run(self, t0):
         from .promoted import read_columns
@@ -1023,6 +1042,8 @@ def main(argv=None):
                     help='the MinBot check of one Auto Review PR, under the lock (the Stop hook)')
     ap.add_argument('--floor', type=int, help=f'--cascade: Staging floor (default {FLOOR}, env SWARM_STAGING_FLOOR)')
     a = ap.parse_args(argv)
+    from . import eventdb
+    eventdb.set_source('cascade')
     if a.floor is not None:
         FLOOR = a.floor
         os.environ['SWARM_STAGING_FLOOR'] = str(a.floor)  # the move log records it

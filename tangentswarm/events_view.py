@@ -18,8 +18,8 @@ follows new rows. One row per event:
   with its Claude, active or idle, tests and other processes, memory, CPU, PR and card, under
   the host load and the start capacity. In a terminal the keys are: a agents, e events, q quit.
 
-  swarm-events [--since today|all|YYYY-MM-DD] [-v] [--once] [--db PATH] [--color|--no-color]
-               [--redraw S] [--agents]
+  swarm-events [--since today|all|YYYY-MM-DD] [--source S[,S...]] [-v] [--once] [--db PATH]
+               [--color|--no-color] [--redraw S] [--agents]
 """
 import argparse
 import json
@@ -255,9 +255,16 @@ def connect(path):
     return db
 
 
-def rows_after(db, last_id, since=''):
-    return [dict(r) for r in db.execute('SELECT * FROM events WHERE id > ? AND received_at >= ? ORDER BY id',
-                                        (last_id, since))]
+def rows_after(db, last_id, since='', sources=()):
+    q, args = 'SELECT * FROM events WHERE id > ? AND received_at >= ?', [last_id, since]
+    if sources:
+        has_source = any(r[1] == 'source' for r in db.execute('PRAGMA table_info(events)'))
+        if has_source:
+            q += f" AND source IN ({', '.join('?' * len(sources))})"
+            args += list(sources)
+        elif 'webhook' not in sources:  # an old webhook-only DB
+            return []
+    return [dict(r) for r in db.execute(q + ' ORDER BY id', args)]
 
 
 def blocks(rows, now=None, color=True, verbose=False):
@@ -332,7 +339,8 @@ def key_list(pressed):
 
 
 def run(path, since='today', verbose=False, once=False, color=None, out=sys.stdout, sleep=time.sleep,
-        polls=None, redraw=10.0, clock=time.time, tty=None, screen='events', keys=None, sample=None):
+        polls=None, redraw=10.0, clock=time.time, tty=None, screen='events', keys=None, sample=None,
+        sources=()):
     """--once or a pipe: print the events, then append new ones. A terminal: redraw the screen
     on a new event and every `redraw` s, so the age shading stays true. screen='agents' shows
     the Agents screen (once on a pipe); in a terminal, keys(timeout) switches the screen."""
@@ -375,7 +383,7 @@ def run(path, since='today', verbose=False, once=False, color=None, out=sys.stdo
         if db is None and os.path.exists(path):
             db = connect(path)
         try:
-            got = rows_after(db, last, lower) if db is not None else []
+            got = rows_after(db, last, lower, sources) if db is not None else []
         except sqlite3.OperationalError as e:  # e.g. a busy WAL checkpoint: try again
             got = []
             print(f"swarm-events: {e}", file=sys.stderr)
@@ -416,6 +424,9 @@ def main(argv=None):
     ap.add_argument('-v', '--verbose', action='store_true', help='print the full rows as JSON')
     ap.add_argument('--once', action='store_true', help='print the events and exit (no follow)')
     ap.add_argument('--db', default=eventdb.PATH)
+    ap.add_argument('--source', action='append', default=[],
+                    help='only these sources (repeat or comma list): webhook, mcp, stop-hook, launcher, slots, '
+                         'relay, minbot, gh, board, cascade, hr-gate')
     ap.add_argument('--redraw', type=float, default=10.0, help='seconds between redraws in a terminal (age shading)')
     ap.add_argument('--color', dest='color', action='store_true', default=None)
     ap.add_argument('--no-color', dest='color', action='store_false')
@@ -426,8 +437,9 @@ def main(argv=None):
     except ValueError:
         ap.error('--since: today, all or YYYY-MM-DD')
     try:
+        sources = tuple(s.strip() for x in a.source for s in x.split(',') if s.strip())
         return run(a.db, a.since, a.verbose, a.once, a.color, redraw=a.redraw,
-                   screen='agents' if a.agents else 'events')
+                   screen='agents' if a.agents else 'events', sources=sources)
     except KeyboardInterrupt:
         return 0
 

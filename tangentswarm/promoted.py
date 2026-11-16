@@ -439,7 +439,7 @@ class Promoter:
                 if self.dry:
                     say(f"would move #{n} Staging -> Human Review (cheap check passed at {head[:8]})")
                 else:
-                    board.move_card(self.g, p['item'], board.HUMAN_REVIEW)
+                    board.move_card(self.g, p['item'], board.HUMAN_REVIEW, n=p['number'])
                     self.g['log']('apply', n, head[:8], 'PASS', [])
                     from . import moves
                     moves.log_move(n, 'Staging', 'Human Review', head, note='cheap check')
@@ -608,6 +608,8 @@ def main(argv=None):
     ap.add_argument('--once', action='store_true')
     ap.add_argument('--dry-run', action='store_true')
     a = ap.parse_args(argv)
+    from . import eventdb
+    eventdb.set_source('daemon')
     p = Promoter(dry_run=a.dry_run)
     if a.once:
         say('result: ' + p.once())

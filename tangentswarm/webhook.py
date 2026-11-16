@@ -347,7 +347,7 @@ class Executor:
     def move(self, n, item, col):
         if self.dry:
             return self.note(f"would move #{n} to {col}")
-        board.move_card(self.g, item, col, self._sh)
+        board.move_card(self.g, item, col, self._sh, n=n)
         self.note(f"#{n} -> {col}")
 
     def minbot(self, n):
@@ -976,6 +976,7 @@ def serve(port=PORT, host='127.0.0.1'):
 
 
 def main(argv=None):
+    eventdb.set_source('webhook')
     ap = argparse.ArgumentParser(prog='swarm-webhook', description=__doc__.split('\n', 1)[0])
     ap.add_argument('--port', type=int, default=PORT)
     ap.add_argument('--classify', metavar='FILE', help='print the actions for a recorded {event, payload} file')

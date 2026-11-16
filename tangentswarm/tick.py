@@ -366,6 +366,8 @@ def gate_reasons(rows):
 
 def sh(argv, check=False, timeout=300):
     r = subprocess.run([str(a) for a in argv], capture_output=True, text=True, timeout=timeout)
+    from . import eventdb
+    eventdb.log_command(argv, r.returncode, '', r.stderr or r.stdout)  # tangentswarm #32: minbot calls, gh writes
     if check and r.returncode:
         raise RuntimeError(f"{' '.join(str(a) for a in argv[:3])}...: {(r.stderr or r.stdout).strip()[:200]}")
     return r
@@ -800,7 +802,7 @@ class Tick:
                 sh(['gh', 'pr', 'ready', str(n), '-R', REPO], check=True)
             self.change(f"#{n} marked ready (Claude finished, head {head[:8]} pushed)")
         if not self.dry:
-            board.move_card(self.g, pr['item'], board.AUTO_REVIEW)
+            board.move_card(self.g, pr['item'], board.AUTO_REVIEW, n=pr.get('number'))
         self.change(f"#{n} card In Progress -> Auto Review")
         key = f"codex-request:{n}@{head}"
         if codex_clean or self.state.done(key) or codex_requested(full):

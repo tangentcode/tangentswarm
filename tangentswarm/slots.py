@@ -493,6 +493,7 @@ def park_idle_others(dry=False, out=print, found=None, park=None):
                                              window=c['window'], parked_at=et_now())
         done.append(c['window'])
         out(f"park: {c['window']} parked after {mins} min idle; session {c['session']} kept; its window stays")
+        _event('park', actor=c['window'], notes=[f"idle {mins} min, no PR card; session {c['session']}"])
     return done
 
 
@@ -571,6 +572,7 @@ def park_ready(prs, cols, dry=False, out=print, claudes=None, park=None, path=No
             st['rework'].pop(str(n), None)
         done.append(n)
         out(f"park: #{n} parked; session {c['session']} kept for swarm-revive {n}")
+        _event('park', pr=n, actor=c.get('window'), notes=[f"its PR is in {col}; session {c['session']}"])
     return done
 
 
@@ -585,6 +587,7 @@ def tell_worker(n, text, sp=None, host=None, out=print):
         out(f"#{n}: no running Claude in {window}: not told")
         return False
     host.tell(existing['pane'], one_line(text))
+    _event('tell', pr=n, actor=window, notes=[one_line(text)[:600]])
     return True
 
 
@@ -617,9 +620,44 @@ def one_line(text):
     return t
 
 
+def _event(event, **kw):
+    from . import eventdb
+    eventdb.log_event(event, source='slots', **kw)
+
+
 def revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, path=None):
     """(b) Resume PR n's Claude (claude --resume SESSION) in its window, in a rework slot,
-    and send the feedback. 0 done, 1 refused or failed, 3 held (no rework slot or memory)."""
+    and send the feedback. 0 done, 1 refused or failed, 3 held (no rework slot or memory).
+    Every non-dry call is one events DB row: 'resume' (a new Claude), 'feedback' (to a
+    running one), or the hold or refusal (tangentswarm #32)."""
+    lines = []
+
+    def said(line):
+        lines.append(line)
+        out(line)
+    rc, error = None, None
+    try:
+        rc = _revive(n, text, dry, said, sp, host, claudes, path)
+        return rc
+    except Exception as e:
+        error = f'{type(e).__name__}: {str(e)[:300]}'
+        raise
+    finally:
+        if not dry:
+            ev = 'feedback' if any('already runs' in l for l in lines) else 'resume'
+            _event(ev, action={0: 'done', 1: 'refused', 3: 'held'}.get(rc, 'failed'),
+                   pr=int(str(n).lstrip('#')) if str(n).lstrip('#').isdigit() else None,
+                   notes=lines[-3:] + [one_line_safe(text)[:600]], error=error)
+
+
+def one_line_safe(text):
+    try:
+        return one_line(text)
+    except ValueError:
+        return str(text or '')[:200]
+
+
+def _revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, path=None):
     n = int(str(n).lstrip('#'))
     try:
         text = one_line(text)
