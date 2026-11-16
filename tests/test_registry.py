@@ -63,7 +63,35 @@ def call_tool(name, **kw):
 
 def test_launch_argv_is_fixed(fake_bins):
     assert registry.launch_argv('muse') == [fake_bins['muse'], '--trust-workspace']
-    assert registry.launch_argv('claude') == ['/usr/bin/env', 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0', '--', fake_bins['claude']]
+    assert registry.launch_argv('claude') == ['/usr/bin/env', '--', 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0', fake_bins['claude']]
+
+
+def test_launch_argv_runs_and_sets_env(tmp_path, monkeypatch):
+    """The env argv really starts the agent with the variable set (env exits 127 on a bad order)."""
+    out = tmp_path / 'out'
+    p = tmp_path / 'bin' / 'claude'
+    p.parent.mkdir()
+    p.write_text(f'#!/bin/sh\necho "$CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION" "$@" > {out}\n')
+    p.chmod(0o755)
+    monkeypatch.setenv('TANGENTSWARM_AGENT_CLAUDE', str(p))
+    for flags in ((), ('--x',)):
+        argv = registry._exec_argv(str(p), flags, ('CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0',))
+        assert subprocess.run(argv).returncode == 0
+        assert out.read_text().split() == ['0', *flags]
+    assert subprocess.run(registry.launch_argv('claude')).returncode == 0
+    assert out.read_text().split() == ['0']
+
+
+def test_binary_path_with_equals_is_not_used(tmp_path, monkeypatch):
+    """env would read such a path as NAME=VALUE, not as the command."""
+    p = tmp_path / 'a=b' / 'claude'
+    p.parent.mkdir()
+    p.write_text('#!/bin/sh\n')
+    p.chmod(0o755)
+    monkeypatch.setenv('TANGENTSWARM_AGENT_CLAUDE', str(p))
+    assert registry.resolve_binary('claude') is None
+    with pytest.raises(registry.AgentError, match='not installed'):
+        registry.launch_argv('claude')
 
 
 def test_unknown_agent_rejected(fake_bins, root):
@@ -138,7 +166,7 @@ def test_start_agent_execs_argv_without_a_shell(fake_bins, root, monkeypatch):
     out = registry.launch_agent('claude', 'proj', session='scratch', run=rec)
     argv = rec.calls[0]
     assert argv[:2] == ['tmux', 'new-session'] and argv[argv.index('-s') + 1] == 'scratch'
-    assert argv[argv.index('--') + 1:] == ['/usr/bin/env', 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0', '--', fake_bins['claude']]
+    assert argv[argv.index('--') + 1:] == ['/usr/bin/env', '--', 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0', fake_bins['claude']]
     assert out['window_name'] == 'claude-proj'
 
 

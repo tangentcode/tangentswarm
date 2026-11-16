@@ -89,7 +89,8 @@ def resolve_binary(name):
     cands = (override,) if override else spec.candidates
     for c in cands:
         p = os.path.expanduser(c)
-        if os.path.isabs(p) and _executable(p):
+        # env reads an argument with '=' as an assignment, not as the command
+        if os.path.isabs(p) and '=' not in p and _executable(p):
             return p
     return None
 
@@ -97,9 +98,11 @@ def resolve_binary(name):
 def _exec_argv(path, flags, env=()):
     # tmux execs a multi-argument command directly but hands a single argument to
     # `sh -c`; run through env when there are no flags, or when we need to set env,
-    # so a shell is never involved.
+    # so a shell is never involved. GNU env reads `[OPTION]... [-] [NAME=VALUE]...
+    # [COMMAND]`: `--` must come before the assignments, or env takes `--` as the
+    # command and exits 127.
     if env or not flags:
-        return ['/usr/bin/env', *env, '--', path, *flags]
+        return ['/usr/bin/env', '--', *env, path, *flags]
     return [path, *flags]
 
 
