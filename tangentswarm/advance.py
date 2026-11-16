@@ -1054,7 +1054,9 @@ def main(argv=None):
             return Advance().step()
     except gatelock.Busy as e:
         # No "busy, give up": the swarm-promoted daemon owns the queue and runs it under the lock.
-        print(f"busy: {e}; " + queue_self(['--minbot', str(a.minbot)] if a.minbot else []))
+        args = (['--minbot', str(a.minbot)] + (['--repo', a.repo] if a.repo else []) if a.minbot else []) + \
+            (['--promote-board', str(a.promote_board)] if a.promote_board else [])  # Codex on PR #47: keep them
+        print(f"busy: {e}; " + queue_self(args))
         return gatelock.EXIT_BUSY
     except CascadeTimeout as e:  # a dry run (no lock, no flag)
         _say(f"stopped: {e}")

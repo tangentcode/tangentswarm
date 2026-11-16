@@ -144,3 +144,25 @@ def test_a_ready_pr_that_conflicts_now_is_not_promoted(monkeypatch):
     monkeypatch.setattr(boards, 'open_prs', lambda gql, b: adv.cols)
     monkeypatch.setattr(board, 'move_card', lambda *a, **k: None)
     assert boardflow.promote(adv, B6) == [30] and any('#20 stays in Ready' in l for l in adv.lines)
+
+
+def test_a_busy_lock_requeues_the_repo_and_board_arguments(monkeypatch, tmp_path):
+    """Codex on PR #47: a requeue lost --repo and --promote-board."""
+    from tangentswarm import advance as A, gatelock
+
+    class Busy:
+        def __init__(self, name):
+            pass
+
+        def __enter__(self):
+            raise gatelock.Busy('held by hr-gate')
+
+        def __exit__(self, *a):
+            return False
+    monkeypatch.setattr(gatelock, 'gate_lock', Busy)
+    monkeypatch.setattr(A, 'Advance', lambda **k: None)
+    queued = []
+    monkeypatch.setattr(A, 'queue_self', lambda args=(), qdir=None: queued.append(list(args)) or 'queued')
+    A.main(['--minbot', '47', '--repo', TS])
+    A.main(['--promote-board', '6'])
+    assert queued == [['--minbot', '47', '--repo', TS], ['--promote-board', '6']]
