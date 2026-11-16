@@ -101,6 +101,16 @@ def actions(rec, card_col=None):
     return []
 
 
+def transcript_of(worktree, projects=None):
+    """The newest Claude transcript (JSONL) of a worktree, or None (slots.latest_session)."""
+    from . import slots
+    sid = slots.latest_session(worktree, projects)
+    if not sid:
+        return None
+    import re
+    return str((projects or slots.PROJECTS) / re.sub(r'[^A-Za-z0-9]', '-', str(worktree)) / f'{sid}.jsonl')
+
+
 def _log(event, **kw):
     try:
         from . import eventdb
@@ -119,7 +129,7 @@ def _wake(pr, why, key):
 
 class PaneWatch:
     def __init__(self, sh=None, capture=None, is_claude=None, cols=None, submit=None, wake=None,
-                 path=None, out=print, dry=False):
+                 path=None, out=print, dry=False, transcript=None):
         self.sh = sh or tick.sh
         self.capture = capture or tick.capture
         self.is_claude = is_claude or tick.is_claude
@@ -127,6 +137,7 @@ class PaneWatch:
         self.submit = submit
         self.wake = wake or _wake
         self.path, self.out, self.dry = path, out, dry
+        self.transcript = transcript
 
     def card_cols(self):
         if self.cols:
@@ -152,8 +163,12 @@ class PaneWatch:
                 _log('pane', action=rec['cls'], pr=rec['pr'], actor=rec['window'], notes=rec['tail'][-2:])
             todo = actions(rec)
             if not todo and rec['claude'] and rec['cls'] == 'idle' and rec['acted'] != rec['hash'] and rec['pr']:
-                cols = cols if cols is not None else self.card_cols()
-                todo = actions(rec, cols.get(rec['pr']))
+                try:  # Codex on PR #52: a board outage must not stop the other panes' observations
+                    cols = cols if cols is not None else self.card_cols()
+                    todo = actions(rec, cols.get(rec['pr']))
+                except Exception as e:
+                    self.out(f"panes: board read failed for {rec['window']}: {type(e).__name__}: {str(e)[:120]}")
+                    cols = {}
             for kind, detail in todo:
                 self.act(rec, kind, detail)
             state[p['id']] = rec
@@ -168,8 +183,16 @@ class PaneWatch:
         if kind == 'enter':
             self.sh(['tmux', 'send-keys', '-t', rec['id'], 'Enter'])
         elif kind == 'stophook':
-            from . import spool
-            (self.submit or spool.submit)('stophook', detail)
+            # Codex on PR #52: the hook's own safety check (a question, partial scope, a pending
+            # decision goes to Needs Input, never ready) needs the worker's transcript
+            t = (self.transcript or transcript_of)(detail)
+            if not t:
+                kind, detail = 'wake', (f"pane {rec['window']} ({rec['id']}) is idle with its card In Progress, "
+                                        "but no transcript was found for the Stop-hook check")
+                self.wake(rec['pr'], detail, f"pane:{rec['id']}:{rec['hash']}")
+            else:
+                from . import spool
+                (self.submit or spool.submit)('stophook', detail, transcript=t)
         elif kind == 'wake':
             self.wake(rec['pr'], detail, f"pane:{rec['id']}:{rec['hash']}")
         _log('pane-action', action=kind, pr=rec['pr'], actor=rec['window'], notes=[str(detail or '')[:300]])
