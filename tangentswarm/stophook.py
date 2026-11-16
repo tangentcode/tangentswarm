@@ -353,8 +353,8 @@ def _run(cwd, g, dry, out, sh, sleep, merges, minbot, transcript, procs, tell):
         ck = f"codex-request:{n}@{head}"
         if not (state.done(ck) or tick.codex_requested(full)):
             if not dry:
-                sh(['gh', 'pr', 'comment', str(n), '-R', REPO, '--body', '@codex review'])
-                state.mark(ck)
+                from . import codexrounds
+                codexrounds.request(n, head, 'stop-hook', sh=sh, state=state)
             did.append('posted "@codex review"')
         if col == board.IN_PROGRESS:
             if not dry:

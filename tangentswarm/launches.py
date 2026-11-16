@@ -161,8 +161,13 @@ def clean_env(env=None):
     return env
 
 
-def start_scoped(branch, window=None):
-    """Run swarm-start-scoped. Returns (rc, json dict or {'refused': text})."""
+def start_scoped(branch, window=None, refuse=None):
+    """Run swarm-start-scoped. Returns (rc, json dict or {'refused': text}). A worktree that
+    already has a live Claude is refused before anything runs (tangentswarm #40 item 8)."""
+    from . import workerprocs
+    why = (refuse or workerprocs.refuse_second_claude)(HOME / 'ver' / ('platform.' + branch.replace('/', '-')))
+    if why:
+        return 1, {'refused': why}
     r = subprocess.run([str(BIN / 'swarm-start-scoped'), branch, *([window] if window else [])],
                        capture_output=True, text=True, timeout=300, env=clean_env())
     try:

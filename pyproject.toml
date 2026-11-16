@@ -41,6 +41,8 @@ swarm-worker-mcp = "tangentswarm.worker_mcp:main"
 swarm-webhook = "tangentswarm.webhook:main"
 swarm-events = "tangentswarm.events_view:main"
 swarm-tmux-status = "tangentswarm.tmux_status:main"
+swarm-watch = "tangentswarm.watchdog:main"
+swarm-codex-rounds = "tangentswarm.codexrounds:main"
 
 [tool.setuptools]
 packages = ["tangentswarm", "tangentswarm.cloud", "tangentswarm.queue"]
