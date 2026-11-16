@@ -964,15 +964,14 @@ The old `webhook-events.sqlite` is renamed to it once. Each row has a `source` a
 
 Rows are written with `eventdb.log_event()`, which never raises.
 
-`swarm-events` is the console viewer of that log. It opens the DB read-only and shows
-today's events (ET), one row per event: time, status (handled, queued, failed), event, PR,
-actor and the outcome in plain words ("moved #513 to Done; cascade"). Skipped events, log-only
+`swarm-events` is the console viewer of that log. `--source mcp,stop-hook` shows only those
+sources. It opens the DB read-only and shows today's events (ET), one row per event: time,
+status (handled, queued, failed), event (an action row starts with its source), PR, actor and the outcome in plain words ("moved #513 to Done; cascade"). Skipped events, log-only
 events, redeliveries and cascade passes that did nothing are hidden. A signature shows only
 when it failed (white on red); a failed event is red. In a terminal the screen is redrawn
 every 10 s (`--redraw`): rows from the last 2 minutes are bright, and each older minute is a
 darker gray. `-v` prints the rows as JSON. `--since all|YYYY-MM-DD` and `--once` are also
-available. `--source mcp,stop-hook`
-shows only those sources.
+available.
 
 The Agents screen (press `a` in a terminal, `e` to go back, `q` to quit; or start with
 `--agents`) shows one line per pane of the `agents` tmux session, read live from tmux, `/proc`

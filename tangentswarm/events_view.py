@@ -18,8 +18,8 @@ follows new rows. One row per event:
   with its Claude, active or idle, tests and other processes, memory, CPU, PR and card, under
   the host load and the start capacity. In a terminal the keys are: a agents, e events, q quit.
 
-  swarm-events [--since today|all|YYYY-MM-DD] [-v] [--once] [--db PATH] [--color|--no-color]
-               [--redraw S] [--agents]
+  swarm-events [--since today|all|YYYY-MM-DD] [--source S[,S...]] [-v] [--once] [--db PATH]
+               [--color|--no-color] [--redraw S] [--agents]
 """
 import argparse
 import json
@@ -257,12 +257,12 @@ def connect(path):
 
 def rows_after(db, last_id, since='', sources=()):
     q, args = 'SELECT * FROM events WHERE id > ? AND received_at >= ?', [last_id, since]
-    if sources:  # tangentswarm #32: only these sources (the old DB has only webhook rows)
+    if sources:
         has_source = any(r[1] == 'source' for r in db.execute('PRAGMA table_info(events)'))
         if has_source:
             q += f" AND source IN ({', '.join('?' * len(sources))})"
             args += list(sources)
-        elif 'webhook' not in sources:
+        elif 'webhook' not in sources:  # an old webhook-only DB
             return []
     return [dict(r) for r in db.execute(q + ' ORDER BY id', args)]
 
@@ -437,7 +437,7 @@ def main(argv=None):
     except ValueError:
         ap.error('--since: today, all or YYYY-MM-DD')
     try:
-        sources = tuple(x.strip() for v in a.source for x in v.split(',') if x.strip())
+        sources = tuple(s.strip() for x in a.source for s in x.split(',') if s.strip())
         return run(a.db, a.since, a.verbose, a.once, a.color, redraw=a.redraw,
                    screen='agents' if a.agents else 'events', sources=sources)
     except KeyboardInterrupt:
