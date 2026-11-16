@@ -806,3 +806,41 @@ def test_a_pre_merge_built_on_a_resolved_tip_ahead_never_skips(tmp_path, monkeyp
     p, g, merges, cols = premerged(tmp_path, monkeypatch, base,
                                    scratch=GitScratch(premerge_graph(base, head='9' * 40)))
     assert p.fast_path(cols, reread=lambda: cols) == [5] and merges
+
+
+def test_a_pre_merge_that_holds_a_refused_staging_pr_never_skips(tmp_path, monkeypatch):
+    """Codex on PR #68: #4 is ahead of #5 in Staging but is refused (no gate pass), so it
+    stays. #5's pre-merge holds #4, and proves nothing about #5 with Human Review alone:
+    the full check runs."""
+    H4 = '4' * 40
+    base = f"{MAIN[:12]} #1@a #4@{H4[:12]}"
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, base)
+    g['gql'] = lambda q, **v: {'repository': {'p4': detail(4, H4), 'p5': detail(5, H5)}}
+    cols[board.STAGING] = [dict(number=4, head=H4, item='I4')] + cols[board.STAGING]
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and merges
+    assert p.left == [(4, H4, 'head 44444444 has no gate pass')]
+
+
+def test_the_slow_path_sees_the_slots_freed_during_the_fast_path(tmp_path, monkeypatch, clean):
+    """Codex on PR #68: Human Review is [#1]; #5 moves, and the re-read shows #1 and #5
+    merged. once() must count 0 of 2 (not 1 + 1), so the slow path re-gates #7 now."""
+    H7 = '7' * 40
+    boards = [page(item(1, HR, 'a'), item(5, ST, H5), item(7, ST, H7))] * 2 + [page(item(7, ST, H7))]
+    det = {'repository': {'p5': detail(5, H5), 'p7': detail(7, H7)}}
+    g = G(tmp_path)
+    g['gql'] = lambda q, **v: det if 'pullRequest(number:' in q else (boards.pop(0) if len(boards) > 1 else boards[0])
+    p = P.Promoter(g=g)
+    slow = []
+    monkeypatch.setattr(p, 'main_sha', lambda: None)
+    monkeypatch.setattr(p, 'queue_cascade', lambda why, now=None: None)
+    monkeypatch.setattr(p, 'slow_path', lambda: slow.append([n for n, _, _ in p.regate()]))
+
+    class L:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+    monkeypatch.setattr(P.gatelock, 'gate_lock', lambda name: L())
+    assert p.once() == 'promoted'
+    assert g.moves == [('I5', board.HUMAN_REVIEW)] and p.hr_count == 0 and slow == [[7]]

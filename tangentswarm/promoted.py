@@ -258,6 +258,7 @@ class Promoter:
         self.lag_woken = set()  # work SHAs whose lag already woke swarmbot (once per SHA)
         self.lag_checked = 0.0
         self.events = None       # tangentswarm.events reader (made on first use)
+        self.board, self.hr_count = None, 0  # fast_path's latest board read and Human Review slots in use
 
     def main_sha(self):
         """origin main's SHA via git ls-remote (no API quota), or None on an error."""
@@ -467,7 +468,10 @@ class Promoter:
         lands during the pass is filled in the same pass. A PR moved in this pass counts in
         Human Review even when the re-read does not show it there yet (board lag)."""
         from . import flow
-        if len(cols.get(board.HUMAN_REVIEW, [])) >= HR_TARGET or not cols.get(board.STAGING):
+        # Codex on PR #68: the latest board read and the Human Review slots in use (this
+        # pass's moves that are still open count), for once()'s slow-path check
+        self.board, self.hr_count = cols, len(cols.get(board.HUMAN_REVIEW, []))
+        if self.hr_count >= HR_TARGET or not cols.get(board.STAGING):
             return []
         reread = reread or (lambda: read_columns(self.g['gql'], max_age=0))
         gated = gate_times(self.log_text())
@@ -496,6 +500,7 @@ class Promoter:
                 lag = {q['number'] for q in cols.get(board.STAGING, [])}
                 hr += [q for n, q in done.items() if n in lag]
                 staging = [q for q in cols.get(board.STAGING, []) if q['number'] not in done]
+                self.board, self.hr_count = cols, len(hr)
                 if len(hr) >= HR_TARGET or not staging:
                     break
                 details = read_details(self.g['gql'], [q['number'] for q in staging])
@@ -504,10 +509,13 @@ class Promoter:
                 for i, p in enumerate(order):
                     n, head = p['number'], p['head']
                     ahead = [(q['number'], q['head']) for q in staging_order(hr, details, [], board.active_fast_track())]
-                    ahead += [(q['number'], q['head']) for q in order[:i]]
+                    # Codex on PR #68: a Staging PR ahead of p in this scan was refused (an
+                    # accepted one moves to Human Review), so it is not promoted with p; a
+                    # pre-merge that holds it proves nothing pairwise with Human Review.
+                    proof = not order[:i]
 
-                    def merge(head, p=p, ahead=ahead):
-                        if self.premerge_current(p, details.get(p['number']), ahead, tip, scratch, main_ref):
+                    def merge(head, p=p, ahead=ahead, proof=proof):
+                        if proof and self.premerge_current(p, details.get(p['number']), ahead, tip, scratch, main_ref):
                             say(f"#{p['number']}: merge-ready on the current future main: no scratch merge")
                             return None
                         main = main_ref()
@@ -629,6 +637,18 @@ class Promoter:
             left.remove(hit)
         return not left
 
+    def fill(self, cols):
+        """(latest board, moved PRs, Human Review slots in use) after the fast path, when
+        Human Review needs it. The count is from fast_path's last board read (Codex on PR #68:
+        a PR moved in this pass that merged since does not hold a slot)."""
+        if not needs_promotion(cols):
+            return cols, [], len(cols.get(board.HUMAN_REVIEW, []))
+        self.board = None
+        moved = self.fast_path(cols)
+        if self.board is None:  # no board from the fast path: count as before
+            return cols, moved, len(cols.get(board.HUMAN_REVIEW, [])) + len(moved)
+        return self.board, moved, self.hr_count
+
     def slow_path(self, run=None):
         """After the fast move, Human Review still short: hr-gate --apply for each leftover head
         with no gate pass (a full gate under our lock; it moves the card to Human Review when a
@@ -712,21 +732,20 @@ class Promoter:
         try:
             with (gatelock.gate_lock('swarm-promoted') if not self.dry else _null()):
                 cols = read_columns(self.g['gql'], max_age=0)  # fresh, under the lock
-                moved = self.fast_path(cols) if needs_promotion(cols) else []
+                cols, moved, hr = self.fill(cols)
                 if moved:  # a free Staging slot: restock it now (the drain below runs it under our lock)
                     self.queue_cascade(f"promoted {', '.join('#' + str(n) for n in moved)}: restock Staging")
                 drained = self.drain()
                 if drained:  # a queued run may have moved cards: read again before the rest
                     cols = read_columns(self.g['gql'], max_age=0)  # the new read already has our moves
                     # tangentswarm #67: a slot freed during the drain (a merge) is filled in this pass
-                    moved = self.fast_path(cols) if needs_promotion(cols) else []
+                    cols, moved, hr = self.fill(cols)
                     if moved:
                         self.queue_cascade(f"promoted {', '.join('#' + str(n) for n in moved)}: restock Staging")
                 if main and (main_moved or self.main_retry_due(cols)):
                     self.main_pass(cols, moved, main)
                     self.last_main = main
                     self.main_retry_at = time.time() + MAIN_RETRY
-                hr = len(cols.get(board.HUMAN_REVIEW, [])) + len(moved)
                 if hr < HR_TARGET and any(a[0].endswith('pending-promote') for a, _ in drained):
                     self.mark_tried()  # a queued pending-promote just ran: that was the slow path
                 elif hr < HR_TARGET and self.slow_due():
