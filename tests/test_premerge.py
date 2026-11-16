@@ -292,7 +292,7 @@ def test_future_main_takes_a_queued_pr_as_its_resolved_vn_tip(world):
     cols = {HR: [card(1, HR, h['hr1'])], ST: [card(7, ST, h['c'])], RD: [card(9, RD, h['z'])]}
     f2, _ = make(world)
     key, fm, why = f2.future_main(s, cols)
-    assert why is None and f'#7@{tip[:12]}' in key
+    assert why is None and subprocess.run(['git', '--git-dir', s.dir, 'merge-base', '--is-ancestor', tip, fm]).returncode == 0
     assert f2.premerge(cols, s)[9] == remote(s, origin, 'b9-v1')
 
 
@@ -323,7 +323,7 @@ def test_a_ready_record_whose_tip_is_gone_is_rebuilt_as_the_next_vn(world):
     assert tips == {9: remote(s, origin, 'b9-v2')} and flow.load_premerge()['9']['vbranch'] == 'b9-v2'
 
 
-def test_a_tip_that_conflicts_only_with_stale_work_rebuilds_work_as_future_main(world):
+def test_a_tip_that_conflicts_only_with_stale_work_gives_work_the_future_main_tree(world):
     """work holds a PR that was pulled and then sent back: the next tip merges cleanly onto
     future main but not onto work. work becomes future main + the PR in a fast-forward push
     (no force, no worker), instead of blocking the queue forever."""
@@ -342,5 +342,52 @@ def test_a_tip_that_conflicts_only_with_stale_work_rebuilds_work_as_future_main(
     v9 = remote(s, origin, 'b9-v1')
     assert subprocess.run(['git', '--git-dir', s.dir, 'merge-base', '--is-ancestor', old, new]).returncode == 0
     assert run(w, 'show', f'{new}:z.txt') == 'z' and run(w, 'show', f'{new}:s.txt') == 's'
-    assert any(n.startswith('#9: its pre-merged tip') and 'work is rebuilt as future main + #9' in n for n in f.notes)
+    assert run(w, 'show', f'{new}:z.txt') == 'z'  # the sent-back PR's stale z.txt is gone
     assert subprocess.run(['git', '--git-dir', s.dir, 'merge-base', '--is-ancestor', v9, new]).returncode == 0
+
+
+def test_a_pr_pulled_sent_back_and_pulled_again_gets_all_its_content_back(world):
+    """Codex on PR #66: work kept the sent-back PR's commits as ancestors; when it came back,
+    a merge treated its old changes as already there. work's tree is future main + the batch."""
+    w, s, h, origin = world
+    run(w, 'checkout', '-q', '-b', 'a', h['main'])
+    (w / 'q.txt').write_text('q\n')
+    run(w, 'add', '.')
+    run(w, 'commit', '-qm', 'PR A')
+    a = run(w, 'rev-parse', 'HEAD')
+    f, _ = make(world)
+    cols = {HR: [card(1, HR, h['hr1'])], RD: [card(5, RD, a)]}
+    assert [p['number'] for p in f.pull_batch({}, cols, s, room=1)] == [5]
+    flow.save_pulls([])  # #5 is sent back: not in the queue any more
+    f, _ = make(world)
+    cols = {HR: [card(1, HR, h['hr1'])], RD: [card(9, RD, h['z'])]}
+    f.pull_batch({}, cols, s, room=1)
+    assert subprocess.run(['git', '--git-dir', s.dir, 'cat-file', '-e', f"{remote(s, origin, 'work')}:q.txt"]).returncode != 0
+    flow.save_pulls([])
+    f, _ = make(world)
+    cols = {HR: [card(1, HR, h['hr1']), card(9, HR, h['z'])], RD: [card(5, RD, a)]}
+    assert [p['number'] for p in f.pull_batch({}, cols, s, room=1)] == [5]
+    work = remote(s, origin, 'work')
+    assert run(w, 'show', f'{work}:q.txt') == 'q' and run(w, 'show', f'{work}:z.txt') == 'z'
+
+
+def test_a_queued_tip_built_on_a_pr_that_left_the_queue_is_not_used(world):
+    """Codex on PR #66: B was pre-merged onto future main with A; A is sent back while B
+    stays in Staging. Future main must not carry A in through B's old tip."""
+    w, s, h, origin = world
+    run(w, 'checkout', '-q', '-b', 'a', h['main'])
+    (w / 'q.txt').write_text('q\n')
+    run(w, 'add', '.')
+    run(w, 'commit', '-qm', 'PR A')
+    a = run(w, 'rev-parse', 'HEAD')
+    f, _ = make(world)
+    tips = f.premerge({ST: [card(5, ST, a)], RD: [card(9, RD, h['z'])]}, s)
+    assert subprocess.run(['git', '--git-dir', s.dir, 'cat-file', '-e', f'{tips[9]}:q.txt']).returncode == 0
+    f, _ = make(world)
+    key, fm, why = f.future_main(s, {ST: [card(9, ST, h['z'])]})  # A left; B (#9) is in Staging
+    assert why is None
+    assert subprocess.run(['git', '--git-dir', s.dir, 'cat-file', '-e', f'{fm}:q.txt']).returncode != 0
+    assert run(w, 'show', f'{fm}:z.txt') == 'z'
+    f, _ = make(world)  # with A still ahead of it, B's tip is used as is
+    key, fm, why = f.future_main(s, {ST: [card(5, ST, a), card(9, ST, h['z'])]})
+    assert subprocess.run(['git', '--git-dir', s.dir, 'merge-base', '--is-ancestor', tips[9], fm]).returncode == 0

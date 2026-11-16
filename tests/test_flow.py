@@ -368,7 +368,7 @@ def test_strict_pull_takes_only_the_next_pr_and_only_when_it_is_merge_ready(monk
     monkeypatch.setattr(f, 'future_main', lambda scratch, cols: ('key', 'fm', None))
     monkeypatch.setattr(f, 'premerge_one', lambda p, scratch, fm: seen.append(p['number']) or ready[p['number']])
     started = []
-    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, rebuild=False: started.append((p['number'], tip, rebuild)) or True)
+    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False: started.append((p['number'], tip, pre_merged)) or True)
     _, cols = f.columns()
     assert f.pull(prs, cols, g['ScratchRepo'](), limit=5, strict=True) is None
     assert seen == [9] and started == [] and g.moves == []
@@ -405,8 +405,9 @@ def test_pull_batch_merges_the_pre_merged_tips_into_work_in_one_push(repo, tmp_p
         assert subprocess.run(['git', '--git-dir', s.dir, 'merge-base', '--is-ancestor', c, tip]).returncode == 0
     assert subprocess.run(['git', '--git-dir', s.dir, 'merge-base', '--is-ancestor', h['z'], tip]).returncode != 0
     assert [(d['pr'], d['tip'], d['work']) for d in flow.load_pulls()] == [(7, v7, tip)]
-    assert f.did[-1].startswith(f"did: #7 {v7[:8]} pulled: 1 pre-merged tip(s) merged into work") \
+    assert f.did[-1].startswith(f"did: #7 {v7[:8]} pulled: 1 pre-merged tip(s) in work") \
         and 'in one push' in f.did[-1]
+    assert run(s.dir, 'rev-parse', f'{tip}^{{tree}}') == run(s.dir, 'rev-parse', f'{v7}^{{tree}}')
     assert run(s.dir, 'ls-remote', str(origin), 'refs/heads/b7') == ''  # the PR's own branch is never pushed
 
 

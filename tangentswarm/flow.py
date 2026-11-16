@@ -429,7 +429,7 @@ class Flow:
                 if not tip:
                     self.note(f"#{n} is next in the pick order and is not merge-ready: nothing behind it is pulled")
                     return None
-                return p if self.start_pull(p, scratch, tip, rebuild=True) else None
+                return p if self.start_pull(p, scratch, tip, pre_merged=True) else None
             if not self.clean(scratch, main, p['head']):
                 self.fail(p, 'does not merge cleanly onto main: merge origin/main into the branch (no rebase)',
                           relay='merge-main')
@@ -454,31 +454,34 @@ class Flow:
         git(scratch, 'fetch', '--no-tags', '--quiet', self.g['origin_url'](), f'{WORK}:refs/heads/{WORK}')
         return git(scratch, 'rev-parse', f'refs/heads/{WORK}').stdout.strip()
 
-    def merge_into_work(self, scratch, n, tip, label, rebuild=False):
+    def merge_into_work(self, scratch, n, tip, label, pre_merged=False):
         """Merge tip into origin work and push it (a fast-forward; never with --dry-run).
         Returns (work commit, None), (work commit, 'already in work') or (None, why). The merge is refused unless it is clean
-        (merge_problem_text): a conflict never reaches work. rebuild: tip is a pre-merged
-        -vN on the current future main, so on a conflict work is rebuilt as that tree
-        (rebuild_work; tangentswarm #65)."""
+        (merge_problem_text): a conflict never reaches work. pre_merged: tip is a pre-merged
+        -vN on the current future main, so work gets its tree (work_commit; tangentswarm #65)."""
         work = self.fetch_work(scratch)
+        if pre_merged:
+            merged = self.work_commit(scratch, work, tip, [tip], f"Staging: {WORK} = future main + #{n} ({label})\n\n"
+                                                                 f"swarm-flow, pre-merged tip {tip}.")
+            if not self.dry:
+                git(scratch, 'push', '--quiet', self.g['origin_url'](), f'{merged}:refs/heads/{WORK}')
+            return merged, None
         if git(scratch, 'merge-base', '--is-ancestor', tip, work, check=False).returncode == 0:
             return work, 'already in work'
         why = []
         merged = merge_commit(scratch, work, tip, f"Merge #{n} ({label}) into {WORK} for Staging\n\n"
                                                   f"swarm-flow, tip {tip}.", why=why)
-        if merged is None and rebuild:
-            merged = self.rebuild_work(scratch, work, tip, n, why[0])
         if merged is None:
             return None, f"{label} {tip[:8]} does not merge cleanly into {WORK} {work[:8]}: {why[0]}"
         if not self.dry:
             git(scratch, 'push', '--quiet', self.g['origin_url'](), f'{merged}:refs/heads/{WORK}')
         return merged, None
 
-    def start_pull(self, p, scratch, tip=None, rebuild=False):
+    def start_pull(self, p, scratch, tip=None, pre_merged=False):
         """tip: the pre-merged -vN tip to merge into work (default: the head)."""
         n, head = p['number'], p['head']
         tip = tip or head
-        merged, why = self.merge_into_work(scratch, n, tip, p['branch'], rebuild=rebuild)
+        merged, why = self.merge_into_work(scratch, n, tip, p['branch'], pre_merged=pre_merged)
         if merged is None:
             self.note(f"#{n} refused, work NOT pushed: {why}")
             return False
@@ -495,8 +498,9 @@ class Flow:
         redeploy covers all of them. tangentswarm #65 (Michal 2026-11-16 3:22 PM ET): strict
         order, no queue-jumping. The PRs go in the shared pick order; each one must be
         merge-ready (premerge_one: pre-merged onto future main as a <branch>-vN tip) and
-        merge cleanly onto the batch so far. The first one that is not stops the batch:
-        nothing behind it is pulled. Returns the pulled PRs."""
+        merge cleanly with the batch so far. The first one that is not stops the batch:
+        nothing behind it is pulled. work gets the tree of future main + the batch
+        (work_commit). Returns the pulled PRs."""
         try:
             return self._pull_batch(prs, cols, scratch, room)
         finally:
@@ -509,7 +513,7 @@ class Flow:
         hd = held()
         fm = self.future_main(scratch, cols)
         work = self.fetch_work(scratch)
-        tip, batch, tips = work, [], {}
+        target, batch, tips = None, [], {}  # target: future main + the batch so far
         for p in ready_order(ready, None, board.active_fast_track()):
             if len(batch) >= room:
                 break
@@ -522,23 +526,28 @@ class Flow:
             if not t:
                 self.note(f"#{n} is next in the pick order and is not merge-ready: nothing behind it is pulled")
                 break
-            if git(scratch, 'merge-base', '--is-ancestor', t, tip, check=False).returncode != 0:
+            if target is not None:  # each tip is future main + one PR: they must merge with each other
                 why = []
-                merged = merge_commit(scratch, tip, t, f"Merge #{n} ({p['branch']}) into {WORK} for Staging\n\n"
-                                                       f"swarm-flow batch, head {head}, tip {t}.", why=why)
-                if merged is None and not batch:  # work drifted from future main (tangentswarm #65)
-                    merged = self.rebuild_work(scratch, tip, t, n, why[0])
+                merged = merge_commit(scratch, target, t, f"batch: + #{n}", why=why)
                 if merged is None:
-                    self.note(f"#{n} is next in the pick order and its tip {t[:8]} does not merge cleanly onto "
-                              f"{WORK}" + (f" + {', '.join('#' + str(q['number']) for q in batch)}" if batch else '')
-                              + f": {why[0]}; nothing behind it is pulled")
+                    self.note(f"#{n} is next in the pick order and its tip {t[:8]} does not merge cleanly with "
+                              f"{', '.join('#' + str(q['number']) for q in batch)} in this batch: {why[0]}; "
+                              "nothing behind it is pulled (the next pass pre-merges it onto them)")
                     break
-                tip = merged
+                t_target = merged
+            else:
+                t_target = t
+            target = t_target
             batch.append(p)
             tips[n] = t
         if not batch:
             return []
-        if tip != work and not self.dry:
+        # Codex on PR #66: work gets the tree of future main + the batch, never a merge with
+        # work's old content (a PR sent back must not stay in it, or stay recorded as merged)
+        tip = self.work_commit(scratch, work, target, [tips[p['number']] for p in batch],
+                               f"Staging: {WORK} = future main + {', '.join('#' + str(p['number']) for p in batch)}"
+                               f"\n\nswarm-flow batch, future main {fm[0]}.")
+        if not self.dry:
             git(scratch, 'push', '--quiet', self.g['origin_url'](), f'{tip}:refs/heads/{WORK}')
         self.last_work = tip
         if not self.dry:
@@ -546,23 +555,19 @@ class Flow:
             save_pulls(load_pulls() + [dict(pr=p['number'], head=p['head'], tip=tips[p['number']], branch=p['branch'],
                                             item=p['item'], work=tip, started=now) for p in batch])
         names = ', '.join(f"#{p['number']} {tips[p['number']][:8]}" for p in batch)
-        self.change(f"{names} pulled: {len(batch)} pre-merged tip(s) merged into {WORK} ({tip[:8]}) in one push; "
-                    "staging redeploys once")
+        self.change(f"{names} pulled: {len(batch)} pre-merged tip(s) in {WORK} ({tip[:8]} = future main + the batch) "
+                    "in one push; staging redeploys once")
         return batch
 
     # -- pre-merge onto future main (tangentswarm #65, Michal 2026-11-16 3:22 and 3:24 PM ET) --
-    def rebuild_work(self, scratch, work, tip, n, why):
-        """work must be future main (Michal 2026-11-16 3:24 PM ET). A pre-merged tip is future
-        main + the PR, so when it conflicts only with work, work holds something future main
-        does not (such as a PR pulled and then sent back). The new work commit has the tip's
-        tree and the parents work and tip: a fast-forward push (no force), the PR branch is
-        not touched, and work becomes future main + #n. Returns the commit."""
-        msg = (f"Rebuild {WORK} as future main + #{n}\n\nswarm-flow: tip {tip} conflicted with {WORK} {work} "
-               f"({why}); {WORK} now has the tip's tree (future main + #{n}).")
-        commit = git(scratch, 'commit-tree', f'{tip}^{{tree}}', '-p', work, '-p', tip, '-m', msg).stdout.strip()
-        self.note(f"#{n}: its pre-merged tip {tip[:8]} conflicts only with {WORK} {work[:8]} ({why[:120]}): "
-                  f"{WORK} is rebuilt as future main + #{n} ({commit[:8]})")
-        return commit
+    def work_commit(self, scratch, work, tree_of, tips, msg):
+        """The new work commit for a pull of pre-merged tips (tangentswarm #65; Codex on PR
+        #66): its tree is `tree_of`'s tree (future main + the pulled PRs), never a merge with
+        work's old content, and its parents are work and the tips, so the push is a
+        fast-forward (no force) and a PR that was pulled, sent back and pulled again gets
+        all of its content back. Nothing outside future main stays in work."""
+        parents = [x for t in [work, *tips] for x in ('-p', t)]
+        return git(scratch, 'commit-tree', f'{tree_of}^{{tree}}', *parents, '-m', msg).stdout.strip()
 
     def have(self, scratch, *shas, branch=None):
         """True when every commit is in the scratch repo: fetched when missing (scratch.ensure,
@@ -581,41 +586,59 @@ class Flow:
 
     def future_main(self, scratch, cols):
         """(key, commit or None, why): main plus every queued PR merged in, in queue order
-        (Human Review, then Staging, each in the pick order, then the pulls in flight). key names main and the queued
-        heads, so a pre-merge is redone only when future main changes."""
+        (Human Review, then Staging, each in the pick order, then the pulls in flight). key
+        names main and the queued heads, so a pre-merge is redone only when future main
+        changes. A queued PR enters as its pre-merged tip (a resolved -vN) only while every
+        PR that tip was built on is still ahead of it in the queue or in main (queued_tip;
+        Codex on PR #66: a tip built on a PR that was sent back carried that PR along).
+        Else as its head; if the head does not merge, it is pre-merged again onto the queue
+        ahead of it (a new -vN; its worker resolves a real conflict)."""
         scratch.ensure_main()
         main = self.sha_of(scratch, scratch.main)
         active = board.active_fast_track()
         queue = [q for c in (board.HUMAN_REVIEW, board.STAGING)
                  for q in sorted(cols.get(c, []), key=lambda q: board.pick_key(q, active))]
-        recs = load_premerge()
-
-        def tip(q):  # a queued PR enters future main as its pre-merged tip (a resolved -vN), if any
-            r = recs.get(str(q['number'])) or {}
-            ok = (r.get('status') == 'ready' and r.get('head') == q['head'] and r.get('tip')
-                  and self.have(scratch, r['tip'], branch=r.get('vbranch')))
-            return dict(number=q['number'], head=r['tip'] if ok else q['head'])
-        queue = [tip(q) for q in queue]
         seen = {q['number'] for q in queue}  # then the pulls in flight: in work, on their way to Staging
-        queue += [dict(number=d['pr'], head=d['tip'] if d.get('tip') and self.have(scratch, d['tip']) else d['head'])
+        queue += [dict(number=d['pr'], head=d['head'], branch=d.get('branch'), item=d.get('item'), col='pull')
                   for d in load_pulls() if d['pr'] not in seen]
-        key = ' '.join([main[:12]] + [f"#{q['number']}@{q['head'][:12]}" for q in queue])
+        toks = [f"#{q['number']}@{q['head'][:12]}" for q in queue]
+        key = ' '.join([main[:12]] + toks)
         if key in self._fm:
             return self._fm[key]
         lost = [q for q in queue if not self.have(scratch, q['head'])]
         if lost:  # never cached: the next pass fetches again
             return key, None, f"#{lost[0]['number']} head {lost[0]['head'][:8]} is not in the scratch repo"
+        recs = load_premerge()
         cur, why = main, None
-        for q in queue:
-            if git(scratch, 'merge-base', '--is-ancestor', q['head'], cur, check=False).returncode == 0:
-                continue
-            nxt = merge_commit(scratch, cur, q['head'], f"future main: + #{q['number']}")
-            if nxt is None:
-                cur, why = None, f"#{q['number']} does not merge onto main + the queue ahead of it"
-                break
-            cur = nxt
+        for i, q in enumerate(queue):
+            use = self.queued_tip(scratch, q, recs.get(str(q['number'])), toks[:i], main) or q['head']
+            if not self.ancestor(scratch, use, cur):
+                nxt = merge_commit(scratch, cur, use, f"future main: + #{q['number']}")
+                if nxt is None and q.get('branch'):  # pre-merge it again onto the queue ahead of it
+                    nxt = self.premerge_one(q, scratch, (' '.join([main[:12]] + toks[:i]), cur, None))
+                if nxt is None:
+                    cur, why = None, (f"#{q['number']} does not merge onto main + the queue ahead of it; "
+                                      "it is pre-merged again (see its -vN)")
+                    break
+                cur = nxt
         self._fm[key] = (key, cur, why)
         return self._fm[key]
+
+    def queued_tip(self, scratch, q, rec, ahead, main):
+        """The pre-merged tip of queued PR q if it is still valid: the same head, and every
+        PR in the future main it was built on (its record's base) is still in `ahead` (the
+        queue tokens before q) or merged into main. Else None."""
+        rec = rec or {}
+        if not (rec.get('status') == 'ready' and rec.get('head') == q['head'] and rec.get('tip')):
+            return None
+        deps = (rec.get('base') or '').split()[1:]
+        for d in deps:
+            if d in ahead:
+                continue
+            h = d.split('@', 1)[-1]
+            if not (h and self.ancestor(scratch, h, main)):
+                return None
+        return rec['tip'] if self.have(scratch, rec['tip'], branch=rec.get('vbranch')) else None
 
     def premerge(self, cols, scratch):
         """Every cascade pass: keep the top PREMERGE_AHEAD Ready PRs pre-merged onto future
