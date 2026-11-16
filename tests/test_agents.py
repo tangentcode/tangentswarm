@@ -257,6 +257,38 @@ def test_multiline_text(agent, text):
     assert pane.submitted == [text]
 
 
+@pytest.mark.parametrize('agent', ['claude', 'codex', 'grok'])
+@pytest.mark.parametrize('text', ['\n\nplease run the tests', ' \n\t\nplease run the tests',
+                                  '\r\n\rplease run the tests'])
+def test_leading_blank_lines_are_dropped(agent, text):
+    # Codex's box ends at the first blank line: the text after leading blank lines never
+    # showed, so the send failed as not_typed (Codex on PR #17)
+    pane = BoxPane(style=agent, drop=1)
+    assert tui(pane, agent).send_text(text) == {'enter_presses': 2, 'submit_verified': True}
+    assert pane.submitted == ['please run the tests']
+
+
+def test_blank_only_text_is_sent_as_is():
+    pane = BoxPane()
+    assert tui(pane).send_text('\n \n') == {'enter_presses': 1, 'submit_verified': False}
+    assert pane.sent[0] == ('lit', '\n \n')
+
+
+@pytest.mark.parametrize('agent', ['claude', 'codex', 'grok'])
+@pytest.mark.parametrize('text', ['explain │ in this diagram', '┃ quoted line\nmore',
+                                  '│\n│ boxed │\n│'])
+def test_text_with_box_borders(agent, text):
+    # the box is compared without │ ┃, so the typed text must be too (Codex on PR #17)
+    pane = BoxPane(style=agent, drop=1)
+    assert tui(pane, agent).send_text(text) == {'enter_presses': 2, 'submit_verified': True}
+    assert pane.submitted == [text]
+
+
+def test_fingerprint_matches_flat_box():
+    assert agents.fingerprint('\n │ \n a │ b') == 'ab'
+    assert agents.holds_text('a\n│ b', 'a │ b')
+
+
 def test_text_with_cr_cannot_submit_part_way():
     pane = BoxPane()
     tui(pane).send_text('one\r\ntwo\rthree')

@@ -25,6 +25,7 @@ FIX = Path(__file__).parent / 'fixtures'
 
 def fake_tell(monkeypatch, pane):
     monkeypatch.setattr(agents, 'require_agent_pane', lambda t: {'pane_id': '%7', 'agent': 'claude'})
+    monkeypatch.setattr(agents, 'pane_blocked', lambda p, a: None)
     monkeypatch.setattr(agents, 'tui_for', lambda a, t: agents.ClaudeTui(
         t, capture=pane.capture, send_literal=pane.literal, send_key=pane.key, sleep=lambda s: None))
 

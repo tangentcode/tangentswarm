@@ -171,25 +171,31 @@ def input_box(screen, glyph, framed=False):
 # Long pastes collapse to a placeholder: Claude and Muse '[Pasted text #1 +40 lines]',
 # Codex '[Pasted Content 2048 chars]'.
 _PASTE_RE = re.compile(r'\[Pasted (text|content)\b', re.I)
-_WS_RE = re.compile(r'\s+')
+_LEADING_BLANK_RE = re.compile(r'\A(?:[ \t]*\n)+')
+_FLAT_RE = re.compile(r'[\s│┃]+')
 FINGERPRINT_CHARS = 24
 
 
+def _flat(s):
+    """The text with all whitespace and box side borders (│ ┃) removed. Typed text and the
+    box are both compared in this form: a box wraps, indents and frames lines, and the
+    message itself can hold a │ that input_box() cannot tell from a border."""
+    return _FLAT_RE.sub('', s)
+
+
 def fingerprint(text):
-    """The first FINGERPRINT_CHARS characters of the text's first non-blank line, with all
-    whitespace removed. A box wraps and indents lines, so compare without whitespace; and
-    Codex's box ends at a blank line, so stay on the first line."""
-    first = next((l for l in text.split('\n') if l.strip()), '')
-    return _WS_RE.sub('', first)[:FINGERPRINT_CHARS]
+    """The first FINGERPRINT_CHARS characters of _flat() of the text's first line that is
+    not blank in that form. Codex's box ends at a blank line, so stay on the first line."""
+    first = next((l for l in text.split('\n') if _flat(l)), '')
+    return _flat(first)[:FINGERPRINT_CHARS]
 
 
 def holds_text(box, text):
     """Return True if the input box (from input_box()) shows `text`, or a paste placeholder."""
     if box is None:
         return False
-    flat = _WS_RE.sub('', box.replace('│', '').replace('┃', ''))
     fp = fingerprint(text)
-    return bool(fp and fp in flat) or bool(_PASTE_RE.search(box))
+    return bool(fp and fp in _flat(box)) or bool(_PASTE_RE.search(box))
 
 
 def detector_for(agent):
@@ -567,6 +573,10 @@ class TuiAgent:
         Returns {'enter_presses': n, 'submit_verified': bool}.
         """
         text = text.replace('\r\n', '\n').replace('\r', '\n')   # a CR is Enter: it would submit part-way
+        if fingerprint(text):
+            # Leading blank lines carry nothing, and Codex's box ends at the first blank
+            # line, so the text after them would never show in the box.
+            text = _LEADING_BLANK_RE.sub('', text)
         self._send_literal(self.target, text)
         if not enter:
             return {'enter_presses': 0, 'submit_verified': False}

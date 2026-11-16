@@ -308,10 +308,11 @@ Sending to an agent always follows scialect's tell-worker sequence.
 1. Reach an empty prompt with the space probe. It types a space, checks the prompt and
    deletes the space. This sees past placeholder text but refuses when someone is typing.
 2. Optionally send `/new`, submit it as in step 3 and wait 10s.
-3. Type the text literally (long text goes in 2048-character `send-keys` pieces, and a
-   CR becomes a newline so it can't submit part-way). Wait at least 0.5s, and until the
-   text shows in the input box and stops changing, then press Enter in a separate
-   `send-keys`: TUIs drop an Enter that arrives with the text.
+3. Type the text literally (long text goes in 2048-character `send-keys` pieces, a CR
+   becomes a newline so it can't submit part-way, and leading blank lines are dropped).
+   Wait at least 0.5s, and until the text shows in the input box and stops changing,
+   then press Enter in a separate `send-keys`: TUIs drop an Enter that arrives with the
+   text.
 4. Check that the text left the input box. Under load the Enter can still be lost, so
    while the text is still sitting there, press Enter again (checking after 0.5s, 1s, 2s
    and 4s). Grey ghost text (Claude Code's suggested prompt, Muse's placeholder) does
