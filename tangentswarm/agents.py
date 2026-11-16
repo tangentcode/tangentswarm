@@ -136,37 +136,58 @@ _BAR_RUN = '─' * 10
 _BORDER = '│┃'
 
 
+def _indent(line):
+    """The column of the line's first character that is not a blank or a │ ┃ border."""
+    return len(line) - len(line.lstrip(' ' + _BORDER))
+
+
+def _is_frame_bar(line, col):
+    """True if the line is a ─ bar that is not indented past column col. Typed text is
+    drawn indented under the glyph, so a bar in it (a quoted screen) sits further right."""
+    return _BAR_RUN in line and _indent(line) <= col
+
+
 def input_box(screen, glyph, framed=False):
     """Return what is typed in the input box, or None if no input box is on screen.
 
-    The input box starts at the lowest line whose first character (after spaces and a
-    │ border) is the prompt glyph, and runs down to the next ─ bar. Box borders are
-    dropped. With framed=True (Claude, Muse, Grok, Gemini) a ─ bar must sit right above
-    the glyph line and another must close the box, so a transcript line or a dialog's
-    menu ('❯ No, exit') never passes for the box. Codex's box has no frame: its glyph
-    sits in column 0 and its continuation lines are indented, so a typed line that starts
-    with the glyph is not taken for the prompt. The box ends at the first blank line,
-    above the footer. Codex's dialogs' menus ('› 3. Cancel') also start in column 0, so
-    callers compare the box with what they typed rather than only asking if it is blank."""
+    The input box starts at a line whose first character (after spaces and a │ border)
+    is the prompt glyph. Box borders are dropped.
+
+    With framed=True (Claude, Muse, Grok, Gemini) a ─ bar must sit right above the glyph
+    line and another must close the box, so a transcript line or a dialog's menu
+    ('❯ No, exit') never passes for the box. Only a bar that is not indented past the
+    glyph counts as the frame: typed lines are drawn indented under the glyph, so a
+    quoted screen in the text (a bar, '❯ old request', a bar) is box content. A glyph
+    line that sits inside another candidate box is such a quote, so the lowest glyph line
+    that is not inside another box is the input box.
+
+    Codex's box has no frame: its glyph sits in column 0 and its continuation lines are
+    indented, so a typed line that starts with the glyph is not taken for the prompt. The
+    box ends at the first blank line, above the footer. Codex's dialogs' menus
+    ('› 3. Cancel') also start in column 0, so callers compare the box with what they
+    typed rather than only asking if it is blank."""
     lines = screen.split('\n')
-    for start in range(len(lines) - 1, -1, -1):
-        if not lines[start].lstrip(' ' + _BORDER).startswith(glyph):
+    boxes = []      # (start, end): the glyph line and the line that ends the box
+    for start, line in enumerate(lines):
+        if not line.lstrip(' ' + _BORDER).startswith(glyph):
             continue
-        if not framed and not lines[start].startswith(glyph):
-            continue        # Codex indents continuation lines, so a '› ...' in the text is not the prompt
-        if framed and (start == 0 or _BAR_RUN not in lines[start - 1]):
+        if not framed:
+            if not line.startswith(glyph):
+                continue    # Codex indents continuation lines, so a '› ...' in the text is not the prompt
+            end = next((j for j in range(start + 1, len(lines))
+                        if not lines[j].strip(' ' + _BORDER)), len(lines))
+            boxes.append((start, end))
             continue
-        out = [lines[start].lstrip(' ' + _BORDER)[len(glyph):]]
-        closed = False
-        for line in lines[start + 1:]:
-            if _BAR_RUN in line:
-                closed = True
-                break
-            if not framed and not line.strip(' ' + _BORDER):
-                break
-            out.append(line)
-        if framed and not closed:
+        col = _indent(line)
+        if start == 0 or not _is_frame_bar(lines[start - 1], col):
             continue
+        end = next((j for j in range(start + 1, len(lines)) if _is_frame_bar(lines[j], col)), None)
+        if end is not None:
+            boxes.append((start, end))
+    for start, end in reversed(boxes):
+        if framed and any(s < start and e >= end for s, e in boxes):
+            continue        # a quoted prompt inside the real box
+        out = [lines[start].lstrip(' ' + _BORDER)[len(glyph):]] + lines[start + 1:end]
         return '\n'.join(l.strip(' ' + _BORDER) for l in out)
     return None
 

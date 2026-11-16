@@ -321,6 +321,29 @@ def test_submit_state_pending_only_for_the_unchanged_box():
     assert t._submit_state('›\n\n  ⏎ send', 'Skip', 'Skip') == 'sent'
 
 
+QUOTED_SCREEN = 'Explain this captured screen:\n' + '─' * 12 + '\n❯ previous request\n' + '─' * 12
+
+
+@pytest.mark.parametrize('agent', ['claude', 'muse', 'grok', 'gemini'])
+@pytest.mark.parametrize('text', [QUOTED_SCREEN, QUOTED_SCREEN + '\nand what it means',
+                                  QUOTED_SCREEN.replace('❯', '>')])
+def test_quoted_framed_prompt_is_not_the_input_box(agent, text):
+    # the quoted bar sat right above the quoted glyph, so the quote passed for the box
+    # (Codex on PR #17)
+    pane = BoxPane(style=agent, drop=1)
+    assert tui(pane, agent).send_text(text) == {'enter_presses': 2, 'submit_verified': True}
+    assert pane.submitted == [text]
+
+
+def test_input_box_skips_a_nested_quote():
+    bar = '─' * 20
+    screen = f'{bar}\n❯ look:\n  {bar}\n  ❯ old\n  {bar}\n{bar}\n  ? for shortcuts'
+    assert agents.input_box(screen, '❯', framed=True) == f'look:\n{bar}\n❯ old\n{bar}'
+    # a transcript prompt above the real box is still not the box
+    screen = f'{bar}\n❯ earlier\n{bar}\n⏺ ok\n{bar}\n❯ now\n{bar}\n'
+    assert agents.input_box(screen, '❯', framed=True) == 'now'
+
+
 def test_fingerprint_matches_flat_box():
     assert agents.fingerprint('\n │ \n a │ b') == 'ab'
     assert agents.holds_text('a\n│ b', 'a │ b')
