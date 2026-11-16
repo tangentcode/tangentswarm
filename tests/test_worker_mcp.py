@@ -8,14 +8,14 @@ from tangentswarm import board, worker_mcp as W
 from test_stophook import G, run, wt  # noqa: F401  (the worktree fixture)
 
 
-def test_only_the_three_worker_tools_are_exposed():
+def test_only_the_four_worker_tools_are_exposed():
     names = [t.name for t in anyio.run(W.build_server().list_tools)]
-    assert names == ['worker_status', 'handoff', 'request_review']
+    assert names == ['worker_status', 'handoff', 'request_review', 'needs_input']
 
 
 def test_outside_a_worker_worktree_every_tool_refuses_with_the_reason(tmp_path, monkeypatch):
     monkeypatch.setenv('SWARM_WORKER_CWD', str(tmp_path))
-    for op in ('status', 'handoff', 'request_review'):
+    for op in ('status', 'handoff', 'request_review', 'needs_input'):
         r = W.via_daemon(op)
         assert r['ok'] is False and 'not a worker worktree' in r['error']
 

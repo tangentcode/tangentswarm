@@ -69,6 +69,7 @@ DEPLOY_LAG = int(os.environ.get('SWARM_DEPLOY_LAG', '600'))  # s before a stagin
 LAG_EVERY = 60  # s between deploy-lag checks
 MAIN_RETRY = int(os.environ.get('SWARM_MAIN_RETRY', '300'))  # s between retries of a held merge-main handoff
 HR_TARGET = int(os.environ.get('SWARM_PROMOTE_HR_TARGET', '2'))  # only raise it for a dry-run proof
+WATCH = os.environ.get('SWARM_WATCH', '1') != '0'  # the watchdog thread (tangentswarm.watchdog)
 
 
 
@@ -645,34 +646,14 @@ def start_spool_thread(p, interval=1.0, stop=None):
     return t
 
 
-def start_pane_thread(p, interval=None, stop=None):
-    """The pane watcher (tangentswarm #40): every panewatch.QUIET s, in its own thread."""
-    import threading
-    from . import panewatch
-    stop = stop or threading.Event()
-    interval = interval or panewatch.QUIET
-    w = panewatch.PaneWatch(out=say)
-
-    def loop():
-        while not stop.is_set():
-            try:
-                w.scan()
-            except Exception as e:  # never stop the daemon; report and go on
-                say(f"panes: scan failed: {type(e).__name__}: {str(e)[:200]}")
-            stop.wait(interval)
-    if p.dry:
-        return None
-    t = threading.Thread(target=loop, name='panes', daemon=True)
-    t.start()
-    return t
-
-
 def run(p, poll=POLL, retry=RETRY, sleep=time.sleep):
     wake = {'now': False}
     signal.signal(signal.SIGUSR1, lambda *a: wake.update(now=True))
     say(f"swarm-promoted: polling every {poll}s (SIGUSR1 wakes it)")
     start_spool_thread(p)
-    start_pane_thread(p)
+    if WATCH:
+        from . import watchdog
+        watchdog.start_thread(p)  # tangentswarm #40: the pane watcher and the watchdog checks
     what = 'idle'
     while True:
         limited = None

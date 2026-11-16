@@ -25,6 +25,8 @@ PROBE_RECHECK = 0.3
 PROBE_CLEANUP = 0.1      # after BSpace
 ENTER_DELAY = 0.5        # between the text and Enter, because TUIs drop an Enter sent too soon
 NEW_CONVERSATION_WAIT = 10.0   # after "/new" and Enter
+STARTUP_WAIT = 5.0       # how long start_agent watches a new pane for a first-run screen
+STARTUP_POLL = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -127,12 +129,112 @@ def detector_for(agent):
 
 
 # ---------------------------------------------------------------------------
+# first-run and other blocking screens (pure functions over capture-pane text)
+#
+# Each entry is (kind, agents it applies to or None for any, phrases that must all
+# appear, case-insensitively, in the bottom BLOCKING_WINDOW non-empty lines). The
+# Claude Code 2.1.302, Codex 0.157.0 and Grok 1.0.62 phrases come from the screens captured in
+# tests/fixtures; the generic trust question also covers older versions and Gemini.
+
+BLOCKING_WINDOW = 30
+BLOCKING_SCREENS = [
+    ('trust_prompt', {'claude'}, ('Yes, I trust this folder', 'No, exit')),
+    ('trust_prompt', {'codex'}, ('Trust this folder?', 'Trust and continue')),
+    ('trust_prompt', None, ('Do you trust the files in this folder?',)),
+    ('trust_prompt', None, ('Do you trust this folder?',)),
+    ('theme_picker', {'claude'}, ('Choose the text style that looks best with your terminal',)),
+    ('login', {'claude'}, ('Select login method',)),
+    ('login', {'claude'}, ('Paste code here if prompted',)),
+    ('login', {'codex'}, ('Sign in with ChatGPT', 'Provide your own API key')),
+    ('api_key_prompt', {'claude'}, ('Detected a custom API key', 'Do you want to use this API key?')),
+    ('bypass_permissions_confirm', {'claude'}, ('Bypass Permissions mode', 'Yes, I accept')),
+    ('update_prompt', {'codex'}, ('Update available', 'Update now')),
+    ('trust_prompt', {'grok'}, ('Do you trust the contents of this directory?', 'Yes, proceed')),
+    ('login', {'grok'}, ('Approve in your browser to finish signing in',)),
+]
+
+BLOCKING_HINTS = {
+    'trust_prompt': "the folder is not trusted; start_agent pre-trusts its worktree, so check "
+                    "the start_agent 'trust' result for a warning",
+    'theme_picker': "the agent has never been set up as this user; finish its first-run "
+                    "setup once by hand",
+    'login': "the agent is not logged in as this user; log in once by hand",
+    'api_key_prompt': "the agent is asking whether to use an API key from the environment; "
+                      "answer it once by hand",
+    'bypass_permissions_confirm': "the agent wants the bypass-permissions mode confirmed by hand",
+    'update_prompt': "the agent is offering an update; answer it once by hand or update it",
+}
+
+
+def _has_input_box(screen, glyph):
+    """True if a prompt line (starting with glyph) sits between the two lowest ─ bars."""
+    lines = screen.split('\n')
+    bars = _bar_lines(lines)
+    return len(bars) >= 2 and any(l.lstrip().startswith(glyph) for l in lines[bars[-2] + 1:bars[-1]])
+
+
+def _codex_input_live(screen):
+    """True if Codex's live › prompt is up: the last › line is not a numbered option of
+    one of its dialogs ("› 1. Trust and continue") and no option follows it."""
+    lines = screen.split('\n')
+    for i in range(len(lines) - 1, -1, -1):
+        if '›' in lines[i]:
+            menu = re.compile(r'^\s*›?\s*\d+\.\s')
+            return not any(menu.match(l) for l in lines[i:])
+    return False
+
+
+def _grok_input_live(screen):
+    """True if Grok's input box ('│ ❯ ...│', between ╭ and ╰ borders) is near the bottom."""
+    lines = [l for l in screen.split('\n') if l.strip()][-6:]
+    return any(re.match(r'^\s*│\s*❯', l) for l in lines) and any(l.lstrip().startswith('╰') for l in lines)
+
+
+def blocking_screen(screen, agent=None):
+    """Return {'kind', 'agent', 'lines', 'hint'} if the screen shows a first-run or other
+    blocking screen (trust, theme, login, API key, bypass confirmation, update) that
+    typing a message into would answer, else None. `screen` is plain text."""
+    a = (agent or '').lower()
+    a = 'codex' if 'codex' in a else a
+    if a in ('claude', 'muse', 'gemini') and _has_input_box(screen, '>' if a == 'gemini' else '❯'):
+        return None     # the normal input box is up, so any matching text is in the transcript
+    if a == 'codex' and _codex_input_live(screen) or a == 'grok' and _grok_input_live(screen):
+        return None
+    lines = [l.rstrip() for l in screen.split('\n') if l.strip()][-BLOCKING_WINDOW:]
+    hay = '\n'.join(lines).lower()
+    for kind, only, phrases in BLOCKING_SCREENS:
+        if only is not None and a and a not in only:
+            continue
+        if not all(p.lower() in hay for p in phrases):
+            continue
+        if (only is None or not a) and not _live_dialog(lines, phrases):
+            continue        # quoted in a transcript (no input-box check applies), not a live dialog
+        return {'kind': kind, 'agent': agent, 'lines': lines[-12:], 'hint': BLOCKING_HINTS[kind]}
+    return None
+
+
+GENERIC_DIALOG_DEPTH = 12    # a live dialog's text and choices sit this close to the bottom
+_CHOICE_RE = re.compile(r'^\s*(?:[›>❯●]?\s*\d+\.\s|[›>❯●]\s*\S)')   # "2. No" or "❯ No, exit"
+
+
+def _live_dialog(lines, phrases):
+    """True if every phrase is in the bottom GENERIC_DIALOG_DEPTH lines and a choice line
+    (numbered, or behind a selection cursor) is there too. Generic phrases, and every
+    phrase when the agent is unknown (no input-box check applies), only match this way,
+    so text merely quoted in a transcript does not."""
+    bottom = lines[-GENERIC_DIALOG_DEPTH:]
+    hay = '\n'.join(bottom).lower()
+    return all(p.lower() in hay for p in phrases) and any(_CHOICE_RE.match(l) for l in bottom)
+
+
+# ---------------------------------------------------------------------------
 # escape-coded captures, used to tell placeholder and suggestion text from real input
 
 _ESC_RE = re.compile(r'\x1b(?:\[([0-9;:?]*)([@-~])|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()][0-9A-Za-z]|.)', re.S)
 # Grey foregrounds TUIs use for placeholders and suggestions (plus SGR 2, dim).
 _GREY_256 = set(range(239, 247)) | {8}
-_KEEP = set('❯›>') | {chr(c) for c in range(0x2500, 0x2580)}   # prompt glyphs and box-drawing characters
+_KEEP = set('❯›') | {chr(c) for c in range(0x2500, 0x2580)}   # prompt glyphs and box-drawing characters
+_KEEP_AT_LINE_START = set('>')   # Gemini's prompt; elsewhere it is placeholder text ("<filepath>")
 
 
 def strip_ansi(text):
@@ -145,7 +247,7 @@ def input_view(text):
     Claude Code (prompt suggestions), Muse (placeholder) and Codex draw hints that way,
     and draw typed input in the normal colour. Use this for prompt detection only: it
     also blanks unrelated dim output elsewhere on the screen."""
-    return ''.join(_mask(chunk) if hint else chunk for chunk, hint in _segments(text))
+    return ''.join(_mask(chunk, mask) for chunk, _, mask in _blanked(text))
 
 
 def _segments(text):
@@ -201,8 +303,34 @@ def _is_hint(dim, fg):
     return False
 
 
-def _mask(chunk):
-    return ''.join(c if (c in _KEEP or c == '\n') else ' ' for c in chunk)
+def _blanked(text):
+    """Yield (plain chunk, drawn as a hint?, blank mask) for an escape-coded capture. The
+    mask has one flag per character of the chunk: True where input_view() blanks it. A
+    hint character is blanked unless it is a prompt glyph, box drawing, a line break, or a
+    '>' at the start of a line (Gemini's prompt; elsewhere, as in Claude's 'Try "refactor
+    <filepath>"', it is placeholder text). A line starts after a line break; it stays at
+    its start until a character that is shown (not blanked) and not a blank, or a
+    non-blank character inside the same hint run."""
+    line_start = True
+    for chunk, hint in _segments(text):
+        mask = []
+        run_start = line_start          # inside a hint run, any non-blank ends the line start
+        for c in chunk:
+            if c == '\n':
+                mask.append(False)
+                line_start = run_start = True
+                continue
+            blank = hint and not (c in _KEEP or (run_start and c in _KEEP_AT_LINE_START))
+            mask.append(blank)
+            if not c.isspace():
+                run_start = False
+                if not blank:
+                    line_start = False
+        yield chunk, hint, mask
+
+
+def _mask(chunk, mask):
+    return ''.join(' ' if b else c for c, b in zip(chunk, mask))
 
 
 # ---------------------------------------------------------------------------
@@ -241,10 +369,10 @@ def claude_prompt(raw):
     'lines' is the plain screen with each suggestion wrapped in SUGGESTION_LABEL; nothing
     outside the input box is changed."""
     plain, styled, masked = [], [], []
-    for chunk, hint in _segments(raw):
+    for chunk, hint, mask in _blanked(raw):
         plain.append(chunk)
         styled.extend([hint] * len(chunk))
-        masked.extend(hint and c not in _KEEP for c in chunk)   # what input_view() blanks
+        masked.extend(mask)                  # what input_view() blanks
     plain = ''.join(plain)
     lines, rows, at = [], [], 0
     for line in plain.split('\n'):
@@ -499,6 +627,15 @@ class NotAnAgentPane(AgentNotReady):
     """The pane's foreground process is not a registered coding agent."""
 
 
+class AgentBlocked(AgentNotReady):
+    """The agent is on a first-run or other blocking screen, which typed text would answer."""
+
+    def __init__(self, target, blocked):
+        self.blocked = blocked
+        super().__init__(f"{target}: agent is on the {blocked['kind']} screen; nothing sent "
+                         f"({blocked['hint']})")
+
+
 def foreground_processes(tty):
     """Return [(pid, stat, comm, args)] for every process on a tty. comm comes from /proc,
     so spaces in args cannot cut it short."""
@@ -560,6 +697,37 @@ def require_agent_pane(target, procs=None):
 # high-level operations (used by the MCP tools and the CLI)
 
 
+def pane_blocked(pane, agent, capture=None):
+    """Return blocking_screen() for a pane's current screen."""
+    raw = capture(pane) if capture else tmux.capture_pane(pane, escapes=True)
+    return blocking_screen(strip_ansi(raw), agent)
+
+
+def watch_startup(pane, agent, wait=STARTUP_WAIT, poll=STARTUP_POLL, capture=None,
+                  sleep=time.sleep, clock=time.monotonic):
+    """Watch a freshly started agent for up to `wait` seconds. Returns {'state', 'blocked',
+    'last_lines'}: state is 'blocked' (a first-run screen, named in 'blocked'), 'ready'
+    (blank prompt), 'starting' (neither yet) or 'exited' (the pane went away)."""
+    capture = capture or (lambda t: tmux.capture_pane(t, escapes=True))
+    det = detector_for(agent)
+    start = clock()
+    screen = ''
+    while True:
+        try:
+            raw = capture(pane)
+        except tmux.TmuxError:
+            return {'state': 'exited', 'blocked': None, 'last_lines': _tail(screen.split('\n'))}
+        screen = strip_ansi(raw)
+        blocked = blocking_screen(screen, agent)
+        if blocked:
+            return {'state': 'blocked', 'blocked': blocked, 'last_lines': _tail(screen.split('\n'))}
+        if det and det(input_view(raw)):
+            return {'state': 'ready', 'blocked': None, 'last_lines': _tail(screen.split('\n'))}
+        if clock() - start >= wait:
+            return {'state': 'starting', 'blocked': None, 'last_lines': _tail(screen.split('\n'))}
+        sleep(poll)
+
+
 def agent_status(target, cdir=None):
     """Return the registered agent in the foreground of the exact pane, its prompt state and the pane info."""
     info = pane_agent(target)
@@ -568,6 +736,7 @@ def agent_status(target, cdir=None):
     screen = strip_ansi(raw)
     lines, prompt = screen_view(raw, agent)
     det = detector_for(agent)
+    blocked = blocking_screen(screen, agent) if agent else None
     panes = tmux.list_panes(info['pane_id'])
     pane = next((p for p in panes if p.get('pane_id') == info['pane_id']), panes[0] if panes else {})
     return {
@@ -575,7 +744,8 @@ def agent_status(target, cdir=None):
         'pane_id': info['pane_id'],
         'agent': agent,
         'typeable': agent is not None,
-        'prompt_blank': det(input_view(raw)) if det else None,
+        'blocked': blocked,
+        'prompt_blank': (False if blocked else det(input_view(raw))) if det else None,
         'supported': det is not None,
         'current_command': pane.get('current_command'),
         'current_path': pane.get('current_path'),
@@ -602,12 +772,16 @@ def pane_ready(target, probe=False, agent=None, cdir=None):
         info = pane_agent(target)
     agent = agent or info['agent']
     target = info['pane_id']
+    blocked = pane_blocked(target, agent) if agent else None
+    if blocked:
+        # never probe a dialog: the space could pick one of its options
+        return {'target': target, 'agent': agent, 'ready': False, 'probed': False, 'blocked': blocked}
     tui = tui_for(agent, target)
     if tui is None:
-        return {'target': target, 'agent': agent, 'ready': None,
+        return {'target': target, 'agent': agent, 'ready': None, 'blocked': None,
                 'note': f"no prompt detector for agent {agent!r}"}
     ready = tui.ensure_prompt_is_empty() if probe else tui.is_prompt_blank()
-    return {'target': target, 'agent': agent, 'ready': bool(ready), 'probed': probe}
+    return {'target': target, 'agent': agent, 'ready': bool(ready), 'probed': probe, 'blocked': None}
 
 
 def tell_agent(target, text, new_conversation=False, require_empty_prompt=True,
@@ -621,6 +795,9 @@ def tell_agent(target, text, new_conversation=False, require_empty_prompt=True,
     info = require_agent_pane(target)          # never type into a shell
     agent = (agent or info['agent']).lower()
     pane = info['pane_id']
+    blocked = pane_blocked(pane, agent)        # even with require_empty_prompt=false
+    if blocked:
+        raise AgentBlocked(target, blocked)
     tui = tui_for(agent, pane)
     if tui is None:
         tui = TuiAgent(pane)
@@ -656,7 +833,11 @@ def wait_for_idle(target, timeout=120.0, poll=1.0, settle=3.0, agent=None, cdir=
         now = clock()
         if h != last_hash:
             last_hash, stable_since = h, now
-        blank = det(screen) if det else True
+        blocked = blocking_screen(strip_ansi(raw), agent)   # dialogs may be drawn in grey (Grok)
+        if blocked and now - stable_since >= settle:
+            return {'target': target, 'agent': agent, 'idle': False, 'blocked': blocked,
+                    'waited_sec': round(now - start, 2), 'prompt_blank': False}
+        blank = (det(screen) if det else True) and not blocked
         if blank and now - stable_since >= settle:
             return {'target': target, 'agent': agent, 'idle': True,
                     'waited_sec': round(now - start, 2), 'prompt_blank': det(screen) if det else None}

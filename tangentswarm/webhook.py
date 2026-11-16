@@ -154,6 +154,21 @@ def ours(body):
     return b.strip().lower() == '@codex review' or any(m in b for m in OUR_MARKS)
 
 
+CODE_REVIEW_STATUS_RE = re.compile(r'"code_review"\s*:\s*\{[^{}]*?"status"\s*:\s*"(\w+)"', re.I)
+STATUS_RE = re.compile(r'"status"\s*:\s*"running"', re.I)
+
+
+def codex_running(body):
+    """True for Codex's in-progress status comment (not a result). The state JSON has no
+    spaces ("status":"running"), so a check for the spaced form never matched. The
+    code_review status wins when it is there (a running security review is not one)."""
+    b = (body or '').replace("'", '"')
+    if 'codex-review-state' in b:
+        m = CODE_REVIEW_STATUS_RE.search(b)
+        return m.group(1).lower() == 'running' if m else bool(STATUS_RE.search(b))
+    return 'Code Review' in b and '**Running**' in b
+
+
 def classify(event, p):
     """[Action] for one delivery (pure: no I/O). An empty list is "skip"; the first action's
     why says why when it is a skip. Every action carries the delivery's repository
@@ -189,7 +204,7 @@ def _classify(event, p):
         if is_codex(c.get('user'), body):
             if not is_pr:
                 return [Action('skip', why='Codex comment on an issue')]
-            if 'codex-review-state' in body and '"status": "running"' in body.replace("'", '"'):
+            if codex_running(body):
                 return [Action('skip', pr=n, why='Codex review is running')]
             return [Action('codex', n, 'Codex comment (summary or receipt)')]
         if is_bot_self(c.get('user')) or ours(body):
@@ -256,7 +271,7 @@ def _classify(event, p):
             return [Action('handoff', n, f"new head {(pr.get('head') or {}).get('sha', '')[:8]}",
                            dict(head=(pr.get('head') or {}).get('sha'), push=True))]
         if action == 'edited':
-            return [Action('cascade', n, 'PR body edited (a Staging gate may pass now)')]
+            return [Action('edited', n, 'PR body edited (a Staging gate may pass now)')]
         return [Action('skip', pr=n, why=f'pull_request {action}')]
 
     if event == 'issues':
@@ -301,6 +316,10 @@ CARD_QUERY = """query($owner:String!,$name:String!,$n:Int!){repository(owner:$ow
     fieldValueByName(name:"Status"){...on ProjectV2ItemFieldSingleSelectValue{name optionId}}}}}
   ...on Issue{projectItems(first:20){nodes{id project{id}
     fieldValueByName(name:"Status"){...on ProjectV2ItemFieldSingleSelectValue{name optionId}}}}}}}}"""
+
+
+ANSWERS_Q = ('query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){pullRequest(number:$n)'
+             '{closingIssuesReferences(first:3){nodes{comments(last:30){nodes{author{login} body createdAt}}}}}}}')
 
 
 # -- the executor ------------------------------------------------------------------------
@@ -466,6 +485,9 @@ class Executor:
         if a.args.get('commit') and a.args['commit'] != full.get('headRefOid'):
             return self.note(f"#{a.pr}: Codex reviewed an older head: skip")
         status, detail = advance.codex_decision(full)  # exact head, like the MinBot pass
+        if status in ('findings', 'clean') and not self.dry:
+            from . import codexrounds
+            codexrounds.result(a.pr, full.get('headRefOid'), status, detail)
         if status == 'findings':
             text = (f"Coordinator: #{a.pr}: Codex found issues on your head {full['headRefOid'][:8]} ({detail}). "
                     f"Read them with: gh pr view {a.pr} --comments (and the review threads). {ROOT_CAUSE}")
@@ -515,6 +537,9 @@ class Executor:
                 self._sh(['gh', 'pr', 'comment', str(a.pr), '-R', self.repo, '--body', '@codex review'])
                 state.mark(key)
             self.note(f'#{a.pr}: posted "@codex review" for {head[:8]}')
+            if not self.dry:  # every round is logged, with no cap (#40 item 7)
+                from . import codexrounds
+                codexrounds.log_round(a.pr, head, 'swarm-webhook')
         if col in (board.READY, board.STAGING, board.HUMAN_REVIEW):
             self.cascade(f'#{a.pr} left {col} with a new head')
 
@@ -570,6 +595,25 @@ class Executor:
         return [c for c in (full.get('comments') or {}).get('nodes') or []
                 if login(c.get('author')) == MICHAL and (c.get('createdAt') or '') > head_at and not ours(c.get('body'))]
 
+    def issue_answers(self, n):
+        """Michal's comments on the issues PR n closes, after the last needs_input question
+        there (needs_input posts the question on the ticket, so he answers there)."""
+        from .stophook import QUESTION_MARK
+        owner, name = REPO.split('/')
+        try:  # Codex on PR #51: a failed read must never stop the resume
+            d = self.g['gql'](ANSWERS_Q, owner=owner, name=name, n=int(n))
+        except Exception as e:
+            self.note(f"#{n}: the answer on the ticket was not read ({type(e).__name__}: {str(e)[:120]})")
+            return []
+        pr = ((d or {}).get('repository') or {}).get('pullRequest') or {}
+        out = []
+        for i in (pr.get('closingIssuesReferences') or {}).get('nodes') or []:
+            cs = (i.get('comments') or {}).get('nodes') or []
+            asked = [k for k, c in enumerate(cs) if QUESTION_MARK in (c.get('body') or '')]
+            if asked:
+                out += [c for c in cs[asked[-1] + 1:] if login(c.get('author')) == MICHAL and not ours(c.get('body'))]
+        return out
+
     def do_reject(self, a):
         n = self.pr_of(a.args['node'])
         if not n:
@@ -592,7 +636,7 @@ class Executor:
             return self.wake(n, f"{self.repo}#{n} answered in Needs Input; no worker relay for this repo yet",
                              key=f'answered:{self.repo}:{n}')
         cs = self.comments_since_head(n)
-        said = ' | '.join(' '.join((c.get('body') or '').split())[:600] for c in cs) or '(see the issue)'
+        said = ' | '.join(' '.join((c.get('body') or '').split())[:600] for c in cs + self.issue_answers(n)) or '(see the issue)'
         ok, note = self.to_worker(n, f"Coordinator: #{n}: Michal answered: {said} Build it, then push.")
         if not ok:
             return self.wake(n, f"#{n} answered; no worker could take it ({note})", key=f'answered:{n}')
@@ -689,6 +733,19 @@ class Executor:
             except Exception as e:
                 self.note(f"label sync: {str(e)[:120]}")
 
+    def do_edited(self, a):
+        """An edit of a Staging PR's body or screenshots: hr-gate --apply again at once (#40
+        item 5), queued under the serial lock. Any other column: a cascade, as before."""
+        from . import gatelock
+        from .promoted import BIN
+        _, col = self.card(a.pr)
+        if col != board.STAGING:
+            return self.cascade(a.why)
+        if self.dry:
+            return self.note(f"would queue hr-gate --apply {a.pr} (Staging PR edited)")
+        (self.enqueue or gatelock.enqueue)([str(BIN / 'hr-gate'), '--apply', str(a.pr)], by='swarm-webhook')
+        self.note(f"queued hr-gate --apply {a.pr}: the Staging PR was edited")
+
     def do_wake(self, a):
         self.wake(a.pr, a.why, key=a.args.get('key'))
 
@@ -769,14 +826,14 @@ def flush_wakes(post=None, now=time.time):
     return True
 
 
-def wake_exception(n, why, key=None, now=time.time, dry=False, post=None, source='swarm-webhook'):
+def wake_exception(n, why, key=None, now=time.time, dry=False, post=None, source='swarm-webhook', extra=None):
     """An exception for swarmbot, from the webhook or any other swarm process (the daemon's
     deploy-lag check): deduped by key for WAKE_DEDUPE s, at most one POST per WAKE_EVERY s
     for all keys together. Returns a note line."""
     key = key or why[:80]
     t = now()
     payload = {'source': source, 'kind': 'exception', 'pr': n or None, 'why': why,
-               'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'log': str(LOG)}
+               'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'log': str(LOG), **(extra or {})}
     with _lock:
         st = _seen()
         last = st.setdefault('wake', {})
