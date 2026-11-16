@@ -269,6 +269,7 @@ tangentswarm/
   worktrees.py     one worktree per agent: layout, sync, .swarm.yaml, spawn/list/remove
   mcp_server.py    swarm-mcp (stdio, or Streamable HTTP with OAuth or an API key)
   agent_mcp_server.py  swarm-agent: agents' message tools (stdio, or one shared HTTP server)
+  agent_report.py  report_status: agent done / needs-input / blocked reports and the swarm's actions
   http_app.py      Streamable HTTP app + auth wiring shared by swarm-mcp and swarm-agent
   queue/           swarm-hub: SQLite message queue, its HTTP server and client
   auth.py          OAuth resource server + optional built-in authorization server
@@ -466,13 +467,14 @@ expose port 5002 or 5003.
 | --- | --- | --- |
 | `list_sessions` | read | tmux sessions: name, id, windows, attached, created |
 | `list_panes(target?, all?)` | read | panes: session, window index/name, pane index/id, active, command, path, size |
-| `capture_pane(target, history_lines?, escapes?)` | read | pane text (`-S -N` scrollback, `-e` escapes) |
-| `send_keys(target, text, enter=true, literal=true)` | shell | agent panes only: literal text, 0.5s, separate Enter; `literal=false` for key names |
+| `capture_pane(target, history_lines?, escapes?)` | read | raw pane text (`-S -N` scrollback, `-e` escapes); diagnostic, not evidence of typed input |
+| `send_keys(target, text, enter=true, literal=true, allow_ctrl_b=false)` | shell | agent panes only: literal text, 0.5s, separate Enter; `literal=false` for key names; the tmux prefix and a lone C-b are refused (see below) |
+| `tmux_action(target, action, arg?)` | shell | named tmux command on an agent's own pane or window: `show_window`, `select_pane`, `zoom`, `unzoom`, `rename_window`, `move_window`, `set_pane_title` (see below) |
 | `list_agents` | read | the registered agents: installed?, binary, exact argv, adapter level; the agent root |
 | `start_agent(agent, repo, branch, session="agents", window_name?)` | shell | start a registered agent (enum) in its own pre-trusted worktree `<root>/<repo>.<branch>` (see [One worktree per agent](#one-worktree-per-agent)); reports `trust` and `startup` (any [blocking screen](#trust-and-first-run-screens)) |
 | `list_worktrees(repo?)` | read | repos under the agent root and their worktrees: branch, dirty, on-layout, panes working in each |
 | `remove_worktree(repo, branch, delete_branch=false)` | shell | remove a clean, unused worktree; delete the branch only if merged |
-| `agent_status(target)` | read | registered agent in the pane's foreground, typeable?, blocked (named screen)?, prompt blank?, last lines |
+| `agent_status(target)` | read | registered agent in the pane's foreground, typeable?, blocked (named screen)?, prompt blank?, `prompt` (typed `input` vs ghost `suggestion`), last lines |
 | `pane_ready(target, probe=false)` | read (probe: shell) | is the agent's prompt empty; `blocked` names a first-run screen (never probed) |
 | `wait_for_idle(target, timeout_sec=120, poll_ms, settle_sec)` | read | screen stable + prompt blank |
 | `tell_agent(target, text, new_conversation?, require_empty_prompt=true)` | shell | agent panes only: tell-worker send sequence; refuses on a blocking screen |
@@ -520,12 +522,50 @@ with `TANGENTSWARM_AGENT_<NAME>=/abs/path`.
   foreground process group (`+` in the `ps` stat) is a registered agent. They refuse a
   bash prompt, a dead pane, or a shell whose agent was suspended with C-z. They then send
   keys to that pane id.
+- Clients never press tmux's prefix. `send_keys` writes straight to the pane, so tmux's
+  key bindings never fire and a prefix key would only reach the agent as a stray control
+  character. `send_keys` refuses the prefix keys in effect for the target's session
+  (`prefix` and `prefix2`: the session's own setting, else the global one) as key names,
+  and points the caller to `tmux_action`.
+- `tmux_action(target, action, arg)` runs one command from a fixed table against the
+  agent's own pane, window or session. It resolves `target` to the exact pane and needs
+  a registered agent there, like the typing tools. It then uses ids (`%pane`, and
+  `$session:@window` for window commands), so renaming a session or window can't
+  redirect the command. The session comes from the caller's target, so for a window
+  linked into several sessions, `other:shared` acts in `other`. A bare `%pane` target
+  leaves the session choice to tmux:
+
+  | action | arg | tmux command |
+  | --- | --- | --- |
+  | `show_window` | | `select-window` on the agent's window |
+  | `select_pane` | | `select-pane` on the agent's pane |
+  | `zoom` / `unzoom` | | `resize-pane -Z`, only when the zoom state needs to change |
+  | `rename_window` | kebab-case name, max 40 | `rename-window` |
+  | `move_window` | index 0–9999 | `move-window` within the agent's session; a taken index gets `-b` (insert there, later windows move up) |
+  | `set_pane_title` | 1–64 printable characters | `select-pane -T`. Agents such as Claude Code may retitle their own pane later (tmux's `allow-set-title`) |
+
+  There are no kill, respawn, run-shell, split, new-window, source-file, set-option or
+  detach actions.
+- The `ctrl+b ctrl+b to run in background` hint on Claude Code's screen is a Claude Code
+  shortcut, not tmux. Agents that copy it off the screen would background the target's
+  running command, so `send_keys` refuses C-b (as a key name, or a raw 0x02 byte) unless
+  `allow_ctrl_b=true`.
 - Agent recognition looks at the process's comm, its argv[0] and, for node, bun and deno,
   the script name. It never looks at the rest of the command line, because prompts often
   mention other agents.
 - Prompt detection uses an escape-coded capture. Text drawn dim or in grey (Claude's
   prompt suggestions, Muse's placeholder) counts as an empty prompt, and text in the
   normal colour counts as real input.
+- Screen text is not prompt state. Plain text (`capture_pane`, `last_lines`) loses the
+  styling, so Claude's dim autocomplete suggestion after an empty `❯` looks like typed
+  input. For claude and muse, `agent_status.prompt` separates `input` from `suggestion`
+  (the trailing dim/grey run of an input line). `input` drops only Claude's padding (the
+  separator after `❯`, the continuation indent) and keeps typed spaces and line breaks;
+  tmux trims blanks at a line end. A dim run next to a dim prompt glyph or box character
+  stays in `input`, because `input_view` keeps those glyphs and the prompt is then not
+  blank. `last_lines` wraps that run as `[ghost suggestion, not typed: ...]`. Nothing
+  outside the input box is relabelled or erased, and text in unfamiliar styles counts as
+  input. `tell_agent` still refuses to type over real input.
 
 The guard does not stop the agents themselves from running commands. You can use
 Claude's `!` bash mode or ask an agent to run something, and `send_keys` can answer
@@ -738,6 +778,7 @@ swarm-agent --http --host 127.0.0.1 --port 8768 --path /mcp/agent \
 | `whoami()` | the bound name and the credential it authenticated with |
 | `send_message(recipient, type, body, context?)` | posts to the hub, signed with the bound name |
 | `read_messages(since?, limit?)` | new messages addressed to you; moves your read cursor |
+| `report_status(state, pr, window, message?, question?)` | tells the swarm you are done, need input, are blocked or are working; the swarm acts on it (below) |
 
 One server serves many agents, so each MCP session (`Mcp-Session-Id`) is bound to an
 agent name, taken from the first of: `register_agent(name)`, an `X-Swarm-Agent: <name>`
@@ -755,6 +796,27 @@ Clients that cannot set headers (claude.ai connectors) call `register_agent` fir
 server instructions tell them to. Names are self-declared: anyone with a valid
 credential is trusted to say who they are. Every send is logged to stderr with the name
 and the credential (`apikey` or `oauth:<client_id>`).
+
+### Agent status reports (report_status)
+
+A swarm worker (any agent, here or in the cloud) tells the swarm its state over this HTTP
+server, so the swarm does not have to guess from an unchanged tmux screen (tangentswarm #53).
+Each report is one `agent-report` row in the swarm events DB (`swarm-events` shows it), and
+the swarm-promoted daemon acts on it through the spool op `report`
+(`tangentswarm/agent_report.py`):
+
+| state | what the swarm does |
+|-------|---------------------|
+| `done` | the worktree must be clean and pushed (else the worker is told why); the Stop-hook handoff advances the card; then the Claude is closed with `/exit` once idle. The window stays and the session is kept for `swarm-revive`. |
+| `needs-input` (with `question`) | posts the question on the ticket, moves the card to Needs Input, and closes the Claude. Moving the card back to In Progress resumes it with the answer. Until the report is handled, the Stop-hook handoff does not run. |
+| `blocked` (with `message`) | posts the blocker on the ticket and moves the card to Needs Input; the Claude keeps running. |
+| `working` | the events DB row only. |
+
+Identity: `pr` is the agent's PR and `window` its tmux window name. The daemon refuses a
+report whose window is not the one the swarm gives that PR, and one MCP session can report
+for only one `PR@window`. The worker brief tells every worker to call this. The #40
+watchdog's pane capture is the fallback only: `agent_report.last_report(pr)` says whether
+the agent reported recently.
 
 ### Auth
 
@@ -776,6 +838,265 @@ The same modes as swarm-mcp, with credentials that are separate in both directio
 - `builtin`: swarm-agent runs its own authorization server, issuing only
   `tangentswarm:agent`. Use this only when it has an origin to itself, because the
   authorization server routes live at the origin root.
+
+## swarm-tick: one pass of the platform PR loop
+
+`swarm-tick` moves the tangentcode/platform swarm forward with no LLM in the loop. A
+routine runs it every 15 minutes. The goal is that every Project 4 card is in Human
+Review or Needs Input when Michal sits down.
+
+```sh
+swarm-tick --dry-run     # change nothing; print "would: ..." lines and judgment items
+swarm-tick               # do the mechanical moves; print "did: ..." lines and judgment items
+swarm-tick --verbose     # also print every pane's class and each tool's output
+```
+
+Each pass classifies every pane in the tmux session `agents` (working, finished,
+idle-dirty, asking, input, menu, exited). It then does the safe mechanical moves:
+
+- An open In Progress or Auto Review PR whose body has no brief section gets the
+  coordinator's brief file (`$SWARM_BRIEF_DIR/<PR>.txt`) added at the end of its body.
+  A PR with no brief file is reported for judgment.
+- A held launch is started when the worker slice has room: one per pass, priority
+  milestone first, then the oldest hold (see `swarm-launch` below). An idle shell whose
+  head is still the `Start #N` scaffold commit, with a brief file, is a held launch that
+  was left behind; the pass queues it. Memory pressure that lasts 10 minutes or more is
+  reported with the live slice numbers and the held launches.
+- A draft In Progress PR whose Claude is finished (idle, clean worktree, local HEAD is
+  the pushed PR head, no open Codex findings, head merges cleanly onto origin/main) is
+  marked ready and moved to Auto Review, with one `@codex review` per head.
+- `active-gate --sweep --demote` and `active-gate --promote-missing` run as they are.
+- One `swarm-flow step` runs (see below). Ready PRs are never gated by the tick.
+
+Candidates in the priority milestone (`ptw 15`; override with
+`SWARM_PRIORITY_MILESTONES`) go first, then FIFO.
+
+Everything else is printed as one line per item that needs judgment, in the form
+`#PR %pane window: reason`. Examples are Codex findings to relay, a menu, idle work
+that is not pushed, a missing MinBot pass, a staging redeploy and a Claude that exited
+mid-work. A pass with nothing to do prints nothing.
+
+swarm-tick never merges, deploys, types into a pane, or kills or closes anything. It
+reuses the tools in `~/bin` (hr-gate, active-gate, pending-promote) and mn-workflow's
+state file; it does not replace them. Its log is `~/.local/state/swarm-tick/tick.log`.
+
+### swarm-brief: the brief in the PR body
+
+The coordinator writes one brief per worker PR to `$SWARM_BRIEF_DIR/<PR>.txt`. A draft
+PR scaffolded with only `Fixes #N` hides that brief from reviewers. `swarm-brief` puts
+the brief in a marked section at the end of the PR body:
+
+```sh
+swarm-brief 472 --file brief.md   # save the brief for #472, then write it into the body
+swarm-brief 472 473               # write the saved briefs into the bodies (no-op if present)
+swarm-brief --check 472 473       # report only
+```
+
+The section starts with `<!-- swarm-brief:start -->` and ends with
+`<!-- swarm-brief:end -->`. A gate check that reads the body (screenshots, the
+where-to-see line, the served commit, code-only) must skip this section, because a
+brief names those things before they exist. `tangentswarm.brief.strip_brief()` does that.
+
+### swarm-launch: held launches
+
+`swarm-start-scoped` exits 3 when the worker slice is short of memory and leaves an
+idle shell. `swarm-launch` runs it and puts a held launch in a queue
+(`$SWARM_HELD`); swarm-tick starts queued launches as memory frees and sends each new
+Claude one line that points to its brief file.
+
+```sh
+swarm-launch BRANCH [WINDOW] --pr N --brief FILE   # start now, or queue on a hold
+swarm-launch --list                                # live memory and the queue
+swarm-launch --next                                # start the first queued launch if memory admits it
+swarm-launch --drop BRANCH
+```
+
+Memory is read live each time: the slice's MemoryCurrent, MemoryHigh and MemoryMax,
+and the host's MemAvailable. A launch needs 700 MB under MemoryHigh and more than
+1.5 GB available, the same rule as `swarm-start-scoped`.
+
+### swarm-flow: the just-in-time Human Review flow
+
+`swarm-flow` enforces methodology#56. Columns are matched by option id
+(`tangentswarm.board`): Ready (finished, never merged, gated or checked), Staging (3 to 5
+fully prepared PRs) and Human Review (exactly 2).
+
+```sh
+swarm-flow step [--dry-run]   # one step under the serial lock (exit 75 = busy)
+swarm-flow event NAME < JSON  # from the GitHub hook: steps only on a Status change or a merge
+swarm-flow status             # Human Review, Staging, Ready, and the running pull
+```
+
+One step:
+
+1. **Promote.** Human Review has fewer than 2: `pending-promote --apply` (never `--fill`).
+2. **Pull.** Staging has fewer than 3 and no pull runs: take the top Ready PR (priority
+   milestone, fewest conflicts, oldest) that stacks cleanly on main + Human Review +
+   Staging (local merge-tree only). A PR that does not merge onto main goes back to In
+   Progress with a merge-main relay. Merge the head into `work` as one merge commit and
+   push it; the push redeploys staging.
+3. **Advance the pull.** Evaluate hr-gate on the pulled head. All pass: `hr-gate --apply`
+   puts it into Staging. CI running or screenshots missing: wait (90 minutes at most). A
+   hard failure or a moved head: back to In Progress with the reason.
+
+Only the pulled PR is merged, deployed or gated. swarm-tick runs one step per pass; the
+GitHub hook runs `swarm-flow event` on `projects_v2_item` and merge events.
+
+### Fast-track (methodology#60)
+
+First keep the flow full (Human Review 2, Staging 3-5, more Ready). Within that, a PR
+labeled `fast-track` or `high priority` (on the PR or on an issue it closes) jumps the
+queue at every step: held launches and pane order in swarm-tick, the Ready head, the
+FIRST Staging slot (it stacks on main + Human Review only; the Staging PRs behind it are
+re-stacked at their own promotion), and the next free Human Review slot. The serial lock
+and every gate still apply. `tangentswarm.board.priority_rank()` is the rule; the live
+hr-gate's queue order uses the same one.
+
+### swarm-promoted: refill Human Review in seconds
+
+A systemd user service with no LLM in the path. Every 30 seconds (or at once on
+`SIGUSR1`, for example from a webhook receiver after a merge) it reads the Status of
+every open PR in one lean GraphQL query, through the minbot shim. When Human Review holds
+fewer than 2 and Staging is not empty, it takes the serial lock (retrying every 5
+seconds while busy) and:
+
+1. **Fast path:** if the Staging head was gated at its current head commit (an hr-gate
+   PASS or PENDING line with no failure) and is not stacked, it moves that card to Human
+   Review first and writes the hr-gate PASS line.
+2. **Slow path:** `pending-promote --apply` if Human Review is still short.
+   `SWARM_PROMOTE_PULL=1` runs a full `swarm-flow step` instead (it also pulls).
+
+```sh
+swarm-promoted --once --dry-run      # one check; print what it would move
+systemctl --user kill -s USR1 swarm-promoted   # wake it now
+```
+
+### swarm-lock: one gate operation at a time
+
+Only one merge or gate operation may run at a time: `hr-gate --apply`, `hr-gate
+--sweep`, `pending-promote` and the work merge. Each takes one global lock with a
+non-blocking flock. A second caller prints `busy: <holder>` and exits 75 at once, with
+no API call; the next event or pass tries again. swarm-tick reports a busy lock as a
+note, not as an error.
+
+```sh
+swarm-lock -n work-merge -- git push origin HEAD:work   # run a command under the lock
+swarm-lock --status                                      # free, or busy and the holder
+```
+
+The lock file is `$SWARM_GATE_LOCK` (default `~/.cache/swarm-serial.lock`); the holder
+note is next to it. `SWARM_SERIAL_HELD=1` (or the older `HR_GATE_LOCK_HELD=1`) marks a
+run whose parent already holds the lock. `hr-gate --apply` also skips draft PRs before it takes the lock.
+
+### swarm-hookgate: the CI-completion hook's front gate
+
+A CI-completion hook runs `ci-last-check SHA` first and stops when it exits 1. A storm
+of CI events on new draft PRs once used up the whole REST quota. `swarm-hookgate`
+decides before any REST call:
+
+```sh
+swarm-hookgate ci-last-check SHA   # gate, then the REST check; 0 = go on, 1 = stop, 2 = error
+swarm-hookgate check SHA           # gate only (no REST call)
+swarm-hookgate wait                # return once the REST quota has a reserve; sleep through the reset
+```
+
+- It maps the SHA to a PR with a cached board snapshot (GraphQL only; refreshed when it
+  is older than 2 minutes or the SHA is not a known head).
+- It skips closed and draft PRs, and every card outside Auto Review and Pending.
+- It debounces per head: a head with complete CI is skipped for 30 minutes, and repeated
+  events while CI runs reach the REST check at most once a minute.
+- Below 300 REST calls left it waits for the reset time instead of failing mid-run.
+
+The `SWARM_HOOK_*` variables override these limits. The state is in `~/.cache/swarm-hook`.
+
+## swarm-webhook, the events DB and swarm-events
+
+`swarm-webhook` (`tangentswarm/webhook.py`) is the GitHub org webhook receiver. It runs the
+board rules with no LLM.
+
+Everything the swarm does is one row in one append-only SQLite table,
+`~/.local/state/swarm-flow/events.sqlite` (`tangentswarm/eventdb.py`, `$SWARM_EVENTS_DB`).
+The old `webhook-events.sqlite` is renamed to it once. Each row has a `source` and an
+`actor`:
+
+| source | what |
+| --- | --- |
+| webhook | every GitHub delivery (received, handled, replay) |
+| mcp | every worker MCP call (worker_status, handoff, request_review) |
+| stop-hook | each Stop hook run and its decision |
+| launcher | a launch (branch, draft PR, brief, worker) and a worker start |
+| slots | park (/exit), resume, feedback to a running Claude, tell |
+| relay | a merge-main relay to a Claude pane |
+| minbot, gh | every `minbot --apply` call and every gh call that writes |
+| board | every card move, with its PR and column |
+| cascade | each cascade pass (its lines) and each MinBot check |
+| hr-gate | hr-gate's own card moves |
+
+Rows are written with `eventdb.log_event()`, which never raises.
+
+`swarm-events` is the console viewer of that log. `--source mcp,stop-hook` shows only those
+sources. It opens the DB read-only and shows today's events (ET), one row per event: time,
+status (handled, queued, failed), event (an action row starts with its source), PR, actor and the outcome in plain words ("moved #513 to Done; cascade"). Skipped events, log-only
+events, redeliveries and cascade passes that did nothing are hidden. A signature shows only
+when it failed (white on red); a failed event is red. In a terminal the screen is redrawn
+every 10 s (`--redraw`): rows from the last 2 minutes are bright, and each older minute is a
+darker gray. `-v` prints the rows as JSON. `--since all|YYYY-MM-DD` and `--once` are also
+available.
+
+The Agents screen (press `a` in a terminal, `e` to go back, `q` to quit; or start with
+`--agents`) shows one line per pane of the `agents` tmux session, read live from tmux, `/proc`
+and `~/.claude/sessions` (`tangentswarm/livestate.py`, `tangentswarm/agents_view.py`). When
+the panes do not fit, `j`/`k` (or the arrows) scroll a row and space/`b` (or PgDn/PgUp) a
+page; the header and the summary stay. No line is wider than the terminal. Each line shows:
+
+- the Claude pid, or "no claude" when no `claude` process runs in the pane;
+- active or idle: the Claude session status, and a screen capture once a minute (a screen
+  that changed in the last minute is active);
+- tests (pytest, jest, vitest, ...) and other processes in the pane;
+- the memory and CPU of the pane's process tree;
+- the PR and card, from the board snapshot file (never fetched by the viewer).
+
+The header shows the load average, the worker slice memory, the Claudes that count against
+`SWARM_MAX_CLAUDES`, and the start capacity. Starts are held while the worker memory is short
+or the 5-minute load average is over `SWARM_LOAD_PER_CPU` (default 1.5) per CPU
+(`launches.admits`). With `--once` or a pipe the screen prints once.
+`python -m tangentswarm.livestate --json` prints one sample as JSON (for the sanity check, #43).
+
+Install it, in one of these ways:
+
+    pip install .                                          # the swarm-events entry point
+    ln -sf "$PWD/bin/swarm-events" ~/bin/swarm-events      # or: this checkout, no install
+
+The `bin/swarm-events` wrapper uses `$TANGENTSWARM_PYTHON` (default `python3`). To keep it
+open in tmux:
+
+    tmux new-session -d -s events -n webhook ~/bin/swarm-events
+    tmux attach -t events
+
+Private ids, hosts and secret paths are in `~/.config/tangentswarm/config.toml`, never in
+the repo. `tangentswarm/config.example.toml` shows the shape.
+
+## swarm-tmux-status: which swarm windows are working
+
+`swarm-tmux-status` is a standalone console table of the windows in the swarm tmux session
+(default `agents`, or `--session` / `$SWARM_TMUX_SESSION`). It reads tmux only. Each window
+gets one class from its foreground command and its screen:
+
+- `WORKING`: Claude runs and is busy ("esc to interrupt" under its input box)
+- `idle`: Claude runs but does no work
+- `shell`: no Claude, a shell prompt
+- a program name (such as `python`): no Claude, another program in the foreground
+
+A row also shows the window index, the ticket from the window name (`mn-458-...` is
+`mn #458`) and the last activity line (Claude's last transcript entry, or the shell's last
+line that is not a prompt). The default view lists only the working windows. Keys: `a`
+toggles all windows, up/down or `j`/`k` select, Enter or `z` zooms into the window's recent
+output, Esc or `q` goes back, `r` refreshes now. It refreshes every `--interval` s (default 2).
+
+    swarm-tmux-status                    # the interactive table
+    swarm-tmux-status --once [--all]     # print the table once
+    swarm-tmux-status --zoom 41          # print the recent output of window 41
+    ln -sf "$PWD/bin/swarm-tmux-status" ~/bin/swarm-tmux-status   # this checkout, no install
 
 ## License
 

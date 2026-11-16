@@ -31,7 +31,7 @@ import sys
 
 import anyio
 
-from . import __version__, agents, registry, tmux, worktrees
+from . import __version__, agents, registry, tmux, tmux_actions, worktrees
 from .auth import SCOPE_READ, SCOPE_SHELL
 
 from mcp.server.mcpserver import MCPServer as _Server   # mcp 2.x (FastMCP was renamed)
@@ -42,6 +42,15 @@ start_agent (see list_agents; every agent gets its own git worktree, see list_wo
 and remove_worktree), and talk to it with tell_agent or send_keys (literal text,
 then Enter after a 0.5s pause). Typing is only allowed into panes whose foreground process
 is a registered agent (claude, muse, grok, gemini, codex) -- never into a shell.
+Never press tmux's prefix: send_keys goes straight to the agent, never through tmux's
+bindings, so send_keys refuses the prefix key. For tmux commands on an agent's own pane
+or window (show_window, select_pane, zoom, unzoom, rename_window, move_window,
+set_pane_title) call tmux_action. ctrl+b (Claude Code's "run in background") is a Claude
+Code key, not tmux's; a lone C-b is refused unless allow_ctrl_b=true.
+Screen text (capture_pane, last_lines) is a diagnostic picture, not evidence of typed input:
+Claude draws grey/dim autocomplete suggestions after an empty prompt. Judge the prompt
+with agent_status.prompt / prompt_blank or pane_ready, and type with tell_agent, which
+refuses to overwrite real input.
 Targets use tmux syntax: session, session:window, session:window.pane or %pane_id.
 cloud_* tools talk to Claude Code cloud sessions through the tangentswarm cloud hub
 (`swarm cloud serve`, ws://127.0.0.1:5002/ws). There are no kill tools and no
@@ -143,7 +152,12 @@ def list_panes(target: str | None = None, all: bool = False) -> dict:
 @_scoped(SCOPE_READ)
 def capture_pane(target: str, history_lines: int | None = None, escapes: bool = False) -> str:
     """Return the visible text of a pane, plus `history_lines` lines of scrollback when set.
-    escapes=true keeps colour/attribute escape sequences (capture-pane -e)."""
+    escapes=true keeps colour/attribute escape sequences (capture-pane -e).
+
+    This is the raw screen, for diagnostics. It is not evidence of typed input: plain text
+    loses the grey/dim styling of an agent's autocomplete suggestion, which then looks
+    exactly like typed text after the prompt glyph. Use agent_status (prompt,
+    prompt_blank) or pane_ready to read the prompt, and tell_agent to type."""
     try:
         return tmux.capture_pane(target, history_lines=history_lines, escapes=escapes)
     except tmux.TmuxError as e:
@@ -151,12 +165,29 @@ def capture_pane(target: str, history_lines: int | None = None, escapes: bool = 
 
 
 @_scoped(SCOPE_SHELL)
-async def send_keys(target: str, text: str, enter: bool = True, literal: bool = True) -> dict:
+async def send_keys(target: str, text: str, enter: bool = True, literal: bool = True,
+                    allow_ctrl_b: bool = False) -> dict:
     """Type into a coding agent's pane. Refused unless the pane's foreground process is a
     registered agent, so it never types into a shell. literal=true (the default) sends the
     text verbatim with send-keys -l, then, if enter is set, waits 0.5s and presses Enter in
-    a separate call. literal=false passes `text` as tmux key names, such as 'C-c', 'Escape'
-    or 'Up'."""
+    a separate call. literal=false passes `text` as one tmux key name, such as 'C-c',
+    'Escape' or 'Up'.
+
+    Keys go straight to the agent, never through tmux's prefix or key bindings, so the
+    tmux prefix key is refused: use tmux_action for tmux commands. The 'ctrl+b ctrl+b to
+    run in background' hint on Claude Code's screen is a Claude Code shortcut, not tmux;
+    C-b is refused unless allow_ctrl_b=true."""
+    why = tmux.refused_key(text, target, literal=literal)
+    if why == 'prefix':
+        raise ToolError(
+            f"refusing to send {text.strip()}: it is tmux's prefix key, and send_keys goes straight "
+            "to the agent, so tmux would never see it. Use tmux_action for tmux commands "
+            f"({', '.join(tmux_actions.ACTIONS)}).")
+    if why == 'ctrl_b' and not allow_ctrl_b:
+        raise ToolError(
+            "refusing to send C-b: ctrl+b is Claude Code's 'run in background' key, not tmux's. "
+            "Use tmux_action for tmux commands. Pass allow_ctrl_b=true if you really mean to "
+            "background the agent's running command.")
     def run():
         pane = agents.require_agent_pane(target)
         pid = pane['pane_id']
@@ -173,6 +204,30 @@ async def send_keys(target: str, text: str, enter: bool = True, literal: bool = 
         raise _err(e)
     return {'target': target, 'pane_id': pane['pane_id'], 'agent': pane['agent'],
             'sent_chars': len(text), 'enter': enter, 'literal': literal}
+
+
+@_scoped(SCOPE_SHELL)
+async def tmux_action(target: str, action: str, arg: str | int | None = None) -> dict:
+    """Run a named tmux command on a coding agent's own pane or window. Use this instead of
+    tmux's prefix key, which send_keys refuses. The target resolves to the exact pane, which
+    must run a registered agent, and the command uses that pane's own window, in the session
+    the target names (pass session:window.pane for a window linked into several sessions;
+    for a bare %pane id tmux picks the session).
+    Actions:
+    - show_window: make the agent's window the current one in its session
+    - select_pane: make the agent's pane the active one in its window
+    - zoom / unzoom: zoom the agent's pane to fill its window / restore the layout
+    - rename_window, arg = kebab-case name (max 40)
+    - move_window, arg = window index: move the agent's window there in its session; if the
+      index is taken, the window is inserted there and later windows move up
+    - set_pane_title, arg = up to 64 printable characters (an agent may later retitle its
+      own pane)
+    There are no kill, respawn or run-command actions. Returns the commands that ran
+    (none when nothing needed to change)."""
+    try:
+        return await anyio.to_thread.run_sync(lambda: tmux_actions.run_action(target, action, arg))
+    except tmux.TmuxError as e:
+        raise _err(e)
 
 
 @_scoped(SCOPE_READ)
@@ -234,7 +289,15 @@ async def agent_status(target: str) -> dict:
     """Report which coding agent (claude, codex, gemini, opencode and others) runs in a pane,
     whether its input prompt is blank, its current command and path, and the last screen
     lines. 'blocked' names a first-run or blocking screen (trust, theme, login, API key,
-    bypass confirmation, update) the agent is stuck on, or is null. Read-only."""
+    bypass confirmation, update) the agent is stuck on, or is null. Read-only.
+
+    prompt_blank and, for claude and muse, `prompt` ({input, suggestion, blank}) are the
+    interpreted prompt: `input` is the typed text as the screen shows it (Claude's prompt
+    padding removed, typed spaces and line breaks kept; tmux drops blanks at a line end),
+    `suggestion` is grey/dim ghost text the agent drew that is not typed. When a dim run
+    can't be told apart from input, it stays in `input`, so `blank` errs toward false. last_lines is the screen as drawn, for diagnostics, with
+    a recognised suggestion in the prompt box wrapped as
+    '[ghost suggestion, not typed: ...]'; do not read typed input from it."""
     try:
         return await anyio.to_thread.run_sync(agents.agent_status, target)
     except tmux.TmuxError as e:
@@ -362,7 +425,7 @@ async def cloud_wait_for_response(session_id: str, text: str | None = None, time
     return await _cloud().cloud_wait_for_response(session_id, text, timeout_sec, poll_ms)
 
 
-TOOLS = [list_sessions, list_panes, capture_pane, send_keys, list_agents, start_agent,
+TOOLS = [list_sessions, list_panes, capture_pane, send_keys, tmux_action, list_agents, start_agent,
          list_worktrees, remove_worktree,
          agent_status, pane_ready, wait_for_idle, tell_agent, swarm_status, tell_worker,
          cloud_list_sessions, cloud_send_message, cloud_get_latest_response, cloud_wait_for_response]
