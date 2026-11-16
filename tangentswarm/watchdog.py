@@ -74,8 +74,10 @@ def codex_facts(full):
             req = max(req or t, t) if t else req
     if req is None:
         return {'req': None, 'reply': False, 'limit': False}
+    from .webhook import codex_running
     after = [c for c in (full.get('comments') or {}).get('nodes') or []
-             if who(c).startswith(CODEX) and (_ts(c.get('createdAt')) or 0) > req]
+             if who(c).startswith(CODEX) and (_ts(c.get('createdAt')) or 0) > req
+             and not codex_running(c.get('body'))]  # Codex on PR #51: "running" is not an answer
     reviews = [r for r in (full.get('reviews') or {}).get('nodes') or []
                if who(r).startswith(CODEX) and (_ts(r.get('submittedAt')) or 0) > req]
     return {'req': req, 'reply': bool(after or reviews),
@@ -329,11 +331,15 @@ class Watchdog:
             w = codex_wait(facts, now)
             if w:
                 found[n] = w
+        if self.dry:  # Codex on PR #51: a dry run must not record the outage as announced
+            import copy
+            import types
+            scratch = types.SimpleNamespace(data=copy.deepcopy(self.st.data), save=lambda: None)
+            text = outage_update(scratch, found, now)
+            return [f"would alert Michal: {text}"] if text else []
         text = outage_update(self.st, found, now)
         if not text:
             return []
-        if self.dry:
-            return [f"would alert Michal: {text}"]
         key = f"codex-outage:{int(now)}"
         self.alert(text, key=key, st=self.st)
         self.incident(key, 'Codex outage', text)

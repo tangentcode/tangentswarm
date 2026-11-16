@@ -153,6 +153,21 @@ def ours(body):
     return b.strip().lower() == '@codex review' or any(m in b for m in OUR_MARKS)
 
 
+CODE_REVIEW_STATUS_RE = re.compile(r'"code_review"\s*:\s*\{[^{}]*?"status"\s*:\s*"(\w+)"', re.I)
+STATUS_RE = re.compile(r'"status"\s*:\s*"running"', re.I)
+
+
+def codex_running(body):
+    """True for Codex's in-progress status comment (not a result). The state JSON has no
+    spaces ("status":"running"), so a check for the spaced form never matched. The
+    code_review status wins when it is there (a running security review is not one)."""
+    b = (body or '').replace("'", '"')
+    if 'codex-review-state' in b:
+        m = CODE_REVIEW_STATUS_RE.search(b)
+        return m.group(1).lower() == 'running' if m else bool(STATUS_RE.search(b))
+    return 'Code Review' in b and '**Running**' in b
+
+
 def classify(event, p):
     """[Action] for one delivery (pure: no I/O). An empty list is "skip"; the first action's
     why says why when it is a skip."""
@@ -178,7 +193,7 @@ def classify(event, p):
         if is_codex(c.get('user'), body):
             if not is_pr:
                 return [Action('skip', why='Codex comment on an issue')]
-            if 'codex-review-state' in body and '"status": "running"' in body.replace("'", '"'):
+            if codex_running(body):
                 return [Action('skip', pr=n, why='Codex review is running')]
             return [Action('codex', n, 'Codex comment (summary or receipt)')]
         if is_bot_self(c.get('user')) or ours(body):

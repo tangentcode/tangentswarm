@@ -256,3 +256,33 @@ def test_worker_root(tmp_path, monkeypatch):
     assert WD.worker_root(str(tmp_path / 'platform.feat' / 'web' / 'x')) == str(tmp_path / 'platform.feat')
     assert WD.worker_root(str(tmp_path / 'other')) is None
     assert Path(WD.worker_root(str(tmp_path / 'platform.feat') + ' (deleted)')).name == 'platform.feat'
+
+
+RUNNING = ('<!-- codex-review-state:v1 {"code_review":{"commit_sha":"abc","has_any_findings":null,'
+           '"status":"running"}} -->\n| 📝 **Code Review** | 🔄 **Running** since now | `abc` |')
+
+
+def test_a_running_status_comment_is_not_a_codex_answer():
+    """Codex on PR #51: a stalled review that only said "running" is still an outage."""
+    from tangentswarm import webhook
+    f = WD.codex_facts(pr_full(req=T0, reply=T0 + 30, body=RUNNING))
+    assert f['reply'] is False and WD.codex_wait(f, T0 + 1900)[0] == 'silent'
+    done = RUNNING.replace('"running"', '"completed"').replace('🔄 **Running**', '✅ **Completed**')
+    assert WD.codex_facts(pr_full(req=T0, reply=T0 + 30, body=done))['reply'] is True
+    assert webhook.codex_running(RUNNING) and not webhook.codex_running(done)
+    assert webhook.codex_running('codex-review-state {"code_review": {"status": "running"}}')  # spaced too
+    p = {'action': 'created', 'repository': {'full_name': webhook.REPO},
+         'comment': {'user': {'login': 'chatgpt-codex-connector[bot]'}, 'body': RUNNING},
+         'issue': {'number': 7, 'pull_request': {}}}
+    assert webhook.classify('issue_comment', p)[0].why == 'Codex review is running'
+
+
+def test_a_dry_run_records_no_outage_and_the_live_pass_still_alerts():
+    """Codex on PR #51: a dry run saved the outage, so the daemon never announced it."""
+    r = Rig([snap_node(5, board.AUTO_REVIEW)], details={5: pr_full(req=T0)})
+    r.w.dry = True
+    assert r.w.codex_pass(_snap(r), T0 + 1900)[0].startswith('would alert Michal')
+    assert 'codex_outage' not in alerts.state().data and 'codex_outage' not in r.w.st.data
+    r.w.dry = False
+    r.w.codex_pass(_snap(r), T0 + 2000)
+    assert len(r.alerts) == 1

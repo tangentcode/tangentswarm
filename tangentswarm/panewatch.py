@@ -355,7 +355,7 @@ class PaneWatch:
         return tick.menu_line(screen or '')
 
     def save_report(self, now):
-        if not self.report:
+        if not self.report or self.dry:  # a dry run never replaces the daemon's report
             return
         rows = {k: {f: v for f, v in p.items() if f not in ('wt',)} | {'wt': p.get('wt')}
                 for k, p in self.latest.items()}

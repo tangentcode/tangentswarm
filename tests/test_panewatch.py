@@ -201,3 +201,11 @@ def test_a_failing_action_on_one_pane_does_not_stop_the_pass(worker):
     out = r.run(60)
     assert out == ['%1 mn-7-feat: exit failed: RuntimeError: never reached an empty prompt']
     assert PW.read_report()['panes']['%1']['cls'] == 'idle'  # the report is still written
+
+
+def test_a_dry_run_writes_no_report_and_no_once_key(worker):
+    r = Rig(worker, (screen(['● x'], typed='relay'), False), pr=AR)
+    r.w.dry = True
+    r.run(0)
+    r.run(60)
+    assert PW.read_report() == {'at': None, 'panes': {}} and alerts.state().data['done'] == {}
