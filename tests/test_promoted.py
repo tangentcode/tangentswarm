@@ -594,27 +594,69 @@ MAIN = 'c' * 40
 
 
 class GitScratch(Scratch):
-    def __init__(self, rows='', ancestor=True):
-        self.rows, self.ancestor, self.calls = rows, ancestor, []
+    """A scratch repo over a fake commit graph {sha: [parents]}; revs match by prefix."""
+    def __init__(self, graph):
+        self.graph, self.calls = dict(graph), []
+
+    def ensure_main(self):
+        return MAIN
+
+    def find(self, rev):
+        return next((c for c in self.graph if c.startswith(rev)), None)
+
+    def chain(self, top):  # the first-parent chain from top, newest first
+        out, c = [], self.find(top)
+        while c:
+            out.append(c)
+            c = self.find((self.graph.get(c) or [None])[0] or '~')
+        return out
 
     def git(self, *a, check=True):
         import subprocess
         self.calls.append(a)
         if a[0] == 'merge-base':
-            return subprocess.CompletedProcess(a, 0 if self.ancestor else 1, '', '')
-        return subprocess.CompletedProcess(a, 0, self.rows, '')
+            base, top = self.find(a[2]), a[3]
+            return subprocess.CompletedProcess(a, 0 if base and base in self.chain(top) else 1, '', '')
+        if '-n' in a:
+            c = self.find(a[-1])
+            return subprocess.CompletedProcess(a, 0 if c else 1, ' '.join([c] + self.graph[c]) if c else '', '')
+        base, top = a[-1].split('..')
+        rows = []
+        for c in self.chain(top):
+            if c.startswith(base):
+                break
+            rows.append(' '.join([c] + self.graph[c]))
+        return subprocess.CompletedProcess(a, 0, '\n'.join(rows) + '\n', '')
+
+
+def full(x):
+    return (x + '0' * 40)[:40]
+
+
+def premerge_graph(base, head=H5, tip='t' * 40, second=None):
+    """The graph of a mechanical pre-merge: future main = base main + one merge per queued
+    head (second: {i: another second parent}, e.g. a resolved tip), then tip = fm + head."""
+    m, *deps = base.split()
+    graph, cur = {full(m): []}, full(m)
+    for i, d in enumerate(deps):
+        c = f'f{i}'.ljust(40, 'e')
+        graph[c] = [cur, (second or {}).get(i) or full(d.split('@', 1)[-1])]
+        cur = c
+    graph[tip] = [cur, head]
+    return graph
 
 
 def premerged(tmp_path, monkeypatch, base, labels=('merge-ready',), d=None, scratch=None, rec=True):
-    """A Promoter for Human Review [#1 at 'a'] and Staging [#5]; returns (promoter, g, merges)."""
+    """A Promoter for Human Review [#1 at 'a'] and Staging [#5]; returns (promoter, g, merges).
+    The scratch repo holds a mechanical pre-merge of #5 on base unless scratch is given."""
     from tangentswarm import flow
     merges = []
     monkeypatch.setattr(flow, 'merge_commit', lambda s, a, b, m: merges.append((a, b)) or f'{a}+{b}')
     if rec:
         flow.set_premerge(5, dict(head=H5, base=base, vbranch='b-v1', tip='t' * 40, status='ready'))
     g = G(tmp_path, details={5: d or detail(5, H5)})
-    if scratch is not None:
-        g['ScratchRepo'] = lambda: scratch
+    sc = scratch if scratch is not None else GitScratch(premerge_graph(base))
+    g['ScratchRepo'] = lambda: sc
     p = P.Promoter(g=g)
     monkeypatch.setattr(p, 'main_sha', lambda: MAIN)
     cols = {board.HUMAN_REVIEW: [dict(number=1, head='a', item='I1')],
@@ -659,17 +701,18 @@ def test_a_queued_pr_merged_since_the_pre_merge_still_matches(tmp_path, monkeypa
     """The pre-merge was built on old main + #2 + #1; #2 merged since (main's one new
     first-parent commit is the merge of #2's head): the tip still holds the future main."""
     old = 'd' * 12
-    rows = f"{MAIN} {old}{'0' * 28} {'b' * 40}\n"
-    s = GitScratch(rows)
-    p, g, merges, cols = premerged(tmp_path, monkeypatch, f"{old} #2@{'b' * 12} #1@a", scratch=s)
+    base = f"{old} #2@{'b' * 12} #1@a"
+    graph = premerge_graph(base)
+    graph[MAIN] = [full(old), 'b' * 40]
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, base, scratch=GitScratch(graph))
     assert p.fast_path(cols, reread=lambda: cols) == [5] and merges == []
     # main also has a commit that is not one of those merges: the full check runs
-    s2 = GitScratch(rows + f"{'e' * 40} {old}{'0' * 28}\n")
-    p, g, merges, cols = premerged(tmp_path, monkeypatch, f"{old} #2@{'b' * 12} #1@a", scratch=s2)
+    g2 = dict(graph, **{'e' * 40: [full(old), '1' * 40], MAIN: ['e' * 40, 'b' * 40]})
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, base, scratch=GitScratch(g2))
     assert p.fast_path(cols, reread=lambda: cols) == [5] and merges
     # the old main is not an ancestor of main: the full check runs
-    s3 = GitScratch(rows, ancestor=False)
-    p, g, merges, cols = premerged(tmp_path, monkeypatch, f"{old} #2@{'b' * 12} #1@a", scratch=s3)
+    g3 = dict(graph, **{MAIN: ['9' * 40, 'b' * 40], '9' * 40: []})
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, base, scratch=GitScratch(g3))
     assert p.fast_path(cols, reread=lambda: cols) == [5] and merges
 
 
@@ -684,14 +727,15 @@ def test_the_pre_merge_base_must_match_the_queue_in_order(tmp_path, monkeypatch)
                        (f"{MAIN[:12]} #1@a #4@{'4' * 12} #9@{'9' * 12}", False),  # a PR not ahead any more
                        (f"{MAIN[:12]} #1@a", False)):                    # #4 is missing
         p = premerged(tmp_path, monkeypatch, base)[0]
-        assert p.premerge_current(staging[1], {}, [(1, 'a'), (4, '4' * 40)], lambda: MAIN, Scratch(),
-                                  lambda: 'main') is skip, base
+        assert p.premerge_current(staging[1], {}, [(1, 'a'), (4, '4' * 40)], lambda: MAIN,
+                                  GitScratch(premerge_graph(base)), lambda: MAIN) is skip, base
     # a merged PR must come first in the base (it was first in the queue)
-    old, rows = 'd' * 12, f"{MAIN} {'d' * 40} {'b' * 40}\n"
+    old = 'd' * 12
     for base, skip in ((f"{old} #2@{'b' * 12} #1@a", True), (f"{old} #1@a #2@{'b' * 12}", False)):
         p, g, merges, cols = premerged(tmp_path, monkeypatch, base)
-        assert p.premerge_current(cols[board.STAGING][0], {}, [(1, 'a')], lambda: MAIN, GitScratch(rows),
-                                  lambda: 'main') is skip, base
+        graph = dict(premerge_graph(base), **{MAIN: [full(old), 'b' * 40]})
+        assert p.premerge_current(cols[board.STAGING][0], {}, [(1, 'a')], lambda: MAIN, GitScratch(graph),
+                                  lambda: MAIN) is skip, base
 
 
 def test_a_moved_pr_with_a_new_head_on_the_re_read_is_checked_at_that_head(tmp_path, monkeypatch):
@@ -709,10 +753,56 @@ def test_a_moved_pr_with_a_new_head_on_the_re_read_is_checked_at_that_head(tmp_p
     p = P.Promoter(g=g)
     assert p.fast_path(cols, reread=lambda: fresh) == [5]
     assert p.left == [(8, H8, 'conflicts with #5 in Human Review')]
-    lag = {board.STAGING: [dict(number=8, head=H8, item='I8')]}  # the move is not on the board yet
+    lag = {board.STAGING: cols[board.STAGING]}  # the move is not on the board yet
     monkeypatch.setattr(flow, 'merge_commit', lambda s, a, b, m: None if H5 in a and b == H8 else f'{a}+{b}')
     g = G(tmp_path, details={5: detail(5, H5), 8: detail(8, H8)})
     (tmp_path / 'hr.log').write_text(LOG8)
     p = P.Promoter(g=g)
     assert p.fast_path(cols, reread=lambda: lag) == [5]
     assert p.left == [(8, H8, 'conflicts with #5 in Human Review')]
+
+
+def test_a_pr_moved_in_this_pass_that_merges_frees_its_slot_again(tmp_path, clean):
+    """Codex on PR #68: #5 moves (the re-read lags: it is still in Staging, so it counts),
+    then #8 moves. The re-read after #8 shows #5 in no column (merged, not lag): its slot
+    is free again, so #9 moves in the same pass."""
+    H9 = '9' * 40
+    g = G(tmp_path, details={5: detail(5, H5), 8: detail(8, H8), 9: detail(9, H9)})
+    (tmp_path / 'hr.log').write_text(LOG8 + "2026-11-13T19:00:00-05:00\tapply\t#9\t99999999\tPASS\tfail=-\tc\n")
+    s5, s8, s9 = (dict(number=n, head=h, item=f'I{n}') for n, h in ((5, H5), (8, H8), (9, H9)))
+    reads = [{board.STAGING: [s5, s8, s9]},  # after #5: the board lags
+             {board.STAGING: [s8, s9]},      # after #8: #5 merged; #8 still lags
+             {board.STAGING: [s8, s9]}]
+    p = P.Promoter(g=g)
+    assert p.fast_path({board.STAGING: [s5, s8, s9]}, reread=lambda: reads.pop(0)) == [5, 8, 9]
+    assert [m[0] for m in g.moves] == ['I5', 'I8', 'I9'] and reads == []
+
+
+def test_a_resolved_pre_merge_never_skips_the_scratch_merge(tmp_path, monkeypatch):
+    """Codex on PR #68: a tip its worker resolved on a -vN (the record has a seed) leaves the
+    head as it was, so it proves nothing about the head: the full check runs. The same when
+    a PR ahead is in future main as its resolved tip."""
+    from tangentswarm import flow
+    base = f'{MAIN[:12]} #1@a'
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, base)
+    flow.set_premerge(5, dict(head=H5, base=base, vbranch='b-v2', seed='s' * 40, tip='t' * 40, status='ready'))
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and merges
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, base)
+    flow.set_premerge(1, dict(head='a', base=MAIN[:12], vbranch='a-v1', seed='s' * 40, tip='u' * 40, status='ready'))
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and merges
+    flow.set_premerge(1, dict(head='a', base=MAIN[:12], vbranch='a-v1', tip='u' * 40, status='ready'))
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, base)
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and merges == []  # mechanical: skipped
+
+
+def test_a_pre_merge_built_on_a_resolved_tip_ahead_never_skips(tmp_path, monkeypatch):
+    """Codex on PR #68: #1 entered future main as its resolved -vN tip, not its head (its
+    record may be gone by now): the tip proves nothing about #5's head with #1's head. And a
+    tip whose second parent is not the head is no proof either."""
+    base = f'{MAIN[:12]} #1@a'
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, base,
+                                   scratch=GitScratch(premerge_graph(base, second={0: 'r' * 40})))
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and merges
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, base,
+                                   scratch=GitScratch(premerge_graph(base, head='9' * 40)))
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and merges

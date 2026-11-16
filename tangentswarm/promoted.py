@@ -490,8 +490,11 @@ class Promoter:
 
             while True:
                 hr = list(cols.get(board.HUMAN_REVIEW, []))  # fresh entries win (a new head; Codex on PR #68)
-                seen = {q['number'] for q in hr}
-                hr += [q for n, q in done.items() if n not in seen]  # board lag only
+                # A moved PR the read still shows in Staging is board lag: it counts in Human
+                # Review. One in no column is no longer open (merged during the pass): its slot
+                # is free (Codex on PR #68).
+                lag = {q['number'] for q in cols.get(board.STAGING, [])}
+                hr += [q for n, q in done.items() if n in lag]
                 staging = [q for q in cols.get(board.STAGING, []) if q['number'] not in done]
                 if len(hr) >= HR_TARGET or not staging:
                     break
@@ -542,7 +545,8 @@ class Promoter:
         """tangentswarm #67 (c): True if Staging PR p carries merge-ready and its pre-merge
         record (flow.PREMERGE_STATE) was built for its current head on the current future main
         ahead of it: main and the PRs `ahead` ([(n, head)]: Human Review, then Staging before
-        p, each in the shared pick order). Then the scratch merge is skipped. The ordered
+        p, each in the shared pick order), as a mechanical merge of its head (no seed), with
+        every PR ahead in it as its head. Then the scratch merge is skipped. The ordered
         (PR, head) list must match: the base is the PRs merged since (first in it; each new
         first-parent commit of main is the merge of one such head, nothing else), then
         exactly `ahead`, in queue order.
@@ -551,9 +555,15 @@ class Promoter:
         labels = set(p.get('own_labels') or []) | {l['name'] for l in ((d or {}).get('labels') or {}).get('nodes') or []}
         if flow.MERGE_READY not in labels or flow.PRE_MERGING in labels:
             return False
-        rec = flow.load_premerge().get(str(p['number'])) or {}
+        recs = flow.load_premerge()
+        rec = recs.get(str(p['number'])) or {}
         if not (rec.get('status') == 'ready' and rec.get('head') == p['head'] and rec.get('tip')
                 and isinstance(rec.get('base'), str) and rec['base'].split()):
+            return False
+        # Codex on PR #68: only a mechanical pre-merge (the head itself merged cleanly; no
+        # seed) proves the head merges. A tip its worker resolved on a -vN leaves the head as
+        # it was. And each PR ahead must be in future main as its head, not as a resolved tip.
+        if rec.get('seed') or any((recs.get(str(n)) or {}).get('seed') for n, _ in ahead):
             return False
         base_main, *deps = rec['base'].split()
         want = [f"#{n}@{h[:12]}" for n, h in ahead]
@@ -568,27 +578,51 @@ class Promoter:
         main = tip()
         if not main:
             return False
-        if not gone:
-            return main.startswith(base_main)
         try:
+            if not self.built_from_heads(scratch, rec['tip'], p['head'], base_main,
+                                         [x.split('@', 1)[-1] for x in deps]):
+                return False
+            if not gone:
+                return main.startswith(base_main)
             return self.merged_onto(scratch, main_ref(), base_main, [x.split('@', 1)[-1] for x in gone])
         except Exception:
             return False
 
+    @staticmethod
+    def merge_rows(scratch, base, top):
+        """[(commit, first parent, second parent)] of each first-parent commit in base..top,
+        oldest first; None if base is not an ancestor of top or a commit there is not a
+        two-parent merge."""
+        if scratch.git('merge-base', '--is-ancestor', base, top, check=False).returncode != 0:
+            return None
+        r = scratch.git('rev-list', '--first-parent', '--parents', f'{base}..{top}', check=False)
+        if r.returncode != 0:
+            return None
+        rows = [line.split() for line in (r.stdout or '').splitlines() if line.strip()]
+        return None if any(len(row) != 3 for row in rows) else rows[::-1]
+
+    def built_from_heads(self, scratch, tip, head, base_main, heads):
+        """Codex on PR #68: True if the pre-merged tip is the merge of future main and the PR
+        head (second parent: the head), and that future main is base_main plus one merge per
+        queued head, in queue order (second parent: that head, never a resolved -vN tip).
+        Then the head itself merged cleanly onto main + the queued heads."""
+        scratch.ensure(tip)
+        r = scratch.git('rev-list', '--parents', '-n', '1', tip, check=False)
+        row = (r.stdout or '').split() if r.returncode == 0 else []
+        if len(row) != 3 or row[2] != head:
+            return False
+        rows = self.merge_rows(scratch, base_main, row[1])
+        return (rows is not None and len(rows) == len(heads)
+                and all(r[2].startswith(h) for r, h in zip(rows, heads)))
+
     def merged_onto(self, scratch, main, base_main, heads):
         """True if main is base_main plus one merge commit per head (first parent: the main
         before it; second parent: that head), in any order, and nothing else."""
-        r = scratch.git('merge-base', '--is-ancestor', base_main, main, check=False)
-        if r.returncode != 0:
+        rows = self.merge_rows(scratch, base_main, main)
+        if rows is None:
             return False
-        r = scratch.git('rev-list', '--first-parent', '--parents', f'{base_main}..{main}', check=False)
-        if r.returncode != 0:
-            return False
-        rows = [line.split() for line in (r.stdout or '').splitlines() if line.strip()]
         left = list(heads)
         for row in rows:
-            if len(row) != 3:
-                return False
             hit = next((h for h in left if row[2].startswith(h)), None)
             if hit is None:
                 return False
