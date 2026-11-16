@@ -653,7 +653,7 @@ class Cascade(Advance):
             how = f"merge-ready on {rec.get('vbranch')}; its pull did not go through (see the notes above)"
         else:
             how = (f"pre-merging: its worker resolves the conflict on {rec.get('vbranch')}"
-                   + ('' if rec.get('relayed') == rec.get('vbranch') else ' (no worker has the relay yet)'))
+                   + ('' if str(rec.get('relayed') or '').startswith(str(rec.get('vbranch'))) else ' (no worker has the relay yet)'))
         self.out(f"STALLED: Human Review {len(hr)}, Staging {len(st)}, no Ready PR was pulled; "
                  f"next in order #{p['number']}: {how}")
 

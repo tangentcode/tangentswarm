@@ -259,6 +259,10 @@ def vn_text(n, branch, rec):
     """The relay for a pre-merge conflict (tangentswarm #65): resolve it on the speculative
     -vN branch only; the PR's own branch stays as it is (clean against main)."""
     vn, files = rec['vbranch'], ', '.join(rec.get('files') or []) or 'files unknown'
+    if rec.get('bad_tip'):
+        return (f"Coordinator: #{n}: your {vn} tip {rec['bad_tip'][:8]} still has conflict markers (<<<<<<< or "
+                f">>>>>>>). Finish the merge on {vn} only: remove every marker, run the tests, commit, and git push "
+                f"origin {vn}. Never change {branch}. No rebase, no force-push. Report the new {vn} tip.")
     return (f"Coordinator: #{n} is next in Ready, and its head {rec['head'][:8]} conflicts with future main "
             f"(main + the Human Review and Staging PRs: {rec.get('base')}) in {files}. Resolve it on the NEW "
             f"speculative branch {vn} ONLY. Never merge main, work or staging into {branch}, and do not change {branch}. "
@@ -327,6 +331,17 @@ def merge_commit(scratch, a, b, msg, why=None):
             why.append(bad)
         return None
     return git(scratch, 'commit-tree', tree, '-p', a, '-p', b, '-m', msg).stdout.strip()
+
+
+def marker_problem(scratch, base, tip):
+    """Why tip must not reach work, or None: the diff base..tip adds a conflict marker (Codex
+    on PR #66: a worker can push a -vN with an unresolved merge; the same rule as
+    merge_problem_text)."""
+    r = git(scratch, 'diff', base, tip, check=False)
+    if r.returncode:
+        return f"cannot diff {str(base)[:8]}..{str(tip)[:8]}"
+    m = MARKER_RE.search(r.stdout or '')
+    return f"{str(tip)[:8]} adds a conflict marker ({m.group(1)})" if m else None
 
 
 def conflict_files(scratch, a, b):
@@ -486,6 +501,8 @@ class Flow:
         if pre_merged:
             merged = self.work_commit(scratch, work, tip, [tip], f"Staging: {WORK} = future main + #{n} ({label})\n\n"
                                                                  f"swarm-flow, pre-merged tip {tip}.")
+            if merged is None:
+                return None, f"pre-merged tip {tip[:8]} has a conflict marker"
             if not self.dry:
                 git(scratch, 'push', '--quiet', self.g['origin_url'](), f'{merged}:refs/heads/{WORK}')
             return merged, None
@@ -570,6 +587,8 @@ class Flow:
         tip = self.work_commit(scratch, work, target, [tips[p['number']] for p in batch],
                                f"Staging: {WORK} = future main + {', '.join('#' + str(p['number']) for p in batch)}"
                                f"\n\nswarm-flow batch, future main {fm[0]}.")
+        if tip is None:
+            return []
         if not self.dry:
             git(scratch, 'push', '--quiet', self.g['origin_url'](), f'{tip}:refs/heads/{WORK}')
         self.last_work = tip
@@ -589,6 +608,10 @@ class Flow:
         work's old content, and its parents are work and the tips, so the push is a
         fast-forward (no force) and a PR that was pulled, sent back and pulled again gets
         all of its content back. Nothing outside future main stays in work."""
+        bad = marker_problem(scratch, work, tree_of)
+        if bad:  # never a conflict marker in work
+            self.note(f"{WORK} NOT pushed: {bad}")
+            return None
         parents = [x for t in [work, *tips] for x in ('-p', t)]
         return git(scratch, 'commit-tree', f'{tree_of}^{{tree}}', *parents, '-m', msg).stdout.strip()
 
@@ -661,7 +684,9 @@ class Flow:
             h = d.split('@', 1)[-1]
             if not (h and self.ancestor(scratch, h, main)):
                 return None
-        return rec['tip'] if self.have(scratch, rec['tip'], branch=rec.get('vbranch')) else None
+        if not self.have(scratch, rec['tip'], branch=rec.get('vbranch')):
+            return None
+        return None if marker_problem(scratch, main, rec['tip']) else rec['tip']
 
     def premerge(self, cols, scratch):
         """Every cascade pass: keep the top PREMERGE_AHEAD Ready PRs pre-merged onto future
@@ -706,12 +731,19 @@ class Flow:
                 and not self.have(scratch, rec['tip'], branch=rec.get('vbranch'))):
             rec = None  # its tip is gone (a deleted -vN): build the next -vN
         if rec and rec.get('head') == head and rec.get('base') == key and rec.get('vbranch'):
-            if rec.get('status') == 'ready':
+            main = key.split()[0]
+            if rec.get('status') == 'ready' and not marker_problem(scratch, main, rec['tip']):
                 self.set_labels(p, MERGE_READY)
                 self._premerged[n] = rec['tip']
                 return rec['tip']
             tip = self.fetch_branch(scratch, rec['vbranch'])
-            if (tip and tip != rec.get('seed') and self.ancestor(scratch, head, tip)
+            bad = marker_problem(scratch, main, tip) if tip and tip != rec.get('seed') else None
+            if bad:  # Codex on PR #66: an unresolved merge is never merge-ready
+                self.note(f"#{n}: {rec['vbranch']} {bad}: not merge-ready; its worker is told")
+                rec = dict(rec, status='conflict', bad_tip=tip)
+                if not self.dry:
+                    set_premerge(n, rec)
+            elif (tip and tip != rec.get('seed') and self.ancestor(scratch, head, tip)
                     and self.ancestor(scratch, rec.get('seed') or '', tip)):
                 if not self.dry:
                     rec.update(status='ready', tip=tip)
@@ -802,7 +834,8 @@ class Flow:
         in Ready (label pre-merging): it keeps its place in the order. NEEDS_WORKER when no
         worker takes it; the next pass tries again."""
         n = p['number']
-        if rec.get('relayed') == rec.get('vbranch'):
+        token = rec.get('vbranch') + (f"@{rec['bad_tip']}" if rec.get('bad_tip') else '')
+        if rec.get('relayed') == token:
             return True
         text = vn_text(n, p.get('branch') or '', rec)
         if self.dry:
@@ -822,8 +855,8 @@ class Flow:
             return False
         with premerge_update() as recs:  # only the record of this -vN (a newer one may exist)
             if (recs.get(str(n)) or {}).get('vbranch') == rec['vbranch']:
-                recs[str(n)]['relayed'] = rec['vbranch']
-        rec['relayed'] = rec['vbranch']
+                recs[str(n)]['relayed'] = token
+        rec['relayed'] = token
         self.change(f"#{n}: worker assigned to resolve {rec['vbranch']} ({said})")
         return True
 

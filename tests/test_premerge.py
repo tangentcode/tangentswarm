@@ -419,3 +419,42 @@ def test_pre_merge_state_writes_are_locked_and_never_lose_another_record(tmp_pat
     flow.set_premerge(7, None)
     assert sorted(flow.load_premerge()) == ['8', '9'] and flow.load_premerge()['9'] == {'head': 'g'}
     assert not list(tmp_path.glob('premerge.json.*.tmp'))
+
+
+def test_a_worker_tip_with_conflict_markers_is_never_merge_ready_or_pushed_to_work(world):
+    """Codex on PR #66: a -vN tip with both parents and unresolved markers was accepted and its
+    tree went to work. It stays pre-merging, the worker is told once, and work is refused."""
+    w, s, h, origin = world
+    f, sent = make(world)
+    p7 = card(7, RD, h['c'])
+    cols = {HR: [card(1, HR, h['hr1'])], RD: [p7]}
+    f.premerge(cols, s)
+    run(w, 'fetch', '-q', str(origin), '+refs/heads/b7-v1:refs/heads/b7-v1')
+    run(w, 'checkout', '-q', 'b7-v1')
+    subprocess.run(['git', 'merge', '-q', '--no-edit', h['c']], cwd=w, capture_output=True)
+    run(w, 'add', '.')
+    run(w, 'commit', '-qm', 'merge with the markers left in')
+    bad = run(w, 'rev-parse', 'HEAD')
+    run(w, 'push', '-q', str(origin), 'b7-v1:refs/heads/b7-v1')
+    assert f.premerge(cols, s) == {7: None}
+    assert len(sent) == 2 and 'still has conflict markers' in sent[1][1]
+    f.premerge(cols, s)
+    assert len(sent) == 2  # told once per bad tip
+    assert f.pull_batch({}, cols, s, room=1) == [] and remote(s, origin, 'work') == h['hr1']
+    (w / 'b.txt').write_text('hr1\nC\n')
+    run(w, 'add', '.')
+    run(w, 'commit', '-qm', 'resolved')
+    run(w, 'push', '-q', str(origin), 'b7-v1:refs/heads/b7-v1')
+    f.premerge(cols, s)  # the next cascade pass
+    assert [p['number'] for p in f.pull_batch({}, cols, s, room=1)] == [7]
+    assert run(w, 'show', f"{remote(s, origin, 'work')}:b.txt") == 'hr1\nC'
+    # a cached ready record whose tip has markers is not used either
+    recs = flow.load_premerge()
+    recs['7'].update(status='ready', tip=bad)
+    flow.save_premerge(recs)
+    flow.save_pulls([])  # #7 is back in Ready, not in flight
+    f2, _ = make(world)
+    good = remote(s, origin, 'b7-v1')
+    assert f2.premerge(cols, s) == {7: good} and good != bad  # the bad cached tip is skipped
+    assert f2.work_commit(s, h['hr1'], bad, [bad], 'm') is None
+    assert any('work NOT pushed' in n and 'conflict marker' in n for n in f2.notes)
