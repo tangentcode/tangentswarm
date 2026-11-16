@@ -749,6 +749,11 @@ class Tick:
         path = brief.brief_path(n)
         if not SCAFFOLD_RE.match(subject) or brief.read_brief(n) is None:
             return False
+        if not self.dry:  # Codex on PR #46: make sure the cascade's start retry knows this PR
+            from . import slots
+            if str(n) not in slots.load()['unstarted']:
+                slots.unstarted_add(n, branch=pr['branch'], brief=str(path),
+                                    issue=(pr.get('closes') or [None])[0])
         self.note(n, s, f"launch not started yet (head is the scaffold commit, brief {path}): "
                         "the cascade's start retry starts it when capacity is free")
         return True

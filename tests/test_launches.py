@@ -128,3 +128,23 @@ def test_brief_line_tells_the_coder_to_use_absolute_image_urls():
     line = L.brief_line('/b/486.txt')
     assert 'absolute https URLs' in line and 'user-attachments' in line and 'swarm-shots' in line
     assert 'Never a relative file name' in line
+
+
+def test_rows_of_the_retired_held_list_become_unstarted_records_once(tmp_path):
+    """Codex on PR #46: a launch held before the upgrade kept its retry only in that file."""
+    import json as _json
+    from tangentswarm import slots
+    old = tmp_path / 'swarm-held.json'
+    old.write_text(_json.dumps([{'branch': 'b486', 'pr': 486, 'brief': '/b/486.txt'}, {'branch': 'nopr'}]))
+    assert L.migrate_held(old) == [486] and not old.exists()
+    rec = slots.load()['unstarted']['486']
+    assert rec['branch'] == 'b486' and rec['brief'] == '/b/486.txt'
+    assert L.migrate_held(old) == []  # no file: nothing
+
+
+def test_the_scaffold_fallback_restores_the_retry_record(monkeypatch, tmp_path):
+    from tangentswarm import slots
+    t = scaffold_tick(monkeypatch, tmp_path, 'Start #440')
+    t.dry = False
+    t.no_claude(7, t.prs[7], t.panes)
+    assert slots.load()['unstarted']['7']['branch'] == 'b'

@@ -80,6 +80,36 @@ def describe(m):
 # ---------------------------------------------------------------------------
 # starting a worker
 
+OLD_HELD = HOME / 'var' / 'swarm-held.json'  # the retired held-launch list (#40)
+
+
+def migrate_held(path=None, add=None):
+    """Once, at daemon start: each row of the retired held-launch list with a PR becomes that
+    PR's unstarted record (the cascade's start retry starts it), then the file goes (Codex
+    on PR #46: a launch held before the upgrade had its retry only in that file). Returns
+    the PR numbers moved."""
+    path = path or OLD_HELD
+    try:
+        rows = json.loads(path.read_text())
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError):
+        rows = []
+    if add is None:
+        from . import slots
+        add = slots.unstarted_add
+    moved = []
+    for r in rows if isinstance(rows, list) else []:
+        if r.get('pr') and r.get('branch'):
+            add(int(r['pr']), branch=r['branch'], brief=r.get('brief') or '', issue=r.get('issue'))
+            moved.append(int(r['pr']))
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return moved
+
+
 def clean_env(env=None):
     """The environment for swarm-start-scoped: without PYTHONPATH. The swarm-promoted daemon
     runs with PYTHONPATH=<its tangentswarm checkout>; inherited, it made swarm-start-scoped

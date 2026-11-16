@@ -607,6 +607,11 @@ def main(argv=None):
     ap.add_argument('--once', action='store_true')
     ap.add_argument('--dry-run', action='store_true')
     a = ap.parse_args(argv)
+    if not a.dry_run:
+        from . import launches
+        moved = launches.migrate_held()
+        if moved:
+            say('held-launch list retired: unstarted records for ' + ', '.join(f'#{n}' for n in moved))
     p = Promoter(dry_run=a.dry_run)
     if a.once:
         say('result: ' + p.once())
