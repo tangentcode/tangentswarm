@@ -65,6 +65,18 @@ def submit(op, cwd, transcript=None, wait=0, spool=None, sleep=time.sleep, clock
     return {'ok': False, 'error': NO_DAEMON.format(wait=wait)}
 
 
+def peek(rid, spool=None):
+    """The answer of a request queued with wait=0, or None while there is none yet (read
+    once: the answer file is removed)."""
+    res = (spool or SPOOL) / f'{rid}.res.json'
+    try:
+        out = json.loads(res.read_text())
+    except (OSError, ValueError):
+        return None
+    res.unlink(missing_ok=True)
+    return out
+
+
 RUN_STALE = 900  # s: a claimed request older than this lost its serve process: queue it again
 
 

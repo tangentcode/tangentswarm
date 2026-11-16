@@ -42,6 +42,7 @@ SHELLS = {'bash', 'sh', 'zsh', 'fish', 'dash'}
 PANE_FMT = '\t'.join(['#{pane_id}', '#{window_index}', '#{window_name}', '#{pane_current_command}',
                       '#{pane_current_path}', '#{pane_dead}', '#{pane_pid}'])
 TRUST_RE = re.compile(r'Do you trust the files in this folder|trust this folder', re.I)
+HANDOFF_WAIT = int(os.environ.get('SWARM_HANDOFF_WAIT', '900'))  # s for the spool to answer a handoff
 EXIT_GRACE = int(os.environ.get('SWARM_EXIT_GRACE', '300'))  # s for the board to show Needs Input
 WAIT = 'wait'
 NUDGE = ("Coordinator: #{n}: you stopped with {bits} in your worktree. Commit and push your work. "
@@ -97,10 +98,10 @@ def classify(screen, blank, claude, unchanged_s, frozen_s=FROZEN_S):
         return 'dialog'
     if tick.MENU_RE.search(tail):
         return 'menu'
+    if not blank:  # Codex on PR #51: a typed answer under an old question is input to send
+        return 'input'
     if asked(screen):
         return 'asking'
-    if not blank:
-        return 'input'
     return 'idle'
 
 
@@ -197,7 +198,7 @@ class PaneWatch:
     """One pass a minute. Every side effect goes through an injectable hook for tests."""
 
     def __init__(self, dry=False, sh=_sh, panes=None, cap=None, facts=worktree, is_claude=None, tell=None,
-                 handoff=None, route=None, wake=None, incident=None, st=None, shell_root=root_is_shell,
+                 handoff=None, result=None, route=None, wake=None, incident=None, st=None, shell_root=root_is_shell,
                  report=None):
         from . import alerts
         self.dry, self.sh = dry, sh
@@ -207,6 +208,8 @@ class PaneWatch:
         self.is_claude = is_claude or self._is_claude
         self.tell = tell or self._tell
         self.handoff = handoff or self._handoff
+        self.result = result or self._result
+        self.inflight = {}  # once-key -> (spool request id, queued at): handoffs not answered yet
         self.route = route or self._route
         self.wake = wake or alerts.wake_swarmbot
         self.st = st or alerts.state()
@@ -227,8 +230,14 @@ class PaneWatch:
         agents.tell_agent(pane, text)
 
     def _handoff(self, wt):
+        """Queue the handoff in the spool; returns the request id (the daemon serves it)."""
         from . import spool
-        return spool.submit('handoff', wt)
+        return spool.submit('handoff', wt)['queued']
+
+    @staticmethod
+    def _result(rid):
+        from . import spool
+        return spool.peek(rid)
 
     def _route(self, n, question, wt, pane):
         from . import needsinput
@@ -346,8 +355,19 @@ class PaneWatch:
             key = f"watch-handoff:{n}@{head}"
             if self.seen(key):
                 return None
-            self.handoff(p['wt']['top'])
-            self.mark(key)
+            if key in self.inflight:  # Codex on PR #51: done only when the spool says it succeeded
+                rid, at = self.inflight[key]
+                res = self.result(rid)
+                if res is None and now - at < HANDOFF_WAIT:
+                    return None
+                del self.inflight[key]
+                if res is not None and res.get('ok'):
+                    self.mark(key)
+                    return f"{tag}{where}: the missed handoff ran: {str(res.get('log') or res.get('why') or 'done')[:160]}"
+                why = (res or {}).get('error') or f'no answer in {HANDOFF_WAIT} s'
+                self.inflight[key] = (self.handoff(p['wt']['top']), now)
+                return f"{tag}{where}: the missed handoff failed ({str(why)[:160]}): queued it again"
+            self.inflight[key] = (self.handoff(p['wt']['top']), now)
             self.incident(f"missed-handoff:{n}@{head[:12]}", f"#{n}: the Stop hook missed a finished worker",
                           f"The worker of #{n} ({where}) was idle with a clean, pushed head {head[:8]} and the card "
                           f"still {detail}.", fix='The pane watcher queued the handoff.')

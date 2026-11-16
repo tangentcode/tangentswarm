@@ -75,6 +75,7 @@ class Rig:
     def __init__(self, worker, screens, pr=None, shell_root=True):
         self.worker, self.screens = worker, screens
         self.calls, self.told, self.handoffs, self.routes, self.wakes, self.incidents = [], [], [], [], [], []
+        self.results = {}
         self.st = alerts.state()
 
         class R:
@@ -85,7 +86,9 @@ class Rig:
                                 pane_pid='100')],
             cap=lambda pid: (self.screens[0], self.screens[1]), facts=lambda path: dict(self.worker),
             is_claude=lambda p: True, tell=lambda p, t: self.told.append((p, t)),
-            handoff=lambda wt: self.handoffs.append(wt), route=lambda *a: self.routes.append(a) or 'routed',
+            handoff=lambda wt: self.handoffs.append(wt) or f'r{len(self.handoffs)}',
+            result=lambda rid: self.results.get(rid, {'ok': True}),
+            route=lambda *a: self.routes.append(a) or 'routed',
             wake=lambda why, key, pr=None, detail=None: self.wakes.append((why, detail)),
             incident=lambda key, title, what, **kw: self.incidents.append((key, title, what)),
             st=self.st, shell_root=lambda pid: shell_root)
@@ -268,3 +271,37 @@ def test_a_failed_tmux_send_keys_is_an_error_not_a_success(worker):
     r.w.sh = lambda argv, timeout=30: Bad()
     r.run(0)
     assert "can't find pane" in r.run(60)[0]
+
+
+def test_typed_input_under_an_old_question_is_sent_not_routed(worker):
+    """Codex on PR #51: the answer typed under a question must be submitted."""
+    assert PW.classify(screen(['● Should the button be blue or red?'], typed='Blue.'), False, True, 60) == 'input'
+    r = Rig(worker, (screen(['● Should the button be blue or red?'], typed='Blue.'), False), pr=AR)
+    r.run(0)
+    r.run(60)
+    assert r.calls == [['tmux', 'send-keys', '-t', '%1', 'Enter']] and r.routes == []
+
+
+def test_a_handoff_is_done_only_when_the_spool_answers_ok(worker, monkeypatch):
+    """Codex on PR #51: a queued handoff is not a done handoff."""
+    r = Rig(worker, (IDLE, True), pr=dict(AR, col=board.IN_PROGRESS))
+    r.results = {'r1': None}  # no answer yet
+    r.run(0)
+    r.run(60)
+    assert r.handoffs == [worker['top']] and r.run(120) == []  # waiting
+    r.results['r1'] = {'ok': False, 'error': 'RuntimeError: gh: HTTP 502'}
+    assert 'failed (RuntimeError: gh: HTTP 502): queued it again' in r.run(180)[0]
+    assert len(r.handoffs) == 2
+    r.results['r2'] = None
+    monkeypatch.setattr(PW, 'HANDOFF_WAIT', 100)
+    assert 'no answer in 100 s' in r.run(300)[0] and len(r.handoffs) == 3  # a lost request
+    assert 'the missed handoff ran' in r.run(360)[0]  # r3 answers ok
+    r.run(420)
+    assert len(r.handoffs) == 3 and len(r.incidents) == 1
+
+
+def test_spool_peek_reads_an_answer_once(tmp_path):
+    from tangentswarm import spool
+    assert spool.peek('x', spool=tmp_path) is None
+    (tmp_path / 'x.res.json').write_text('{"ok": true}')
+    assert spool.peek('x', spool=tmp_path) == {'ok': True} and spool.peek('x', spool=tmp_path) is None
