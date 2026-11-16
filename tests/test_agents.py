@@ -335,7 +335,7 @@ def test_live_captures_input_box():
     assert codex._submit_state(view('codex_update_dialog.ansi'), MSG) == 'unknown'
     assert agents.tui_for('muse', 't')._submit_state(view('muse_typed.ansi'), MSG) == 'pending'
     grok = agents.tui_for('grok', 't')
-    assert grok._submit_state(view('grok_typed.ansi'), MSG) == 'pending'
+    assert grok._submit_state(view('grok_typed_msg.ansi'), MSG) == 'pending'
     assert grok._submit_state(view('grok_idle.ansi'), MSG) == 'sent'
     assert agents.grok_prompt_blank(view('grok_idle.ansi'))
-    assert not agents.grok_prompt_blank(view('grok_typed.ansi'))
+    assert not agents.grok_prompt_blank(view('grok_typed_msg.ansi'))
