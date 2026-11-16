@@ -491,9 +491,12 @@ class Executor:
         key = f"codex-request:{a.pr}@{head}"
         if not (state.done(key) or tick.codex_requested(full) or tick.codex_reviewed_head(full)):
             if not self.dry:
-                from . import codexrounds
-                codexrounds.request(a.pr, head, 'swarm-webhook', sh=self._sh, state=state)
+                self._sh(['gh', 'pr', 'comment', str(a.pr), '-R', REPO, '--body', '@codex review'])
+                state.mark(key)
             self.note(f'#{a.pr}: posted "@codex review" for {head[:8]}')
+            if not self.dry:  # every round is logged, with no cap (#40 item 7)
+                from . import codexrounds
+                codexrounds.log_round(a.pr, head, 'swarm-webhook')
         if col in (board.READY, board.STAGING, board.HUMAN_REVIEW):
             self.cascade(f'#{a.pr} left {col} with a new head')
 
@@ -568,8 +571,8 @@ class Executor:
         n = self.pr_of(a.args['node'])
         if not n:
             return self.wake(0, 'Needs Input answered on an issue with no PR: TRIAGE handoff', key=f"answered:{a.args['node']}")
-        cs = self.comments_since_head(n) + self.issue_answers(n)
-        said = ' | '.join(' '.join((c.get('body') or '').split())[:600] for c in cs) or '(see the issue)'
+        cs = self.comments_since_head(n)
+        said = ' | '.join(' '.join((c.get('body') or '').split())[:600] for c in cs + self.issue_answers(n)) or '(see the issue)'
         ok, note = self.to_worker(n, f"Coordinator: #{n}: Michal answered: {said} Build it, then push.")
         if not ok:
             return self.wake(n, f"#{n} answered; no worker could take it ({note})", key=f'answered:{n}')

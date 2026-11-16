@@ -33,6 +33,11 @@ def request(n, head, by, sh=None, state=None, store=None, now=None):
     sh(['gh', 'pr', 'comment', str(n), '-R', REPO, '--body', '@codex review'])
     if state is not None:
         state.mark(f"codex-request:{n}@{head}")
+    return log_round(n, head, by, store=store, now=now)
+
+
+def log_round(n, head, by, store=None, now=None):
+    """Log one "@codex review" request of PR n for head as the next round. Returns its number."""
     store = store or _store()
     k = len(rounds(n, store)) + 1
     try:
