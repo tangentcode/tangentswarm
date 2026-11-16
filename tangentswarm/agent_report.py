@@ -110,14 +110,40 @@ def reports(pr=None, since=0.0, path=None):
     return st.rows(where, tuple(args))
 
 
+def _act(r):
+    """The action of a report row: the state ('done', ...) or '<state> handled' and so on."""
+    return r.get('action') or next(iter(json.loads(r.get('decisions') or '[]')), '') or ''
+
+
 def last_report(pr, within=3600, now=None, path=None):
     """The newest report an agent sent for PR pr in the last `within` s (not the daemon's
     'handled' rows), or None. The #40 watchdog asks this before it guesses from the pane."""
     now = time.time() if now is None else now
     for r in reversed(reports(pr, now - within, path)):
-        acts = [r.get('action')] + json.loads(r.get('decisions') or '[]')
-        if any(a in STATES for a in acts):
+        if _act(r) in STATES:
             return r
+    return None
+
+
+PENDING_TTL = 3600  # s: a report the daemon never handled stops holding the handoff
+
+
+def pending_input(pr, within=PENDING_TTL, now=None, path=None):
+    """The needs-input or blocked report of PR pr that the daemon has not handled yet, or
+    None. The Stop-hook handoff waits for it (Codex on PR #54: spool requests run in
+    parallel, so the handoff could move the card to Ready before the question was posted).
+    The newest row that is not 'working' decides; the row is written before the agent gets
+    its answer, so it is there before the agent's turn can end."""
+    now = time.time() if now is None else now
+    try:
+        rows = reports(pr, now - within, path)
+    except Exception:
+        return None
+    for r in reversed(rows):
+        a = _act(r)
+        if a == 'working':
+            continue
+        return r if a in ('needs-input', 'blocked') else None
     return None
 
 

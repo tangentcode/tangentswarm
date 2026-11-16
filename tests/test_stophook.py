@@ -287,3 +287,21 @@ def test_two_hook_runs_for_one_worktree_never_overlap(wt, monkeypatch):
     for t in ts:
         t.join(5)
     assert overlap == []
+
+
+def test_a_pending_needs_input_report_holds_the_handoff(wt):
+    # Codex on PR #54: the Stop hook ran before the queued report and a Codex-clean head went to Ready
+    from tangentswarm import agent_report
+    head = run(wt, 'rev-parse', 'HEAD')
+    g = G(head, codex=True)
+    ran, calls = [], []
+
+    def go():
+        return stophook.run(wt, g=g, sh=calls.append, merges=lambda cwd, head: True, sleep=lambda s: None,
+                            minbot=lambda n: ran.append(n) or 'pass')
+    agent_report.accept('needs-input', 7, 'mn-7-feat', question='Which?', submit=lambda *a, **k: {'queued': 'x'})
+    line = go()
+    assert 'reported needs-input or blocked' in line and calls == [] and g.moves == [] and ran == []
+    agent_report.log('needs-input handled', 7, 'mn-7-feat')
+    go()  # not marked seen: once the report is handled, the next Stop hands off
+    assert ran == [7]

@@ -761,7 +761,7 @@ the swarm-promoted daemon acts on it through the spool op `report`
 | state | what the swarm does |
 |-------|---------------------|
 | `done` | the worktree must be clean and pushed (else the worker is told why); the Stop-hook handoff advances the card; then the Claude is closed with `/exit` once idle. The window stays and the session is kept for `swarm-revive`. |
-| `needs-input` (with `question`) | posts the question on the ticket, moves the card to Needs Input, and closes the Claude. Moving the card back to In Progress resumes it with the answer. |
+| `needs-input` (with `question`) | posts the question on the ticket, moves the card to Needs Input, and closes the Claude. Moving the card back to In Progress resumes it with the answer. Until the report is handled, the Stop-hook handoff does not run. |
 | `blocked` (with `message`) | posts the blocker on the ticket and moves the card to Needs Input; the Claude keeps running. |
 | `working` | the events DB row only. |
 

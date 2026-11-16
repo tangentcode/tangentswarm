@@ -265,6 +265,22 @@ def test_last_report_is_for_the_watchdog():
     assert R.last_report(12, within=10, now=10 ** 11) is None
 
 
+def test_pending_input_until_handled_or_superseded():
+    noop = lambda *a, **k: {'queued': 'x'}
+    assert R.pending_input(12) is None
+    R.accept('needs-input', 12, 'w', question='Which?', submit=noop)
+    R.accept('working', 12, 'w', message='waiting')
+    assert R.pending_input(12)['pr'] == 12 and R.pending_input(13) is None
+    R.log('needs-input refused', 12, 'w', error='x')
+    assert R.pending_input(12) is None
+    R.accept('blocked', 12, 'w', message='down', submit=noop)
+    assert R.pending_input(12)
+    R.accept('done', 12, 'w', submit=noop)
+    assert R.pending_input(12) is None
+    R.accept('blocked', 12, 'w', message='down', submit=noop)
+    assert R.pending_input(12, now=10 ** 11) is None  # a report never handled stops holding after the TTL
+
+
 # -- the worker brief ----------------------------------------------------------------------
 
 def test_the_brief_tells_the_worker_to_report():
