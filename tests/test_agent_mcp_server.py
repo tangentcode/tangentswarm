@@ -60,7 +60,7 @@ def call(server, name, args):
 
 def test_tools_exposed():
     names = [t.name for t in anyio.run(S.build_server().list_tools)]
-    assert names == ['register_agent', 'whoami', 'send_message', 'read_messages']
+    assert names == ['register_agent', 'whoami', 'send_message', 'read_messages', 'report_status']
 
 
 def test_send_message_with_sender_reaches_the_real_hub(hub_url):
