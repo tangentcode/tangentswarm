@@ -724,25 +724,22 @@ class Cascade(Advance):
         st = slots.load()
         issues = slots.backlog_issues(snap, board.active_fast_track(), prs,
                                       named=st['named'], launching=st['launching'])
+        # tangentswarm #44: capacity from live state (running Claudes, launch and start
+        # requests in the spool, worker memory), never from reservations or held lists
+        from . import spool
         live = slots.live_claudes()
-        pending = slots.pending_launches(st)  # queued launches: each will start a Claude
-        try:
-            from . import launches
-            held = [r for r in launches.read_queue() if str(r.get('pr')) not in st['unstarted']]
-        except (OSError, ValueError):
-            held = []
-        pending = pending + [r.get('pr') or r.get('branch') for r in held]  # memory-held starts too (Codex on PR #26)
-        cap = max(0, slots.MAX_CLAUDES - live - len(pending))
+        flying = [r for r in spool.in_flight(('launch',))]
+        cap, why_none = slots.capacity()
         unstarted = st['unstarted']
         cap = self.retry_starts(unstarted, cap)  # launched PRs with no Claude first
-        n, target = slots.start_plan(len(k['new']) + len(unstarted) + len(pending), issues, ready, READY_TARGET)
+        n, target = slots.start_plan(len(k['new']) + len(unstarted) + len(flying), issues, ready, READY_TARGET)
         facts = (f"new={len(k['new'])}/{target} rework={len(k['rework'])}/{slots.REWORK_SLOTS} "
                  f"ready={ready}/{READY_TARGET} backlog_without_pr={len(issues)} "
-                 f"claudes={live}/{slots.MAX_CLAUDES} launching={len(pending)} "
+                 f"claudes={live}/{slots.MAX_CLAUDES} launching={len(flying)} "
                  f"unstarted={len(unstarted)}")
         if n and not cap:
-            self.out(f"signal: {n} new-work slot(s) free, but {live} Claudes run (cap {slots.MAX_CLAUDES}): "
-                     f"no launch ({facts})")
+            self.out(f"signal: {n} new-work slot(s) free, but no capacity: {why_none or 'cap used'} "
+                     f"({facts})")
             return
         n = min(n, cap)
         if n:
@@ -758,22 +755,20 @@ class Cascade(Advance):
     def retry_starts(self, unstarted, cap):
         """Queue a worker start for each launched PR whose window has no Claude (oldest first,
         within the Claude cap; one queued start per PR at a time). Returns the cap left."""
-        from . import slots, spool
-        now = time.time()
+        from . import spool
+        reqs = spool.in_flight(('start', 'launch'))  # live: in the spool now
+        flying = {int(r['pr']) for r in reqs if r.get('op') == 'start' and r.get('pr')}
+        launching = {int(r['issue']) for r in reqs if r.get('op') == 'launch' and r.get('issue')}
         for pr, rec in sorted(unstarted.items(), key=lambda kv: kv[1].get('at', 0)):
             brief_only = bool(rec.get('brief_pane'))  # its Claude runs: only the brief line is sent
+            if int(pr) in flying or int(rec.get('issue') or 0) in launching:
+                continue  # its start or its launch runs (capacity() already counts it)
             if cap <= 0 and not brief_only:  # Codex on PR #26: a brief retry needs no capacity
-                continue
-            if now - float(rec.get('queued') or 0) < 600:
-                cap -= 0 if brief_only else 1  # a start is in flight
                 continue
             if self.dry:
                 self.out(f"start: would queue the worker start of #{pr} ({rec.get('branch')})")
             else:
                 spool.submit('start', '', pr=int(pr))
-                with slots.update() as d:
-                    if str(pr) in d['unstarted']:
-                        d['unstarted'][str(pr)]['queued'] = now
                 self.out(f"start: queued the {'brief line' if brief_only else 'worker start'} of #{pr} "
                          f"({rec.get('branch')})" + ('' if brief_only else ': its window has no Claude'))
             cap -= 0 if brief_only else 1

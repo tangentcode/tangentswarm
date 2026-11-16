@@ -85,6 +85,21 @@ def reclaim(spool=None, older_than=None, now=time.time):
     return back
 
 
+def in_flight(ops=('launch', 'start'), spool=None):
+    """[request dict] of the requests with these ops that wait or run now (live work, not
+    bookkeeping: tangentswarm #44). Each request is one Claude about to start."""
+    spool = spool or SPOOL
+    out = []
+    for f in list(spool.glob('*.req.json')) + list(spool.glob('*.run.json')) if spool.is_dir() else []:
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if d.get('op') in ops:
+            out.append(d)
+    return out
+
+
 def dispatch(spool=None, spawn=subprocess.Popen, command=None, log=None, now=time.time):
     """Daemon side, every second: claim each request and serve it in its own process.
     Returns the claimed request ids."""

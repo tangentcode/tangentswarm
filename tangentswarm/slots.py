@@ -294,14 +294,6 @@ def unstarted_retry(pr, path=None):
             d['unstarted'][str(pr)]['queued'] = 0
 
 
-def pending_launches(st, now=None):
-    """Issue numbers whose queued launch has not reached unstarted_add yet (fresh entries only).
-    Codex on PR #26: they held neither a new-work slot nor Claude capacity, so the next pass
-    could queue a second full batch."""
-    now = time.time() if now is None else now
-    return sorted(int(k) for k, t in (st.get('launching') or {}).items() if now - float(t) < LAUNCHING_TTL)
-
-
 def launch_done(n, path=None):
     """The launch of issue n ended (its draft PR exists, or it failed and may be tried again)."""
     with update(path) as d:
@@ -327,18 +319,36 @@ def live_claudes(sessions=None, alive=None):
     return n
 
 
-def claude_load(path=None, held=None):
-    """Live Claudes plus the reserved starts (queued launches, unstarted PRs with no Claude
-    yet, memory-held launches): what a new Claude start is admitted against (MAX_CLAUDES)."""
-    st = load(path)
-    if held is None:
-        try:
-            from . import launches
-            held = [r for r in launches.read_queue() if str(r.get('pr')) not in st['unstarted']]
-        except (OSError, ValueError):
-            held = []
-    waiting = [r for r in st['unstarted'].values() if not r.get('brief_pane')]  # a brief_pane one runs
-    return live_claudes() + len(pending_launches(st)) + len(waiting) + len(held)
+def claude_load(spool=None):
+    """What a new Claude start is admitted against (MAX_CLAUDES), from live state only
+    (tangentswarm #44, Michal 2026-11-15 7:17 PM ET: never from reservations or held
+    lists): the Claudes that run now, plus the launch and start requests waiting or
+    running in the spool (each is a Claude about to start)."""
+    from . import spool as _spool
+    return live_claudes() + len(_spool.in_flight(spool=spool))
+
+
+def worker_memory():
+    """The worker slice memory, read live (launches.memory), or None when unknown."""
+    from . import launches
+    return launches.memory()
+
+
+def capacity(spool=None, mem=None, mine=0):
+    """(free Claude starts, why none): MAX_CLAUDES minus claude_load(), and 0 while the
+    worker memory does not admit a start (read live). mine: requests of the caller's own
+    that claude_load() already counts (a launch checking its own capacity)."""
+    from . import launches
+    try:
+        m = (mem or worker_memory)()
+        if m is not None and not launches.admits(m):
+            return 0, f"worker memory holds starts ({launches.describe(m)})"
+    except Exception:
+        pass  # memory unreadable: the Claude count still caps
+    load = claude_load(spool) - mine
+    if load >= MAX_CLAUDES:
+        return 0, f"{load} Claudes run or start (cap {MAX_CLAUDES})"
+    return MAX_CLAUDES - load, ''
 
 
 def prune_named(taken, path=None, now=None):

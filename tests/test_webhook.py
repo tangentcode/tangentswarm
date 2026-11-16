@@ -380,13 +380,6 @@ def test_a_closed_pr_drops_its_unstarted_launch():
     assert '77' not in slots.load()['unstarted']
 
 
-def test_a_closed_pr_drops_its_held_launch():
-    from tangentswarm import launches
-    launches.hold('b', pr=78)
-    Fake(col=board.IN_PROGRESS).run(W.Action('closed', 78))
-    assert launches.read_queue() == []
-
-
 def test_a_reopened_pr_leaves_canceled_for_its_working_column():
     """Codex on PR #26: a reopened PR stayed in Canceled."""
     opened = {'action': 'reopened', 'repository': REPO, 'pull_request': pr(9, draft=True)}

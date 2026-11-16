@@ -449,12 +449,6 @@ def test_concurrent_writers_never_lose_a_record(tmp_path):
     assert not list(tmp_path.glob('*.tmp'))
 
 
-def test_pending_launches_count_only_fresh_entries():
-    from tangentswarm import slots as S
-    st = {'launching': {'5': 1000, '6': 1000 - S.LAUNCHING_TTL - 1}}
-    assert S.pending_launches(st, now=1000) == [5]
-
-
 def test_revive_holds_a_new_claude_at_the_global_cap_but_still_tells_a_running_one(wt, monkeypatch):
     """Codex on PR #26: a resume started a Claude with MAX_CLAUDES already running."""
     monkeypatch.setattr(slots, 'live_claudes', lambda *a, **k: slots.MAX_CLAUDES)
@@ -467,9 +461,15 @@ def test_revive_holds_a_new_claude_at_the_global_cap_but_still_tells_a_running_o
     assert rc == 0 and host.told == [('%5', 'more')]
 
 
-def test_claude_load_counts_live_and_reserved_starts():
-    from tangentswarm import launches
-    slots.save({'launching': {'5': __import__('time').time()}, 'unstarted': {'601': {'branch': 'b'},
-                                                                         '602': {'brief_pane': '%1'}}})
-    launches.hold('held-b', pr=700)
-    assert slots.claude_load() == slots.live_claudes() + 1 + 1 + 1
+def test_claude_load_counts_live_claudes_and_spool_starts_only(monkeypatch):
+    """tangentswarm #44: no reservations, no held list; the spool requests are live work."""
+    from tangentswarm import spool
+    monkeypatch.setattr(slots, 'live_claudes', lambda *a, **k: 3)
+    slots.save({'launching': {'5': __import__('time').time()}, 'unstarted': {'601': {'branch': 'b'}}})
+    assert slots.claude_load() == 3
+    spool.submit('launch', '', issue=40)
+    spool.submit('start', '', pr=601)
+    spool.submit('handoff', '/w')
+    assert slots.claude_load() == 5
+    assert slots.capacity() == (slots.MAX_CLAUDES - 5, '')
+    assert slots.capacity(mine=1) == (slots.MAX_CLAUDES - 4, '')

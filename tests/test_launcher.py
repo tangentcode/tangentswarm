@@ -249,3 +249,20 @@ def test_a_closed_pr_is_never_started_again_by_the_retry():
     lz.sh = lambda *a, check=True: 'CLOSED' if a[:3] == ('gh', 'pr', 'view') else ''
     note = lz.start_existing(601, slots.load()['unstarted']['601'])
     assert 'closed' in note and '601' not in slots.load()['unstarted']
+
+
+def test_no_live_capacity_makes_nothing_and_the_issue_stays_in_backlog(tmp_path, monkeypatch):
+    """tangentswarm #40/#44: the Backlog is the queue; a launch checks live capacity first."""
+    from tangentswarm import spool
+    monkeypatch.setattr(slots, 'live_claudes', lambda *a, **k: slots.MAX_CLAUDES)
+    spool.submit('launch', '', issue=412)  # this launch's own request (capacity counts it, mine=1)
+    run = Run()
+    lz = L.Launcher(g=gate(), run=run, git_dir=tmp_path, launch=lambda *a, **k: ('launched', {}))
+    slots.launch_mark([412])
+    import pytest as _pytest
+    with _pytest.raises(L.Deferred):
+        lz.launch(412, 'Board marks right and wrong')
+    assert run.calls == []  # no branch, no PR
+    monkeypatch.setattr(L, 'Launcher', lambda: lz)
+    res = L.execute({'issue': 412, 'title': 'Board marks right and wrong'})
+    assert res['ok'] and 'stays in Backlog' in res['deferred'] and '412' not in slots.load()['launching']
