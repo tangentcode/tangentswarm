@@ -11,12 +11,17 @@ capture), frozen (the busy line is on screen but nothing moved for FROZEN_S), di
 trust-folder dialog), menu (a choice or permission menu), asking (the last message asks
 Michal something), input (unsent text in the prompt), idle (an empty prompt).
 
+Agents report their own state (report_status, tangentswarm #53), so the pane capture is
+the fallback: a PR whose agent reported in the last REPORT_QUIET s is left to that report.
+
 Actions on a worker pane (~/ver/platform.<slug>, not a coordinator window):
   input     press Enter (a relay that was typed but not sent)
-  asking    a bug (a Claude never asks in its pane): route it like needs_input (question
-            on the ticket, card to Needs Input, /exit), and an incident ticket
-  idle      a pending exit (needs_input), or the work is handed off (card past In
-            Progress, PR closed, no PR): /exit, the window and its shell stay
+  asking    a bug (a Claude never asks in its pane): routed as a needs-input report
+            (agent_report: question on the ticket, card to Needs Input, /exit), and an
+            incident ticket
+  idle      card in Needs Input (dirty work is fine: --resume brings it back), or the work
+            is handed off (card past In Progress, PR closed, no PR): /exit, the window and
+            its shell stay
             card In Progress or draft with a clean, pushed head: the Stop hook missed it,
             so the handoff runs now (through the spool), and an incident ticket
             dirty or unpushed: one nudge to commit and push or call needs_input
@@ -43,8 +48,7 @@ PANE_FMT = '\t'.join(['#{pane_id}', '#{window_index}', '#{window_name}', '#{pane
                       '#{pane_current_path}', '#{pane_dead}', '#{pane_pid}'])
 TRUST_RE = re.compile(r'Do you trust the files in this folder|trust this folder', re.I)
 HANDOFF_WAIT = int(os.environ.get('SWARM_HANDOFF_WAIT', '900'))  # s for the spool to answer a handoff
-EXIT_GRACE = int(os.environ.get('SWARM_EXIT_GRACE', '300'))  # s for the board to show Needs Input
-WAIT = 'wait'
+REPORT_QUIET = int(os.environ.get('SWARM_REPORT_QUIET', '600'))  # s an agent's own report holds the watcher off
 NUDGE = ("Coordinator: #{n}: you stopped with {bits} in your worktree. Commit and push your work. "
          "If you need a decision from Michal, call the needs_input tool of the tangentswarm MCP server "
          "instead of asking here.")
@@ -117,9 +121,9 @@ def dirty_bits(wt):
             (['no upstream'] if wt.get('ahead') is None else []))
 
 
-def decide(p, pr, pending_exit=None):
+def decide(p, pr):
     """[(action, detail)] for one pane. p: the pane (cls, wt, screen); pr: its open board PR
-    {number, col, draft, head} or None; pending_exit: why it must /exit (needs_input), or WAIT."""
+    {number, col, draft, head} or None."""
     cls, wt = p.get('cls'), p.get('wt') or {}
     if not is_worker(p) or cls in ('shell', 'new', 'working'):
         return []
@@ -129,10 +133,8 @@ def decide(p, pr, pending_exit=None):
         return [('trust', '')]
     if cls in ('menu', 'frozen'):
         return [(cls, '')]
-    if pending_exit == WAIT:  # the card is moving to Needs Input: no handoff, no exit yet
-        return []
-    if pending_exit:  # the question is on the ticket already (needs_input)
-        return [('exit', pending_exit)]
+    if pr and pr.get('col') == board.NEEDS_INPUT:  # the question is on the ticket already
+        return [('exit', 'card in Needs Input')]
     if cls == 'asking':
         return [('ask', asked(p.get('screen')) or '')]
     bits = dirty_bits(wt)
@@ -198,7 +200,7 @@ class PaneWatch:
     """One pass a minute. Every side effect goes through an injectable hook for tests."""
 
     def __init__(self, dry=False, sh=_sh, panes=None, cap=None, facts=worktree, is_claude=None, tell=None,
-                 handoff=None, result=None, route=None, wake=None, incident=None, st=None, shell_root=root_is_shell,
+                 handoff=None, result=None, route=None, reported=None, wake=None, incident=None, st=None, shell_root=root_is_shell,
                  report=None):
         from . import alerts
         self.dry, self.sh = dry, sh
@@ -211,10 +213,10 @@ class PaneWatch:
         self.result = result or self._result
         self.inflight = {}  # once-key -> (spool request id, queued at): handoffs not answered yet
         self.route = route or self._route
+        self.reported = reported or self._reported
         self.wake = wake or alerts.wake_swarmbot
         self.st = st or alerts.state()
         self.incident = incident or (lambda *a, **k: alerts.incident(*a, st=self.st, **k))
-        self.exits = {}
         self.shell_root = shell_root
         self.report = REPORT if report is None else report
         self.latest = {}  # pane id -> the latest capture (reportable at any moment)
@@ -239,17 +241,24 @@ class PaneWatch:
         from . import spool
         return spool.peek(rid)
 
-    def _route(self, n, question, wt, pane):
-        from . import needsinput
-        return needsinput.route(n, question, wt=wt, source=f'pane {pane} (asked in the pane: a bug)')
+    def _route(self, n, question, window):
+        """A pane that asks: queue the needs-input report agent_report handles (tangentswarm #53)."""
+        from . import agent_report
+        out = agent_report.accept('needs-input', n, window, question=question, agent='pane-watch')
+        if not out.get('ok'):
+            raise RuntimeError(out.get('error') or 'the needs-input report was refused')
+        return 'queued as a needs-input report (question on the ticket, card to Needs Input, /exit)'
+
+    @staticmethod
+    def _reported(n):
+        from . import agent_report
+        return agent_report.last_report(n, within=REPORT_QUIET) is not None
 
     def once(self, prs, now=None):
         """One capture of every pane. prs: {branch: {number, col, draft, head}} of the open
         board PRs. Returns the actions taken, as lines."""
-        from . import needsinput
         now = time.time() if now is None else now
         seen, done = {}, []
-        self.exits = needsinput.pending_exits()
         for row in self.panes_fn():
             p = dict(row)
             p['claude'] = bool(self.is_claude(p))
@@ -267,7 +276,10 @@ class PaneWatch:
             pr = prs.get((p['wt'] or {}).get('branch'))
             p['pr'] = pr['number'] if pr else None
             seen[p['id']] = p
-            for action, detail in decide(p, pr, self.pending_exit(p, pr, now)):
+            if pr and is_worker(p) and self.reported(pr['number']):
+                p['note'] = 'its agent reported recently: left to the report'
+                continue
+            for action, detail in decide(p, pr):
                 try:
                     line = self.act(action, detail, p, pr, now)
                 except Exception as e:  # one pane failing never stops the others
@@ -277,25 +289,6 @@ class PaneWatch:
         self.latest = seen
         self.save_report(now)
         return done
-
-    def pending_exit(self, p, pr, now):
-        """Why the worker must /exit, WAIT, or None. A pending exit holds only while its card
-        is in Needs Input (Codex on PR #51: an answer that came before the /exit must not close
-        the resumed worker). A card not yet shown there waits EXIT_GRACE s, then the pending
-        exit is dropped."""
-        top = (p.get('wt') or {}).get('top')
-        rec = self.exits.get(top or '')
-        if not rec:
-            return None
-        if pr and pr.get('col') == board.NEEDS_INPUT:
-            return rec.get('why')
-        if now - float(rec.get('at') or 0) < EXIT_GRACE:
-            return WAIT
-        if not self.dry:
-            from . import needsinput
-            needsinput.clear_exit(top)
-        self.exits.pop(top, None)
-        return None
 
     def seen(self, key):
         """True when the action of key already succeeded (persisted)."""
@@ -344,7 +337,7 @@ class PaneWatch:
             key = f"watch-ask:{n}:{screen_hash(detail)}"
             if self.seen(key):
                 return None
-            note = self.route(n, detail, p['wt']['top'], p['id'])
+            note = self.route(n, detail, p['window'])
             self.mark(key)
             self.incident(f"ask:{n}:{screen_hash(detail)}", f"#{n}: a worker asked in its pane",
                           f"The worker Claude of #{n} ({where}) asked in its pane instead of calling needs_input: "
@@ -388,10 +381,6 @@ class PaneWatch:
             self.mark(f"watch-noexit:{p['id']}")
             return f"{tag}{where}: idle ({why}), but Claude is the pane's own process: /exit would close the window"
         self.tell(p['id'], '/exit')
-        top = (p.get('wt') or {}).get('top')
-        if top and top in self.exits:
-            from . import needsinput
-            needsinput.clear_exit(top)
         return f"{tag}{where}: idle ({why}): sent /exit, the window stays"
 
     def diagnose(self, kind, p, n, what):

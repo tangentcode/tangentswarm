@@ -583,9 +583,6 @@ class Executor:
         if not ok:
             return self.wake(n, f"#{n} answered; no worker could take it ({note})", key=f'answered:{n}')
         self.note(f"#{n}: Michal's answer relayed ({note})")
-        if not self.dry:  # Codex on PR #51: the resumed worker must not get a late /exit
-            from . import needsinput
-            needsinput.clear_exits_of(n)
 
     def do_merged(self, a):
         self.cascade(f'#{a.pr} merged')

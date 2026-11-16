@@ -65,7 +65,9 @@ def test_decide(worker):
     assert PW.decide(pane(dict(worker, dirty=True), 'idle'), ip) == [('nudge', 'uncommitted changes')]
     assert PW.decide(pane(dict(worker, scaffold=True), 'idle'), ip) == []  # waits for its brief
     assert PW.decide(pane(worker, 'asking', screen=ASK), ip)[0][0] == 'ask'
-    assert PW.decide(pane(worker, 'asking', screen=ASK), ip, 'asked Michal') == [('exit', 'asked Michal')]
+    ni = dict(pr, col=board.NEEDS_INPUT)
+    assert PW.decide(pane(worker, 'asking', screen=ASK), ni) == [('exit', 'card in Needs Input')]
+    assert PW.decide(pane(dict(worker, dirty=True), 'idle'), ni) == [('exit', 'card in Needs Input')]  # no nudge
     assert PW.decide(pane(worker, 'idle', window='meth-26-auto-coordinator-1'), pr) == []  # never a coordinator
 
 
@@ -85,7 +87,7 @@ class Rig:
             panes=lambda: [dict(id='%1', widx='1', window='mn-7-feat', command='claude', path=worker['top'],
                                 pane_pid='100')],
             cap=lambda pid: (self.screens[0], self.screens[1]), facts=lambda path: dict(self.worker),
-            is_claude=lambda p: True, tell=lambda p, t: self.told.append((p, t)),
+            is_claude=lambda p: True, reported=lambda n: False, tell=lambda p, t: self.told.append((p, t)),
             handoff=lambda wt: self.handoffs.append(wt) or f'r{len(self.handoffs)}',
             result=lambda rid: self.results.get(rid, {'ok': True}),
             route=lambda *a: self.routes.append(a) or 'routed',
@@ -147,17 +149,27 @@ def test_a_pane_that_asks_is_routed_like_needs_input_and_reported(worker):
     r.run(60)
     r.run(120)
     assert len(r.routes) == 1 and r.routes[0][0] == 7 and 'blue or red' in r.routes[0][1]
+    assert r.routes[0][2] == 'mn-7-feat'  # the window agent_report checks against the PR
     assert len(r.incidents) == 1 and 'asked in its pane' in r.incidents[0][1]
 
 
-def test_a_pending_exit_closes_the_claude_and_clears(worker):
+def test_a_claude_whose_card_is_in_needs_input_is_closed(worker):
     r = Rig(worker, (ASK, True), pr=dict(AR, col=board.NEEDS_INPUT))
-    from tangentswarm import needsinput
-    needsinput.mark_exit(worker['top'], 7, 'asked Michal (needs_input)')
     r.run(0)
     r.run(60)
     assert r.told == [('%1', '/exit')] and r.routes == []
-    assert needsinput.pending_exits() == {}
+
+
+def test_an_agents_own_recent_report_holds_the_watcher_off(worker):
+    """tangentswarm #53: the pane capture is the fallback; a reporting agent is left alone."""
+    r = Rig(worker, (IDLE, True), pr=dict(AR, col=board.IN_PROGRESS))
+    r.w.reported = lambda n: n == 7
+    r.run(0)
+    assert r.run(60) == [] and r.handoffs == [] and r.told == []
+    assert 'reported recently' in PW.read_report()['panes']['%1']['note']
+    r.w.reported = lambda n: False
+    r.run(120)
+    assert r.handoffs == [worker['top']]
 
 
 def test_a_menu_wakes_swarmbot_with_the_capture_once(worker):
@@ -212,30 +224,6 @@ def test_a_dry_run_writes_no_report_and_no_once_key(worker):
     r.run(0)
     r.run(60)
     assert PW.read_report() == {'at': None, 'panes': {}} and alerts.state().data['done'] == {}
-
-
-def test_a_pending_exit_holds_only_while_the_card_is_in_needs_input(worker):
-    """Codex on PR #51: Michal answered before the /exit; the resumed worker must not be closed."""
-    from tangentswarm import needsinput
-    r = Rig(worker, (IDLE, True), pr=dict(AR, col=board.IN_PROGRESS))
-    needsinput.mark_exit(worker['top'], 7, 'asked Michal (needs_input)', now=lambda: 1000)
-    r.run(1000)
-    assert r.run(1060) == [] and r.handoffs == [] and r.told == []  # the board may lag: wait
-    r.run(1000 + PW.EXIT_GRACE + 1)
-    assert needsinput.pending_exits() == {} and r.told == []  # the stale exit is dropped
-    assert r.handoffs == [worker['top']]  # and the normal rules apply again
-
-
-def test_an_answer_clears_the_pending_exit_of_its_pr():
-    from tangentswarm import needsinput, webhook
-    from test_webhook import Fake
-    needsinput.mark_exit('/w/platform.a', 7, 'asked')
-    needsinput.mark_exit('/w/platform.b', 8, 'asked')
-    ex = Fake(col=board.IN_PROGRESS)
-    ex.pr_of = lambda node: 7
-    ex.full = {'comments': {'nodes': []}, 'commits': {'nodes': [{'commit': {'committedDate': '0'}}]}}
-    ex.run(webhook.Action('answered', 0, 'x', dict(node='N')))
-    assert ex.relays and list(needsinput.pending_exits()) == ['/w/platform.b']
 
 
 @pytest.mark.parametrize('scr,blank,col,attr', [

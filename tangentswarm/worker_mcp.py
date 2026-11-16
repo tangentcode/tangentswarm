@@ -139,18 +139,20 @@ def do_request_review(wt=None, sh=None):
     return {'posted': True, 'pr': n, 'head': head}
 
 
-def do_needs_input(wt, pr, question, route=None, g=None):
-    """The needs_input tool, daemon side: the PR must be this worktree's own open PR."""
-    from . import needsinput, stophook
+def do_needs_input(wt, pr, question, accept=None, window_of=None, g=None):
+    """The needs_input tool, daemon side: the PR must be this worktree's own open PR. It is
+    the report_status needs-input of swarm-agent (tangentswarm #53), for a worker that has
+    only this stdio server: queued, so the worker's turn can end and the close can run."""
+    from . import agent_report, stophook
     branch, _ = stophook.pushed_head(wt)
     found = stophook.find_pr(g or gate(), branch) if branch else None
     if not found:
         return {'posted': False, 'why': 'no open PR on the board has this branch'}
     if int(pr) != found[0]:
         return {'posted': False, 'why': f"#{pr} is not your PR; yours is #{found[0]}"}
-    note = (route or needsinput.route)(found[0], question, wt=str(wt), source='the needs_input tool', g=g or gate())
-    return {'posted': True, 'pr': found[0], 'note': note,
-            'next': 'End your turn now. The server closes this session with /exit and resumes it with the answer.'}
+    window = (window_of or (lambda n: agent_report.Reporter().resolve(n)[0]))(found[0])
+    out = (accept or agent_report.accept)('needs-input', found[0], window, question=question, agent='needs_input tool')
+    return dict(out, posted=bool(out.get('ok')))
 
 
 def via_daemon(op, **extra):
