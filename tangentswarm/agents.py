@@ -716,20 +716,16 @@ def watch_startup(pane, agent, wait=STARTUP_WAIT, poll=STARTUP_POLL, capture=Non
         try:
             raw = capture(pane)
         except tmux.TmuxError:
-            return {'state': 'exited', 'blocked': None, 'last_lines': _tail(screen)}
+            return {'state': 'exited', 'blocked': None, 'last_lines': _tail(screen.split('\n'))}
         screen = strip_ansi(raw)
         blocked = blocking_screen(screen, agent)
         if blocked:
-            return {'state': 'blocked', 'blocked': blocked, 'last_lines': _tail(screen)}
+            return {'state': 'blocked', 'blocked': blocked, 'last_lines': _tail(screen.split('\n'))}
         if det and det(input_view(raw)):
-            return {'state': 'ready', 'blocked': None, 'last_lines': _tail(screen)}
+            return {'state': 'ready', 'blocked': None, 'last_lines': _tail(screen.split('\n'))}
         if clock() - start >= wait:
-            return {'state': 'starting', 'blocked': None, 'last_lines': _tail(screen)}
+            return {'state': 'starting', 'blocked': None, 'last_lines': _tail(screen.split('\n'))}
         sleep(poll)
-
-
-def _tail(screen, n=5):
-    return [l for l in screen.rstrip('\n').split('\n')][-n:]
 
 
 def agent_status(target, cdir=None):

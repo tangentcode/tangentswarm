@@ -771,6 +771,38 @@ def test_watch_startup_ready_starting_and_exited():
     assert agents.watch_startup('%9', 'claude', capture=gone)['state'] == 'exited'
 
 
+
+def test_watch_startup_last_lines_are_screen_lines():
+    # every state's last_lines is the last non-empty screen lines, not the last characters
+    # of the screen (main's _tail(lines) once shadowed a string-taking _tail here)
+    def tail_ok(out, screen):
+        lines = agents.strip_ansi(screen).split('\n')
+        while lines and not lines[-1]:
+            lines.pop()
+        assert out['last_lines'] == lines[-5:] and all(isinstance(l, str) for l in lines)
+        assert any(l.strip() for l in out['last_lines'])
+
+    trust_screen = screens('claude_trust.ansi')[0]
+    tail_ok(agents.watch_startup('%9', 'claude', capture=lambda p: trust_screen,
+                                 sleep=lambda s: None), trust_screen)
+    ready = screens('codex_ready.ansi')[0]
+    tail_ok(agents.watch_startup('%9', 'codex', capture=lambda p: ready, sleep=lambda s: None), ready)
+    t = iter(range(100))
+    slow = 'loading\nstill loading\n\n'
+    out = agents.watch_startup('%9', 'claude', wait=3, capture=lambda p: slow,
+                               sleep=lambda s: None, clock=lambda: next(t))
+    assert out['state'] == 'starting' and out['last_lines'] == ['loading', 'still loading']
+    seq = iter([slow])
+
+    def then_gone(p):
+        try:
+            return next(seq)
+        except StopIteration:
+            raise tmux.TmuxError(['tmux'], 1, "can't find pane")
+    out = agents.watch_startup('%9', 'claude', wait=10, capture=then_gone, sleep=lambda s: None,
+                               clock=lambda: 0)
+    assert out['state'] == 'exited' and out['last_lines'] == ['loading', 'still loading']
+
 # ---------------------------------------------------------------------------
 # agent_status, pane_ready and tell_agent on a blocked pane
 
