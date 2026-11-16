@@ -182,6 +182,19 @@ def test_a_board_pass_retries_unknown_mergeability(monkeypatch, tmp_path):
     adv = Adv(cols)
     monkeypatch.setattr(boards, 'open_prs', lambda gql, b: adv.cols)
     checked = []
-    monkeypatch.setattr(boardflow, 'minbot_repo', lambda a, n, repo: checked.append((n, repo)))
+    monkeypatch.setattr(boardflow, 'minbot_repo', lambda a, n, repo, promote_after=True: checked.append((n, repo, promote_after)))
     monkeypatch.setattr(board, 'move_card', lambda *a, **k: None)
-    assert boardflow.board_pass(adv, B6) == [30] and checked == [(47, TS)]
+    assert boardflow.board_pass(adv, B6) == [30] and checked == [(47, TS, False)]  # promote once, after all checks
+
+
+def test_a_ready_pr_with_red_ci_now_is_not_promoted(monkeypatch):
+    """Codex on PR #47: a CI rerun failed after the PR reached Ready."""
+    from tangentswarm import advance as A
+    cols = {board.READY: [pr(20, due='2026-11-20', milestone='m'), pr(30)]}
+    cols[board.READY][0]['head'] = 'r' * 40
+    adv = Adv(cols)
+    monkeypatch.setattr(boards, 'open_prs', lambda gql, b: adv.cols)
+    monkeypatch.setattr(board, 'move_card', lambda *a, **k: None)
+    monkeypatch.setattr(A, 'check_runs', lambda h, repo=None: [{'name': 't', 'status': 'completed',
+                                                               'conclusion': 'failure' if h[0] == 'r' else 'success'}])
+    assert boardflow.promote(adv, B6) == [30] and any('#20 stays in Ready: CI is not green' in l for l in adv.lines)

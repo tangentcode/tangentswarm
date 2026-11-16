@@ -41,6 +41,14 @@ def promote(adv, b):
             _say(adv, f"{p['repo']}#{p['number']} stays in Ready: GitHub mergeable is {p.get('mergeable')} "
                       "(a merge of main is needed, or GitHub has not computed it yet)")
             continue
+        from . import advance as A
+        try:
+            ci = A.ci_problem(A.check_runs(p['head'], p['repo']))  # Codex on PR #47: a rerun may have failed
+        except Exception as e:
+            ci = f"CI not readable: {type(e).__name__}"
+        if ci:
+            _say(adv, f"{p['repo']}#{p['number']} stays in Ready: {ci}")
+            continue
         if adv.dry:
             _say(adv, f"would move {p['repo']}#{p['number']} Ready -> Human Review (board {b.number})")
         else:
@@ -53,8 +61,9 @@ def promote(adv, b):
     return moved
 
 
-def minbot_repo(adv, n, repo):
-    """The MinBot check of PR n in repo. Returns True when it passed (card to Ready)."""
+def minbot_repo(adv, n, repo, promote_after=True):
+    """The MinBot check of PR n in repo. Returns True when it passed (card to Ready); then
+    promote() runs, unless the caller promotes once after a batch (promote_after False)."""
     from . import advance as A
     b = board.for_repo(repo)
     if b is None:
@@ -92,7 +101,8 @@ def minbot_repo(adv, n, repo):
         adv.minbot('evidence', n, '--repo', repo, '--title', 'MinBot pass', '--commit', head, '--body', A.pass_text(head))
     board.move_card(adv.g, card['item'], board.READY, b=b)
     _say(adv, f"MinBot-pass {repo}#{n} at {head[:8]}: pass comment, Auto Review -> Ready")
-    promote(adv, b)
+    if promote_after:
+        promote(adv, b)
     return True
 
 
@@ -101,8 +111,8 @@ def board_pass(adv, b):
     BOARD_EVERY s): the MinBot check of each Auto Review PR, then promote. It retries what an
     event could not finish, such as GitHub's mergeable still UNKNOWN (Codex on PR #47)."""
     for p in boards.open_prs(adv.g['gql'], b).get(board.AUTO_REVIEW, []):
-        if not p['draft']:
-            minbot_repo(adv, p['number'], p['repo'])
+        if not p['draft']:  # Codex on PR #47: check them all first, then promote in pick order
+            minbot_repo(adv, p['number'], p['repo'], promote_after=False)
     return promote(adv, b)
 
 
