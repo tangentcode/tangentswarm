@@ -974,6 +974,25 @@ darker gray. `-v` prints the rows as JSON. `--since all|YYYY-MM-DD` and `--once`
 available. `--source mcp,stop-hook`
 shows only those sources.
 
+The Agents screen (press `a` in a terminal, `e` to go back, `q` to quit; or start with
+`--agents`) shows one line per pane of the `agents` tmux session, read live from tmux, `/proc`
+and `~/.claude/sessions` (`tangentswarm/livestate.py`, `tangentswarm/agents_view.py`). When
+the panes do not fit, `j`/`k` (or the arrows) scroll a row and space/`b` (or PgDn/PgUp) a
+page; the header and the summary stay. No line is wider than the terminal. Each line shows:
+
+- the Claude pid, or "no claude" when no `claude` process runs in the pane;
+- active or idle: the Claude session status, and a screen capture once a minute (a screen
+  that changed in the last minute is active);
+- tests (pytest, jest, vitest, ...) and other processes in the pane;
+- the memory and CPU of the pane's process tree;
+- the PR and card, from the board snapshot file (never fetched by the viewer).
+
+The header shows the load average, the worker slice memory, the Claudes that count against
+`SWARM_MAX_CLAUDES`, and the start capacity. Starts are held while the worker memory is short
+or the 5-minute load average is over `SWARM_LOAD_PER_CPU` (default 1.5) per CPU
+(`launches.admits`). With `--once` or a pipe the screen prints once.
+`python -m tangentswarm.livestate --json` prints one sample as JSON (for the sanity check, #43).
+
 Install it, in one of these ways:
 
     pip install .                                          # the swarm-events entry point
@@ -987,6 +1006,28 @@ open in tmux:
 
 Private ids, hosts and secret paths are in `~/.config/tangentswarm/config.toml`, never in
 the repo. `tangentswarm/config.example.toml` shows the shape.
+
+## swarm-tmux-status: which swarm windows are working
+
+`swarm-tmux-status` is a standalone console table of the windows in the swarm tmux session
+(default `agents`, or `--session` / `$SWARM_TMUX_SESSION`). It reads tmux only. Each window
+gets one class from its foreground command and its screen:
+
+- `WORKING`: Claude runs and is busy ("esc to interrupt" under its input box)
+- `idle`: Claude runs but does no work
+- `shell`: no Claude, a shell prompt
+- a program name (such as `python`): no Claude, another program in the foreground
+
+A row also shows the window index, the ticket from the window name (`mn-458-...` is
+`mn #458`) and the last activity line (Claude's last transcript entry, or the shell's last
+line that is not a prompt). The default view lists only the working windows. Keys: `a`
+toggles all windows, up/down or `j`/`k` select, Enter or `z` zooms into the window's recent
+output, Esc or `q` goes back, `r` refreshes now. It refreshes every `--interval` s (default 2).
+
+    swarm-tmux-status                    # the interactive table
+    swarm-tmux-status --once [--all]     # print the table once
+    swarm-tmux-status --zoom 41          # print the recent output of window 41
+    ln -sf "$PWD/bin/swarm-tmux-status" ~/bin/swarm-tmux-status   # this checkout, no install
 
 ## License
 
