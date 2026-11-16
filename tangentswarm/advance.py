@@ -61,7 +61,8 @@ DEPLOY_FALLBACK = int(os.environ.get('SWARM_DEPLOY_FALLBACK', '180'))  # then ac
 
 CODEX_FIELDS = """number state isDraft headRefOid mergeable body
  closingIssuesReferences(first:3){nodes{number comments(last:1){nodes{body}}}}
- comments(last:40){nodes{author{login} body}}
+ comments(last:40){nodes{author{login} body createdAt}}
+ commits(last:1){nodes{commit{committedDate}}}
  reviews(last:30){nodes{author{login} commit{oid} comments{totalCount}}}
  reviewThreads(last:60){nodes{id isResolved isOutdated comments(first:1){nodes{author{login} originalCommit{oid}}}}}"""
 
@@ -184,11 +185,11 @@ def minbot_order(prs, active=None):
 CI_BAD = ('failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale')
 
 
-def check_runs(head):
+def check_runs(head, repo=None):
     """[{name, status, conclusion}] of the latest check runs on the exact head (REST, the
     minbot App quota through the gh shim)."""
     r = proc.sh('gh', 'api', '--paginate', '--slurp',
-                f'repos/{REPO}/commits/{head}/check-runs?per_page=100&filter=latest',
+                f'repos/{repo or REPO}/commits/{head}/check-runs?per_page=100&filter=latest',
                 check=False, who='swarm-advance')
     if r.returncode:
         raise RuntimeError(f"check runs of {head[:8]}: {(r.stderr or r.stdout).strip()[:160]}")
@@ -1022,11 +1023,21 @@ def main(argv=None):
     ap.add_argument('--minbot', type=int, metavar='N',
                     help='the MinBot check of one Auto Review PR, under the lock (the Stop hook)')
     ap.add_argument('--floor', type=int, help=f'--cascade: Staging floor (default {FLOOR}, env SWARM_STAGING_FLOOR)')
+    ap.add_argument('--repo', help='--minbot: the PR\'s repository when it is not the platform repo (#45)')
+    ap.add_argument('--promote-board', type=int, metavar='N',
+                    help='a board without staging (Project 6, #45): Ready -> Human Review in pick order')
     a = ap.parse_args(argv)
     if a.floor is not None:
         FLOOR = a.floor
         os.environ['SWARM_STAGING_FLOOR'] = str(a.floor)  # the move log records it
     try:
+        if (a.minbot and a.repo and a.repo != REPO) or a.promote_board:
+            from . import boardflow
+            lock = f"swarm-advance {'--minbot ' + str(a.minbot) + ' --repo ' + a.repo if a.minbot else '--promote-board ' + str(a.promote_board)}"
+            if a.dry_run:
+                return boardflow.main(a, Advance(dry_run=True))
+            with gatelock.gate_lock(lock):
+                return boardflow.main(a, Advance())
         if a.minbot:
             if a.dry_run:
                 return Advance(dry_run=True).minbot_one(a.minbot)

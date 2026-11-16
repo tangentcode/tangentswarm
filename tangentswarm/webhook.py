@@ -155,7 +155,17 @@ def ours(body):
 
 def classify(event, p):
     """[Action] for one delivery (pure: no I/O). An empty list is "skip"; the first action's
-    why says why when it is a skip."""
+    why says why when it is a skip. Every action carries the delivery's repository
+    (tangentswarm #45: platform on Project 4, tangentswarm and methodology on Project 6)."""
+    acts = _classify(event, p)
+    repo = ((p.get('repository') or {}).get('full_name') or '')
+    if repo:
+        for a in acts:
+            a.args.setdefault('repo', repo)
+    return acts
+
+
+def _classify(event, p):
     repo = ((p.get('repository') or {}).get('full_name') or '')
     action = p.get('action') or ''
     sender = p.get('sender') or {}
@@ -163,8 +173,8 @@ def classify(event, p):
         return [Action('skip', why='ping')]
     if event == 'projects_v2_item':
         return project_move(p)
-    if repo != REPO:
-        return [Action('skip', why=f'not {REPO} ({repo or "no repo"})')]
+    if board.for_repo(repo) is None:
+        return [Action('skip', why=f'not a swarm repo ({repo or "no repo"})')]
     if log_only(event):
         return [Action('log-only', why=f'{event}: logged only (Michal 2026-11-15 1:55 PM ET)')]
     if event in ('check_run', 'status', 'workflow_job', 'create', 'delete'):
@@ -261,9 +271,10 @@ def project_move(p):
         return [Action('skip', why=f"projects_v2_item {p.get('action')}")]
     # Codex on PR #26: only the board's own project and its Status field (another project's
     # move with the same column names must never reach a platform worker)
-    if item.get('project_node_id') != board.PROJECT_ID:
+    b = board.for_project(item.get('project_node_id'))
+    if b is None:
         return [Action('skip', why=f"projects_v2_item of another project ({item.get('project_node_id')})")]
-    if ch.get('field_node_id') and ch.get('field_node_id') != board.STATUS_FIELD:
+    if ch.get('field_node_id') and ch.get('field_node_id') != b.status_field:
         return [Action('skip', why='projects_v2_item: not the Status field')]
     frm = board.column({'optionId': (ch.get('from') or {}).get('id'), 'name': (ch.get('from') or {}).get('name')})
     to = board.column({'optionId': (ch.get('to') or {}).get('id'), 'name': (ch.get('to') or {}).get('name')})
@@ -271,12 +282,12 @@ def project_move(p):
         return [Action('skip', why=f"card move by {login(p.get('sender'))}")]
     node = item.get('content_node_id')
     if frm == board.HUMAN_REVIEW and to == board.IN_PROGRESS:
-        return [Action('reject', 0, 'Michal sent the PR back from Human Review', dict(node=node)),
-                Action('cascade', 0, 'Human Review has a free slot')]
+        return [Action('reject', 0, 'Michal sent the PR back from Human Review', dict(node=node, board=b.number)),
+                Action('cascade', 0, 'Human Review has a free slot', dict(board=b.number))]
     if frm == board.NEEDS_INPUT and to == board.IN_PROGRESS:
-        return [Action('answered', 0, 'Michal answered the question', dict(node=node))]
+        return [Action('answered', 0, 'Michal answered the question', dict(node=node, board=b.number))]
     if frm == board.HUMAN_REVIEW or to == board.DONE:
-        return [Action('cascade', 0, f"card moved {frm} -> {to}")]
+        return [Action('cascade', 0, f"card moved {frm} -> {to}", dict(board=b.number))]
     return [Action('skip', why=f"card moved {frm} -> {to}: his decision")]
 
 
@@ -318,10 +329,20 @@ class Executor:
         from . import tick
         return tick.sh(argv, check=True).stdout
 
+    # -- the action's repository and board (tangentswarm #45) -----------------------------
+    repo = REPO
+    board_ = board.DEFAULT
+
+    def platform(self):
+        return self.repo == REPO
+
     def card(self, n):
-        """(item id, column) of PR or issue n on Project 4. The board snapshot has open items
-        only, so a merged or closed one (do_merged, do_closed, a closed linked issue) is read
-        from the item itself (Codex on PR #26: the Done/Canceled move never found its card)."""
+        """(item id, column) of PR or issue n on its board. The Project 4 snapshot has open
+        items only, so a merged or closed one (do_merged, do_closed, a closed linked issue) is
+        read from the item itself (Codex on PR #26: the Done/Canceled move never found its
+        card); another board's card is always read from the item."""
+        if not self.platform():
+            return self.card_direct(n)
         from . import boardcache
         snap = boardcache.snapshot(self.g['gql'], max_age=0)
         for it, c in boardcache.open_prs(snap) + boardcache.open_issues(snap):
@@ -331,18 +352,18 @@ class Executor:
 
     def card_direct(self, n):
         """(item id, column) from the PR or issue's own projectItems, open or closed."""
-        owner, name = REPO.split('/')
+        owner, name = self.repo.split('/')
         d = self.g['gql'](CARD_QUERY, owner=owner, name=name, n=n)
         node = (((d or {}).get('repository') or {}).get('issueOrPullRequest') or {})
         for it in (node.get('projectItems') or {}).get('nodes') or []:
-            if ((it.get('project') or {}).get('id')) == board.PROJECT_ID:
+            if ((it.get('project') or {}).get('id')) == self.board_.id:
                 return it['id'], board.column(it.get('fieldValueByName'))
         return None, None
 
     def move(self, n, item, col):
         if self.dry:
             return self.note(f"would move #{n} to {col}")
-        board.move_card(self.g, item, col, self._sh)
+        board.move_card(self.g, item, col, self._sh, b=self.board_)
         self.note(f"#{n} -> {col}")
 
     def minbot(self, n):
@@ -350,13 +371,20 @@ class Executor:
         from .promoted import BIN
         if self.dry:
             return self.note(f"would queue swarm-advance --minbot {n}")
-        (self.enqueue or gatelock.enqueue)([str(BIN / 'swarm-advance'), '--minbot', str(n)], by='swarm-webhook')
-        self.note(f"queued the MinBot check of #{n}")
+        extra = [] if self.platform() else ['--repo', self.repo]  # #45: another repo's check
+        (self.enqueue or gatelock.enqueue)([str(BIN / 'swarm-advance'), '--minbot', str(n), *extra], by='swarm-webhook')
+        self.note(f"queued the MinBot check of #{n}" + ('' if self.platform() else f" ({self.repo})"))
 
     def cascade(self, why):
         from . import advance
         if self.dry:
             return self.note('would queue a cascade pass')
+        if self.board_ is not board.DEFAULT:  # #45: a board without staging: its own promote step
+            from . import gatelock
+            from .promoted import BIN
+            (self.enqueue or gatelock.enqueue)([str(BIN / 'swarm-advance'), '--promote-board',
+                                                str(self.board_.number)], by='swarm-webhook')
+            return self.note(f"queued the board {self.board_.number} promote ({why})")
         advance.flag_rerun(by=f'swarm-webhook: {why}')
         self.note(f"cascade {(self.cascade_fn or advance.queue_cascade)()}")
 
@@ -366,6 +394,8 @@ class Executor:
             return True, 'would relay to the worker'
         if self.give:
             return self.give(n, text)
+        if not self.platform():  # #45 phase 2: worker windows are named by platform PR number only
+            return False, f"no worker relay for {self.repo} yet"
         from . import flow
         return flow.Flow(dry_run=False, out=lambda l: None, g=self.g).hand_off(n, text)
 
@@ -374,7 +404,7 @@ class Executor:
         no worker); else wake swarmbot. A merged or closed PR, or a card in Done, Canceled or
         Parked, is left alone (Codex on PR #26: a late Codex or CI delivery restarted done work)."""
         from . import advance
-        state = (advance.codex_details(self.g['gql'], n).get('state') or 'OPEN')
+        state = (advance.codex_details(self.g['gql'], n, self.repo).get('state') or 'OPEN')
         item, col = self.card(n)
         if state != 'OPEN' or col in (board.DONE, board.CANCELED, board.PARKED):
             return self.note(f"#{n}: {why}, but the PR is {state.lower()} and its card is in {col}: no rework")
@@ -414,6 +444,10 @@ class Executor:
 
     # -- handlers -----------------------------------------------------------------------
     def run(self, a):
+        self.repo = a.args.get('repo') or REPO
+        num = a.args.get('board')
+        self.board_ = (next((b for b in board.BOARDS if b.number == num), None) if num else None) \
+            or board.for_repo(self.repo) or board.DEFAULT
         fn = getattr(self, 'do_' + a.kind, None)
         if fn is None:
             return self.note(f"skip: {a.why}")
@@ -453,10 +487,10 @@ class Executor:
 
     def do_ci(self, a):
         from . import advance
-        full = self.g['fetch'](a.pr, refresh=True)
+        full = self.pr_full(a.pr)
         if a.args.get('sha') != full.get('headRefOid'):
             return self.note(f"#{a.pr}: CI on an older head: skip")
-        problem = advance.ci_problem(advance.check_runs(a.args['sha']))
+        problem = advance.ci_problem(advance.check_runs(a.args['sha'], self.repo))
         if problem and problem.startswith('CI is still running'):
             return self.note(f"#{a.pr}: {problem}")
         item, col = self.card(a.pr)
@@ -478,17 +512,17 @@ class Executor:
             return self.note(f"#{a.pr}: a push in In Progress: left to the Stop hook")
         if col in (board.NEEDS_INPUT, board.DONE, board.CANCELED, board.PARKED):
             return self.note(f"#{a.pr}: card in {col}: not moved")
-        full = self.g['fetch'](a.pr, refresh=True)
+        full = self.pr_full(a.pr)
         head = full.get('headRefOid')
         if full.get('isDraft') and not self.dry:
-            self._sh(['gh', 'pr', 'ready', str(a.pr), '-R', REPO])
+            self._sh(['gh', 'pr', 'ready', str(a.pr), '-R', self.repo])
         if col != board.AUTO_REVIEW:
             self.move(a.pr, item, board.AUTO_REVIEW)
         state = tick.State(tick.STATE_DIR / 'state.json')
-        key = f"codex-request:{a.pr}@{head}"
+        key = f"codex-request:{a.pr}@{head}" if self.platform() else f"codex-request:{self.repo}#{a.pr}@{head}"
         if not (state.done(key) or tick.codex_requested(full) or tick.codex_reviewed_head(full)):
             if not self.dry:
-                self._sh(['gh', 'pr', 'comment', str(a.pr), '-R', REPO, '--body', '@codex review'])
+                self._sh(['gh', 'pr', 'comment', str(a.pr), '-R', self.repo, '--body', '@codex review'])
                 state.mark(key)
             self.note(f'#{a.pr}: posted "@codex review" for {head[:8]}')
         if col in (board.READY, board.STAGING, board.HUMAN_REVIEW):
@@ -514,21 +548,34 @@ class Executor:
     def closing_issues(self, n):
         """The issues PR n closes, with their repository (a cross-repo "Fixes o/r#17" is
         another repo's issue 17, not this repo's)."""
-        owner, name = REPO.split('/')
+        owner, name = self.repo.split('/')
         d = self.g['gql'](f'query{{repository(owner:"{owner}",name:"{name}"){{pullRequest(number:{int(n)})'
                           '{closingIssuesReferences(first:20){nodes{number repository{nameWithOwner}}}}}}')
         pr = ((d or {}).get('repository') or {}).get('pullRequest') or {}
         return (pr.get('closingIssuesReferences') or {}).get('nodes') or []
 
     def pr_of(self, node):
-        """The number of a card's PR or issue, only when it is in REPO (else None)."""
+        """The number of a card's PR or issue, only when it is in one of its board's repos
+        (else None); the action's repo becomes that repo."""
         d = self.g['gql']('query($id:ID!){node(id:$id){...on PullRequest{number repository{nameWithOwner}} '
                           '...on Issue{number repository{nameWithOwner}}}}', id=node)
         nd = (d or {}).get('node') or {}
-        return nd.get('number') if ((nd.get('repository') or {}).get('nameWithOwner') == REPO) else None
+        repo = (nd.get('repository') or {}).get('nameWithOwner')
+        if repo not in self.board_.repos:
+            return None
+        self.repo = repo
+        return nd.get('number')
+
+    def pr_full(self, n):
+        """The PR's head, draft state, comments and reviews: hr-gate's read for platform, the
+        CODEX_FIELDS read for another repo (hr-gate knows only platform)."""
+        if self.platform():
+            return self.g['fetch'](n, refresh=True)
+        from . import advance
+        return advance.codex_details(self.g['gql'], n, self.repo)
 
     def comments_since_head(self, n):
-        full = self.g['fetch'](n, refresh=True)
+        full = self.pr_full(n)
         head_at = ((full.get('commits') or {}).get('nodes') or [{}])[0].get('commit', {}).get('committedDate', '')
         return [c for c in (full.get('comments') or {}).get('nodes') or []
                 if login(c.get('author')) == MICHAL and (c.get('createdAt') or '') > head_at and not ours(c.get('body'))]
@@ -537,6 +584,9 @@ class Executor:
         n = self.pr_of(a.args['node'])
         if not n:
             return self.note('reject: not a PR')
+        if not self.platform():
+            return self.wake(n, f"{self.repo}#{n} rejected from Human Review; no worker relay for this repo yet",
+                             key=f'reject:{self.repo}:{n}')
         cs = self.comments_since_head(n)
         said = ' | '.join(' '.join((c.get('body') or '').split())[:400] for c in cs) or '(no comment: see the PR)'
         ok, note = self.to_worker(n, f"Coordinator: #{n}: Michal sent it back from Human Review: {said} {ROOT_CAUSE}")
@@ -548,6 +598,9 @@ class Executor:
         n = self.pr_of(a.args['node'])
         if not n:
             return self.wake(0, 'Needs Input answered on an issue with no PR: TRIAGE handoff', key=f"answered:{a.args['node']}")
+        if not self.platform():
+            return self.wake(n, f"{self.repo}#{n} answered in Needs Input; no worker relay for this repo yet",
+                             key=f'answered:{self.repo}:{n}')
         cs = self.comments_since_head(n)
         said = ' | '.join(' '.join((c.get('body') or '').split())[:600] for c in cs) or '(see the issue)'
         ok, note = self.to_worker(n, f"Coordinator: #{n}: Michal answered: {said} Build it, then push.")
@@ -557,23 +610,22 @@ class Executor:
 
     def do_merged(self, a):
         self.cascade(f'#{a.pr} merged')
-        full = self.g['fetch'](a.pr, refresh=True)
         item, _ = self.card(a.pr)
         if item:
             self.move(a.pr, item, board.DONE)
         for i in self.closing_issues(a.pr):
             num = i.get('number')
             repo = (i.get('repository') or {}).get('nameWithOwner')
-            if repo != REPO:  # Codex on PR #26: never close a same-number platform issue
-                self.note(f"#{a.pr} closes {repo}#{num}: not a {REPO} issue, left to GitHub")
+            if repo != self.repo:  # Codex on PR #26: never close a same-number issue of another repo
+                self.note(f"#{a.pr} closes {repo}#{num}: not a {self.repo} issue, left to GitHub")
                 continue
             if not num or self.dry:
                 continue
             it, _ = self.card(num)  # before the close: the issue is still in the open snapshot
-            self._sh(['gh', 'issue', 'close', str(num), '-R', REPO, '--reason', 'completed'])
+            self._sh(['gh', 'issue', 'close', str(num), '-R', self.repo, '--reason', 'completed'])
             if it:
                 self.move(num, it, board.DONE)
-        if not self.dry:
+        if not self.dry and self.platform():  # active-gate knows only Project 4
             from .promoted import BIN
             for argv in ([BIN / 'active-gate', '--sweep', '--demote'], [BIN / 'active-gate', '--promote-missing']):
                 try:
@@ -596,23 +648,25 @@ class Executor:
         A reopened PR whose card is in Canceled or Done goes back to that working column."""
         if a.args.get('what') == 'issue':
             col = board.TRIAGE
-            url = f'https://github.com/{REPO}/issues/{a.pr}'
+            url = f'https://github.com/{self.repo}/issues/{a.pr}'
         else:
             col = board.IN_PROGRESS if a.args.get('draft') else board.AUTO_REVIEW
-            url = f'https://github.com/{REPO}/pull/{a.pr}'
+            url = f'https://github.com/{self.repo}/pull/{a.pr}'
         item, cur = self.card(a.pr)
         if item and cur and not (a.args.get('reopened') and cur in (board.CANCELED, board.DONE)):
             return self.note(f"#{a.pr} already has a card in {cur}")
         # Codex on PR #26: a reopened PR left its card in Canceled, where nothing works on it
         if self.dry:
-            return self.note(f"would put #{a.pr} on Project 4 in {col}")
-        item = item or json.loads(self._sh(['gh', 'project', 'item-add', '4', '--owner', 'tangentcode', '--url', url,
+            return self.note(f"would put #{a.pr} on Project {self.board_.number} in {col}")
+        item = item or json.loads(self._sh(['gh', 'project', 'item-add', str(self.board_.number), '--owner',
+                                            'tangentcode', '--url', url,
                                             '--format', 'json']))['id']
         self.move(a.pr, item, col)
         if a.args.get('what') == 'pr':
             from .promoted import BIN
             try:
-                self._sh([str(BIN / 'swarm-label-sync'), str(a.pr), '--apply'])
+                if self.platform():  # swarm-label-sync knows only platform
+                    self._sh([str(BIN / 'swarm-label-sync'), str(a.pr), '--apply'])
             except Exception as e:
                 self.note(f"label sync: {str(e)[:120]}")
 
