@@ -1,24 +1,19 @@
-"""swarm-launch: start a worker Claude, queue it when memory holds it, start queued ones later.
+"""swarm-launch: start a worker Claude, and read worker memory live.
 
-swarm-start-scoped exits 3 ("held") when the worker slice is short of memory. Before
-this module nothing recorded a held launch, so nothing retried it and nobody saw the
-pressure. swarm-launch runs swarm-start-scoped and, on a hold, adds the launch to a
-queue file. swarm-tick then calls start_next() on each pass: when memory admits a
-launch, it starts the first queued one (priority milestone first, then the oldest
-hold), one launch per pass, and sends the new Claude one line that points to its brief.
+swarm-start-scoped exits 3 ("held") when the worker slice is short of memory. There is no
+held-launch list any more (Michal 2026-11-15 6:44 PM ET, tangentswarm #40: the Backlog
+column is the queue): the launcher checks live capacity before it makes anything, and a
+start that memory still holds stays the PR's unstarted record, which the cascade retries
+when capacity is free.
 
 Memory is read live on every check: the slice's MemoryCurrent, MemoryHigh and
 MemoryMax from systemd, and MemAvailable from /proc/meminfo. Nothing assumes a fixed
 slice size. The admission rule is the same as swarm-start-scoped's.
 
-    swarm-launch BRANCH [WINDOW] [--pr N] [--brief FILE]   start, or queue on a hold
-    swarm-launch --list                                    print the queue and memory
-    swarm-launch --next                                    start the first queued launch if memory admits it
-    swarm-launch --drop BRANCH                             remove a queued launch
+    swarm-launch BRANCH [WINDOW] [--pr N] [--brief FILE]   start a worker
+    swarm-launch --memory                                  print the worker memory
 """
 import argparse
-import contextlib
-import fcntl
 import json
 import os
 import subprocess
@@ -28,7 +23,6 @@ from pathlib import Path
 
 HOME = Path.home()
 BIN = Path(os.environ.get('SWARM_TICK_BIN', str(HOME / 'bin')))
-QUEUE = Path(os.environ.get('SWARM_HELD', str(HOME / 'var' / 'swarm-held.json')))
 SLICE = os.environ.get('SWARM_SLICE', 'swarm-workers.slice')
 MB = 1024 ** 2
 FLOOR = 700 * MB              # headroom under MemoryHigh (swarm-start-scoped's rule)
@@ -84,59 +78,37 @@ def describe(m):
 
 
 # ---------------------------------------------------------------------------
-# the queue
+# starting a worker
 
-@contextlib.contextmanager
-def locked_queue(path=None):
-    path = path or QUEUE
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path.with_suffix('.lock'), 'a') as lk:
-        fcntl.flock(lk, fcntl.LOCK_EX)
-        try:
-            rows = json.loads(path.read_text())
-            if not isinstance(rows, list):
-                rows = []
-        except (OSError, ValueError):
-            rows = []
-        before = json.dumps(rows)
-        yield rows
-        if json.dumps(rows) != before:
-            tmp = path.with_suffix('.tmp')
-            tmp.write_text(json.dumps(rows, indent=1))
-            os.replace(tmp, path)
+OLD_HELD = HOME / 'var' / 'swarm-held.json'  # the retired held-launch list (#40)
 
 
-def read_queue():
-    with locked_queue() as rows:
-        return list(rows)
+def migrate_held(path=None, add=None):
+    """Once, at daemon start: each row of the retired held-launch list with a PR becomes that
+    PR's unstarted record (the cascade's start retry starts it), then the file goes (Codex
+    on PR #46: a launch held before the upgrade had its retry only in that file). Returns
+    the PR numbers moved."""
+    path = path or OLD_HELD
+    try:
+        rows = json.loads(path.read_text())
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError):
+        rows = []
+    if add is None:
+        from . import slots
+        add = slots.unstarted_add
+    moved = []
+    for r in rows if isinstance(rows, list) else []:
+        if r.get('pr') and r.get('branch'):
+            add(int(r['pr']), branch=r['branch'], brief=r.get('brief') or '', issue=r.get('issue'))
+            moved.append(int(r['pr']))
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return moved
 
-
-def hold(branch, window=None, pr=None, brief=None, now=None):
-    """Add a held launch, or refresh its details if it is already queued (keeps its place)."""
-    with locked_queue() as rows:
-        for r in rows:
-            if r['branch'] == branch:
-                r.update({k: v for k, v in dict(window=window, pr=pr, brief=brief).items() if v})
-                return r
-        r = dict(branch=branch, window=window, pr=pr, brief=brief, held_at=now or time.time())
-        rows.append(r)
-        return r
-
-
-def drop(branch):
-    with locked_queue() as rows:
-        n = len(rows)
-        rows[:] = [r for r in rows if r['branch'] != branch]
-        return n != len(rows)
-
-
-def ordered(rows, rank=lambda pr: 1):
-    """Priority milestone first (rank 0), then the oldest hold."""
-    return sorted(rows, key=lambda r: (rank(r.get('pr')), r.get('held_at', 0)))
-
-
-# ---------------------------------------------------------------------------
-# launching
 
 def clean_env(env=None):
     """The environment for swarm-start-scoped: without PYTHONPATH. The swarm-promoted daemon
@@ -181,11 +153,9 @@ def launch(branch, window=None, pr=None, brief=None, start=start_scoped, send=se
     """Start a worker. Returns (what, detail): what is 'launched', 'held' or 'refused'."""
     rc, out = start(branch, window)
     if rc == HELD and out.get('held'):
-        hold(branch, out.get('window') or window, pr, brief)
-        return 'held', out
+        return 'held', out  # no list: the caller keeps the PR's unstarted record
     if rc != 0:
         return 'refused', out
-    drop(branch)
     if brief:
         try:
             send(out['pane'], out['unit'], brief)
@@ -194,62 +164,18 @@ def launch(branch, window=None, pr=None, brief=None, start=start_scoped, send=se
     return 'launched', out
 
 
-def drop_pr(pr):
-    """Remove the held launches of PR pr (it was closed). Returns how many."""
-    with locked_queue() as rows:
-        n = len(rows)
-        rows[:] = [r for r in rows if r.get('pr') != pr]
-        return n - len(rows)
-
-
-def start_next(rank=lambda pr: 1, mem=memory, start=start_scoped, send=send_brief, room=lambda: True,
-               closed=lambda pr: False):
-    """Start at most one queued launch if memory admits it and room() says the Claude cap
-    has room (Codex on PR #26: the held queue drained past MAX_CLAUDES).
-
-    Returns (what, row, detail): what is 'empty', 'waiting' (memory or the cap holds it), or
-    launch()'s result for the first queued row."""
-    for r in read_queue():  # Codex on PR #26: a closed PR's held launch never starts
-        if r.get('pr') and closed(r['pr']):
-            drop_pr(r['pr'])
-    rows = ordered(read_queue(), rank)
-    if not rows:
-        return 'empty', None, None
-    m = mem()
-    if not admits(m):
-        return 'waiting', rows[0], describe(m)
-    if not room():
-        return 'waiting', rows[0], 'the Claude cap is full'
-    r = rows[0]
-    what, out = launch(r['branch'], r.get('window'), r.get('pr'), r.get('brief'), start=start, send=send)
-    if what == 'refused':
-        drop(r['branch'])  # a refusal (busy window, missing worktree) needs judgment, not a retry
-    return what, r, out
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(prog='swarm-launch', description=__doc__.split('\n', 1)[0])
     ap.add_argument('branch', nargs='?')
     ap.add_argument('window', nargs='?')
     ap.add_argument('--pr', type=int)
     ap.add_argument('--brief', help='brief file; the new Claude is told to read it')
-    g = ap.add_mutually_exclusive_group()
-    g.add_argument('--list', action='store_true')
-    g.add_argument('--next', action='store_true')
-    g.add_argument('--drop', metavar='BRANCH')
+    ap.add_argument('--memory', action='store_true', help='print the worker memory and exit')
     a = ap.parse_args(argv)
     try:
-        if a.list:
+        if a.memory:
             print(describe(memory()) + ('; admits a launch' if admits(memory()) else '; holds launches'))
-            for r in ordered(read_queue()):
-                print(json.dumps(r))
             return 0
-        if a.drop:
-            return 0 if drop(a.drop) else 1
-        if a.next:
-            what, r, out = start_next()
-            print(json.dumps(dict(what=what, row=r, detail=out)))
-            return 0 if what in ('launched', 'empty', 'waiting') else 1
         if not a.branch:
             ap.error('BRANCH is required')
         if a.brief and not Path(a.brief).is_file():

@@ -815,37 +815,39 @@ def test_the_minbot_pass_resolves_the_addressed_threads(monkeypatch):
 
 
 def test_a_live_signal_queues_the_launches_and_respects_the_claude_cap(monkeypatch, tmp_path):
-    """MethBot 2026-11-15 3:35 AM ET: START_CLAUDE named issues seven times; none started."""
-    from tangentswarm import slots, spool
+    """MethBot 2026-11-15 3:35 AM ET: START_CLAUDE named issues seven times; none started.
+    tangentswarm #44: capacity is live state: running Claudes, launch and start requests in
+    the spool, and the worker memory; never reservations or a held list."""
+    from tangentswarm import launches, slots, spool
     g = CascadeGate(issues=[(n, board.BACKLOG) for n in (40, 41, 42, 43)])
     out = []
     c = A.Cascade(g=g, dry_run=False, out=out.append)
     monkeypatch.setattr(slots, 'live_claudes', lambda: 8)  # 2 under the cap of 10
     c.signal({})
     reqs = sorted(json.loads(p.read_text())['issue'] for p in spool.SPOOL.glob('*.req.json'))
-    assert reqs == [40, 41] and set(slots.load()['launching']) == {'40', '41'}
+    assert reqs == [40, 41]
     assert out[-1] == 'launch: queued #40, #41 for swarm-promoted (branch, draft PR, brief, worker)'
     assert slots.load()['named'] == {}  # named only once a draft PR exists
     out.clear()
-    c.signal({})  # Codex on PR #26: the 2 queued launches hold the last 2 Claudes of the cap
+    c.signal({})  # the 2 launch requests in the spool are 2 Claudes about to start
     assert not any(l.startswith('START_CLAUDE') for l in out) and 'launching=2' in out[-1], out
     monkeypatch.setattr(slots, 'live_claudes', lambda: 6)
     out.clear()
-    c.signal({})  # room again: the picker skips the queued ones
+    c.signal({})  # room again: the picker skips the issues being launched
     assert any(l.startswith('START_CLAUDE n=2 issues=#42,#43') for l in out), out
-    from tangentswarm import launches
-    slots.save(dict(slots.load(), launching={}))  # the launches ended ...
-    launches.hold('held-branch', pr=99)  # ... but one start is held for memory: it still holds a Claude
-    out.clear()
-    c.signal({})
-    start = [l for l in out if l.startswith('START_CLAUDE')]
-    assert start and start[0].startswith('START_CLAUDE n=3') and 'launching=1' in start[0], out  # 10 - 6 live - 1 held
-    launches.drop('held-branch')
+    for p in spool.SPOOL.glob('*.req.json'):
+        p.unlink()  # the launches ended
     slots.save(dict(slots.load(), launching={}))
+    monkeypatch.setattr(slots, 'worker_memory', lambda: dict(current=4500 * 1024 ** 2, high=4608 * 1024 ** 2,
+                                                             max=5120 * 1024 ** 2, avail=4 * 1024 ** 3))
+    out.clear()
+    c.signal({})  # the worker memory holds starts: no launch, read live
+    assert any('no capacity: worker memory holds starts' in l for l in out), out
+    monkeypatch.setattr(slots, 'worker_memory', lambda: None)
     monkeypatch.setattr(slots, 'live_claudes', lambda: 10)
     out.clear()
     c.signal({})
-    assert out[0].startswith('signal: 4 new-work slot(s) free, but 10 Claudes run (cap 10): no launch')
+    assert any('no capacity: 10 Claudes run or start (cap 10)' in l for l in out), out
 
 
 def test_no_minbot_pass_while_the_pr_has_an_open_question_for_michal():

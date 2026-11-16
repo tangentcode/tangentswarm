@@ -22,10 +22,8 @@ bot holding it together by hand. Each pass:
      Auto Review and posts "@codex review" (once per head).
   3. (Retired by methodology#56: Ready PRs get no gate. Only the flow step's one pulled
      PR is gated.)
-  3b. Starts at most one held launch (swarm-launch queue) when the worker slice has
-     room, priority milestone first, then the oldest hold. Memory limits are read live.
-     Memory pressure that lasts PRESSURE_MINUTES or more is reported, with the numbers
-     and the held launches.
+  3b. (Retired by tangentswarm #40: there is no held-launch list; the Backlog column is
+     the queue, and the cascade retries a launched PR's worker start.)
   4. Runs `active-gate --sweep --demote` and `active-gate --promote-missing`.
   5. Runs one swarm-flow step (tangentswarm.flow): promote Staging -> Human Review when
      Human Review has fewer than 2, and pull one Ready PR into Staging.
@@ -65,7 +63,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from . import board, brief, flow, gatelock, launches
+from . import board, brief, flow, gatelock
 
 ET = ZoneInfo('America/New_York')
 HOME = Path.home()
@@ -85,7 +83,6 @@ LATER_COLS = ('Pending', 'Human Review', 'Done', 'Canceled')
 EXTRA_PARKED = {202, 344, 350}
 SHELLS = {'bash', 'sh', 'zsh', 'fish', 'dash'}
 STUCK_MINUTES = 20
-PRESSURE_MINUTES = int(os.environ.get('SWARM_PRESSURE_MINUTES', '10'))
 SETTLE = 1.5
 
 # ---------------------------------------------------------------------------
@@ -762,11 +759,13 @@ class Tick:
         path = brief.brief_path(n)
         if not SCAFFOLD_RE.match(subject) or brief.read_brief(n) is None:
             return False
-        queued = any(r['branch'] == pr['branch'] for r in launches.read_queue())
-        if not queued:
-            if not self.dry:
-                launches.hold(pr['branch'], s['window'], n, str(path))
-            self.change(f"#{n} queued held launch {pr['branch']} (shell {s['id']}, head is the scaffold commit)")
+        if not self.dry:  # Codex on PR #46: make sure the cascade's start retry knows this PR
+            from . import slots
+            if str(n) not in slots.load()['unstarted']:
+                slots.unstarted_add(n, branch=pr['branch'], brief=str(path),
+                                    issue=(pr.get('closes') or [None])[0])
+        self.note(n, s, f"launch not started yet (head is the scaffold commit, brief {path}): "
+                        "the cascade's start retry starts it when capacity is free")
         return True
 
     def finished(self, n, pr, c, scratch):
@@ -858,59 +857,6 @@ class Tick:
             if any('stayed' in m and 'rebased onto' in m for m in msg):
                 self.note(n, pane, f"needs a speculative vN branch: relay /tmp/relay-{n}-spec.md to its Claude")
             hr_peers = self.g['list_hr_prs'](refresh=True)
-
-    # step 3b: held launches and memory pressure ---------------------------
-    def launch_pass(self, now=None):
-        now = time.time() if now is None else now
-        try:
-            m = launches.memory()
-        except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
-            self.note(None, None, f"cannot read worker memory: {e}")
-            return
-        by_branch = {p['branch']: n for n, p in self.prs.items() if p['state'] == 'OPEN'}
-        rows = launches.read_queue()
-        for r in rows:
-            r['pr'] = r.get('pr') or by_branch.get(r['branch'])
-        rank = lambda pr: self.prs.get(pr, {}).get('rank', 1)  # noqa: E731
-        rows = launches.ordered([r for r in rows if (self.prs.get(r['pr']) or {}).get('state') not in ('MERGED', 'CLOSED')],
-                                rank)
-        ok = launches.admits(m)
-        since = self.state.data.get('pressure_since')
-        if ok:
-            self.state.data.pop('pressure_since', None)
-        else:
-            since = since or now
-            self.state.data['pressure_since'] = since
-            mins = int((now - since) // 60)
-            if mins >= PRESSURE_MINUTES:
-                held = ', '.join(f"#{r['pr']}" if r['pr'] else r['branch'] for r in rows) or 'none'
-                self.note(None, None, f"memory pressure for {mins} min: {launches.describe(m)}; "
-                                      f"held launches: {held}")
-        if not rows or not ok:
-            return
-        first = rows[0]
-        name = f"#{first['pr']}" if first['pr'] else first['branch']
-        if self.dry:
-            self.change(f"{name} start held launch {first['branch']} ({launches.describe(m)})")
-            return
-        from . import slots
-        closed = lambda pr: (self.prs.get(pr) or {}).get('state') in ('MERGED', 'CLOSED')  # noqa: E731
-        what, row, out = launches.start_next(rank=rank, mem=lambda: m, closed=closed,
-                                             room=lambda: slots.live_claudes() < slots.MAX_CLAUDES)
-        if what == 'waiting':
-            return self.note(first['pr'], None, f"held launch {first['branch']} waits: {out}")
-        if what == 'launched':
-            self.change(f"{name} started held launch in {out.get('window')} ({out.get('pane')})")
-            if out.get('brief_error'):
-                from . import slots
-                if first.get('pr') and first.get('brief'):
-                    slots.brief_pending(first['pr'], out.get('pane'), out.get('unit'), first['brief'],
-                                        branch=first['branch'])
-                self.note(first['pr'], None, f"started, but the brief line was not sent: {out['brief_error']}"
-                                             "; the cascade's start retry sends it")
-        elif what == 'refused':
-            self.note(first['pr'], None, f"held launch {first['branch']} refused and dropped from the queue: "
-                                         f"{out.get('refused', out)}")
 
     # step 4 ---------------------------------------------------------------
     def active_pass(self):
@@ -1011,7 +957,6 @@ class Tick:
         self.brief_pass()
         with self.g['ScratchRepo']() as scratch:
             self.panes_pass(scratch)
-        self.launch_pass()
         self.active_pass()
         self.flow_pass()
         self.closable()
