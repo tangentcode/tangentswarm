@@ -118,3 +118,21 @@ def test_soonest_due_of_a_pr_and_its_issues():
                               {'title': 'ptw 15', 'dueOn': '2026-11-15T00:00:00Z'}]) == ('2026-11-15', 'ptw 15')
     assert board.soonest_due([{}, {'title': 'someday'}]) == ('', 'someday')
     assert board.soonest_due([{}]) == ('', '')
+
+
+def test_board_prs_ignores_another_repos_closing_issue():
+    """Codex on PR #38: swarm-tick's due date and fast-track use this repo's issues only, as the
+    fill, promote and MinBot pickers do (boardcache.closes)."""
+    foreign = {'number': 490, 'repository': {'nameWithOwner': 'o/other'},
+               'milestone': {'title': 'Early', 'dueOn': '2026-11-01T00:00:00Z'}, 'labels': {'nodes': []}}
+    item = {'id': 'I', 'fieldValueByName': {'name': 'Ready', 'optionId': board.OPTION[board.READY]},
+            'content': {'__typename': 'PullRequest', 'number': 9, 'state': 'OPEN', 'isDraft': False,
+                        'headRefName': 'b', 'headRefOid': 'h', 'title': 't', 'body': '',
+                        'repository': {'nameWithOwner': tick.REPO},
+                        'milestone': {'title': 'MVP', 'dueOn': '2026-12-01T00:00:00Z'},
+                        'labels': {'nodes': []}, 'closingIssuesReferences': {'nodes': [foreign]}}}
+    page = {'organization': {'projectV2': {'items': {'nodes': [item],
+                                                     'pageInfo': {'hasNextPage': False, 'endCursor': None}}}}}
+    board.FT_STATE.write_text('{"active": 490}')
+    pr = tick.board_prs({'gql': lambda q, c=None: page, 'PARKED': set()})[9]
+    assert (pr['due'], pr['milestone'], pr['closes'], pr['ft']) == ('2026-12-01', 'MVP', [], False)

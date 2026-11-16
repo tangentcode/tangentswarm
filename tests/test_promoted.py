@@ -67,6 +67,8 @@ def test_staging_order_puts_only_the_active_fast_track_first():
     assert [p['number'] for p in P.staging_order(st, det, q, active=490)] == [6, 5, 7]
     assert [p['number'] for p in P.staging_order(st, det, q, active=488)] == [7, 5, 6]
     assert [p['number'] for p in P.staging_order(st, det, q, active=None)] == [5, 6, 7]
+    det = {6: {'closingIssuesReferences': {'nodes': [{'number': 490, 'repository': {'nameWithOwner': 'o/other'}}]}}}
+    assert [p['number'] for p in P.staging_order(st, det, q, active=490)] == [5, 6, 7]  # another repo's 490
 
 
 def test_read_columns_keeps_the_active_fast_track_current(tmp_path):
