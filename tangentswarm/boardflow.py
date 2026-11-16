@@ -42,10 +42,14 @@ def promote(adv, b):
                       "(a merge of main is needed, or GitHub has not computed it yet)")
             continue
         from . import advance as A
-        try:
-            ci = A.ci_problem(A.check_runs(p['head'], p['repo']))  # Codex on PR #47: a rerun may have failed
+        try:  # Codex on PR #47: the head, base and Codex result may have changed since its pass
+            d = A.codex_details(adv.g['gql'], p['number'], p['repo'])
+            ci = (f"head moved to {(d.get('headRefOid') or '')[:8]}" if d.get('headRefOid') != p['head']
+                  else f"targets {d.get('baseRefName')}, not main" if d.get('baseRefName') != 'main'
+                  else f"not Codex-clean on {p['head'][:8]}" if not A.codex_clean(d)
+                  else A.ci_problem(A.check_runs(p['head'], p['repo'])))  # a CI rerun may have failed
         except Exception as e:
-            ci = f"CI not readable: {type(e).__name__}"
+            ci = f"not readable now: {type(e).__name__}"
         if ci:
             _say(adv, f"{p['repo']}#{p['number']} stays in Ready: {ci}")
             continue
@@ -79,6 +83,8 @@ def minbot_repo(adv, n, repo, promote_after=True):
     why = None
     if head != card['head']:
         why = f"head moved to {head[:8]}"
+    elif d.get('baseRefName') != 'main':  # Codex on PR #47: mergeable is against the PR's own base
+        why = f"targets {d.get('baseRefName')}, not main"
     elif d.get('isDraft'):
         why = 'is a draft'
     elif A.open_question(d):

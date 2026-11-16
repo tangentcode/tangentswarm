@@ -59,7 +59,7 @@ RERUN = Path(os.environ.get('SWARM_CASCADE_RERUN', str(gatelock.LOCK.with_name('
 REDEPLOY_LATE = int(os.environ.get('SWARM_REDEPLOY_LATE', '600'))  # lag warning only after this (Michal 2026-11-15)
 DEPLOY_FALLBACK = int(os.environ.get('SWARM_DEPLOY_FALLBACK', '180'))  # then accept a .deploy-sha that contains the head
 
-CODEX_FIELDS = """number state isDraft headRefOid mergeable body
+CODEX_FIELDS = """number state isDraft headRefOid baseRefName mergeable body
  closingIssuesReferences(first:3){nodes{number comments(last:1){nodes{body}}}}
  comments(last:40){nodes{author{login} body createdAt}}
  commits(last:1){nodes{commit{committedDate}}}

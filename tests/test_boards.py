@@ -51,6 +51,17 @@ def test_a_project_6_card_move_carries_its_board():
     assert a.kind == 'cascade' and a.args['board'] == 6
 
 
+import pytest
+
+
+@pytest.fixture
+def clean_now(monkeypatch):
+    """promote() re-reads each candidate: by default the same head, base main, Codex clean."""
+    from tangentswarm import advance as A
+    monkeypatch.setattr(A, 'codex_details', lambda gql, n, repo=None: dict(
+        codex_pr('h' * 40, clean=True), isDraft=False, mergeable='MERGEABLE', body='', baseRefName='main'))
+
+
 class Adv:
     def __init__(self, cols, dry=False):
         self.dry, self.lines, self.moves, self.minbots = dry, [], [], []
@@ -69,7 +80,7 @@ def pr(n, **kw):
     return dict(number=n, repo=TS, head='h' * 40, item=f'I{n}', draft=False, closes=[], **kw)
 
 
-def test_promote_fills_human_review_in_pick_order(monkeypatch):
+def test_promote_fills_human_review_in_pick_order(monkeypatch, clean_now):
     cols = {board.HUMAN_REVIEW: [pr(1)], board.READY: [pr(30), pr(20, due='2026-11-20', milestone='m'), pr(25)]}
     adv = Adv(cols)
     monkeypatch.setattr(boards, 'open_prs', lambda gql, b: adv.cols)
@@ -87,7 +98,7 @@ def test_minbot_repo_passes_a_clean_pr_to_ready_then_promotes(monkeypatch):
     adv = Adv(cols)
     monkeypatch.setattr(boards, 'open_prs', lambda gql, b: adv.cols)
     head = 'h' * 40
-    d = dict(codex_pr(head, clean=True), isDraft=False, mergeable='MERGEABLE', body='')
+    d = dict(codex_pr(head, clean=True), isDraft=False, mergeable='MERGEABLE', body='', baseRefName='main')
     monkeypatch.setattr(A, 'codex_details', lambda gql, n, repo=None: d)
     monkeypatch.setattr(A, 'check_runs', lambda h, repo=None: [{'name': 'tests', 'status': 'completed',
                                                                'conclusion': 'success'}])
@@ -117,7 +128,7 @@ def test_every_read_and_cleanup_of_another_repo_uses_that_repo(monkeypatch):
     assert '47' in slots.load()['unstarted'] and launches.read_queue()
 
 
-def test_a_project_6_pr_is_fast_track_by_its_own_labels(monkeypatch):
+def test_a_project_6_pr_is_fast_track_by_its_own_labels(monkeypatch, clean_now):
     cols = {board.READY: [pr(30), pr(40, ft=True)]}
     adv = Adv(cols)
     monkeypatch.setattr(boards, 'open_prs', lambda gql, b: adv.cols)
@@ -137,7 +148,7 @@ def test_same_number_findings_in_two_repos_both_wake():
     assert wakes[0]['why'].startswith(TS + ':')
 
 
-def test_a_ready_pr_that_conflicts_now_is_not_promoted(monkeypatch):
+def test_a_ready_pr_that_conflicts_now_is_not_promoted(monkeypatch, clean_now):
     """Codex on PR #47: a merge after its MinBot pass made it conflict with main."""
     cols = {board.READY: [pr(20, due='2026-11-20', milestone='m', mergeable='CONFLICTING'), pr(30)]}
     adv = Adv(cols)
@@ -168,7 +179,7 @@ def test_a_busy_lock_requeues_the_repo_and_board_arguments(monkeypatch, tmp_path
     assert queued == [['--minbot', '47', '--repo', TS], ['--promote-board', '6']]
 
 
-def test_a_board_pass_retries_unknown_mergeability(monkeypatch, tmp_path):
+def test_a_board_pass_retries_unknown_mergeability(monkeypatch, tmp_path, clean_now):
     """Codex on PR #47: a promote that met UNKNOWN had no retry; the daemon queues a board
     pass every BOARD_EVERY s, and the pass checks Auto Review and promotes."""
     from tangentswarm import gatelock, promoted as P
@@ -193,8 +204,25 @@ def test_a_ready_pr_with_red_ci_now_is_not_promoted(monkeypatch):
     cols = {board.READY: [pr(20, due='2026-11-20', milestone='m'), pr(30)]}
     cols[board.READY][0]['head'] = 'r' * 40
     adv = Adv(cols)
+    monkeypatch.setattr(A, 'codex_details', lambda gql, n, repo=None: dict(
+        codex_pr('r' * 40 if n == 20 else 'h' * 40, clean=True), baseRefName='main'))
     monkeypatch.setattr(boards, 'open_prs', lambda gql, b: adv.cols)
     monkeypatch.setattr(board, 'move_card', lambda *a, **k: None)
     monkeypatch.setattr(A, 'check_runs', lambda h, repo=None: [{'name': 't', 'status': 'completed',
                                                                'conclusion': 'failure' if h[0] == 'r' else 'success'}])
     assert boardflow.promote(adv, B6) == [30] and any('#20 stays in Ready: CI is not green' in l for l in adv.lines)
+
+
+def test_promote_and_the_pass_need_base_main_and_codex_clean_now(monkeypatch):
+    """Codex on PR #47: a PR on another base, or with findings after its pass, stays."""
+    from tangentswarm import advance as A
+    monkeypatch.setattr(board, 'move_card', lambda *a, **k: None)
+    adv = Adv({board.READY: [pr(20, due='2026-11-20', milestone='m'), pr(30)]})
+    monkeypatch.setattr(boards, 'open_prs', lambda gql, b: adv.cols)
+    det = {20: dict(codex_pr('h' * 40, findings=True), baseRefName='main'),
+           30: dict(codex_pr('h' * 40, clean=True), baseRefName='main')}
+    monkeypatch.setattr(A, 'codex_details', lambda gql, n, repo=None: det[n])
+    assert boardflow.promote(adv, B6) == [30] and any('#20 stays in Ready: not Codex-clean' in l for l in adv.lines)
+    det[30] = dict(det[30], baseRefName='deploy')
+    adv.lines.clear()
+    assert boardflow.promote(adv, B6) == [] and any('targets deploy, not main' in l for l in adv.lines)
