@@ -577,3 +577,10 @@ def test_a_held_ready_head_is_handed_off_again_when_a_worker_can_take_it(tmp_pat
     assert rcs == [0]
     f.retry_held(cols, now=10_000 + F.HELD_RETRY)
     assert moves == [('I7', board.IN_PROGRESS)] and 7 not in F.held()
+
+
+def test_shots_relay_tells_the_worker_to_use_a_throwaway_user_or_scratch_root():
+    """#64: the screenshot relay sends a worker to staging, so it carries the scratch rule."""
+    from tangentswarm.gatechecks import SCRATCH_RULE
+    text = flow.shots_text(7)
+    assert SCRATCH_RULE in text and 'staging' in text and text.isascii()
