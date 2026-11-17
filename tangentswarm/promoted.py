@@ -256,6 +256,7 @@ class Promoter:
         self.work_seen = (None, 0.0)  # (origin work SHA, when this daemon first saw it)
         self.lag_woken = set()  # work SHAs whose lag already woke swarmbot (once per SHA)
         self.lag_checked = 0.0
+        self.p6_retry_at = 0.0
         self.events = None       # tangentswarm.events reader (made on first use)
         self.board, self.hr_count = None, 0  # fast_path's latest board read and Human Review slots in use
 
@@ -357,6 +358,7 @@ class Promoter:
                 say(f"spool: serving {rid}")
         except Exception as e:
             say(f"spool: {type(e).__name__}: {e}")
+        self.retry_p6launch()
         # tangentswarm #31: GitHub events instead of the mn-workflow timer and the Codex poll
         try:
             if self.events is None:
@@ -366,6 +368,21 @@ class Promoter:
                     say(f"event: {line}")
         except Exception as e:
             say(f"events: {type(e).__name__}: {e}")
+
+    def retry_p6launch(self, now=None, retry=None):
+        """Every p6launch.RETRY_EVERY s: send again the MethBot exceptions of Project 6
+        launches whose POST failed (Codex on PR #108). Never raises."""
+        from . import p6launch
+        now = time.time() if now is None else now
+        if now - self.p6_retry_at < p6launch.RETRY_EVERY:
+            return
+        self.p6_retry_at = now
+        try:
+            sent, left = (retry or p6launch.retry_pending)()
+            if sent or left:
+                say(f"p6launch: {sent} kept MethBot exception(s) sent, {left} still kept")
+        except Exception as e:
+            say(f"p6launch retry: {type(e).__name__}: {e}")
 
     def queue_cascade(self, why, now=None):
         from . import advance

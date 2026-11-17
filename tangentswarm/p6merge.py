@@ -34,14 +34,16 @@ step is reported and the rest go on):
   - one events DB row
   - a tangentswarm merge wakes swarmbot: a deploy is needed. Only a note: deploys need
     Michal's OK
-  - the Project 6 Backlog pull: about LIVE_TARGET live workers; the next Backlog issues in the
-    strict pick order (board.pick_key) go to MethBot as one 'pull' POST. Triage is never read,
-    so tickets made from proposals stay there.
+  - the Project 6 Backlog pull: about LIVE_TARGET live workers (launches still queued count
+    too); the next Backlog issues in the strict pick order (board.pick_key) are each queued as
+    one Project 6 launch (p6launch, tangentswarm #98: branch, draft PR, cards, brief,
+    worktree, window and Claude, with no AI). Triage is never read, so tickets made from
+    proposals stay there. A launch that fails is one MethBot exception (p6launch.execute).
 
 Any check fails: no merge, and one exception POST to MethBot's alert URL with the reasons,
 once per PR and head (alerts.tell_methbot 'exception'). The whole run holds the once-lock of
 the PR and head, so the done report and the comment cannot both merge. A MethBot POST after
-the merge (the pull, a cleanup exception) that fails stays in a pending file of the PR and
+the merge (a cleanup exception) that fails stays in a pending file of the PR and
 head; the next done report or MERGE-READY comment of that head sends it, with no new merge.
 """
 import os
@@ -199,12 +201,13 @@ class P6Merge:
 
     def __init__(self, repo, n, head, trigger, gql=None, sh=None, tell=None, wake=None, tmux=None,
                  remove=None, procs=None, live=None, backlog=None, sleep=time.sleep, wt=None, st=None,
-                 now=time.time, delbranch=None, tipcheck=None):
+                 now=time.time, delbranch=None, tipcheck=None, launch=None, inflight=None):
         self.repo, self.n, self.head, self.trigger = repo, int(n), head, trigger
         self._gql, self._sh, self.tell = gql, sh, tell or alerts.tell_methbot
         self.wake = wake or (lambda why, key, pr: alerts.wake_swarmbot(why, key, pr=pr))
         self._tmux, self._remove, self._procs = tmux, remove, procs
         self._live, self._backlog, self._delbranch, self._tipcheck = live, backlog, delbranch, tipcheck
+        self._launch, self._inflight = launch, inflight
         self.sleep, self.wt, self.st, self.now = sleep, wt, st, now
         self.notes = []
 
@@ -495,22 +498,39 @@ class P6Merge:
         self.note(self.wake(why, f"p6-deploy:{self.n}@{self.head}", self.n))  # the wake queue retries a failed POST
 
     def pull(self, pr):
-        """The Project 6 Backlog pull: free = LIVE_TARGET - live workers; the next free Backlog
-        issues in pick order go to MethBot in one 'pull' POST (once per merge). Returns the
-        notices to deliver."""
+        """The Project 6 Backlog pull: free = LIVE_TARGET - live workers - launches still queued;
+        the next free Backlog issues in pick order (not one already queued) are each queued as
+        one Project 6 launch (tangentswarm #98: before, they went to MethBot in a 'pull' POST).
+        The daemon runs each launch in its own process, so this run does not wait for a Claude
+        to start. Returns no notices: a launch that fails tells MethBot itself; a pick that
+        could not be queued raises, and after_merge reports it as a cleanup exception."""
+        from . import p6launch
         b = board.for_repo(self.repo)
         live = (self._live or live_workers)()
-        free = LIVE_TARGET - live
+        queued = (self._inflight or p6launch.in_flight)()
+        free = LIVE_TARGET - live - len(queued)
         if free <= 0:
-            return self.note(f"Backlog pull: {live} live Project 6 workers (target {LIVE_TARGET}): none pulled")
-        picks = [i for i in (self._backlog or (lambda: backlog_issues(self.gql, b)))()][:free]
+            return self.note(f"Backlog pull: {live} live Project 6 workers and {len(queued)} queued launches "
+                             f"(target {LIVE_TARGET}): none pulled")
+        picks = [i for i in (self._backlog or (lambda: backlog_issues(self.gql, b)))()
+                 if (i['repo'], int(i['number'])) not in queued][:free]
         if not picks:
-            return self.note(f"Backlog pull: {live} live workers, Project 6 Backlog is empty")
-        line = ', '.join(f"{i['repo']}#{i['number']}" for i in picks)
-        self.note(f"Backlog pull: {line}")
-        return [{'kind': 'pull', 'key': '',
-                 'reason': f"Backlog pull after {self.repo}#{self.n} merged: {live} live Project 6 workers, "
-                           f"target {LIVE_TARGET}; start in this order: {line}"}]
+            return self.note(f"Backlog pull: {live} live workers, no Project 6 Backlog issue to start")
+        after = {'repo': self.repo, 'pr': self.n, 'head': self.head}
+        launch = self._launch or (lambda i: p6launch.queue(i['repo'], i['number'], i.get('title') or '', after=after))
+        done, failed = [], []
+        for i in picks:
+            name = f"{i['repo']}#{i['number']}"
+            try:
+                launch(i)
+                done.append(name)
+            except Exception as e:  # the next pick still goes
+                failed.append(f"{name} ({type(e).__name__}: {str(e)[:120]})")
+        if done:
+            self.note(f"Backlog pull: queued launches of {', '.join(done)} ({live} live workers, target {LIVE_TARGET})")
+        if failed:
+            raise RuntimeError('Backlog pull: not queued: ' + ', '.join(failed))
+        return []
 
 
 def live_workers(panes=None, root=None):
