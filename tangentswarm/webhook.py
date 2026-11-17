@@ -28,11 +28,13 @@ SQLite event log (eventdb: a 'received' row before the reply, a 'handled' row af
            ready, "@codex review" once per head, card Auto Review, cascade
   relay    a human comment on a PR in work: relay it to the worker, card In Progress
   reject / answered   Michal's card moves (Human Review -> In Progress, Needs Input -> In
-           Progress): relay his comments since the head to the worker
+           Progress): relay his comments since the head to the worker. Any move out of
+           Human Review first wakes swarm-promoted and queues the cascade (tangentswarm #136)
   merged   SIGUSR1 to swarm-promoted first (tangentswarm #67: Human Review refills at once),
            then the cascade, card Done, close each linked issue and its card Done, park the
            worker, active-gate sweeps
-  closed   card Canceled
+  closed   SIGUSR1 to swarm-promoted first, card Canceled; a close in Human Review or
+           Staging queues the cascade (tangentswarm #136: its slot refills at once)
   issue_closed  an issue closed while its card is in Triage or Discuss (tangentswarm #122): card
            Done (completed) or Canceled (not planned, duplicate); off the board if the board has
            no such column
@@ -810,7 +812,7 @@ class Executor:
             return self.note('would send SIGUSR1 to swarm-promoted')
         try:
             said = (self.signal_promoted or signal_promoted)()
-        except Exception as e:  # the merge handling goes on; the poll still finds the free slot
+        except Exception as e:  # the event handling goes on; the poll still finds the free slot
             said = f"not woken: {type(e).__name__}: {str(e)[:120]}"
         self.note(f"{why or f'#{n} merged'}: swarm-promoted {said}")
 
@@ -916,9 +918,13 @@ class Executor:
         return done
 
     def do_closed(self, a):
+        if self.platform():  # tangentswarm #136: a close may free a slot: refill before the card read
+            self.wake_promoted(a.pr, f'#{a.pr} closed')
         item, col = self.card(a.pr)
         if item and col != board.CANCELED:
             self.move(a.pr, item, board.CANCELED)
+        if col in (board.HUMAN_REVIEW, board.STAGING) and self.board_ is board.DEFAULT:
+            self.cascade(f"#{a.pr} closed in {col}")  # its slot is free: restock
         if not self.dry:  # a canceled launch must not be started again by the start retry
             from . import slots
             if self.platform():  # Codex on PR #47: launch records are platform PR numbers

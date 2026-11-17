@@ -498,11 +498,13 @@ class Cascade(Advance):
 
       1. promote   Human Review has a free slot: the fast path moves the next Staging PR.
       2. fill      Staging stocking (Michal 2026-11-15; before: 2026-11-14 7:16 PM ET).
-                   (A) Each pull in flight gets ONE served check, never a wait: when EVERY
-                   staging site's .deploy-sha contains its head, hr-gate --apply moves it
-                   into Staging. The serial lock is never held for a redeploy, so a promote
-                   never waits on one. The swarm-promoted daemon queues the next cascade
-                   when a staging .deploy-sha changes. (B) Every pass pre-merges the top
+                   (A) Each pull in flight gets ONE served check, never a wait: when its
+                   priority staging site serves it, a pre-merged Ready PR moves into Staging
+                   with no gate re-run (tangentswarm #136: Flow.stage; an older pull record
+                   still gets hr-gate --apply). The serial lock is never held for a redeploy,
+                   so a promote never waits on one. Each push to work starts the ptw deploy
+                   at once (tangentswarm.stagingdeploy), and the swarm-promoted daemon queues
+                   the next cascade within a second of a staging .deploy-sha change. (B) Every pass pre-merges the top
                    Ready PRs onto future main (main + Human Review + Staging heads, in
                    that order) as a new <branch>-vN (Flow.premerge, tangentswarm #65): a
                    clean one gets the label merge-ready; a real conflict gets pre-merging
@@ -537,6 +539,7 @@ class Cascade(Advance):
         self.sleep, self.clock = sleep, clock
         self.f = flow.Flow(dry_run=dry_run, out=lambda line: None, g=self.g)
         self.f.tool_timeout = STEP_TIMEOUT
+        self.f.stale_ok = True  # tangentswarm #136: promote and fill never wait on a board read
         self._seen = [0, 0]
         # one deadline per PROCESS (watchdog sets it): a rerun pass must not start a fresh budget
         self.deadline = DEADLINE if DEADLINE is not None and clock is time.monotonic else self.clock() + BUDGET
@@ -564,9 +567,11 @@ class Cascade(Advance):
         """ONE served check for each pull in flight, no wait: the serial lock is never held for
         a redeploy, so a promote never waits on one (Human Review sat empty about 15 min twice on
         2026-11-14 while pulls of #495 and #514 waited on a PTW redeploy). A pull whose head
-        every staging site serves gets hr-gate --apply. Every staging site redeploys the work
-        tip by itself (ptw: a timer, 2 to 4 min), and the swarm-promoted daemon queues the next
-        cascade when a staging .deploy-sha changes. A pull not served after REDEPLOY_LATE s
+        the priority staging site serves moves on: a pre-merged Ready PR goes to Staging with
+        no gate re-run (Flow.stage, tangentswarm #136); an older pull record gets hr-gate
+        --apply. The push to work starts the ptw deploy at once (tangentswarm.stagingdeploy;
+        the timer is the backup), and swarm-promoted queues the next cascade within a second
+        of a staging .deploy-sha change (Promoter.deploy_watch). A pull not served after REDEPLOY_LATE s
         prints REDEPLOY_LATE. Returns the PRs whose pull ended (moved or failed)."""
         from . import flow
         ended = []
@@ -591,8 +596,9 @@ class Cascade(Advance):
                     continue
                 self.out(f"served: the priority staging site serves #{n} {head[:8]} (the others roll out in the background)")
             before = len(self.f.did)
-            self.out(f"gate: hr-gate on #{n} {head[:8]} (timeout {STEP_TIMEOUT}s)")
-            self.f.advance(d, prs, scratch)
+            self.out(f"stage: #{n} {head[:8]} is pre-merged: Ready -> Staging, no gate re-run (tangentswarm #136)"
+                     if d.get('pre_merged') else f"gate: hr-gate on #{n} {head[:8]} (timeout {STEP_TIMEOUT}s)")
+            self.f.advance(d, prs, scratch, served=True)  # the served check above (tangentswarm #136)
             self.flush()
             if (len(self.f.did) > before) if self.dry else n not in flow.pulled_prs():
                 ended.append(n)
@@ -625,7 +631,8 @@ class Cascade(Advance):
         with self.g['ScratchRepo']() as scratch:
             ended = self.gate_pulls(prs, scratch) if flow.load_pulls() else []
             if ended and self.dry:
-                gated = [n for n in ended if any(f"#{n} hr-gate --apply" in line for line in self.f.did)]
+                gated = [n for n in ended if any(f"#{n} hr-gate --apply" in line or f"#{n} Ready -> Staging" in line
+                                                 for line in self.f.did)]
                 cols = self._staged(cols, gated)
             elif ended:
                 prs, cols = self.columns()
@@ -974,7 +981,7 @@ def priority_host(n, gql=None):
     titles = []
     try:
         if gql is not None:
-            for _, c in boardcache.open_prs(boardcache.snapshot(gql)):
+            for _, c in boardcache.open_prs(boardcache.snapshot(gql, stale_ok=True)):
                 if c.get('number') == n:
                     titles = boardcache.milestones(c)
     except Exception:

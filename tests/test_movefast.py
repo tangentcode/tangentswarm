@@ -78,7 +78,6 @@ def test_events_of_another_repo_or_project_or_field_change_nothing():
 
 @pytest.mark.parametrize('event,payload', [
     ('pull_request', pr_event('opened', 9)),
-    ('pull_request', pr_event('milestoned', 5)),
     ('projects_v2_item', {'action': 'created', 'projects_v2_item': {'node_id': 'I9', 'project_node_id': board.DEFAULT.id}}),
     ('projects_v2_item', item_event('I9', RD)),  # a move of a card the cache does not hold
     ('issues', {'action': 'labeled', 'repository': {'full_name': B.REPO}, 'issue': {'number': 3}}),

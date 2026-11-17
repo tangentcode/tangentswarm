@@ -36,6 +36,13 @@ it retries every RETRY seconds) and:
      that stacks cleanly is merged into work ONCE (the push redeploys staging) and gated
      into Staging by hr-gate --apply.
 
+  tangentswarm #136: every event that frees a Human Review slot (a merge, a close, a reject,
+  any move out) sends SIGUSR1, so the refill starts within a second. The movers read a board
+  cache that is only stale as is (boardcache: stale is not dirty); resync() reads the board
+  after the move. Every second the daemon also reads the staging .deploy-sha files
+  (deploy_watch): a change with pulls in flight queues the cascade at once, and a ptw deploy
+  that ended behind origin work is started again (tangentswarm.stagingdeploy).
+
     swarm-promoted                  run the daemon
     swarm-promoted --once [--dry-run]   one check (and promotion) and exit
 """
@@ -76,12 +83,13 @@ def _names(node):
     return [l['name'] for l in ((node or {}).get('labels') or {}).get('nodes') or []]
 
 
-def read_board(gql, max_age=None):
+def read_board(gql, max_age=None, stale_ok=True):
     """({column key: [{number, head, item, closes}]} for OPEN platform PRs by option id,
     [fast-track items for board.update_active]), from the shared board snapshot (boardcache;
-    max_age 0 reads the board now)."""
+    max_age 0 reads the board now). stale_ok (the default: every caller moves cards): a cache
+    that is only stale is used as is (tangentswarm #136)."""
     from . import boardcache
-    snap = boardcache.snapshot(gql, max_age)
+    snap = boardcache.snapshot(gql, max_age, stale_ok=stale_ok)
     cols, ft = {}, []
     for it, c in boardcache.open_prs(snap):
         col = boardcache.col(it)
@@ -99,9 +107,9 @@ def read_board(gql, max_age=None):
     return cols, ft
 
 
-def read_columns(gql, ft_state=None, max_age=None):
+def read_columns(gql, ft_state=None, max_age=None, stale_ok=True):
     """Columns as read_board, and keep the ONE active fast-track ticket current (board.FT_STATE)."""
-    cols, ft = read_board(gql, max_age)
+    cols, ft = read_board(gql, max_age, stale_ok)
     try:  # the Ready entry time, for the Ready -> Human Review wait in the move log
         from . import moves
         moves.note_ready([p['number'] for p in cols.get(board.READY, [])])
@@ -164,7 +172,7 @@ def read_details(gql, numbers):
         return {}
     from . import boardcache
     try:
-        keys = boardcache.keys(boardcache.snapshot(gql))
+        keys = boardcache.keys(boardcache.snapshot(gql, stale_ok=True))
     except Exception:
         keys = {}
     out = {}
@@ -229,6 +237,11 @@ class Promoter:
         self.p6_retry_at = 0.0
         self.events = None       # tangentswarm.events reader (made on first use)
         self.board, self.hr_count = None, 0  # fast_path's latest board read and Human Review slots in use
+        import threading
+        self._deploy_lock = threading.Lock()
+        self.poke = None         # wakes the main loop at once (run() sets it; the SIGUSR1 path)
+        self.deploy_seen = None  # the ptw .deploy-sha deploy_watch saw last (tangentswarm #136)
+        self.redeployed = None   # the origin work SHA deploy_watch last started the deploy for
 
     def main_sha(self):
         """origin main's SHA via git ls-remote (no API quota), or None on an error."""
@@ -299,17 +312,19 @@ class Promoter:
         say(note)
         return behind
 
-    def deploy_due(self):
+    def deploy_due(self, sites=None):
         """Why to queue a cascade for the pulls in flight, or None (Michal 2026-11-15). The
         cascade never waits on a redeploy; it checks once and exits. So when a staging
         .deploy-sha changes while a pull is in flight (or at the first look after a start),
-        the next cascade must gate it. Local file reads only: no GraphQL, no git fetch."""
+        the next cascade must gate it. Local file reads only: no GraphQL, no git fetch.
+        sites: served_all() already read (deploy_watch)."""
         from . import flow
         try:
-            key = tuple((k, sha) for k, _, sha, _ in self.g['served_all']())
+            key = tuple((k, sha) for k, _, sha, _ in (sites if sites is not None else self.g['served_all']()))
         except Exception:
             return None
-        prev, self.last_deploy = self.last_deploy, key
+        with self._deploy_lock:  # deploy_watch (each second) and side_work (each poll) share it
+            prev, self.last_deploy = self.last_deploy, key
         pulls = flow.load_pulls()
         if not pulls or key == prev:
             return None
@@ -319,12 +334,61 @@ class Promoter:
         new = ', '.join(f"{k} {sha[:8] if sha else '-'}" for k, sha in key if (k, sha) not in prev)
         return f"a staging .deploy-sha changed ({new}) with pulls in flight ({names})"
 
+    def deploy_shas(self):
+        """[(site key, host, static .deploy-sha, err)] like hr-gate's served_all, but file reads
+        only (served_all also runs git in each checkout; this runs every second)."""
+        sites = self.g.get('SITES') if hasattr(self.g, 'get') else None
+        if not sites:
+            return self.g['served_all']()
+        out = []
+        for k, (host, shafile, *_) in sites.items():
+            try:
+                out.append((k, host, Path(shafile).read_text().strip(), None))
+            except OSError as e:
+                out.append((k, host, None, f"cannot read {shafile}: {e.strerror}"))
+        return out
+
+    def deploy_watch(self, work_sha=None, start=None):
+        """tangentswarm #136: every second (file reads only), when a staging .deploy-sha changes
+        (a deploy ended): (1) with pulls in flight, queue the cascade now and wake the main loop
+        (before, the next poll found it up to 30 s later: 25 s lost on 2026-11-17); (2) when
+        origin work moved past what the ptw deploy built, start ptw-staging-deploy again (a
+        start during a running deploy is a no-op; tangentswarm.stagingdeploy). Returns the
+        lines it logged."""
+        from . import stagingdeploy
+        try:
+            sites = self.deploy_shas()
+        except Exception:
+            return []
+        out = []
+        ptw = next((sha for k, _, sha, _ in sites if k == stagingdeploy.SITE), None)
+        why = self.deploy_due(sites)
+        if why:
+            self.queue_cascade(why)
+            out.append(why)
+            if self.poke:
+                self.poke()
+        if ptw is not None and ptw != self.deploy_seen:
+            first, self.deploy_seen = self.deploy_seen is None, ptw
+            work = (work_sha or self.work_sha)()
+            if work and ptw != work and work != self.redeployed and not first:
+                self.redeployed = work
+                note = (start or stagingdeploy.start)(f"ptw serves {(ptw or '-')[:8]}, origin work is {work[:8]}")
+                say(note)
+                out.append(note)
+        return out
+
     def each_second(self):
         """Cheap work every second (its own thread): serve the worker spool
         (tangentswarm.spool: the Stop hook and swarm-worker-mcp requests from inside
-        swarm-workers.slice), and act on new GitHub events (tangentswarm.events, #31)."""
+        swarm-workers.slice), act on new GitHub events (tangentswarm.events, #31), and watch
+        the staging .deploy-sha files (deploy_watch, tangentswarm #136)."""
         if self.dry:
             return
+        try:
+            self.deploy_watch()
+        except Exception as e:
+            say(f"deploy watch: {type(e).__name__}: {e}")
         from . import events, spool
         try:
             for rid in spool.dispatch(log=str(STOP_LOG)):
@@ -598,6 +662,18 @@ class Promoter:
             say(note)
         return note
 
+    def resync(self):
+        """tangentswarm #136: the movers act on a board cache that is only stale (an event that
+        only the other readers need). The board read that clears it runs at the END of once():
+        after the moves AND the drain of the queued refill cascade (Codex on PR #138), outside
+        the serial lock, so it is never on the critical path of either refill move. It reads
+        only when the cache is stale, dirty or due for its sync. Never raises."""
+        from . import boardcache
+        try:
+            boardcache.snapshot(self.g['gql'])
+        except Exception as e:
+            say(f"board resync: {type(e).__name__}: {str(e)[:160]}")
+
     def side_work(self, cols):
         """(main SHA, main moved, queued requests): the work of a check that is not a card
         move: git ls-remote of main, the board passes, the deploy-lag check, and the cascade
@@ -632,6 +708,8 @@ class Promoter:
                 from . import flow
                 pull_due = needs_pull(cols, flow.load_pull())
                 if not main_moved and not waiting and not pull_due:
+                    if not self.dry:
+                        self.resync()  # tangentswarm #136: nothing to move or drain now
                     return 'idle'
                 if waiting:
                     say(f"{len(waiting)} queued gate request(s): draining")
@@ -666,6 +744,8 @@ class Promoter:
         except gatelock.Busy as e:
             say(f"busy: {e}; retrying in {RETRY}s")
             return 'busy'
+        if not self.dry:  # Codex on PR #138: after the drain (the refill cascade) and the lock
+            self.resync()
         return 'promoted'
 
 
@@ -711,6 +791,7 @@ def start_spool_thread(p, interval=1.0, stop=None):
 def run(p, poll=POLL, retry=RETRY, sleep=time.sleep):
     wake = {'now': False}
     signal.signal(signal.SIGUSR1, lambda *a: wake.update(now=True))
+    p.poke = lambda: wake.update(now=True)  # tangentswarm #136: a deploy end wakes the loop too
     say(f"swarm-promoted: polling every {poll}s (SIGUSR1 wakes it)")
     start_spool_thread(p)
     if WATCH:
