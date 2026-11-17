@@ -33,9 +33,9 @@ def thread(resolved=False, outdated=False, replies=(), opener=CODEX, oid=HEAD):
 
 
 def full(head=HEAD, state='OPEN', draft=False, base='main', mergeable='MERGEABLE', comments=None, threads=(),
-         checks=None, closes=((89, 'OPEN', TS),), branch='p6-done-automerge'):
+         checks=None, closes=((89, 'OPEN', TS),), branch='p6-done-automerge', hrepo=TS):
     return {'number': 90, 'state': state, 'isDraft': draft, 'baseRefName': base, 'headRefOid': head,
-            'headRefName': branch, 'mergeable': mergeable,
+            'headRefName': branch, 'headRepository': {'nameWithOwner': hrepo}, 'mergeable': mergeable,
             'closingIssuesReferences': {'nodes': [{'number': n, 'state': s, 'repository': {'nameWithOwner': r}}
                                                   for n, s, r in closes]},
             'comments': {'nodes': [summary(head)] if comments is None else comments},
@@ -83,7 +83,8 @@ class World:
 
     def kw(self, **extra):
         return {**dict(gql=self.gql, sh=self.sh, tmux=self.tmux, remove=self.remove, procs=lambda p: [],
-                       live=lambda: self.live, backlog=lambda: self.backlog, sleep=self.slept.append), **extra}
+                       live=lambda: self.live, backlog=lambda: self.backlog, sleep=self.slept.append,
+                       tipcheck=lambda branch: None), **extra}
 
     def run(self, repo=TS, n=90, head=HEAD, trigger='done', **extra):
         kw = self.kw(**extra)
@@ -205,7 +206,7 @@ def test_an_unknown_mergeable_is_read_again_before_it_fails():
 
 
 def test_methodology_uses_meth_windows_and_no_deploy_note():
-    w = World([full(closes=((7, 'CLOSED', METH),))])
+    w = World([full(closes=((7, 'CLOSED', METH),), hrepo=METH)])
     r = w.run(repo=METH)
     assert r['merged'] is True and ['kill-window', '-t', '@4'] in w.tmuxed
     assert not any(a[0] == 'kill-window' and a[-1] == '@1' for a in w.tmuxed)
@@ -562,3 +563,42 @@ def test_replies_by_other_reviewers_do_not_clear_an_outdated_thread():
 
 def test_the_worker_login_is_the_webhook_identity():
     assert M.WORKER_LOGIN == W.MICHAL
+
+
+# -- Codex on PR #90 (561c3f2): never a fork's or a diverged local worktree --------------------
+
+@pytest.mark.parametrize('hrepo', ['someone/tangentswarm', None])
+def test_a_fork_head_touches_no_local_worktree_or_branch(hrepo):
+    w = World([full(hrepo=hrepo)])
+    r = w.run()
+    assert r['merged'] is True and w.removed == []
+    assert any('no local worktree or branch is touched' in x for x in r['notes'])
+    assert [p['kind'] for p in w.posts] == ['pull']  # a note, not a problem
+
+
+def test_a_local_branch_with_more_commits_is_left_and_reported():
+    w = World([full()])
+    r = w.run(tipcheck=lambda branch: 'its tip cccccccc has commits that are not in the merged head')
+    assert r['merged'] is True and w.removed == []
+    assert [p['kind'] for p in w.posts] == ['pull', 'exception'] and 'not in the merged head' in w.posts[1]['reason']
+
+
+def test_tip_problem_reads_the_local_branch(tmp_path, monkeypatch):
+    import subprocess
+
+    def git(*a):
+        return subprocess.run(['git', '-C', str(repo), *a], capture_output=True, text=True, check=True).stdout.strip()
+    repo = tmp_path / 'tangentswarm'
+    repo.mkdir()
+    git('init', '-q', '-b', 'main')
+    git('-c', 'user.name=t', '-c', 'user.email=t@x', 'commit', '-q', '--allow-empty', '-m', 'a')
+    merged = git('rev-parse', 'HEAD')
+    git('branch', 'feat')
+    monkeypatch.setattr(worktrees, 'plain_repo', lambda name, top=None: str(repo))
+    run = M.P6Merge(TS, 90, merged, 'done')
+    assert run.tip_problem('feat') is None and run.tip_problem('missing') is None
+    git('checkout', '-q', 'feat')
+    git('-c', 'user.name=t', '-c', 'user.email=t@x', 'commit', '-q', '--allow-empty', '-m', 'b')
+    assert 'has commits that are not in the merged head' in run.tip_problem('feat')
+    ahead = git('rev-parse', 'HEAD')
+    assert M.P6Merge(TS, 90, ahead, 'done').tip_problem('main') is None  # an older tip is in the head

@@ -28,7 +28,9 @@ step is reported and the rest go on):
   - the PR card and the closed issue cards go to Done on Project 6
   - the PR's tmux windows (<code>-<PR>-*: swarm for tangentswarm, meth for methodology) close
   - `git worktree remove` when the worktree is clean (worktrees.remove_worktree), and the
-    local branch is deleted; a dirty or busy worktree is reported and left
+    local branch is deleted; a dirty or busy worktree is reported and left. Only for a head
+    branch in this repo (never a fork's), and only when the local branch has no commit that
+    the merged head does not have
   - one events DB row
   - a tangentswarm merge wakes swarmbot: a deploy is needed. Only a note: deploys need
     Michal's OK
@@ -60,7 +62,7 @@ SHA_RE = re.compile(r'^[0-9a-f]{40}$')
 MERGE_READY_RE = re.compile(r'^\s*MERGE-READY\s+([0-9a-f]{40})\b')
 CI_OK = ('SUCCESS', 'NEUTRAL', 'SKIPPED')
 
-FIELDS = """number state isDraft baseRefName headRefOid headRefName mergeable
+FIELDS = """number state isDraft baseRefName headRefOid headRefName headRepository{nameWithOwner} mergeable
  closingIssuesReferences(first:10){nodes{number state repository{nameWithOwner}}}
  comments(last:60){nodes{author{login} body createdAt}}
  reviews(last:30){nodes{author{login} commit{oid} comments{totalCount}}}
@@ -197,12 +199,12 @@ class P6Merge:
 
     def __init__(self, repo, n, head, trigger, gql=None, sh=None, tell=None, wake=None, tmux=None,
                  remove=None, procs=None, live=None, backlog=None, sleep=time.sleep, wt=None, st=None,
-                 now=time.time, delbranch=None):
+                 now=time.time, delbranch=None, tipcheck=None):
         self.repo, self.n, self.head, self.trigger = repo, int(n), head, trigger
         self._gql, self._sh, self.tell = gql, sh, tell or alerts.tell_methbot
         self.wake = wake or (lambda why, key, pr: alerts.wake_swarmbot(why, key, pr=pr))
         self._tmux, self._remove, self._procs = tmux, remove, procs
-        self._live, self._backlog, self._delbranch = live, backlog, delbranch
+        self._live, self._backlog, self._delbranch, self._tipcheck = live, backlog, delbranch, tipcheck
         self.sleep, self.wt, self.st, self.now = sleep, wt, st, now
         self.notes = []
 
@@ -430,6 +432,13 @@ class P6Merge:
         branch = pr.get('headRefName') or ''
         if not branch:
             return self.note('no head branch name: worktree and branch left')
+        head_repo = (pr.get('headRepository') or {}).get('nameWithOwner')
+        if head_repo != self.repo:  # Codex on PR #90: a fork's branch name says nothing about ours
+            return self.note(f"the head branch is in {head_repo or 'an unknown repo'}, not {self.repo}: "
+                             "no local worktree or branch is touched")
+        why = (self._tipcheck or self.tip_problem)(branch)
+        if why:  # never remove a worktree whose branch has work the merge does not have
+            raise RuntimeError(f"worktree and branch {branch} left: {why}")
         path = self.worktree(pr)
         procs = self._procs or worktrees.processes_in
         end = self.now() + EXIT_WAIT
@@ -447,6 +456,19 @@ class P6Merge:
             self.note(f"deleted local branch {branch}")
         else:
             raise RuntimeError(f"local branch {branch} kept: {out.get('branch_kept') or 'not deleted'}")
+
+    def tip_problem(self, branch):
+        """Why the local branch must stay, or None: it has commits that are not in the merged
+        head. A missing local branch is no problem (the cleanup reports it)."""
+        from . import worktrees
+        repo_path = worktrees.plain_repo(self.repo.split('/')[1])
+        r = worktrees.git(['rev-parse', '--verify', '--quiet', f'refs/heads/{branch}'], repo_path, check=False)
+        tip = (r.stdout or '').strip()
+        if r.returncode or not tip or tip == self.head:
+            return None
+        if worktrees._ok(['merge-base', '--is-ancestor', tip, self.head], repo_path):
+            return None
+        return f"its tip {tip[:8]} has commits that are not in the merged head {self.head[:8]}"
 
     def delete_branch(self, branch):
         """Delete the local branch when no worktree has it: only when it exists and is merged
