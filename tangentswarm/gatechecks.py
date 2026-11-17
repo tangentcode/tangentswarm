@@ -28,6 +28,12 @@ Condition 6 checks EVERY staging site (check_served_sites). Each site serves the
 work branch, so a PR with served files reaches all of them. Platform #493 entered Human
 Review while one staging site still served 95f38a27, which did not contain its head
 37ceb8f4; the gate had read only the one site that site_for picked.
+
+tangentswarm #116 (Michal 2026-11-17 11:14 AM ET): each PR has ONE priority staging site.
+Its milestone picks it ([staging] priority in the config: {milestone word: site key}; the
+default is PTW -> ptw), else [staging] priority_default (default ptw). Condition 6 and every
+column move wait only for that site. The other sites roll out in the background: their lag
+is named in the reason, but it never fails the check.
 """
 import re
 import urllib.request
@@ -188,10 +194,50 @@ def check_served(paths, entering, static_sha, has_head, err=None, tips=(), conta
     return (False, why) if entering else (True, 'lenient re-gate: ' + why)
 
 
-def check_served_sites(paths, entering, sites, has_head, tips=(), contains=None, work_bad=None):
-    """(ok, why) for condition 6 on EVERY staging site. sites: [(host, static_sha, err)].
-    Each site must serve the head (or the -vN tip condition 9 picked); one site that lags
-    fails entry (platform #493: ptw lagged while the other two served the head).
+PRIORITY_DEFAULT = 'ptw'           # site key; [staging] priority_default overrides it
+PRIORITY_MILESTONES = {'PTW': 'ptw'}  # milestone word -> site key; [staging] priority overrides it
+
+
+def _milestone_match(word, title):
+    return re.search(r'(?<![A-Za-z0-9])' + re.escape(word) + r'(?![A-Za-z0-9])', title or '', re.I) is not None
+
+
+def priority_site(milestones=(), cfg=None):
+    """The site key of a PR's priority staging site (tangentswarm #116). milestones: the
+    titles of the PR's milestone and of the issues it closes. The first title that holds a
+    configured milestone word (case-insensitive, a whole word) picks its site; else the
+    configured default."""
+    if cfg is None:
+        from . import config
+        cfg = config.get('staging', default={}) or {}
+    table = cfg.get('priority') if isinstance(cfg.get('priority'), dict) else PRIORITY_MILESTONES
+    for title in milestones or ():
+        for word, key in table.items():
+            if _milestone_match(word, title):
+                return key
+    return cfg.get('priority_default') or PRIORITY_DEFAULT
+
+
+def priority_host(milestones=(), cfg=None):
+    """The host of the priority staging site ([staging] sites maps key -> host), or None when
+    the config names no such site (then every site is checked, as before #116)."""
+    if cfg is None:
+        from . import config
+        cfg = config.get('staging', default={}) or {}
+    return (cfg.get('sites') or {}).get(priority_site(milestones, cfg))
+
+
+_DEFAULT = object()
+
+
+def check_served_sites(paths, entering, sites, has_head, tips=(), contains=None, work_bad=None, priority=_DEFAULT):
+    """(ok, why) for condition 6. sites: [(host, static_sha, err)].
+
+    tangentswarm #116: only the PR's priority site (host `priority`; by default the configured
+    default priority site, see priority_host) must serve the head (or the -vN tip condition 9
+    picked). The other sites roll out in the background: a lag there is named after
+    "rolling out", never a failure. When the priority host is not among `sites` (or the
+    config names none), EVERY site must serve it (platform #493, the rule before #116).
     A re-gate (not entering) stays lenient, and names the sites that lag."""
     if not any(SERVED_RE.search(p) for p in paths):
         return True, 'n/a (no served files: web/, api/, app/)'
@@ -199,12 +245,26 @@ def check_served_sites(paths, entering, sites, has_head, tips=(), contains=None,
         return (False, work_bad) if entering else (True, 'lenient re-gate: ' + work_bad)
     if not sites:
         return (False, 'no staging site to check') if entering else (True, 'lenient re-gate: no staging site')
-    res = [(host, *check_served(paths, entering, sha, has_head, err, tips, contains)) for host, sha, err in sites]
+    if priority is _DEFAULT:
+        try:
+            priority = priority_host()
+        except Exception:
+            priority = None
     lag = 'lenient re-gate: '
-    bad = [f"{h}: {w[len(lag):] if w.startswith(lag) else w}" for h, ok, w in res if not ok or w.startswith(lag)]
+    res = [(host, *check_served(paths, entering, sha, has_head, err, tips, contains)) for host, sha, err in sites]
+    first = [r for r in res if r[0] == priority] if priority else []
+    rest = [r for r in res if r not in first] if first else []
+    must = first or res
+    bad = [f"{h}: {w[len(lag):] if w.startswith(lag) else w}" for h, ok, w in must if not ok or w.startswith(lag)]
+    behind = [h for h, ok, w in rest if not ok or w.startswith(lag)]
+    roll = f"; rolling out (not blocking): {', '.join(behind)}" if behind else ''
     if bad:
-        why = f"{len(bad)} of {len(res)} staging sites do not serve it: " + '; '.join(bad)
+        why = (f"the priority site does not serve it: {bad[0]}" if first else
+               f"{len(bad)} of {len(res)} staging sites do not serve it: " + '; '.join(bad)) + roll
         return (False, why) if entering else (True, lag + why)
+    if first:
+        h, _, w = first[0]
+        return True, f"the priority site serves it: {h}: {w}" + roll
     return True, f"all {len(res)} staging sites serve it: " + '; '.join(f"{h}: {w}" for h, _, w in res)
 
 

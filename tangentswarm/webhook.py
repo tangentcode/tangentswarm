@@ -434,7 +434,7 @@ class Executor:
         if not self.platform():
             return self.card_direct(n)
         from . import boardcache
-        snap = boardcache.snapshot(self.g['gql'], max_age=0)
+        snap = boardcache.snapshot(self.g['gql'])  # tangentswarm #116: the event-fed cache
         for it, c in boardcache.open_prs(snap) + boardcache.open_issues(snap):
             if c['number'] == n:
                 return it['id'], boardcache.col(it)
@@ -1192,9 +1192,19 @@ def _add(*a, **kw):
         log(decision='eventdb failed', error=f'{type(e).__name__}: {e}')
 
 
-def handle(event, payload, delivery='', ex=None):
-    """Classify and run one delivery; log the decision. Returns the actions."""
+def handle(event, payload, delivery='', ex=None, received=None):
+    """Classify and run one delivery; log the decision. Returns the actions.
+    tangentswarm #116: first the board cache follows the event (boardcache.apply_event), so
+    the mover that this event wakes decides from a current cache with no board read. A
+    platform merge starts the merge clock (moves.note_merge): the next card move logs the
+    time from the event to the move."""
+    from . import boardcache
+    boardcache.apply_event(event, payload)
     acts = classify(event, payload)
+    for a in acts:
+        if a.kind == 'merged' and ((payload.get('repository') or {}).get('full_name') or '') == REPO:
+            from . import moves
+            moves.note_merge(a.pr, received=received, merged_at=(payload.get('pull_request') or {}).get('merged_at'))
     ex = ex or Executor()
     for a in acts:
         ex.run(a)
@@ -1215,7 +1225,7 @@ def enqueue(event, delivery, payload):
     INBOX.mkdir(parents=True, exist_ok=True)
     f = INBOX / f"{time.time_ns()}-{_inbox_name(delivery)}.json"
     tmp = f.with_suffix('.tmp')
-    tmp.write_text(json.dumps(dict(event=event, delivery=delivery, payload=payload)))
+    tmp.write_text(json.dumps(dict(event=event, delivery=delivery, payload=payload, received=time.time())))
     os.replace(tmp, f)
     return f
 
@@ -1259,7 +1269,7 @@ def drain(ex_factory=Executor):
         try:
             d = json.loads(f.read_text())
             delivery = d.get('delivery') or delivery
-            handle(d['event'], d['payload'], delivery, ex_factory())
+            handle(d['event'], d['payload'], delivery, ex_factory(), received=d.get('received'))
         except Exception as e:
             log(delivery=delivery, error=f'{type(e).__name__}: {e}')
             _add('handled', delivery, '', error=f'{type(e).__name__}: {str(e)[:500]}')

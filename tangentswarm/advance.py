@@ -346,7 +346,7 @@ class Advance:
         """swarm-advance --minbot N (the Stop hook, tangentswarm #28): the MinBot check of one
         Auto Review PR. A pass posts the MinBot pass comment and moves the card to Ready."""
         from .promoted import read_columns
-        cols = read_columns(self.g['gql'], max_age=0)
+        cols = read_columns(self.g['gql'])  # tangentswarm #116: the event-fed board cache
         ar = [p for p in cols.get(board.AUTO_REVIEW, []) if p['number'] == n]
         if not ar:
             self.out(f"#{n} is not in Auto Review: no MinBot check")
@@ -589,7 +589,7 @@ class Cascade(Advance):
                                  f"by {sites} {_age(age)} after the work merge"
                                  + (f"; see {', '.join(see)}" if see else ''))
                     continue
-                self.out(f"served: every staging site serves #{n} {head[:8]}")
+                self.out(f"served: the priority staging site serves #{n} {head[:8]} (the others roll out in the background)")
             before = len(self.f.did)
             self.out(f"gate: hr-gate on #{n} {head[:8]} (timeout {STEP_TIMEOUT}s)")
             self.f.advance(d, prs, scratch)
@@ -673,7 +673,7 @@ class Cascade(Advance):
             if served:
                 p = served[0]
                 lag = self.lagging(dict(pr=p['number'], head=p['head'], work=work))
-                self.out("would gate each one when every staging site serves the batch (no wait; the "
+                self.out("would gate each one when its priority staging site serves the batch (no wait; the "
                          "daemon queues a cascade on a .deploy-sha change)"
                          + (f" (now lagging: {', '.join(h for _, h, _, _ in lag)})" if lag else ''))
             for n in nums:
@@ -945,7 +945,7 @@ class Cascade(Advance):
     def _run(self, t0):
         from .promoted import read_columns
         self.out("promote: reading the board")
-        if not self.promote(read_columns(self.g['gql'], max_age=0)):  # the one board read of this pass
+        if not self.promote(read_columns(self.g['gql'])):  # the event-fed board cache (tangentswarm #116)
             self.out('promote: ' + self.why[-1])
         self.out("fill: reading the board")
         self.pulled = []
@@ -967,14 +967,40 @@ def hr_gate():
     return runpy.run_path(str(BIN / 'hr-gate'), run_name='swarm_advance')
 
 
-def lagging(g, d, now=time.time):
+def priority_host(n, gql=None):
+    """tangentswarm #116: the host of PR n's priority staging site, picked by its milestones
+    (and those of the issues it closes) in the board cache; else the configured default."""
+    from . import boardcache, gatechecks
+    titles = []
+    try:
+        if gql is not None:
+            for _, c in boardcache.open_prs(boardcache.snapshot(gql)):
+                if c.get('number') == n:
+                    titles = boardcache.milestones(c)
+    except Exception:
+        titles = []
+    try:
+        return gatechecks.priority_host(titles)
+    except Exception:
+        return None
+
+
+_PRIORITY = object()
+
+
+def lagging(g, d, now=time.time, priority=_PRIORITY):
     """[(site key, host, static sha, err)] for each staging site that does not serve the
-    pulled head yet (platform #493: ptw lagged while the others served it). Every work push
-    lands on all four staging sites within about 2.5 min (slowest 2:49; Michal 2026-11-15),
-    so "deployed" is every .deploy-sha EQUAL to the pull's work commit: file reads only.
-    After DEPLOY_FALLBACK s it falls back to "the .deploy-sha contains the head" (git), for a
-    site that already serves a newer work commit."""
+    pulled head yet. tangentswarm #116 (Michal 2026-11-17 11:14 AM ET): only the PR's
+    PRIORITY site counts (priority_host; `priority` overrides it): the other sites roll out
+    in the background and never hold the card. With no priority site among the sites, every
+    site counts (platform #493). "Deployed" is the .deploy-sha EQUAL to the pull's work
+    commit: file reads only. After DEPLOY_FALLBACK s it falls back to "the .deploy-sha
+    contains the head" (git), for a site that already serves a newer work commit."""
     sites = g['served_all']()
+    if priority is _PRIORITY:
+        priority = priority_host(d.get('pr'), g.get('gql') if hasattr(g, 'get') else None)
+    first = [x for x in sites if priority and x[1] == priority]
+    sites = first or sites
     exact = [(k, host, sha, err) for k, host, sha, err in sites if not (sha and sha == d.get('work'))]
     if not exact or now() - float(d.get('started') or 0) < DEPLOY_FALLBACK:
         return exact

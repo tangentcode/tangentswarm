@@ -527,7 +527,7 @@ def test_a_dry_run_shows_the_gate_after_every_site_serves_and_no_cornerbot_reque
     out, pulled = cascade(monkeypatch, tmp_path, cols, g)
     assert pulled == [9]
     assert not any('CORNERBOT' in l for l in out)  # ptw redeploys the work tip by itself (Michal 2026-11-15)
-    assert ('would gate each one when every staging site serves the batch (no wait; the daemon queues a cascade '
+    assert ('would gate each one when its priority staging site serves the batch (no wait; the daemon queues a cascade '
             'on a .deploy-sha change) (now lagging: ptw.example)') in out
     assert 'would run hr-gate --apply 9 (Ready -> Staging when it passes)' in out
 
@@ -588,7 +588,7 @@ def test_the_next_cascade_gates_the_whole_batch_once_ptw_serves_it(monkeypatch, 
     g = CascadeGate(served=ALL_SERVE, has={W})
     out, gated, slept, c = live(monkeypatch, tmp_path, g, ready=(9, 10), staging=())
     assert gated == [9, 10] and slept == 0 and F.load_pulls() == []
-    assert 'served: every staging site serves #9 99999999' in out
+    assert 'served: the priority staging site serves #9 99999999 (the others roll out in the background)' in out
     assert 'fill: Staging 2, target 2: no pull needed' in out
 
 

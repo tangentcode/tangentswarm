@@ -1017,13 +1017,15 @@ hr-gate's queue order uses the same one.
 
 A systemd user service with no LLM in the path. Every 30 seconds (or at once on
 `SIGUSR1`, for example from a webhook receiver after a merge) it reads the Status of
-every open PR in one lean GraphQL query, through the minbot shim. When Human Review holds
-fewer than 2 and Staging is not empty, it takes the serial lock (retrying every 5
-seconds while busy) and:
+every open PR from the board cache. When Human Review holds fewer than 2 and Staging is
+not empty, it takes the serial lock (retrying every 5 seconds while busy) and:
 
-1. **Fast path:** if the Staging head was gated at its current head commit (an hr-gate
-   PASS or PENDING line with no failure) and is not stacked, it moves that card to Human
-   Review first and writes the hr-gate PASS line.
+1. **Fast path (tangentswarm #116):** if hr-gate passed the Staging PR at its current
+   head (an hr-gate PASS or PENDING line with no failure), it moves that card to Human
+   Review first and writes the hr-gate PASS line. Nothing else is checked again: every
+   Human Review check ran before the PR entered Staging. After the move, one GraphQL read
+   confirms the head; a PR whose head moved, or that became a draft, goes back to Staging.
+   The main SHA, the deploy-lag check and the cascade check run after the move.
 2. **Slow path:** `pending-promote --apply` if Human Review is still short.
    `SWARM_PROMOTE_PULL=1` runs a full `swarm-flow step` instead (it also pulls).
 
@@ -1035,6 +1037,23 @@ at once. When a pass is already running, it starts the next pass when that one e
 wanted pass is kept in `SWARM_MN_PENDING` (default `~/.local/state/swarm-flow/mn-pending`),
 so a daemon restart does not lose it. A Codex result on a platform PR also queues
 `swarm-advance --minbot N`. `mn-workflow.timer` is only a slow backstop.
+
+**Board cache (tangentswarm #116).** `swarm-webhook` patches the board snapshot
+(`~/.cache/swarm-board-snapshot.json`) from every delivery: a Status move, a merge or a
+close, a new head, labels, draft state. Every swarm card move patches it too. So nothing
+reads the board before a move. An event the cache cannot follow (a new card, a new
+milestone, hr-gate's own move) marks it dirty, and the next read takes the board. The
+sync reads the board every `SWARM_BOARD_SYNC` seconds (default 1800) and writes each
+difference it finds to `~/.local/state/swarm-flow/board-sync.log`: those are the events
+the cache missed. The merge clock writes one line per platform merge to
+`~/.local/state/swarm-flow/merge-to-move.log`: the seconds from the merge event (and from
+GitHub's merge time) to the card move, or "no move".
+
+**Priority staging site (tangentswarm #116).** Each PR has one priority staging site. A
+milestone word picks it (`[staging] priority = { PTW = "ptw" }` in the config, the
+default), else `[staging] priority_default` (default `ptw`). hr-gate condition 6 and the
+cascade's served check wait only for that site. The other sites roll out in the
+background; their lag is named as "rolling out (not blocking)" and never holds a card.
 
 ```sh
 swarm-promoted --once --dry-run      # one check; print what it would move

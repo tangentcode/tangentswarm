@@ -273,8 +273,12 @@ def _move(g, item, col, sh=None, b=None):
             from . import tick
             tick.sh(argv, check=True)
         return
+    from . import boardcache
     if 'move' in g and col in (g.get('OPT') or HR_GATE_COLS):
-        return g['move'](item, col)
+        with boardcache.hold():  # hr-gate's move() calls invalidate(): we patch the cache instead
+            g['move'](item, col)
+        boardcache.moved(item, col)  # tangentswarm #116: the cache shows the move, no board read
+        return
     argv = ['gh', 'project', 'item-edit', '--id', item, '--project-id', g['project_id'](),
             '--field-id', g['STATUS_FIELD'], '--single-select-option-id', OPTION[col]]
     if sh:
@@ -287,5 +291,4 @@ def _move(g, item, col, sh=None, b=None):
             g['cache_drop'](name)
     if g.get('cache_drop_prefix'):
         g['cache_drop_prefix']('pr:')
-    from . import boardcache
-    boardcache.invalidate()
+    boardcache.moved(item, col)  # tangentswarm #116: the cache shows the move, no board read

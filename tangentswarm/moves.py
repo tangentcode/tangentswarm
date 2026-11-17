@@ -21,6 +21,8 @@ from pathlib import Path
 STATE = Path(os.environ.get('SWARM_FLOW_STATE', str(Path.home() / '.local' / 'state' / 'swarm-flow' / 'pull.json'))).parent
 LOG = Path(os.environ.get('SWARM_MOVES_LOG', str(STATE / 'moves.log')))
 SEEN = Path(os.environ.get('SWARM_READY_SEEN', str(STATE / 'ready-seen.json')))
+MERGES = Path(os.environ.get('SWARM_MERGE_CLOCK', str(STATE / 'merge-clock.json')))
+CLOCK_LOG = Path(os.environ.get('SWARM_MERGE_CLOCK_LOG', str(STATE / 'merge-to-move.log')))
 KEEP = 14 * 86400  # forget a first-seen time after 14 days
 
 
@@ -78,6 +80,78 @@ def log_move(n, frm, to, head='', note='', floor=None, now=None, log=None, seen=
         return line
     except Exception:
         return None
+
+
+def _pending(path):
+    try:
+        d = json.loads(path.read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save(path, d):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f'.{path.name}.{os.getpid()}')
+    tmp.write_text(json.dumps(d, sort_keys=True))
+    os.replace(tmp, path)
+
+
+def _iso(text):
+    try:
+        return datetime.fromisoformat(str(text).replace('Z', '+00:00')).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def note_merge(n, received=None, merged_at=None, path=None, now=None):
+    """tangentswarm #116: start the merge clock for platform PR n. received: when swarm-webhook
+    got the event (epoch); merged_at: GitHub's merge time (ISO). Never raises."""
+    now = time.time() if now is None else now
+    path = path or MERGES
+    try:
+        d = _pending(path)
+        d[str(n)] = {'received': float(received) if received else now, 'merged_at': _iso(merged_at)}
+        _save(path, d)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def merge_clock(moved, frm='Staging', to='Human Review', path=None, log=None, now=None, upto=None):
+    """tangentswarm #116: close the merge clocks this pass answers. moved: the PRs the pass
+    moved (frm -> to). Each merge received at or before `upto` (the pass start; default now)
+    gets one line in CLOCK_LOG: the seconds from the event to the move (and from GitHub's
+    merge time), or "no move" when the pass moved nothing. Returns the lines. Never raises."""
+    now = time.time() if now is None else now
+    upto = now if upto is None else upto
+    path, log = path or MERGES, log or CLOCK_LOG
+    out = []
+    try:
+        d = _pending(path)
+        done = [k for k, v in d.items() if float(v.get('received') or 0) <= upto]
+        if not done:
+            return out
+        for k in sorted(done, key=lambda k: d[k].get('received') or 0):
+            v = d.pop(k)
+            got, gh = float(v.get('received') or now), v.get('merged_at')
+            stamp = datetime.fromtimestamp(now, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            if moved:
+                line = (f"{stamp}\t{_et(now)}\tmerge #{k}\tmoved {', '.join('#' + str(m) for m in moved)} "
+                        f"{frm} -> {to}\tevent->move {now - got:.1f}s"
+                        + (f"\tmerge->move {now - float(gh):.1f}s" if gh else ''))
+            else:
+                line = f"{stamp}\t{_et(now)}\tmerge #{k}\tno move\tevent->decision {now - got:.1f}s"
+            out.append(line)
+        _save(path, d)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, 'a') as f:
+            f.write(''.join(x + '\n' for x in out))
+        from . import eventdb
+        for line in out:
+            eventdb.log_event('merge-clock', source='board', notes=[line.split('\t', 2)[2]])
+    except Exception:
+        pass
+    return out
 
 
 def waits(log=None):
