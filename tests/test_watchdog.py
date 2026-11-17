@@ -281,7 +281,7 @@ def test_a_dry_run_records_no_outage_and_the_live_pass_still_alerts():
     """Codex on PR #51: a dry run saved the outage, so the daemon never announced it."""
     r = Rig([snap_node(5, board.AUTO_REVIEW)], details={5: pr_full(req=T0)})
     r.w.dry = True
-    assert r.w.codex_pass(_snap(r), T0 + 1900)[0].startswith('would alert Michal')
+    assert r.w.codex_pass(_snap(r), T0 + 1900)[0].startswith('would alert swarmbot')
     assert 'codex_outage' not in alerts.state().data and 'codex_outage' not in r.w.st.data
     r.w.dry = False
     r.w.codex_pass(_snap(r), T0 + 2000)
@@ -308,3 +308,21 @@ def test_a_late_review_of_an_older_head_is_not_the_answer():
     assert WD.codex_facts(summary)['reply'] is True
     limit = pr_full(req=T0, reply=T0 + 60, body='You have reached your Codex usage limits for code reviews.')
     assert WD.codex_facts(limit)['limit'] is True  # a limit notice names no head and still counts
+
+
+def test_swarm_watch_once_drains_its_wake_posts_before_it_exits(monkeypatch):
+    """Codex on PR #71: swarm-watch --once is a short-lived process; its wake POSTs run in
+    daemon threads, so main() waits for them before it returns."""
+    from tangentswarm import watchdog, webhook
+    order = []
+
+    class Fake:
+        def __init__(self, dry=False):
+            pass
+
+        def once(self):
+            order.append('once')
+    monkeypatch.setattr(watchdog, 'Watchdog', Fake)
+    monkeypatch.setattr(webhook, 'drain_posts', lambda *a, **k: order.append('drain') or 0)
+    assert watchdog.main(['--once']) == 0
+    assert order == ['once', 'drain']

@@ -1,4 +1,5 @@
-"""New Needs Input cards ping Michal in MethBot's chat (tangentswarm #40 item 4c).
+"""New Needs Input cards wake swarmbot (tangentswarm #40 item 4c). Since tangentswarm #19 they
+never POST to MethBot: MethBot gets only the Project 6 done and needs-input reports.
 
 The question itself goes through agent_report (tangentswarm #53): report_status or the
 worker tool needs_input posts it on the ticket, moves the card and closes the Claude, and a
@@ -10,7 +11,7 @@ REPO = 'tangentcode/platform'
 
 
 def new_cards(st, numbers, ping, titles=None, first_run_quiet=True, now=time.time):
-    """Ping Michal for each card new in Needs Input (numbers: the PRs and issues there now).
+    """Ping (alerts.alert) for each card new in Needs Input (numbers: the PRs and issues there now).
     The first look only records them. Returns the numbers pinged."""
     numbers = sorted(set(numbers))
     if 'needs_input_seen' not in st.data and first_run_quiet:
