@@ -688,3 +688,78 @@ def test_advance_with_a_clean_body_applies(monkeypatch):
     monkeypatch.setattr(f, 'pull', lambda *a: None)
     f.step()
     assert calls == ['7'] and flow.load_pull() is None
+
+
+STATUS_BODY = 'Check it on staging: /x.\nNot on staging yet.'
+
+
+@pytest.mark.parametrize('rows', [
+    [('1 not draft', True, 'ready')],                                   # status text only
+    [('7a screenshots current', False, 'no image in body')],           # status text and screenshots
+])
+def test_a_worker_job_hold_never_times_out(monkeypatch, tick_state, rows):
+    """Codex on PR #133: a status hold after PULL_TIMEOUT failed the pull, and the next pass
+    pulled and pushed the PR to work again. Worker jobs wait like screenshots."""
+    from tangentswarm import slots
+    prs = {7: card(7, RD)}
+    f, g = make_flow(prs, dry=False, rows=rows)
+    g['fetch'] = lambda n, refresh=False: {'number': n, 'body': STATUS_BODY}
+    monkeypatch.setattr('tangentswarm.alerts.incident', lambda *a, **k: None)
+    monkeypatch.setattr(slots, 'revive', lambda n, text, out=print, **k: out('sent') or 0)
+    monkeypatch.setattr(f, 'leave', lambda *a, **k: pytest.fail('no leave'))
+    pull_state(7, started=10_000 - flow.PULL_TIMEOUT - 60)
+    f.advance(flow.load_pull(), prs, g['ScratchRepo']())
+    assert g.moves == [] and flow.load_pull()['pr'] == 7
+    assert any(n.startswith('STATUS_TEXT #7: the body still states') for n in f.notes)
+
+
+def test_a_status_hold_with_another_wait_still_times_out(monkeypatch, tick_state):
+    prs = {7: card(7, RD)}
+    f, g = make_flow(prs, dry=False, rows=[('6 deployed + served', False, 'static .deploy-sha LACKS the head')])
+    g['fetch'] = lambda n, refresh=False: {'number': n, 'body': STATUS_BODY}
+    monkeypatch.setattr('tangentswarm.alerts.incident', lambda *a, **k: None)
+    monkeypatch.setattr(flow.Flow, 'worker_job', lambda *a, **k: None)
+    left = []
+    monkeypatch.setattr(f, 'leave', lambda p, reason, **k: left.append(reason))
+    pull_state(7, started=10_000 - flow.PULL_TIMEOUT - 60)
+    f.advance(flow.load_pull(), prs, g['ScratchRepo']())
+    assert left and left[0].startswith('still waiting after')
+
+
+@pytest.mark.parametrize('rows, kind', [
+    ([('1 not draft', True, 'ready')], 'status'),
+    ([('7a screenshots current', False, 'no image in body')], 'shots'),  # the same bug in the screenshot job
+])
+def test_a_worker_job_for_a_gone_worktree_queues_a_worker_start(monkeypatch, tick_state, tmp_path, rows, kind):
+    """Codex on PR #133: a refusal such as "worktree /x is gone" was only logged, every pass.
+    Now the relay is saved and a worker start is queued with it, once per head."""
+    from tangentswarm import slots
+    monkeypatch.setattr(flow, 'RELAY_DIR', tmp_path)
+    prs = {7: card(7, RD)}
+    f, g = make_flow(prs, dry=False, rows=rows)
+    g['fetch'] = lambda n, refresh=False: {'number': n, 'body': STATUS_BODY if kind == 'status' else 'Where to see: /x.'}
+    monkeypatch.setattr('tangentswarm.alerts.incident', lambda *a, **k: None)
+    revived, started = [], []
+    monkeypatch.setattr(slots, 'revive', lambda n, text, out=print, **k: revived.append(n) or out('worktree /x is gone') or 1)
+    monkeypatch.setattr(slots, 'start_later', lambda n, branch, relay: started.append((n, branch, relay.name)) or True)
+    pull_state(7)
+    f.advance(flow.load_pull(), prs, g['ScratchRepo']())
+    f.advance(flow.load_pull(), prs, g['ScratchRepo']())
+    assert revived == [7] and started == [(7, 'b7', f'relay-7-{kind}.md')]
+    assert (tmp_path / f'relay-7-{kind}.md').read_text().strip()
+    assert flow.load_pull()['pr'] == 7
+
+
+def test_a_held_status_relay_is_queued(monkeypatch, tick_state, tmp_path):
+    from tangentswarm import slots
+    monkeypatch.setattr(flow, 'RELAY_DIR', tmp_path)
+    prs = {7: card(7, RD)}
+    f, g = make_flow(prs, dry=False, rows=[('1 not draft', True, 'ready')])
+    g['fetch'] = lambda n, refresh=False: {'number': n, 'body': STATUS_BODY}
+    monkeypatch.setattr('tangentswarm.alerts.incident', lambda *a, **k: None)
+    queued = []
+    monkeypatch.setattr(slots, 'revive', lambda n, text, out=print, **k: out('no rework slot') or 3)
+    monkeypatch.setattr(slots, 'queue_revive', lambda n, text, **k: queued.append((n, k['relay'])))
+    pull_state(7)
+    f.advance(flow.load_pull(), prs, g['ScratchRepo']())
+    assert queued == [(7, str(tmp_path / 'relay-7-status.md'))]
