@@ -933,8 +933,9 @@ The swarm never edits a PR body (option A, Michal via MethBot on PR #133). Befor
 swarm-flow or swarm-tick runs `hr-gate --apply`, `gatechecks.check_status()` reads the body.
 If a sentence states where the PR stands, the PR is held (a pull waits, as for
 screenshots, and like screenshots it never times out), its worker gets one relay per head
-that names the sentences, and one incident is opened per head. Both worker jobs go through
-`to_worker`: a Claude that cannot take the relay now gets a queued revive, and a gone
+that names the sentences, and one incident is opened per head. When a job is new for the
+head, every open job (screenshots and status text) goes in one relay, `relay-<N>-jobs.md`,
+because the revive queue keeps one entry per PR. The relay goes through `to_worker`: a Claude that cannot take the relay now gets a queued revive, and a gone
 worktree gets a worker start with the relay as its brief. The detector has no wording exemptions: a false match costs
 the worker one rewording. It reads whole sentences over soft line breaks and skips code
 fences (also inside blockquotes) and the brief section.

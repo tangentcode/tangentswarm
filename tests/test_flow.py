@@ -718,7 +718,7 @@ def test_a_status_hold_with_another_wait_still_times_out(monkeypatch, tick_state
     f, g = make_flow(prs, dry=False, rows=[('6 deployed + served', False, 'static .deploy-sha LACKS the head')])
     g['fetch'] = lambda n, refresh=False: {'number': n, 'body': STATUS_BODY}
     monkeypatch.setattr('tangentswarm.alerts.incident', lambda *a, **k: None)
-    monkeypatch.setattr(flow.Flow, 'worker_job', lambda *a, **k: None)
+    monkeypatch.setattr(flow.Flow, 'worker_jobs', lambda *a, **k: None)
     left = []
     monkeypatch.setattr(f, 'leave', lambda p, reason, **k: left.append(reason))
     pull_state(7, started=10_000 - flow.PULL_TIMEOUT - 60)
@@ -745,8 +745,8 @@ def test_a_worker_job_for_a_gone_worktree_queues_a_worker_start(monkeypatch, tic
     pull_state(7)
     f.advance(flow.load_pull(), prs, g['ScratchRepo']())
     f.advance(flow.load_pull(), prs, g['ScratchRepo']())
-    assert revived == [7] and started == [(7, 'b7', f'relay-7-{kind}.md')]
-    assert (tmp_path / f'relay-7-{kind}.md').read_text().strip()
+    assert revived == [7] and started == [(7, 'b7', 'relay-7-jobs.md')]
+    assert (tmp_path / 'relay-7-jobs.md').read_text().strip()
     assert flow.load_pull()['pr'] == 7
 
 
@@ -762,4 +762,63 @@ def test_a_held_status_relay_is_queued(monkeypatch, tick_state, tmp_path):
     monkeypatch.setattr(slots, 'queue_revive', lambda n, text, **k: queued.append((n, k['relay'])))
     pull_state(7)
     f.advance(flow.load_pull(), prs, g['ScratchRepo']())
-    assert queued == [(7, str(tmp_path / 'relay-7-status.md'))]
+    assert queued == [(7, str(tmp_path / 'relay-7-jobs.md'))]
+
+
+SHOTS_ROW = [('7a screenshots current', False, 'no image in body')]
+
+
+def test_both_worker_jobs_go_in_one_queued_relay(monkeypatch, tick_state, tmp_path):
+    """Codex on PR #133: the revive queue keeps one entry per PR, so the screenshot job
+    replaced the queued status job. Now one relay holds every open job."""
+    from tangentswarm import slots
+    monkeypatch.setattr(flow, 'RELAY_DIR', tmp_path)
+    prs = {7: card(7, RD)}
+    f, g = make_flow(prs, dry=False, rows=SHOTS_ROW)
+    g['fetch'] = lambda n, refresh=False: {'number': n, 'body': STATUS_BODY}
+    monkeypatch.setattr('tangentswarm.alerts.incident', lambda *a, **k: None)
+    queued, revived = [], []
+    monkeypatch.setattr(slots, 'revive', lambda n, text, out=print, **k: revived.append(n) or out('no rework slot') or 3)
+    monkeypatch.setattr(slots, 'queue_revive', lambda n, text, **k: queued.append(text))
+    pull_state(7)
+    f.advance(flow.load_pull(), prs, g['ScratchRepo']())
+    f.advance(flow.load_pull(), prs, g['ScratchRepo']())
+    assert revived == [7] and len(queued) == 1
+    assert 'needs screenshots' in queued[0] and 'Not on staging yet.' in queued[0]
+    assert (tmp_path / 'relay-7-jobs.md').read_text().strip() == queued[0]
+
+
+def test_a_new_job_resends_every_open_job(monkeypatch, tick_state, tmp_path):
+    """The status job went out alone; when screenshots are needed later on the same head,
+    the new relay carries both, so a replace in the queue loses nothing."""
+    from tangentswarm import slots
+    monkeypatch.setattr(flow, 'RELAY_DIR', tmp_path)
+    prs = {7: card(7, RD)}
+    f, g = make_flow(prs, dry=False, rows=[('1 not draft', True, 'ready')])
+    g['fetch'] = lambda n, refresh=False: {'number': n, 'body': STATUS_BODY}
+    monkeypatch.setattr('tangentswarm.alerts.incident', lambda *a, **k: None)
+    sent = []
+    monkeypatch.setattr(slots, 'revive', lambda n, text, out=print, **k: sent.append(text) or out('sent') or 0)
+    pull_state(7)
+    f.advance(flow.load_pull(), prs, g['ScratchRepo']())
+    g.rows = SHOTS_ROW
+    f.advance(flow.load_pull(), prs, g['ScratchRepo']())
+    f.advance(flow.load_pull(), prs, g['ScratchRepo']())
+    assert len(sent) == 2 and 'needs screenshots' not in sent[0]
+    assert 'needs screenshots' in sent[1] and 'Not on staging yet.' in sent[1]
+
+
+def test_both_jobs_for_a_gone_worktree_start_one_worker_with_both(monkeypatch, tick_state, tmp_path):
+    from tangentswarm import slots
+    monkeypatch.setattr(flow, 'RELAY_DIR', tmp_path)
+    prs = {7: card(7, RD)}
+    f, g = make_flow(prs, dry=False, rows=SHOTS_ROW)
+    g['fetch'] = lambda n, refresh=False: {'number': n, 'body': STATUS_BODY}
+    monkeypatch.setattr('tangentswarm.alerts.incident', lambda *a, **k: None)
+    started = []
+    monkeypatch.setattr(slots, 'revive', lambda n, text, out=print, **k: out('worktree /x is gone') or 1)
+    monkeypatch.setattr(slots, 'start_later', lambda n, branch, relay: started.append(relay) or True)
+    pull_state(7)
+    f.advance(flow.load_pull(), prs, g['ScratchRepo']())
+    brief_text = started[0].read_text()
+    assert len(started) == 1 and 'needs screenshots' in brief_text and 'Not on staging yet.' in brief_text

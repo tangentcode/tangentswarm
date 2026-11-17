@@ -1066,13 +1066,16 @@ class Flow:
         full = self.g['fetch'](n, refresh=True)
         rows, _ = self.g['evaluate'](full, hr_peers=self.g['list_hr_prs'](refresh=True), scratch=scratch)
         verdict, why = gate_verdict(rows)
-        held = self.status_hold(n, full, d['head'], p=p) if verdict != 'fail' else None
+        held, status_job = self.status_hold(n, full, d['head']) if verdict != 'fail' else (None, None)
         if held:  # tangentswarm #130: a body that says where the PR stands waits for its worker
             verdict, why = 'wait', why + [held]
         age = int(self.now() - d['started'])
         shots = [w for w in why if w.startswith('7a')] if verdict == 'wait' else []
-        if shots:  # Michal 2026-11-15: screenshots are a job for a worker now, not a timeout
-            self.screenshot_job(n, d['head'], full, p=p)
+        # Michal 2026-11-15: screenshots are a job for a worker now, not a timeout. Every open
+        # job goes in one relay (Codex on PR #133: the revive queue keeps one entry per PR).
+        jobs_now = ([('shots', shots_text(n))] if shots else []) + ([('status', status_job)] if held else [])
+        if jobs_now:
+            self.worker_jobs(n, d['head'], jobs_now, p)
         # Worker jobs (screenshots, status text) never time out: a fail would drop the pull, and
         # the next pass would pull and push it to work again (Codex on PR #133).
         jobs = [w for w in why if w.startswith(WORKER_JOB_ROWS)] if verdict == 'wait' else []
@@ -1110,44 +1113,49 @@ class Flow:
         if rc == 0 or moved:
             drop_pull(n)
 
-    def status_hold(self, n, full, head, p=None):
+    def status_hold(self, n, full, head):
         """tangentswarm #130 (option A, Michal via MethBot on PR #133): a body that says where
         the PR stands (merged into work, on staging, the sha a site serves) holds hr-gate
-        --apply. Its worker gets the job to remove the text, once per head, and an incident
-        is opened. The swarm never edits the body. Returns the wait reason, or None."""
+        --apply, and an incident is opened. The swarm never edits the body. Returns (the wait
+        reason, the worker's job text), or (None, None)."""
         from .gatechecks import check_status, status_lines, status_text
         body = (full or {}).get('body') or ''
         ok, why = check_status(n, body, REPO, head=head, dry=self.dry)
         if ok:
-            return None
-        self.worker_job(n, head, 'status', status_text(n, status_lines(body)), 'status-text job', p)
-        return STATUS_ROW + why
+            return None, None
+        return STATUS_ROW + why, status_text(n, status_lines(body))
 
     def screenshot_job(self, n, head, full=None, p=None):
         """A UI PR without screenshots: give its worker the screenshot job now, once per
         head (wake its running Claude, or resume its parked one in a rework slot)."""
-        self.worker_job(n, head, 'shots', shots_text(n), 'screenshot job', p)
+        self.worker_jobs(n, head, [('shots', shots_text(n))], p)
 
-    def worker_job(self, n, head, kind, text, what, p=None):
-        """Give PR n's worker a job while its pull waits, once per head. The relay is saved
-        to relay-<n>-<kind>.md and goes through to_worker (Codex on PR #133): a Claude that
+    def worker_jobs(self, n, head, jobs, p=None):
+        """Give PR n's worker its open jobs [(kind, text)] while its pull waits. Each kind is
+        sent once per head. When one is new, ALL open jobs go in one relay, saved to
+        relay-<n>-jobs.md (Codex on PR #133): the revive queue keeps one entry per PR and a
+        queued worker start keeps its first brief path, so a message that held only the
+        newest job would drop the others. The relay goes through to_worker: a Claude that
         cannot take it now gets a queued revive, and a gone worktree gets a worker start
         with the relay as its brief. A refusal never just repeats every pass."""
         from . import tick
         state = tick.State(tick.STATE_DIR / 'state.json')
-        key = f"{kind}-job:{n}@{head}"  # shots-job:N@H, status-job:N@H
-        if state.done(key):
+        keys = [f"{kind}-job:{n}@{head}" for kind, _ in jobs]  # shots-job:N@H, status-job:N@H
+        if all(state.done(k) for k in keys):
             return
+        what = ' and '.join({'shots': 'screenshot job', 'status': 'status-text job'}.get(k, k) for k, _ in jobs)
         if self.dry:
             self.change(f"#{n} would give its worker the {what}")
             return
-        relay_path = RELAY_DIR / f"relay-{n}-{kind}.md"
+        text = '\n\n'.join(t for _, t in jobs)
+        relay_path = RELAY_DIR / f"relay-{n}-jobs.md"
         try:
             relay_path.write_text(text + '\n')
         except OSError:
             pass
         waiting, said = self.to_worker(p or {'number': n}, text, relay_path)
-        state.mark(key)
+        for k in keys:
+            state.mark(k)
         self.change(f"#{n} {what} " + (said if waiting else f"sent to its worker ({said})"))
 
     def start_worker(self, p, relay_path, why):
