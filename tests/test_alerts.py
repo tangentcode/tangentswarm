@@ -178,3 +178,47 @@ def test_an_incident_ticket_is_opened_once_per_key_and_capped_per_hour(monkeypat
     assert alerts.incident('c', 'x', 'y', sh=sh, now=lambda: t[0]) == 'capped'
     t[0] += 3601
     assert alerts.incident('c', 'x', 'y', sh=sh, now=lambda: t[0]).startswith('https://')
+
+
+def test_overlapping_methbot_reports_post_once():
+    """Codex on PR #71: two serve processes of the same report both posted. The check, the
+    POST and the mark run under one interprocess lock, and the check reads the file again."""
+    import threading
+    other = alerts.state()  # loaded before the first report marks the key, like a second process
+    inside, release, posts = threading.Event(), threading.Event(), []
+
+    def slow(p):
+        posts.append(p)
+        inside.set()
+        release.wait(5)
+        return True
+    first = []
+    t = threading.Thread(target=lambda: first.append(
+        alerts.tell_methbot('done', 'tangentcode/tangentswarm', 71, head=HEAD, post=slow)))
+    t.start()
+    assert inside.wait(5)
+    second = []
+    t2 = threading.Thread(target=lambda: second.append(
+        alerts.tell_methbot('done', 'tangentcode/tangentswarm', 71, head=HEAD, st=other, post=slow)))
+    t2.start()
+    t2.join(0.3)
+    assert t2.is_alive()  # waits on the lock while the first POST runs
+    release.set()
+    t.join(5)
+    t2.join(5)
+    assert first == [True] and second == ['already sent'] and len(posts) == 1
+
+
+def test_a_stale_state_does_not_repeat_an_alert_or_an_incident():
+    """The same class: swarm-watch --once beside the daemon, each with its own loaded state."""
+    a, b = alerts.state(), alerts.state()
+    sent = []
+    assert alerts.alert('Codex outage', key='k9', st=a, post=sent.append) is True
+    assert alerts.alert('Codex outage', key='k9', st=b, post=sent.append) is False
+    assert len(sent) == 1
+    calls = []
+    sh = lambda argv: calls.append(argv) or 'https://github.com/tangentcode/methodology/issues/91\n'  # noqa: E731
+    c, d = alerts.state(), alerts.state()
+    assert alerts.incident('z', 't', 'w', st=c, sh=sh).endswith('/issues/91')
+    assert alerts.incident('z', 't', 'w', st=d, sh=sh) == 'dup'
+    assert len(calls) == 2  # one issue create and one item-add

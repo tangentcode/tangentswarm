@@ -11,7 +11,10 @@ Everything else the watchdog finds (a Codex outage, a stalled promote, a new Nee
 card on any board) is an alert(): it wakes swarmbot and never POSTs to the MethBot URL.
 Every alert, wake, MethBot POST and incident is also a row in the events DB (source 'watch').
 """
+import contextlib
+import fcntl
 import hashlib
+import json
 import os
 import time
 from pathlib import Path
@@ -42,6 +45,39 @@ def record(kind, text, pr=None, key=None, now=None, repo=None):
                                   detail={'key': key} if key else None, repo=repo, now=now)
     except Exception:
         pass
+
+
+@contextlib.contextmanager
+def once_lock(once):
+    """An interprocess lock of one once-key (Codex on PR #71): the check, the action and the
+    mark of a once-key run under it, so two processes (two spool serves of the same report,
+    or swarm-watch --once beside the daemon) cannot both act before either marks it."""
+    locks = Path(STATE).parent / 'watch-locks'  # read at call time: tests move STATE
+    locks.mkdir(parents=True, exist_ok=True)
+    with open(locks / (hashlib.sha1(once.encode()).hexdigest()[:20] + '.lock'), 'a') as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lk, fcntl.LOCK_UN)
+
+
+def done_now(st, once):
+    """st.done(once), with the state file read again: another process may have marked it
+    after st was loaded. Call it under once_lock."""
+    if st.done(once):
+        return True
+    path = getattr(st, 'path', None)
+    if path is None:
+        return False
+    try:
+        disk = (json.loads(Path(path).read_text()).get('done') or {})
+    except (OSError, ValueError, AttributeError):
+        return False
+    if once in disk:
+        st.data['done'][once] = disk[once]
+        return True
+    return False
 
 
 def et_stamp(t):
@@ -90,14 +126,15 @@ def tell_methbot(kind, repo, pr, head=None, question=None, st=None, post=None, n
         payload['question'] = question
         text = f"{repo}#{pr} needs input: {question}"[:2000]
     st = st or state()
-    if st.done(once):
-        return 'already sent'
-    t = now()
-    payload['at'] = et_stamp(t)
-    if (post or methbot_post)(payload) is False:
-        record(f'methbot-{kind}-failed', text, pr=pr, key=once, now=t, repo=repo)
-        return 'the POST to MethBot failed (no URL, or every try failed; see the webhook log)'
-    st.mark(once)
+    with once_lock(once):  # a second report waits here, then finds the key marked
+        if done_now(st, once):
+            return 'already sent'
+        t = now()
+        payload['at'] = et_stamp(t)
+        if (post or methbot_post)(payload) is False:
+            record(f'methbot-{kind}-failed', text, pr=pr, key=once, now=t, repo=repo)
+            return 'the POST to MethBot failed (no URL, or every try failed; see the webhook log)'
+        st.mark(once)
     record(f'methbot-{kind}', text, pr=pr, key=once, now=t, repo=repo)
     return True
 
@@ -109,9 +146,10 @@ def alert(text, key, pr=None, st=None, post=None, now=time.time):
     before."""
     st = st or state()
     once = f"alert:{key}"
-    if st.done(once):
-        return False
-    st.mark(once)
+    with once_lock(once):
+        if done_now(st, once):
+            return False
+        st.mark(once)
     wake_swarmbot(text, once, pr=pr, post=post, kind='alert', now=now())
     return True
 
@@ -136,10 +174,16 @@ def incident_body(what, why, fix, prevent=None):
 
 def incident(key, title, what, why=None, fix=None, prevent=None, st=None, sh=None, now=time.time):
     """Open one incident ticket on the methodology board (Project 6), once per key and at
-    most INCIDENTS_PER_HOUR an hour. Returns the issue URL, 'dup', 'capped' or 'failed: ...'."""
+    most INCIDENTS_PER_HOUR an hour. Returns the issue URL, 'dup', 'capped' or 'failed: ...'.
+    The check, the gh calls and the mark run under once_lock (Codex on PR #71)."""
     st = st or state()
     once = f"incident:{key}"
-    if st.done(once):
+    with once_lock(once):
+        return _incident(once, key, title, what, why, fix, prevent, st, sh, now)
+
+
+def _incident(once, key, title, what, why, fix, prevent, st, sh, now):
+    if done_now(st, once):
         return 'dup'
     t = now()
     recent = [x for x in st.data.get('incident_times', []) if t - x < 3600]
