@@ -51,6 +51,7 @@ class Env:
     def __init__(self, tmp_path, nodes4=(), nodes6=(), msgs=(), auth=None):
         self.nodes4, self.nodes6 = list(nodes4), list(nodes6)
         self.ran, self.moved, self.gql_calls = [], [], []
+        self.closes = {}     # PR number -> [(issue, repo, latest comment body)]
         self.hub = FakeHub(msgs)
         self.store = eventdb.EventStore(str(tmp_path / 'events.sqlite'))
         self.lock = tmp_path / 'swarm-serial.lock'
@@ -65,6 +66,10 @@ class Env:
 
     def gql(self, q, **v):
         self.gql_calls.append(q)
+        if 'closingIssuesReferences(first:20)' in q:
+            nodes = [{'number': i, 'repository': {'nameWithOwner': r}, 'comments': {'nodes': [{'body': b}]}}
+                     for i, r, b in self.closes.get(v['n'], [])]
+            return {'repository': {'pullRequest': {'closingIssuesReferences': {'nodes': nodes}}}}
         if 'projectV2(number:4)' in q:
             return boardfake.answer(self.nodes4)
         assert v.get('n') == 6
@@ -366,6 +371,28 @@ def test_answer_comments_on_the_ticket_then_moves_the_card(tmp_path, no_real_eve
     assert e.post('/api/swarms/4/cards/12/answer', {'body': '  '})[0] == 400
 
 
+def test_answer_goes_on_the_linked_issue_that_holds_the_question(tmp_path):
+    """Codex on PR #74: the Stop hook posts a PR's question on the issue it closes, and
+    advance.open_question blocks the MinBot pass until that issue's latest comment is not the
+    question. The answer goes there, not on the PR."""
+    from tangentswarm.stophook import QUESTION_MARK
+    e = Env(tmp_path, nodes4=[node(12, board.NEEDS_INPUT), node(30, board.NEEDS_INPUT, 'Issue')])
+    e.closes[12] = [(20, 'tangentcode/platform', f'{QUESTION_MARK}\nQuestion from the worker'),
+                    (21, 'tangentcode/platform', 'an old comment, no question'),
+                    (22, 'tangentcode/other', f'{QUESTION_MARK}\nQuestion')]
+    st, obj = e.post('/api/swarms/4/cards/12/answer', {'body': 'yes'})
+    assert st == 200 and obj['answered_on'] == ['tangentcode/platform#20', 'tangentcode/other#22']
+    assert e.ran == [['gh', 'issue', 'comment', '20', '-R', 'tangentcode/platform', '--body', 'yes'],
+                     ['gh', 'issue', 'comment', '22', '-R', 'tangentcode/other', '--body', 'yes']]
+    assert e.moved == [('item-12', board.IN_PROGRESS)]
+    # an issue card in Needs Input: the answer goes on the issue itself, no PR read
+    e.ran.clear()
+    n = len(e.gql_calls)
+    st, obj = e.post('/api/swarms/4/cards/30/answer', {'body': 'ok'})
+    assert st == 200 and e.ran == [['gh', 'issue', 'comment', '30', '-R', 'tangentcode/platform', '--body', 'ok']]
+    assert not any('closingIssuesReferences(first:20)' in q for q in e.gql_calls[n:])
+
+
 def test_answer_a_hub_question(tmp_path):
     e = Env(tmp_path, msgs=[dict(id=4, sender='w1', recipient='michal', type='question', body='which?', read=0),
                             dict(id=5, sender='w2', recipient='michal', type='status', body='hi', read=0)])
@@ -394,6 +421,14 @@ def test_a_failed_move_is_an_error_reply_not_a_crash(tmp_path):
 def test_serves_on_loopback_only_and_over_http(tmp_path):
     with pytest.raises(SystemExit, match='loopback'):
         S.serve(Env(tmp_path).api, '0.0.0.0', 0)
+    for host in ('::1', 'localhost'):   # Codex on PR #74: ::1 needs an AF_INET6 server
+        try:
+            s6 = S.serve(Env(tmp_path).api, host, 0)
+        except OSError as err:
+            if host == '::1' and 'Address family' not in str(err):
+                pytest.skip(f'no IPv6 loopback here: {err}')
+            raise
+        s6.server_close()
     e = Env(tmp_path, nodes4=[node(7, board.TRIAGE, 'Issue')])
     srv = S.serve(e.api, '127.0.0.1', 0)
     th = threading.Thread(target=srv.serve_forever, daemon=True)

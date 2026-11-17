@@ -1111,7 +1111,8 @@ no auth; `GET /api/whoami` shows the caller.
 
 Human actions (JSON bodies): `POST /api/swarms/{b}/cards/{n}/triage {"action": "approve" |
 "backlog" | "active" | "discuss"}` (approve = Backlog, where the launcher takes work),
-`POST /api/swarms/{b}/cards/{n}/answer {"body"}` (a comment on the ticket, then Needs Input
+`POST /api/swarms/{b}/cards/{n}/answer {"body"}` (a comment where the question is: each linked issue whose latest comment is
+the question, else the card itself; then Needs Input
 -> In Progress, which swarm-webhook relays to the worker) and `POST
 /api/swarms/{b}/messages/{id}/answer {"body"}` (a hub reply to a question or blocker). Each
 one uses the swarm's own tools (`board.move_card`, `tick.sh` for the gh write, the hub

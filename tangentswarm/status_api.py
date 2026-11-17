@@ -30,7 +30,9 @@ Human-action endpoints (JSON body; a human identity only, see below):
   POST /api/swarms/{b}/cards/{n}/triage    {"action": "approve"|"backlog"|"active"|"discuss",
                                             "repo": optional}
   POST /api/swarms/{b}/cards/{n}/answer    {"body": "...", "repo": optional}: the answer goes
-                                           on the ticket as a comment, then the card moves
+                                           where the question is (the linked issue whose
+                                           latest comment is the question, else the card
+                                           itself) as a comment, then the card moves
                                            Needs Input -> In Progress (swarm-webhook then
                                            relays it to the worker, as for a move by hand)
   POST /api/swarms/{b}/messages/{id}/answer {"body": "..."}: a reply to a hub question or
@@ -59,6 +61,7 @@ import hmac
 import json
 import os
 import re
+import socket
 import sys
 import time
 from dataclasses import dataclass, field
@@ -508,10 +511,40 @@ def answer(src, b, n, body, who, repo=None):
     card = find_card(src, b, n, repo)
     if card['col'] != board.NEEDS_INPUT:
         raise ApiError(409, f"#{n} is in {card['col']}, not Needs Input")
-    _record(who, 'answer', card, b, to=board.IN_PROGRESS)
-    src.run(['gh', 'issue', 'comment', str(n), '-R', card['repo'], '--body', body])
+    on = question_targets(src, card)
+    _record(who, 'answer', card, b, to=board.IN_PROGRESS, on=[f'{r}#{i}' for r, i in on])
+    for r, i in on:
+        src.run(['gh', 'issue', 'comment', str(i), '-R', r, '--body', body])
     src.move(b, card, board.IN_PROGRESS)
-    return {'ok': True, 'number': n, 'from': board.NEEDS_INPUT, 'col': board.IN_PROGRESS}
+    return {'ok': True, 'number': n, 'from': board.NEEDS_INPUT, 'col': board.IN_PROGRESS,
+            'answered_on': [f'{r}#{i}' for r, i in on]}
+
+
+QUESTION_Q = """query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){
+ pullRequest(number:$n){closingIssuesReferences(first:20){nodes{number repository{nameWithOwner}
+  comments(last:1){nodes{body}}}}}}}"""
+
+
+def question_targets(src, card):
+    """[(repo, number)] where the answer goes: where the question is. The Stop hook and
+    report_status post a PR's question on the issue it closes (stophook.needs_input,
+    agent_report), and advance.open_question blocks the MinBot pass while that issue's latest
+    comment is still the question (Codex on PR #74). So: every issue the PR closes whose
+    latest comment has QUESTION_MARK; else the card itself (an issue card, or a PR that
+    asked on itself)."""
+    from .stophook import QUESTION_MARK
+    if card['kind'] == 'pr':
+        owner, name = card['repo'].split('/', 1)
+        d = src.gql(QUESTION_Q, owner=owner, name=name, n=card['number'])
+        pr = ((d or {}).get('repository') or {}).get('pullRequest') or {}
+        out = []
+        for i in (pr.get('closingIssuesReferences') or {}).get('nodes') or []:
+            last = ((i.get('comments') or {}).get('nodes') or [{}])[-1]
+            if QUESTION_MARK in (last.get('body') or ''):
+                out.append(((i.get('repository') or {}).get('nameWithOwner') or card['repo'], i['number']))
+        if out:
+            return out
+    return [(card['repo'], card['number'])]
 
 
 def answer_message(hub, mid, body, who):
@@ -729,7 +762,10 @@ def make_handler(api):
 def serve(api, host='127.0.0.1', port=DEFAULT_PORT):
     if host not in LOOPBACK:
         raise SystemExit(f'swarm-api binds only a loopback address, not {host}: the front proxy routes /api/ to it')
-    return ThreadingHTTPServer((host, port), make_handler(api))
+    cls = ThreadingHTTPServer
+    if host == '::1':   # Codex on PR #74: ThreadingHTTPServer binds AF_INET only
+        cls = type('ThreadingHTTPServer6', (ThreadingHTTPServer,), {'address_family': socket.AF_INET6})
+    return cls((host, port), make_handler(api))
 
 
 def main(argv=None):
