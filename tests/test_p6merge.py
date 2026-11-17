@@ -52,6 +52,7 @@ class World:
         self.prs = list(prs)  # one read each; the last one repeats
         self.gh, self.tmuxed, self.posts, self.wakes, self.slept, self.removed = [], [], [], [], [], []
         self.windows = windows
+        self.merges_on_command = True
         self._remove = remove
         self.live = live
         self.backlog = backlog if backlog is not None else [
@@ -66,6 +67,8 @@ class World:
 
     def sh(self, argv):
         self.gh.append(argv)
+        if argv[:3] == ['gh', 'pr', 'merge'] and self.merges_on_command:
+            self.prs = [dict(self.prs[-1], state='MERGED')]
         return ''
 
     def tmux(self, args):
@@ -468,3 +471,31 @@ def test_a_pr_merged_into_another_base_gets_no_cleanup():
     assert w.merges() == [] and w.moves() == [] and w.tmuxed == [] and w.removed == []
     assert not any(a[:3] == ['gh', 'issue', 'close'] for a in w.gh)
     assert [p['kind'] for p in w.posts] == ['exception']
+
+
+# -- Codex on PR #90 (869bbe0): a merge queue only queues; no cleanup until it merged ---------
+
+def test_a_queued_merge_is_not_done_and_gets_no_cleanup():
+    w = World([full()])
+    w.merges_on_command = False  # the command queued it; GitHub still shows it OPEN
+    r = w.run()
+    assert r['merged'] is False and 'does not show the PR merged' in r['why'] and 'it is open at' in r['why']
+    assert len(w.merges()) == 1 and w.moves() == [] and w.tmuxed == [] and w.removed == []
+    assert [p['kind'] for p in w.posts] == ['exception']
+    assert len(w.slept) == M.MERGEABLE_TRIES - 1
+    w.prs = [full(state='MERGED')]  # the queue merged it: the next report cleans up, with no new merge
+    r = w.run(trigger='comment')
+    assert r['merged'] is True and len(w.merges()) == 1 and w.removed
+
+
+def test_a_merge_confirmed_on_a_later_read_goes_on():
+    w = World([full()])
+    w.merges_on_command = False
+    real = w.sh
+
+    def sh(argv):
+        real(argv)
+        if argv[:3] == ['gh', 'pr', 'merge']:
+            w.prs = [full(), full(state='MERGED')]  # one more read still OPEN, then MERGED
+    w.sh = sh
+    assert w.run()['merged'] is True and w.slept == [M.MERGEABLE_WAIT] and w.removed

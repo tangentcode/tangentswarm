@@ -19,8 +19,9 @@ reason, and a Codex summary or worker reply that is not in the read is not clean
 A PR that is already MERGED at the head into main gets the cleanup with no merge; one
 merged into another base is a reason.
 
-All pass: `gh pr merge --merge --match-head-commit <sha>`, then (each step on its own; a
-failed step is reported and the rest go on):
+All pass: `gh pr merge --merge --match-head-commit <sha>`. Only when a new read shows the PR
+MERGED at the head (a merge queue may only queue it), then (each step on its own; a failed
+step is reported and the rest go on):
   - the PR card and the closed issue cards go to Done on Project 6
   - the PR's tmux windows (<code>-<PR>-*: swarm for tangentswarm, meth for methodology) close
   - `git worktree remove` when the worktree is clean (worktrees.remove_worktree), and the
@@ -258,6 +259,9 @@ class P6Merge:
                              '--match-head-commit', self.head])
                 except Exception as e:
                     return self.refuse([f"gh pr merge failed: {type(e).__name__}: {str(e)[:200]}"])
+                why = self.confirm_merged()
+                if why:  # Codex on PR #90: a merge queue only queues it; no cleanup until GitHub merged it
+                    return self.refuse([why])
                 self.note(f"merged {self.repo}#{self.n} at {self.head[:8]}")
             st.mark(once)
         self.after_merge(pr)
@@ -276,6 +280,24 @@ class P6Merge:
             if i + 1 < MERGEABLE_TRIES:
                 self.sleep(MERGEABLE_WAIT)
         return pr, problems(pr, self.head)
+
+    def confirm_merged(self):
+        """None when GitHub shows the PR MERGED at the head (read again a few times), else why
+        not. The merge command can end with the PR only in a merge queue."""
+        state = '?'
+        for i in range(MERGEABLE_TRIES):
+            try:
+                pr = read(self.gql, self.repo, self.n)
+            except Exception as e:
+                pr, state = {}, f"not readable ({type(e).__name__})"
+            else:
+                if pr.get('state') == 'MERGED' and pr.get('headRefOid') == self.head:
+                    return None
+                state = f"{(pr.get('state') or '?').lower()} at {(pr.get('headRefOid') or '?')[:8]}"
+            if i + 1 < MERGEABLE_TRIES:
+                self.sleep(MERGEABLE_WAIT)
+        return (f"gh pr merge ran, but GitHub does not show the PR merged at {self.head[:8]} (it is {state}; "
+                "a merge queue?): no cleanup yet; the next report of this head, or the merge event, finishes it")
 
     def refuse(self, why):
         """No merge: one exception to MethBot (once per PR and head) and an events row."""
