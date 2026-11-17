@@ -312,3 +312,45 @@ def test_a_condition_before_a_served_commit_is_kept(text):
 ])
 def test_soft_line_breaks(body, new, gone):
     assert G.strip_status(body) == (new, gone)
+
+
+@pytest.mark.parametrize('body, new, gone', [
+    # Codex on PR #133: a sentence may end inside closing inline marks
+    ('**Not on staging yet.** Where-to-see: open /lobby.', 'Where-to-see: open /lobby.', ['**Not on staging yet.**']),
+    ('_Merged into work._ Check it on staging: /x.', 'Check it on staging: /x.', ['_Merged into work._']),
+    ('(Merged into work.) Check it on staging: /x.', 'Check it on staging: /x.', ['(Merged into work.)']),
+    ('"Not on staging yet." Check it on staging: /x.', 'Check it on staging: /x.', ['"Not on staging yet."']),
+    ('Intro. ~~Merged into work.~~ Check it on staging: /x.', 'Intro. Check it on staging: /x.',
+     ['~~Merged into work.~~']),
+])
+def test_sentence_ends_after_closing_marks(body, new, gone):
+    assert G.strip_status(body) == (new, gone)
+
+
+@pytest.mark.parametrize('body', [
+    # Codex on PR #133: a fence inside a blockquote, at any quote depth
+    '> ```text\n> Merged into work.\n> ```\nCheck it on staging: /x.\n',
+    '> > ~~~\n> > Not on staging yet.\n> > ~~~\n',
+])
+def test_a_fence_in_a_blockquote_is_not_read(body):
+    assert G.strip_status(body) == (body, []) and G.status_lines(body) == []
+
+
+@pytest.mark.parametrize('body, left', [
+    # a cut here could break the Markdown: the text stays and is reported
+    ('> Not on staging yet.\n', ['> Not on staging yet.']),
+    ('| site | state |\n| --- | --- |\n| ptw | Merged into work. |\n', ['| ptw | Merged into work.']),
+    ('<p>Not on staging yet.</p>\n', ['<p>Not on staging yet.</p>']),
+    ('**Intro. Not on staging yet.** Check it on staging: /x.\n', ['Not on staging yet.**']),
+    ('`a. Merged into work.` b.\n', ['Merged into work.`']),
+])
+def test_status_that_cannot_be_cut_safely_is_left_and_reported(body, left):
+    assert G.strip_status(body) == (body, [])
+    assert G.status_lines(body) == left
+
+
+def test_scrub_status_with_only_left_text_opens_an_incident_and_does_not_edit():
+    tickets = []
+    ok, why = G.scrub_status(1, '> Not on staging yet.\n', REPO, patch=lambda *a: pytest.fail('no edit'),
+                             incident=lambda *a, **k: tickets.append(k))
+    assert ok and why.startswith('Left 1') and 'by hand' in tickets[0]['fix']

@@ -936,8 +936,12 @@ is deployed to staging") tells how something works and is kept. So is a bare men
 `.deploy-sha`; only a claim about which commit it holds is removed. The same exemption
 applies to both kinds of match. A sentence may wrap over soft line breaks: a line that goes
 on in lower case is the same sentence, and a line that starts with a capital letter, a new
-list item or a heading starts a new one. Code fences close only on a matching run of the
-same character, as long or longer (CommonMark).
+list item or a heading starts a new one. A sentence may end inside closing inline marks
+(`**Not on staging yet.**`). Code fences close only on a matching run of the same
+character, as long or longer (CommonMark), and a fence inside a blockquote counts too.
+When a cut is not clearly safe (a blockquote, a table row, an HTML line, or a sentence
+that would leave an inline mark unpaired), the text stays: the incident names it for a
+hand edit, and the PR is not held.
 
 ### swarm-launch: start a worker
 
