@@ -24,6 +24,7 @@ test = ["pytest", "websockets>=13"]
 swarm = "tangentswarm.cli:main"
 swarm-mcp = "tangentswarm.mcp_server:main"
 swarm-hub = "tangentswarm.queue.hub:main"
+swarm-api = "tangentswarm.status_api:main"
 swarm-agent = "tangentswarm.agent_mcp_server:main"
 swarm-tick = "tangentswarm.tick:main"
 swarm-brief = "tangentswarm.brief:main"

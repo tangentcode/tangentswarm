@@ -4,7 +4,10 @@
   swarm auth approve [--ttl 600]          print a one-time approval code for the login page
   swarm auth client add --name N [--scopes ...]   confidential client for client_credentials
   swarm auth client list | remove <client_id>
-  swarm auth token issue --client X [--scopes ...] [--ttl 30d]   pre-issued bearer token
+  swarm auth token issue --client X [--scopes ...] [--ttl 30d] [--subject LOGIN]
+                                          pre-issued bearer token; swarm-api tokens take
+                                          tangentswarm:status, and tangentswarm:act with
+                                          --subject (the human the token acts for)
   swarm auth token list [--all] | revoke <token_id>
   swarm auth show-config
 
@@ -32,14 +35,19 @@ def parse_ttl(text):
     return int(m.group(1)) * mult
 
 
-def _scopes(values):
+def _scopes(values, api=False):
+    """api: a pre-issued token may also take the swarm-api scopes (never a client)."""
     scopes = []
     for v in values or []:
         scopes += v.replace(',', ' ').split()
     scopes = scopes or list(A.ALL_SCOPES)
-    bad = [s for s in scopes if s not in A.ISSUABLE_SCOPES]
+    valid = A.ISSUABLE_SCOPES + (A.API_SCOPES if api else [])
+    bad = [s for s in scopes if s not in valid]
     if bad:
-        raise SystemExit(f'unknown scope(s): {bad}; valid: {A.ISSUABLE_SCOPES}')
+        raise SystemExit(f'unknown scope(s): {bad}; valid: {valid}')
+    if A.SCOPE_ACT in scopes and A.SCOPE_STATUS not in scopes:
+        print(f'note: every swarm-api request needs {A.SCOPE_STATUS}; adding it', file=sys.stderr)
+        scopes.insert(scopes.index(A.SCOPE_ACT), A.SCOPE_STATUS)
     if A.SCOPE_READ not in scopes and A.SCOPE_SHELL in scopes:
         print(f'note: every request needs {A.SCOPE_READ}; adding it', file=sys.stderr)
         scopes.insert(0, A.SCOPE_READ)
@@ -70,6 +78,7 @@ def main(argv):
     p.add_argument('--scopes', nargs='*')
     p.add_argument('--ttl', type=parse_ttl, default=parse_ttl('30d'), help='e.g. 12h, 30d, never (default 30d)')
     p.add_argument('--label')
+    p.add_argument('--subject', help='the human the token acts for (needed with tangentswarm:act)')
     p = pt.add_parser('list')
     p.add_argument('--all', action='store_true')
     p = pt.add_parser('revoke')
@@ -115,8 +124,11 @@ def main(argv):
             print(f'removed {a.client_id} and revoked its tokens')
     elif a.cmd == 'token':
         if a.sub == 'issue':
-            token, tid, exp = store.issue_token(a.client, _scopes(a.scopes), a.ttl, 'access',
-                                                None, a.client, a.label or 'pre-issued')
+            scopes = _scopes(a.scopes, api=True)
+            if A.SCOPE_ACT in scopes and not a.subject:
+                raise SystemExit(f'{A.SCOPE_ACT} needs --subject LOGIN: the human this token acts for')
+            token, tid, exp = store.issue_token(a.client, scopes, a.ttl, 'access',
+                                                None, a.subject or a.client, a.label or 'pre-issued')
             print(f'token_id: {tid}')
             print(f'token:    {token}')
             print(f'expires:  {_when(exp)}')
