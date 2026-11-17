@@ -26,8 +26,9 @@ State: ~/.local/state/swarm-flow/slots.json
   parked  {PR: {session, window, pane, worktree, branch, head, parked_at}}
   rework  {PR: {session, window, pane, worktree, branch, head, started, feedback}}
   relayed {PR: head} the head a rework relay was sent for (the cascade sends one per head)
-  queued  {PR: {text, why, at}} a revive held for a rework slot (tangentswarm #102); the
-          cascade runs it after its park step, when a slot is free (run_queued)
+  queued  {PR: {text, why, at}} a revive held for a rework slot (tangentswarm #102), or a
+          conflicting In Progress PR that waits for a Claude (tangentswarm #101); the cascade
+          runs it after its park step, in pick order, when a slot is free (run_queued)
 
     swarm-slots              the running Claudes by slot, and the parked sessions
     swarm-slots --park [--dry-run]   park the Claude of each PR in Ready now
@@ -70,6 +71,7 @@ CONFLICT_MAX_CLAUDES = int(os.environ.get('SWARM_CONFLICT_MAX_CLAUDES', '9'))
 CONFLICT_AVAIL_MIN = int(float(os.environ.get('SWARM_CONFLICT_AVAIL_MIN_GB', '1.5')) * 1024 ** 3)
 TMUX_SESSION = 'agents'
 FEEDBACK_MAX = 4000
+QUEUE_REFUSALS = int(os.environ.get('SWARM_QUEUE_REFUSALS', '3'))  # refusals before a waiting PR is flagged
 
 
 # -- state ------------------------------------------------------------------------
@@ -771,14 +773,44 @@ def revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, path
                    notes=lines[-3:] + [one_line_safe(text)[:600]], error=error)
 
 
-def queue_revive(n, text, why='', path=None, now=None):
+def queue_revive(n, text, why='', path=None, now=None, branch=None, relay=None):
     """Keep a held revive of PR n (tangentswarm #102). One entry per PR: a newer feedback
-    replaces the older one, and the entry keeps its place in the queue."""
+    replaces the older one, and the entry keeps its place in the queue. branch and relay
+    (the relay file; tangentswarm #101) let run_queued turn it into a worker start when the
+    worktree is gone; an earlier value is kept when none is given."""
     n = int(str(n).lstrip('#'))
     with update(path) as st:
         old = st['queued'].get(str(n)) or {}
-        st['queued'][str(n)] = dict(text=text, why=str(why)[:200],
-                                    at=old.get('at') or (time.time() if now is None else now))
+        rec = dict(text=text, why=str(why)[:200], at=old.get('at') or (time.time() if now is None else now))
+        for k, v in (('branch', branch), ('relay', relay)):
+            if v or old.get(k):
+                rec[k] = v or old[k]
+        st['queued'][str(n)] = rec
+
+
+def start_later(n, branch, brief, path=None):
+    """Record a worker start for PR n with brief (a relay file) as its brief: the cascade's
+    start retry starts it when capacity frees (tangentswarm #101). The relay goes with the
+    start, so a queued revive of n is dropped. False, and nothing recorded, with no branch
+    (Codex on PR #109: the launcher cannot start a worker on an empty branch)."""
+    if not branch:
+        return False
+    n = int(str(n).lstrip('#'))
+    unqueue(n, path)
+    if str(n) not in load(path)['unstarted']:
+        unstarted_add(n, path=path, branch=branch, brief=str(brief), setup='done', issue=None)
+    return True
+
+
+def waiting(path=None, st=None):
+    """{PR number} of the PRs that wait for a Claude: a queued revive or an unstarted worker
+    (tangentswarm #101). An In Progress card of such a PR is valid with no live Claude. A
+    queued revive refused QUEUE_REFUSALS times in a row does not count: it is still retried,
+    but swarm-tick and the sanity check flag it, so a person looks at it.
+    st: the slots state when the caller has it."""
+    st = load(path) if st is None else st
+    queued = [k for k, r in (st.get('queued') or {}).items() if int(r.get('refused') or 0) < QUEUE_REFUSALS]
+    return {int(k) for k in queued + list(st.get('unstarted') or {}) if str(k).isdigit()}
 
 
 def unqueue(n, path=None):
@@ -788,15 +820,30 @@ def unqueue(n, path=None):
         st['queued'].pop(str(n), None)
 
 
+def wait_order(recs, prs=None):
+    """[(PR text, record)] of {PR: record} in the shared pick order (board.pick_key; tangentswarm
+    #101: Claudes start for waiting In Progress PRs in pick order). A PR that is not in prs
+    (the open board PRs, or None) goes after them, oldest record first."""
+    prs, ft = prs or {}, board.active_fast_track()
+
+    def key(kv):
+        p = prs.get(int(kv[0])) if str(kv[0]).isdigit() else None
+        if p is not None and 'number' in p:
+            return (0, board.pick_key(p, ft), 0.0)
+        return (1, (), float(kv[1].get('at') or 0))
+    return sorted(recs.items(), key=key)
+
+
 def run_queued(out=print, prs=None, dry=False, path=None, revive_fn=None):
-    """Run the held revives, oldest first (tangentswarm #102: #539 stayed held after swarm-revive
-    exited 3, and nothing retried it). The cascade calls this after its park step, so a slot that
-    a park freed is used in the same pass. prs: the open board PRs; a queued PR that is not open
-    any more is dropped. The first revive that is still held ends the run: the slots are full.
-    Returns the PR numbers that were revived."""
+    """Run the held revives in pick order (wait_order; tangentswarm #102: #539 stayed held
+    after swarm-revive exited 3, and nothing retried it; tangentswarm #101: a conflicting PR
+    waits for its Claude here in In Progress). The cascade calls this after its park step, so
+    a slot that a park freed is used in the same pass. prs: the open board PRs; a queued PR
+    that is not open any more is dropped. The first revive that is still held ends the run:
+    the slots are full. Returns the PR numbers that were revived."""
     q = load(path)['queued']
     done = []
-    for k, rec in sorted(q.items(), key=lambda kv: float(kv[1].get('at') or 0)):
+    for k, rec in wait_order(q, prs):
         n = int(k)
         if prs is not None and (prs.get(n) or {}).get('state', 'GONE') != 'OPEN':
             out(f"revive queue: #{n} is not an open board PR: dropped")
@@ -812,12 +859,23 @@ def run_queued(out=print, prs=None, dry=False, path=None, revive_fn=None):
         if rc == 3:
             out(f"revive queue: #{n} still held ({last}); {len(q) - len(done)} wait")
             break
-        unqueue(n, path)
         if rc == 0:
+            unqueue(n, path)
             done.append(n)
             out(f"revive queue: #{n} revived ({last})")
-        else:
-            out(f"NEEDS_WORKER #{n}: the queued revive was refused ({last}); dropped from the queue")
+            continue
+        # Codex on PR #109: a refusal never drops the saved feedback. No worktree: a worker
+        # start with the relay. Else it stays queued, and the next pass tries again.
+        from .flow import head_branch, no_worker
+        if no_worker(last) and rec.get('relay') and start_later(n, rec.get('branch') or head_branch(n),
+                                                                  rec['relay'], path=path):
+            out(f"revive queue: #{n} has no worktree ({last}); a worker start with its relay is queued")
+            continue
+        with update(path) as st:
+            if str(n) in st['queued']:
+                st['queued'][str(n)]['refused'] = int(st['queued'][str(n)].get('refused') or 0) + 1
+                st['queued'][str(n)]['why'] = str(last)[:200]
+        out(f"NEEDS_WORKER #{n}: the queued revive was refused ({last}); it stays queued")
     return done
 
 

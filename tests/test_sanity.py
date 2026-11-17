@@ -502,3 +502,15 @@ def test_gather_holds_only_the_platform_numbers_of_the_launch_records(monkeypatc
     got = rules(sanity.gather({'gql': None}, snap, T0, claudes=[], units=[]))
     assert got == [('no-live-claude', 79)]
     assert next(f for f in sanity.gather({'gql': None}, snap, T0, claudes=[], units=[]))['repo'] == TS
+
+
+def test_a_pr_waiting_for_a_claude_is_no_live_claude_finding(monkeypatch):
+    """tangentswarm #101: an In Progress PR with a queued revive waits for a Claude: valid."""
+    from tangentswarm import slots
+    monkeypatch.setattr(slots, 'load', lambda: {'unstarted': {}, 'queued': {'79': {'text': 'x'}}})
+    monkeypatch.setattr(sanity, 'cards_from_board', lambda gql_, b: [])
+    snap = {'prs': [node(79, board.IN_PROGRESS, draft=True, closes=[(43, ())]),
+                    node(80, board.IN_PROGRESS, draft=True, closes=[(44, ())])],
+            'issues': [node(43, board.ACTIVE, kind='Issue'), node(44, board.ACTIVE, kind='Issue')], 'at': T0}
+    got = rules(sanity.gather({'gql': None}, snap, T0, claudes=[], units=[]))
+    assert got == [('no-live-claude', 80)]

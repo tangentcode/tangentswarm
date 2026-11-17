@@ -115,7 +115,7 @@ def drop_pull(n):
         save_pulls([p for p in pulls if p['pr'] != n])
 
 
-HELD = STATE.with_name('held.json')
+HELD = STATE.with_name('held.json')  # retired (tangentswarm #101): clear_held deletes it
 PREMERGE_STATE = STATE.with_name('premerge.json')  # {PR: {head, base, vbranch, tip|seed, status, relayed}}
 
 
@@ -178,36 +178,22 @@ def shots_text(n):
             f"{SCRATCH_RULE} {SHOTS_RULE} Do not change code; push only the PR body edit.")
 
 
-def held():
-    """{PR number: {head, why}}: PRs whose failed pull found no worker (not pulled again at
-    that head)."""
+def clear_held():
+    """tangentswarm #101 (Michal 2026-11-17 8:49 AM ET: drop parking): held.json is retired.
+    The daemon calls this once at start. It deletes the file and returns the PR numbers it
+    held. Nothing else is needed: the next main check (Ready) and the main recheck at daemon
+    start (Staging) find each conflict again and send it to In Progress."""
     try:
-        return {int(k): v for k, v in json.loads(HELD.read_text()).items()}
+        d = json.loads(HELD.read_text())
+    except FileNotFoundError:
+        return []
     except (OSError, ValueError):
-        return {}
-
-
-def hold(n, head, why, relay=None, tried=None):
-    d = held()
-    d[n] = {'head': head, 'why': why[:200], 'relay': str(relay) if relay else None,
-            'tried': time.time() if tried is None else tried}
-    _save_held(d)
-
-
-def unhold(n):
-    d = held()
-    if d.pop(n, None) is not None:
-        _save_held(d)
-
-
-def _save_held(d):
-    HELD.parent.mkdir(parents=True, exist_ok=True)
-    tmp = HELD.with_name(f'{HELD.name}.{os.getpid()}.tmp')
-    tmp.write_text(json.dumps({str(k): v for k, v in d.items()}))
-    os.replace(tmp, HELD)
-
-
-HELD_RETRY = int(os.environ.get('SWARM_HELD_RETRY', '300'))  # s between handoff retries of a held head
+        d = {}
+    try:
+        HELD.unlink()
+    except FileNotFoundError:
+        pass
+    return sorted(int(k) for k in (d if isinstance(d, dict) else {}) if str(k).isdigit())
 
 
 def pulled_pr():
@@ -298,6 +284,22 @@ def vn_text(n, branch, rec):
             f"(it holds future main); git merge {rec['head']} (your head); resolve the conflicts; run the tests; "
             f"git push origin {vn}; then git switch {branch}. No rebase, no force-push. Report the {vn} tip and "
             "the test counts.")
+
+
+def head_branch(n):
+    """The head branch of platform PR n from GitHub, or '' when it cannot be read (Codex on
+    PR #109: a board record may have no branch, and a worker start needs it)."""
+    try:
+        r = proc.sh('gh', 'pr', 'view', str(n), '-R', REPO, '--json', 'headRefName', '--jq', '.headRefName',
+                    check=False, who='swarm-flow')
+    except Exception:
+        return ''
+    return (r.stdout or '').strip() if r.returncode == 0 else ''
+
+
+def pr_branch(p):
+    """The head branch of board PR p: its record, else GitHub (head_branch), else ''."""
+    return p.get('branch') or head_branch(p['number'])
 
 
 def no_worker(said):
@@ -585,18 +587,13 @@ class Flow:
         ready = [p for p in cols.get(board.READY, []) if not p['draft']]
         if not ready or room < 1:
             return []
-        hd = held()
         fm = self.future_main(scratch, cols)
         work = self.fetch_work(scratch)
         target, batch, tips = None, [], {}  # target: future main + the batch so far
         for p in ready_order(ready, None, board.active_fast_track()):
             if len(batch) >= room:
                 break
-            n, head = p['number'], p['head']
-            if (hd.get(n) or {}).get('head') == head:
-                self.note(f"#{n} is next in the pick order and held: its last pull failed with no worker "
-                          f"({hd[n]['why'][:100]}); a new head releases it; nothing behind it is pulled")
-                break
+            n = p['number']
             t = self.premerge_one(p, scratch, fm)
             if not t:
                 self.note(f"#{n} is next in the pick order and is not merge-ready: nothing behind it is pulled")
@@ -1053,53 +1050,56 @@ class Flow:
             return f"no worker to resume ({why}) and no start: {held}"
         if any(int(r.get('pr') or 0) == n for r in spool.in_flight(('start',))) or str(n) in slots.load()['unstarted']:
             return f"no worker to resume ({why}); its worker start is already queued"
-        slots.unstarted_add(n, branch=p.get('branch') or '', brief=str(relay_path), setup='done', issue=None)
+        if not slots.start_later(n, pr_branch(p), relay_path):  # Codex on PR #109: never an empty branch
+            return f"no worker to resume ({why}); its branch is unknown, so no start"
         spool.submit('start', '', pr=n)
         return f"no worker to resume ({why}); queued a worker start with the relay {relay_path.name}"
 
-    def hand_off(self, n, text):
-        """(ok, note): give_worker as a success boolean, for callers that take (ok, note)
-        (Codex on PR #26: mainmerge read give_worker's rc 0 as a failure)."""
-        rc, said = self.give_worker(n, text)
-        return rc == 0, said
+    def hand_off(self, p, text, relay_path):
+        """(ok, note) for mainmerge.recheck: the relay reaches the PR's Claude now, or it
+        waits for a Claude (to_worker). ok is True in both cases: the card goes to In
+        Progress (tangentswarm #101). Codex on PR #26: never give_worker's rc."""
+        waiting, said = self.to_worker(p, text, relay_path)
+        return True, said
 
-    def retry_held(self, cols, now=None):
-        """Codex on PR #26: a held head (its failed pull found no worker) was never handed off
-        again when capacity freed. Every HELD_RETRY s, each Ready PR held at its current head
-        with a saved relay goes to its worker again; on success the card moves to In Progress
-        and the hold ends. Staging holds are retried by the daemon's merge-main retry."""
-        now = time.time() if now is None else now
-        hd = held()
-        for p in cols.get(board.READY, []):
-            h = hd.get(p['number'])
-            if not h or h.get('head') != p.get('head') or not h.get('relay') or now - float(h.get('tried') or 0) < HELD_RETRY:
-                continue
-            n = p['number']
-            try:
-                text = Path(h['relay']).read_text().strip()
-            except OSError:
-                continue
-            if self.dry:
-                self.change(f"would retry the held handoff of #{n} ({h.get('why', '')[:80]})")
-                continue
-            rc, said = self.give_worker(n, text)
-            if rc != 0:
-                hold(n, h['head'], h.get('why', ''), relay=h['relay'], tried=now)
-                self.note(f"NEEDS_WORKER #{n}: retried the held handoff; still no worker ({said})")
-                continue
-            unhold(n)
-            board.move_card(self.g, p['item'], board.IN_PROGRESS, n=n, repo=REPO)
-            from . import moves
-            moves.log_move(n, board.READY, 'In Progress', p.get('head', ''), note=('held: ' + h.get('why', ''))[:120])
-            self.change(f"#{n} -> In Progress: the held handoff reached its worker ({said})")
+    def to_worker(self, p, text, relay_path):
+        """(waiting, note): tangentswarm #101 (Michal 2026-11-17 8:49 AM ET: drop parking).
+        Give a conflicting PR's Claude its relay now. If no Claude can take it now, the
+        relay is saved and waits for a Claude, and the card still goes to In Progress:
+          - no rework slot or memory (revive rc 3): the revive is queued with the text, and
+            the cascade runs the queue in pick order when capacity frees (slots.run_queued);
+          - no worktree or window to resume: an unstarted record with the relay file as its
+            brief, and the cascade's start retry starts its worker (Advance.retry_starts);
+          - any other refusal: the revive stays queued, and every pass tries it again
+            (Codex on PR #109: a refusal never drops the saved feedback).
+        The queued record keeps the branch and the relay path, so a later "worktree is
+        gone" refusal turns it into a worker start (slots.run_queued).
+        waiting is False when its Claude has the relay now."""
+        from . import slots
+        n = p['number']
+        rc, said = self.give_worker(n, text, queue=True)
+        if rc == 0:
+            return False, said
+        branch = pr_branch(p)
+        if no_worker(said):
+            if slots.start_later(n, branch, relay_path):  # the start, not a revive, gives its Claude the relay
+                return True, f"waiting for a Claude: a worker start with the relay {relay_path.name} is queued ({said})"
+            # Codex on PR #109: no branch, so no start can be recorded: keep the revive queued;
+            # run_queued tries the start again once the branch can be read
+        slots.queue_revive(n, text, why=said, branch=branch, relay=str(relay_path))
+        if rc == 3:
+            return True, f"waiting for a Claude: the revive is queued ({said})"
+        return True, f"waiting for a Claude: the revive was refused ({said}); it stays queued and is retried"
 
-    def give_worker(self, n, text, priority=False):
+    def give_worker(self, n, text, priority=False, queue=False):
         """(rc, last line) of slots.revive: 0 = its Claude runs and got the text. priority: a
-        conflict fix for fill (tangentswarm #65): no rework-slot wait, only the hard limits."""
+        conflict fix for fill (tangentswarm #65): no rework-slot wait, only the hard limits.
+        queue: a held revive (rc 3) is queued (slots.queue_revive)."""
         from . import slots
         lines = []
+        kw = dict({'priority': True} if priority else {}, **({'queue': True} if queue else {}))
         try:
-            rc = slots.revive(n, text, out=lines.append, **({'priority': True} if priority else {}))
+            rc = slots.revive(n, text, out=lines.append, **kw)
         except Exception as e:
             return 1, f"{type(e).__name__}: {str(e)[:160]}"
         return rc, (lines[-1] if lines else f'rc={rc}')
@@ -1138,15 +1138,16 @@ class Flow:
     def fail(self, p, reason, relay=None, text=None):
         """Send a pulled PR back to its worker. tangentswarm #83: only for a real conflict
         (a PR that does not merge onto main); any other way out of the pull is leave().
-        Michal 2026-11-15: never demote into a
-        column with no worker. The card moves to In Progress only once its Claude runs and
-        has the relay; else it stays where it is, its head is held from new pulls, and the
-        note says NEEDS_WORKER."""
+        tangentswarm #101 (Michal 2026-11-17 8:49 AM ET: drop parking; this replaces the Nov
+        15 rule never to move a card into a column with no worker): the card always goes to
+        In Progress. Its Claude gets the relay now, or the relay waits for a Claude
+        (to_worker) and the move note says so. Nothing is held, so nothing behind it in Ready
+        waits. Returns True when the card moved."""
         n = p['number']
         text = text or (f"Coordinator: #{n} left the Staging pull: {reason}. Fix the root cause, push, and "
                         "report the head commit and test counts.")
         if self.dry:
-            self.change(f"#{n} -> In Progress (with its worker): {reason[:200]}")
+            self.change(f"#{n} -> In Progress (its worker gets the relay, or it waits for a Claude): {reason[:200]}")
             return False
         drop_pull(n)
         relay_path = RELAY_DIR / f"relay-{n}-{relay or 'gate'}.md"
@@ -1154,16 +1155,15 @@ class Flow:
             relay_path.write_text(text + '\n')
         except OSError:
             pass
-        rc, said = self.give_worker(n, text)
-        if rc != 0:
-            hold(n, p.get('head', ''), reason, relay=relay_path)
-            self.note(f"NEEDS_WORKER #{n}: {reason[:160]}; the card stays in {p.get('col') or '?'} because no "
-                      f"worker could be started ({said}); its head is held from new pulls")
-            return False
+        waiting, said = self.to_worker(p, text, relay_path)
         board.move_card(self.g, p['item'], board.IN_PROGRESS, n=n, repo=REPO)
         from . import moves
-        moves.log_move(n, p.get('col') or '?', 'In Progress', p.get('head', ''), note=reason[:120])
-        self.change(f"#{n} -> In Progress: {reason[:200]} (its worker has the relay: {said})")
+        moves.log_move(n, p.get('col') or '?', 'In Progress', p.get('head', ''),
+                       note=(('waiting for a Claude: ' if waiting else '') + reason)[:120])
+        if waiting:
+            self.change(f"#{n} -> In Progress, WAITING_FOR_CLAUDE: {reason[:200]} ({said})")
+        else:
+            self.change(f"#{n} -> In Progress: {reason[:200]} (its worker has the relay: {said})")
         return True
 
     # -- the step ---------------------------------------------------------------

@@ -22,6 +22,7 @@ The checks (each one has a rule id; docs/sanity-check.md is the full list):
   not-draft              a ready PR in In Progress, Needs Input or Parked (draft PRs only)
   draft                  a draft PR in Auto Review, Ready, Staging or Human Review
   no-live-claude         an In Progress PR with no live Claude in a worktree on its branch
+                         (not one that waits for a Claude: unstarted or a queued revive, #101)
   human-review-over-two  more than two PRs in Human Review
   active-work2           an Active issue with the work2 label
   active-pr-count        an Active issue without exactly one open PR in a flow column
@@ -561,7 +562,8 @@ def gather(g, snap, now, claudes=None, failed=None, units=None):
     st = slots.load()
     # the launch records hold platform numbers only (slots, webhook.Executor.do_closed)
     hold_issues = {(boardcache.REPO, n) for n in watchdog.launching_issues(st, now)}
-    hold_prs = {(boardcache.REPO, int(k)) for k in (st.get('unstarted') or {}) if str(k).isdigit()}
+    # an In Progress PR that waits for a Claude (unstarted, or a queued revive: tangentswarm #101)
+    hold_prs = {(boardcache.REPO, n) for n in slots.waiting(st=st)}
     if units is None:
         from . import unitcheck
         try:

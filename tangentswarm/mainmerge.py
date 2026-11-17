@@ -6,9 +6,9 @@ depends on main. So on a new main SHA, each Staging PR gets one local merge-tree
 (no API call; cached per (main, head)). A PR that conflicts goes to In Progress and gets
 a merge-main relay (merge commit, no rebase). A clean PR is left alone.
 
-The relay is written to /tmp/relay-<PR>-mergemain-<HHMM>.md. It is sent at once only
-if the PR's Claude pane shows an empty prompt (tell_agent's probe); otherwise it stays a
-held relay for the usual retry. The swarm-promoted daemon calls recheck() when it sees a
+The relay is written to /tmp/relay-<PR>-mergemain-<HHMM>.md. The daemon gives it to the
+PR's Claude through Flow.hand_off: now, or it waits for a Claude in In Progress
+(tangentswarm #101). The swarm-promoted daemon calls recheck() when it sees a
 new main SHA (git ls-remote, every poll).
 """
 import json
@@ -108,11 +108,11 @@ def deliver(pr, text, find=find_pane, tell=None):
 def recheck(staging, main, clean, move, say, details=None, dry=False, cache_path=None,
             send=deliver, now=None, give=None):
     """Relay a merge-main to each Staging PR that conflicts with the new main, and move it to
-    In Progress only once its worker has the relay (Codex on PR #26: a parked Staging worker
-    was demoted with no live pane to take it). give(n, text) -> (ok, note) is the
-    revive-capable handoff (Flow.hand_off, never give_worker's rc); without it, send() to a live pane only. A PR
-    whose worker cannot be started stays in Staging, held from new pulls (NEEDS_WORKER).
-    Returns the PR numbers that conflict."""
+    In Progress. give(pr, text, relay path) -> (ok, note) is the revive-capable handoff
+    (Flow.hand_off): its Claude gets the relay now, or the relay waits for a Claude, and the
+    card moves in both cases (tangentswarm #101: drop parking). Without give, send() to a
+    live pane only; when that fails, the card stays in Staging (NEEDS_WORKER) and nothing is
+    held. Returns the PR numbers that conflict."""
     cache = load_cache(cache_path)
     bad = conflicts(staging, main, clean, cache)
     save_cache(cache, cache_path)
@@ -125,15 +125,13 @@ def recheck(staging, main, clean, move, say, details=None, dry=False, cache_path
         text = relay_text(n, branch, p['head'], main)
         path = write_relay(n, text, now)
         if give:
-            ok, how = give(n, text)
+            ok, how = give(dict(p, branch=branch), text, path)
         else:
             how = send(dict(number=n, branch=branch), text)
             ok = how == 'sent'
         if not ok:
-            from . import flow
-            flow.hold(n, p['head'], f'conflicts with main {main[:8]}', relay=path)
-            say(f"NEEDS_WORKER #{n}: conflicts with main {main[:8]}; no worker took the merge-main relay "
-                f"{path.name} ({how}); the card stays in Staging, its head is held from new pulls")
+            say(f"NEEDS_WORKER #{n}: conflicts with main {main[:8]}; no live Claude took the merge-main relay "
+                f"{path.name} ({how}); the card stays in Staging")
             continue
         move(p['item'], board.IN_PROGRESS, n)
         say(f"moved #{n} Staging -> In Progress: conflicts with main {main[:8]}; merge-main relay {path.name} {how}")

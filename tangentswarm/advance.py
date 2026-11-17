@@ -63,7 +63,7 @@ RERUN = Path(os.environ.get('SWARM_CASCADE_RERUN', str(gatelock.LOCK.with_name('
 REDEPLOY_LATE = int(os.environ.get('SWARM_REDEPLOY_LATE', '600'))  # lag warning only after this (Michal 2026-11-15)
 DEPLOY_FALLBACK = int(os.environ.get('SWARM_DEPLOY_FALLBACK', '180'))  # then accept a .deploy-sha that contains the head
 
-CODEX_FIELDS = """number state isDraft headRefOid baseRefName mergeable body
+CODEX_FIELDS = """number state isDraft headRefOid headRefName baseRefName mergeable body
  closingIssuesReferences(first:3){nodes{number comments(last:1){nodes{body}}}}
  comments(last:40){nodes{author{login} body createdAt}}
  commits(last:1){nodes{commit{committedDate}}}
@@ -370,11 +370,11 @@ class Advance:
         Review PR that stays only because of an open, not outdated Codex thread on its head,
         or because GitHub says it conflicts with main, goes back to rework. Its Claude is
         revived with the finding text, or with "merge origin/main and resolve the conflicts";
-        the card moves to In Progress, and the PR becomes a draft (board.move_card). A revive
-        held for a rework slot is queued (slots.run_queued runs it when a slot frees), and the
-        card moves too. A refused revive (no worker can run) leaves the card in Auto Review
-        with a NEEDS_WORKER line, so the next check tries again. One revive per head and
-        reason. Returns the skip note, or None when neither reason holds."""
+        the card moves to In Progress, and the PR becomes a draft (board.move_card). tangentswarm
+        #101 (drop parking): when no Claude can take it now, the feedback waits for a Claude
+        (Flow.to_worker: a queued revive, or a worker start with the relay as its brief), and
+        the card moves too. One revive per head and reason. Returns the skip note, or None
+        when neither reason holds."""
         n, head = p['number'], p.get('head') or ''
         if d.get('mergeable') == 'CONFLICTING':
             kind, why, text = 'conflict', 'conflicts with main (GitHub mergeable)', conflict_rework_text(n, head)
@@ -387,23 +387,20 @@ class Advance:
         if self.dry:
             self.out(f"would send #{n} back to rework ({why}): draft, Auto Review -> In Progress, revive")
             return f"{why}: would go back to rework"
-        from . import moves, slots, tick
+        from . import flow, moves, tick
         state = tick.State(tick.STATE_DIR / 'state.json')
         key = f"ar-rework:{n}@{head}:{kind}"
         if not state.done(key):
-            lines = []
+            relay_path = flow.RELAY_DIR / f"relay-{n}-{kind}.md"
             try:
-                rc = slots.revive(n, text, out=lines.append, queue=True)
-            except Exception as e:
-                rc, lines = 1, [f"{type(e).__name__}: {str(e)[:160]}"]
-            said = lines[-1] if lines else f'rc={rc}'
-            if rc not in (0, 3):
-                self.out(f"NEEDS_WORKER #{n}: {why}; no worker could take the rework ({said}); "
-                         "the card stays in Auto Review")
-                return f"{why}: no worker for the rework"
+                relay_path.write_text(text + '\n')
+            except OSError:
+                pass
+            # Codex on PR #109: the board record has no branch; a deferred start needs it
+            pb = dict(p, branch=p.get('branch') or d.get('headRefName') or '')
+            waiting, said = flow.Flow(dry_run=False, out=lambda l: None, g=self.g).to_worker(pb, text, relay_path)
             state.mark(key)
-            self.out(f"#{n} {why}: its Claude " + ('has the feedback' if rc == 0 else 'is queued for a rework slot')
-                     + f" ({said})")
+            self.out(f"#{n} {why}: " + (f"WAITING_FOR_CLAUDE: {said}" if waiting else f"its Claude has the feedback ({said})"))
         board.move_card(self.g, p['item'], board.IN_PROGRESS, n=n, repo=REPO)
         moves.log_move(n, 'Auto Review', 'In Progress', head, note=f"swarm-advance: {why}"[:120])
         self.out(f"NEEDS_REWORK #{n} {why}: Auto Review -> In Progress, draft")
@@ -734,9 +731,9 @@ class Cascade(Advance):
                  f"next in order #{p['number']}: {how}")
 
     def rework(self, p, conflicts):
-        """Card to In Progress, NEEDS_REWORK line, and the relay: swarm-revive in a rework slot,
-        else a swarm-resume relay line. One relay per head."""
-        from . import flow, slots
+        """Card to In Progress, NEEDS_REWORK line, and the relay: its Claude gets it now, or it
+        waits for a Claude in In Progress (Flow.fail; tangentswarm #101). One relay per head."""
+        from . import slots
         n, head = p['number'], p.get('head') or ''
         files = sorted({f for _, fs in conflicts for f in fs})
         self.out(f"NEEDS_REWORK #{n} {' '.join(files) or '(files unknown)'}")
@@ -756,9 +753,10 @@ class Cascade(Advance):
             return
         moved = self.f.fail(p, f"conflicts with {where}"[:200], relay='merge-main', text=msg)
         self.flush()
-        if not moved:  # no worker could be started: the card stays, and the next pass tries again
-            self.out(f"RELAY: swarm-resume {n} {flow.RELAY_DIR / f'relay-{n}-merge-main.md'}")
-            return  # Codex on PR #26: never record a relay no worker took
+        if not moved:
+            return
+        # tangentswarm #101: the card is in In Progress and its Claude has the relay or waits
+        # for one with it saved (Flow.to_worker): one relay per head
         with slots.update() as st:
             st['relayed'][str(n)] = head
 
@@ -861,13 +859,15 @@ class Cascade(Advance):
             self.out(f"signal: the new-work slots are full ({facts}): no START_CLAUDE")
 
     def retry_starts(self, unstarted, cap):
-        """Queue a worker start for each launched PR whose window has no Claude (oldest first,
-        within the Claude cap; one queued start per PR at a time). Returns the cap left."""
-        from . import spool
+        """Queue a worker start for each launched PR whose window has no Claude (in pick order,
+        within the Claude cap; one queued start per PR at a time). Returns the cap left.
+        tangentswarm #101: a conflicting PR with no worktree waits here in In Progress, so the
+        order is the shared pick order (slots.wait_order), not the record age."""
+        from . import slots, spool
         reqs = spool.in_flight(('start', 'launch'))  # live: in the spool now
         flying = {int(r['pr']) for r in reqs if r.get('op') == 'start' and r.get('pr')}
         launching = {int(r['issue']) for r in reqs if r.get('op') == 'launch' and r.get('issue')}
-        for pr, rec in sorted(unstarted.items(), key=lambda kv: kv[1].get('at', 0)):
+        for pr, rec in slots.wait_order(unstarted, getattr(self, 'prs', None)):
             brief_only = bool(rec.get('brief_pane'))  # its Claude runs: only the brief line is sent
             if int(pr) in flying or int(rec.get('issue') or 0) in launching:
                 continue  # its start or its launch runs (capacity() already counts it)
@@ -945,7 +945,6 @@ class Cascade(Advance):
         self.auto_review(cols)
         self.park(cols)
         self.revive_queue()  # after park: a parked worker may have freed a rework slot
-        self.f.retry_held(cols)
         self.flush()
         self.signal(cols)
         self.out(f"cascade: done in {int(self.clock() - t0)}s")

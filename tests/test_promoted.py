@@ -306,10 +306,9 @@ def test_once_rechecks_staging_only_when_main_moves(tmp_path, monkeypatch):
     assert p.once() == 'promoted' and passes[-1] == '2' * 40
 
 
-def test_a_held_merge_main_handoff_is_retried_without_a_new_main(tmp_path, monkeypatch):
-    """Codex on PR #26: a Staging PR whose merge-main handoff found no worker waited for the
-    next merge to main."""
-    from tangentswarm import flow
+def test_no_held_merge_main_retry_without_a_new_main(tmp_path, monkeypatch):
+    """tangentswarm #101 (drop parking): the recheck never holds a Staging PR, so the daemon
+    has no merge-main retry: with main unchanged it stays idle."""
     g = G(tmp_path)
     g['gql'] = lambda q, **v: page(item(1, HR, 'a'), item(2, HR, 'b'), item(5, ST, H5))
     p = P.Promoter(g=g)
@@ -318,13 +317,23 @@ def test_a_held_merge_main_handoff_is_retried_without_a_new_main(tmp_path, monke
     monkeypatch.setattr(p, 'main_pass', lambda cols, moved, main: passes.append(main))
     monkeypatch.setattr(P.gatelock, 'gate_lock', lambda name: P._null())
     assert p.once() == 'promoted' and len(passes) == 1
-    flow.hold(5, H5, 'conflicts with main 11111111')  # recheck found no worker for #5
-    assert p.once() == 'idle' and len(passes) == 1  # within MAIN_RETRY
-    p.main_retry_at = 0
-    assert p.once() == 'promoted' and len(passes) == 2  # retried, main unchanged
-    flow.hold(5, 'f' * 40, 'conflicts with main 11111111')  # a new head: not this handoff
-    p.main_retry_at = 0
-    assert p.main_retry_due(P.read_columns(g['gql'], max_age=0)) == []
+    assert p.once() == 'idle' and len(passes) == 1
+    assert not hasattr(p, 'main_retry_due')
+
+
+def test_the_daemon_start_clears_the_retired_held_file(tmp_path, monkeypatch):
+    """tangentswarm #101: held.json is retired. The daemon deletes it once at start and names
+    the PRs it held; the next passes find each conflict again."""
+    import json
+    from tangentswarm import flow
+    flow.HELD.write_text(json.dumps({'516': {'head': 'h' * 40, 'why': 'conflicts'}, '7': {}}))
+    said = []
+    monkeypatch.setattr(P, 'say', said.append)
+    monkeypatch.setattr(P, 'Promoter', lambda dry_run=False: type('X', (), {'once': lambda self: 'idle'})())
+    assert P.main(['--once']) == 0
+    assert not flow.HELD.exists()
+    assert any(l.startswith('parking retired: cleared held.json (#7, #516)') for l in said)
+    assert flow.clear_held() == []  # no file: nothing to do
 
 
 def test_main_sha_reads_ls_remote_and_survives_errors(tmp_path):

@@ -16,8 +16,8 @@ grows) and:
          prevents overlap; its 5-minute timer stays as a slow backstop.
 
 For the platform repo only (swarm-webhook queues the other repos' MinBot checks itself):
-  pull_request edited (a body edit, such as added screenshots) on a PR whose pull waits or
-  is held -> a cascade pass now (re-runs its gate), and the MinBot check.
+  pull_request edited (a body edit, such as added screenshots) on a PR whose pull waits
+  -> a cascade pass now (re-runs its gate), and the MinBot check.
   a Codex review, or a Codex comment on a PR (a review summary, a receipt)
       -> queue `swarm-advance --minbot N` for the daemon's drain: a PR in Auto Review that
          Codex just cleared gets the MinBot check at once (it does nothing for a PR outside
@@ -253,11 +253,11 @@ class Events:
         return lines
 
     def queue_gate(self, n, why):
-        """A body edit on a PR whose pull waits (SCREENSHOTS_NEEDED) or is held (NEEDS_WORKER):
-        a cascade pass re-runs its gate now (MethBot 2026-11-15: #519 got its images at 2:48
-        AM ET, and nothing re-ran the gate for 35 min)."""
+        """A body edit on a PR whose pull waits (SCREENSHOTS_NEEDED): a cascade pass re-runs
+        its gate now (MethBot 2026-11-15: #519 got its images at 2:48 AM ET, and nothing
+        re-ran the gate for 35 min). There are no held PRs any more (tangentswarm #101)."""
         from . import advance, flow
-        if n not in flow.pulled_prs() and n not in flow.held():
+        if n not in flow.pulled_prs():
             return None
         if self.dry:
             return f"{why}: would queue a cascade pass"

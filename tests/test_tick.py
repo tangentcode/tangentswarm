@@ -369,3 +369,19 @@ def test_state_writers_in_several_processes_keep_every_once_key(tmp_path):
     stale.data['screens']['%1'] = {'key': 'x'}
     stale.save()  # its stale copy must not erase the 80 keys
     assert len(tick.State(path).data['done']) == 80 and tick.State(path).data['screens'] == {'%1': {'key': 'x'}}
+
+
+def test_an_in_progress_pr_that_waits_for_a_claude_is_not_flagged(monkeypatch, tmp_path):
+    """tangentswarm #101: a conflicting PR waits in In Progress for a Claude (a queued revive
+    or an unstarted start). The In Progress board check accepts it; any other PR with no
+    Claude is still flagged."""
+    from tangentswarm import slots
+    monkeypatch.setattr(tick, 'PARK_REGISTRY', tmp_path / 'swarm-parked.tsv')
+    notes = []
+    t = tick.Tick.__new__(tick.Tick)
+    t.note = lambda n, pane, reason: notes.append((n, reason))
+    slots.queue_revive(7, 'Coordinator: #7 merge main')
+    slots.unstarted_add(8, branch='b8', brief='/tmp/relay-8.md')
+    for n in (7, 8, 9):
+        t.no_claude(n, dict(col='In Progress', head='h' * 40), [])
+    assert [n for n, _ in notes] == [9] and 'no Claude working on it' in notes[0][1]

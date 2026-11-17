@@ -66,6 +66,9 @@ These do not cause a finding:
 - An Active issue with no pull request while its launch is in flight (the watchdog's
   `launching_issues`: launching, unstarted, or named in the last 10 minutes).
 - An In Progress pull request whose Claude is starting now (an `unstarted` record).
+- An In Progress pull request that waits for a Claude (#101): a conflicting pull request
+  goes to In Progress at once, and its feedback waits in the revive queue (`queued`) or in
+  an `unstarted` record until a worker slot or memory frees.
 - A finding that goes away before its grace ends.
 
 The snapshot has open items only. So the check does not see closed issues in Triage or
