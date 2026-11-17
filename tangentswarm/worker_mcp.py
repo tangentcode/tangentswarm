@@ -186,9 +186,13 @@ def status(wt=None, g=None, checks_of=checks):
                     'passed': len([1 for _, b in cis if b == 'pass'])})
 
 
-def do_handoff(wt=None, transcript=None):
-    """With transcript (the pane watcher's recovered Stop hook), the hook's question check runs
-    first: a question, partial scope or a pending decision goes to Needs Input, never ready."""
+def do_handoff(wt=None, transcript=None, g=None, run=None):
+    """The worker says it is done (the handoff tool, the pane watcher). With transcript (the
+    pane watcher's recovered Stop hook), the hook's question check runs first: a question,
+    partial scope or a pending decision goes to Needs Input, never ready. The handoff is
+    forced (tangentswarm #120): a head handed off before, sent back by a Codex finding the
+    worker found already fixed, is marked ready, moved to Auto Review and reviewed again.
+    'done' is True only when that happened (or the question went to Needs Input)."""
     from . import stophook
     wt = wt or worktree()
     repo = project6_repo(wt)
@@ -197,10 +201,9 @@ def do_handoff(wt=None, transcript=None):
     branch, head = stophook.pushed_head(wt)
     if not branch or len(head) != 40:
         return {'done': False, 'why': f"not finished: {head}"}
-    if stophook.seen(f"{branch}@{head}"):
-        return {'done': True, 'why': f"head {head[:8]} was already handed off"}
-    line = stophook.run(wt, g=gate(), transcript=transcript)
-    return {'done': line is not None, 'log': line}
+    outcome = {}
+    line = (run or stophook.run)(wt, g=g or gate(), transcript=transcript, force=True, outcome=outcome)
+    return {'done': bool(outcome.get('state')), 'state': outcome.get('state'), 'head': head, 'log': line}
 
 
 def do_request_review(wt=None, sh=None):

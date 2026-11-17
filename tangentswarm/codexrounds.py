@@ -127,11 +127,25 @@ def errored_after(full, t):
     return False
 
 
-def decide(full, last, now, wait=ASK_WAIT):
+def answered_after(full, t):
+    """True when Codex posted a review or a comment after time t."""
+    for kind, at in (('reviews', 'submittedAt'), ('comments', 'createdAt')):
+        for c in ((full.get(kind) or {}).get('nodes')) or []:
+            if _login(c).startswith(CODEX) and (_ts(c.get(at)) or 0) > t:
+                return True
+    return False
+
+
+def decide(full, last, now, wait=ASK_WAIT, again=False):
     """(kind, why) for an ask on full's head; last is the time of the latest earlier ask
-    for the head, or None. kind: 'ask' (first ask), 'retry' or 'skip'. Pure."""
+    for the head, or None. kind: 'ask' (first ask), 'retry' or 'skip'. again: ask even when
+    Codex answered the head, unless an ask of it is still pending (tangentswarm #120). Pure."""
     if answered(full):
-        return 'skip', 'Codex already answered this head'
+        if not again or running(full):
+            return 'skip', 'Codex already answered this head'
+        if last is not None and now - last < wait and not answered_after(full, last):
+            return 'skip', f"an ask for this head is {int((now - last) // 60)} min old and still pending"
+        return 'retry', 'the worker says this head is done: ask Codex again'
     if running(full):
         return 'skip', 'a Codex review of this head is running'
     if last is None:
@@ -188,12 +202,13 @@ class _lock:
 
 
 def ask(n, head, by, full, repo=REPO, sh=None, state=None, store=None, now=None, dry=False, wait=ASK_WAIT,
-        retry_only=False):
+        retry_only=False, again=False):
     """The one way to post "@codex review" (tangentswarm #63). full is the PR read (head,
     commits, comments, reviews). Under the lock: read the earlier asks, decide(), and on
     'ask' or 'retry' post, mark the once-key and log the row with the head. A dry run
     decides only. retry_only: never a first ask (a Codex reply can only lead to a retry).
-    Returns {'posted', 'kind', 'why', 'round'}."""
+    again: the worker says this head is done although Codex already answered it (a finding
+    it found already fixed, tangentswarm #120): ask once more. Returns {'posted', 'kind', 'why', 'round'}."""
     from . import tick
     if full.get('headRefOid') and full['headRefOid'] != head:
         return {'posted': False, 'kind': 'skip', 'why': f"the PR head is {full['headRefOid'][:8]}, not {head[:8]}",
@@ -209,7 +224,7 @@ def ask(n, head, by, full, repo=REPO, sh=None, state=None, store=None, now=None,
         logged = asks_logged(n, head, repo, store)
         t = None if logged else _state_time(state, key)  # the key alone: an ask before #63
         times = logged + asks_on_github(full) + ([t] if t is not None else [])
-        kind, why = decide(full, max(times) if times else None, now, wait)
+        kind, why = decide(full, max(times) if times else None, now, wait, again=again)
         if retry_only and kind == 'ask':
             kind, why = 'skip', 'no earlier ask for this head to retry'
         if kind == 'skip' or dry:

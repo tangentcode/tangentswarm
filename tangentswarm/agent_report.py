@@ -225,7 +225,7 @@ class Reporter:
         if self._handoff:
             return self._handoff(wt)
         from . import stophook
-        return stophook.run(wt, g=self.g, sh=self.sh)
+        return stophook.run(wt, g=self.g, sh=self.sh, force=True)  # tangentswarm #120: done even with no new push
 
     def tell(self, pr, text):
         try:

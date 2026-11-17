@@ -224,3 +224,18 @@ def test_the_webhook_does_not_retry_on_a_stopped_card():
     ex = Fake(col=board.AUTO_REVIEW, full=dict(full(comments=[err]), state='CLOSED'))
     ex.run(W.Action('codex', 9, 'Codex comment (summary or receipt)'))
     assert not any('@codex review' in c for c in ex.calls) and rows(CR.RETRY) == []
+
+
+def test_again_asks_once_more_on_a_head_codex_already_answered():
+    """tangentswarm #120: the worker says the head is done (a finding it found already fixed):
+    one more ask, a retry of the head; a second one waits for the answer."""
+    t0 = time.time()
+    answer = {'author': CODEX, 'body': f'Codex Review: Reviewed commit `{H[:10]}`', 'createdAt': iso(t0 - 600)}
+    pr = full(comments=[answer], committed=t0 - 900)
+    assert ask(pr, now=t0)[0]['why'] == 'Codex already answered this head'  # not forced: skipped
+    res, calls = ask(pr, now=t0, again=True)
+    assert res['posted'] and res['kind'] == 'retry' and calls == [ASK]
+    res, calls = ask(pr, now=t0 + 60, again=True)
+    assert not res['posted'] and 'still pending' in res['why'] and calls == []
+    later = full(comments=[answer, dict(answer, createdAt=iso(t0 + 120))], committed=t0 - 900)
+    assert ask(later, now=t0 + 180, again=True)[0]['posted']  # Codex answered the re-ask

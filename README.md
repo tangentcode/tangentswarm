@@ -1070,7 +1070,12 @@ did not change for a minute has finished or stopped. It then acts on a worker pa
 - unsent text in the prompt: Enter
 - idle with the work handed off, or the card in Needs Input: `/exit`; the window stays
 - idle, clean and pushed, but the card is still In Progress or the PR is a draft: the
-  handoff the Stop hook missed, through the spool
+  watcher runs the handoff itself, right then (tangentswarm #120): it marks the PR ready,
+  moves the card to Auto Review and asks Codex, also for a head that was handed off before
+  (a finding the worker found already fixed). A handoff that does not finish in
+  `SWARM_HANDOFF_WAIT` s goes to swarmbot once, with an incident
+- idle with uncommitted files or unpushed commits: one nudge, and swarmbot is told once,
+  with an incident; the card is not moved
 - a question in the pane: queued as a needs-input report (a worker never asks in its pane)
 - a menu, a frozen busy screen, or a trust dialog that stays: swarmbot diagnoses
 

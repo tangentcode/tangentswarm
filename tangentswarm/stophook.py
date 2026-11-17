@@ -244,8 +244,16 @@ def tell_worker(n, text):
 
 
 def run(cwd, g=None, dry=False, out=None, sh=None, sleep=time.sleep, merges=merges_onto_main, minbot=minbot_check,
-        transcript=None, procs=None, tell=None):
-    """The handoff for one worktree. Returns the logged line, or None when nothing was due."""
+        transcript=None, procs=None, tell=None, force=False, outcome=None):
+    """The handoff for one worktree. Returns the logged line, or None when nothing was due.
+
+    force (tangentswarm #120): a worker that says it is done (report_status done, the handoff
+    tool) or the pane watcher that finds it idle with a clean, pushed head: the head may have
+    been handed off before (a Codex finding sent it back and the worker changed nothing), so
+    the once-per-head key and the open Codex findings on the head do not stop it: the PR is
+    marked ready, the card goes to Auto Review and Codex is asked again. outcome: a dict that
+    gets 'state': 'handed' (ready, Auto Review, Codex asked or clean) or 'question' (the
+    transcript asks; Needs Input)."""
     from . import slots, tick, workerprocs
     sh = sh or (lambda argv: tick.sh(argv, check=True))
     procs = procs or workerprocs.leftovers
@@ -258,7 +266,8 @@ def run(cwd, g=None, dry=False, out=None, sh=None, sleep=time.sleep, merges=merg
     lines = _LINES.get()
     try:
         with branch_lock(cwd):  # platform #541: two hook runs for one PR must never race
-            return _run(cwd, g, dry, out, sh, sleep, merges, minbot, transcript, procs, tell)
+            return _run(cwd, g, dry, out, sh, sleep, merges, minbot, transcript, procs, tell, force,
+                        outcome if outcome is not None else {})
     except Exception as e:
         error = f'{type(e).__name__}: {str(e)[:300]}'
         raise
@@ -287,17 +296,18 @@ def branch_lock(cwd):
     return held()
 
 
-def _run(cwd, g, dry, out, sh, sleep, merges, minbot, transcript, procs, tell):
+def _run(cwd, g, dry, out, sh, sleep, merges, minbot, transcript, procs, tell, force, outcome):
     from . import tick, workerprocs
     branch, head = pushed_head(cwd)
     if branch and transcript:  # a question for Michal goes first, whatever the head
         asked = needs_input(cwd, branch, transcript, g=g, dry=dry, out=out, sh=sh)
         if asked:
+            outcome['state'] = 'question'
             return asked
     if branch is None or len(head) != 40:
         return say(f"{cwd.name}: not finished: {head}", out) if branch else None
     key = f"{branch}@{head}"
-    if seen(key):
+    if seen(key) and not force:
         return None
     mark_seen = (lambda k: None) if dry else _mark_seen  # a dry run records nothing
     g = g if g is not None else hr_gate()
@@ -329,7 +339,7 @@ def _run(cwd, g, dry, out, sh, sleep, merges, minbot, transcript, procs, tell):
                    "left to swarm-tick", out)
     status, detail = tick.codex_status(full)
     pushed_after = status == 'findings' and not tick.codex_reviewed_head(full)
-    if status == 'findings' and not pushed_after:
+    if status == 'findings' and not pushed_after and not force:
         mark_seen(key)
         return say(f"#{n} head {head[:7]} pushed; Codex findings are open on this head ({detail}): "
                    "left to mn-workflow", out)
@@ -350,7 +360,7 @@ def _run(cwd, g, dry, out, sh, sleep, merges, minbot, transcript, procs, tell):
         line = f"#{n} head {head[:7]} is already Codex-clean. {what[0].upper() + what[1:]}: {last}"
     else:
         from . import codexrounds  # tangentswarm #63: the one guarded poster
-        res = codexrounds.ask(n, head, 'stop-hook', full, sh=sh, dry=dry)
+        res = codexrounds.ask(n, head, 'stop-hook', full, sh=sh, dry=dry, again=force)
         if res['kind'] != 'skip':
             did.append('posted "@codex review"')
         if col == board.IN_PROGRESS:
@@ -359,12 +369,14 @@ def _run(cwd, g, dry, out, sh, sleep, merges, minbot, transcript, procs, tell):
             did.append('moved the card to Auto Review')
         if not did:
             mark_seen(key)
+            outcome['state'] = 'handed'
             return say(f"#{n} head {head[:7]} pushed; already ready, in Auto Review and asked for a Codex review", out)
         what = ', '.join(did[:-1]) + (', and ' if len(did) > 1 else '') + did[-1]
         line = f"#{n} head {head[:7]} pushed. {what[0].upper() + what[1:]}." + (
             f" (Codex threads from an older head are open: {detail}; Codex re-reviews this head)"
             if pushed_after else '')
     mark_seen(key)
+    outcome['state'] = 'handed'
     return say(line + (' (dry run)' if dry else ''), out)
 
 
