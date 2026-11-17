@@ -334,3 +334,64 @@ def test_the_priority_site_of_a_pull_comes_from_its_milestone_in_the_cache(monke
     assert A.priority_host(9, gql) == 'minavo.example'
     assert A.priority_host(10, gql) == 'work.example'
     assert A.priority_host(11, None) == 'work.example'
+
+
+# -- Codex on PR #117 ------------------------------------------------------------------------------
+
+@pytest.mark.parametrize('found', [dict(headRefOid='9' * 40, isDraft=False), dict(headRefOid=H5, isDraft=True)])
+def test_a_pr_that_confirm_sends_back_is_not_picked_again_and_the_next_one_moves(tmp_path, monkeypatch, found):
+    """Codex on PR #117 (P2): confirm() writes what GitHub said into the cache. The next pass
+    refuses #5 (a new head has no gate pass; a draft is refused) and moves #8 instead. Covers
+    a moved head and a same-head draft."""
+    monkeypatch.setattr(P, 'HR_TARGET', 2)
+    nodes = [node(1, HR, 'a' * 40), node(5, ST, H5), node(8, ST, H8)]
+    g = G(tmp_path)
+    reads = []
+
+    def gql(q, **v):
+        if 'projectV2' in q:
+            reads.append(q)
+            return boardfake.answer(nodes)
+        g.order.append('gql')
+        return {'repository': {'p5': dict(number=5, state='OPEN', **found),
+                               'p8': dict(number=8, state='OPEN', isDraft=False, headRefOid=H8)}}
+    g['gql'] = gql
+    g['OPT'] = {HR: 'x', ST: 'y'}
+    p = P.Promoter(g=g)
+    one = lambda: {k: v[:1] if k == ST else v for k, v in P.read_columns(gql).items()}  # noqa: E731
+    assert p.fast_path(one(), reread=one) == [5]
+    assert g.moves == [('I5', HR), ('I5', ST)]
+    assert p.fast_path(P.read_columns(gql), reread=lambda: P.read_columns(gql)) == [8]
+    assert g.moves[2:] == [('I8', HR)]
+    assert p.left and p.left[0][0] == 5 and len(reads) == 1  # no board read: the cache
+    if found['isDraft']:  # ready again: the event clears it and #5 may move
+        B.apply_event('pull_request', pr_event('ready_for_review', 5))
+        assert [q['number'] for q in P.read_columns(gql)[ST] if not q['draft']] == [5]
+
+
+def test_a_draft_in_the_cache_is_never_moved(tmp_path):
+    g = G(tmp_path)
+    cols = {HR: [], ST: [dict(number=5, head=H5, item='I5', draft=True)]}
+    p = P.Promoter(g=g)
+    assert p.fast_path(cols, reread=lambda: cols) == [] and p.left == [(5, H5, 'is a draft')]
+
+
+@pytest.mark.parametrize('changes,reads', [
+    ({'body': {'from': 'old'}}, 2),           # "Fixes #N" may have changed: read the board
+    ({'base': {'ref': {'from': 'x'}}}, 2),    # the base is not in the cache either
+    (None, 2),                                # no changes field: be safe
+    ({'title': {'from': 'old'}}, 1),          # a title-only edit: the cache follows it
+])
+def test_a_body_edit_makes_the_next_read_take_the_board(changes, reads):
+    """Codex on PR #117 (P2): closingIssuesReferences (and the labels and milestones it
+    brings) come from the body; the cache cannot derive them."""
+    gql, calls = counting([node(5, ST, H5)])
+    B.snapshot(gql)
+    e = pr_event('edited', 5, body='Fixes #9', title='t2')
+    if changes is not None:
+        e['changes'] = changes
+    B.apply_event('pull_request', e)
+    snap = B.snapshot(gql)
+    assert len(calls) == reads
+    if reads == 1:
+        assert next(c for _, c in B.open_prs(snap))['title'] == 't2'

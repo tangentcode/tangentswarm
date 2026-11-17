@@ -298,6 +298,12 @@ def ops_for(event, p):
             put['labels'] = _labels([x.get('name') for x in pr.get('labels') or [] if x.get('name')])
         elif action == 'edited':
             put.update(body=pr.get('body') or '', title=pr.get('title') or '')
+            ch = p.get('changes')
+            if not isinstance(ch, dict) or set(ch) - {'title'}:
+                # Codex on PR #117: a body edit can add or drop "Fixes #N", and the cache cannot
+                # derive closingIssuesReferences (and its labels and milestones) from the body.
+                # A base change is not in the cache either. Only a title-only edit is followed.
+                return [{'op': 'pr', 'number': n, 'set': put}, {'op': 'dirty'}]
         return [{'op': 'pr', 'number': n, 'set': put}] if put else []
     if event == 'issues':
         i = p.get('issue') or {}

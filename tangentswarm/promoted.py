@@ -91,7 +91,8 @@ def read_board(gql, max_age=None):
         names = boardcache.pr_labels(c)  # tangentswarm #65: the promote order sees every fast-track label
         cols.setdefault(col, []).append(dict(number=c['number'], head=c['headRefOid'], item=it['id'],
                                              closes=[i['number'] for i in closes], due=due, milestone=ms,
-                                             labels=names, own_labels=_names(c), ft=board.is_fast_track(names)))
+                                             labels=names, own_labels=_names(c), ft=board.is_fast_track(names),
+                                             draft=bool(c.get('isDraft'))))
     for it, c in boardcache.open_issues(snap):
         ft.append(dict(number=c['number'], kind='Issue', state='OPEN', col=boardcache.col(it),
                        labels=_names(c), closes=[]))
@@ -425,6 +426,8 @@ class Promoter:
         n, head = p['number'], p['head'] or ''
         if (f'#{n}', head[:8]) not in gated:
             return f'head {head[:8]} has no gate pass'
+        if p.get('draft'):  # the cache follows converted_to_draft, and confirm() writes what it found
+            return 'is a draft'
         return None
 
     def fast_path(self, cols, reread=None):
@@ -506,7 +509,12 @@ class Promoter:
                    else 'is a draft' if d.get('isDraft') else None)
             if not why:
                 continue
-            from . import moves
+            from . import boardcache, moves
+            # Codex on PR #117: the cache gets what GitHub said, so the next pass does not
+            # pick the same PR again (a new head has no gate pass; a draft is refused). A
+            # ready_for_review or synchronize event clears it the usual way.
+            boardcache.patch({'op': 'pr', 'number': n,
+                              'set': {'headRefOid': d.get('headRefOid'), 'isDraft': bool(d.get('isDraft'))}})
             try:
                 board.move_card(self.g, p['item'], board.STAGING, n=n)
             except Exception as e:
