@@ -143,7 +143,9 @@ def test_a_conflicting_next_pr_blocks_the_pull_until_its_worker_resolves_the_vn(
     assert len(sent) == 1
 
 
-def test_a_clean_pr_is_pre_merged_mechanically_and_rebuilt_as_v2_when_future_main_changes(world):
+def test_a_clean_pr_is_pre_merged_mechanically_and_kept_when_future_main_changes(world):
+    """tangentswarm #69: an existing -vN that still merges cleanly onto a changed future main
+    is kept: no new -vN, no new remote branch. A pull puts future main + that tip in work."""
     w, s, h, origin = world
     f, sent = make(world)
     p9 = card(9, RD, h['z'], ['pre-merging'])
@@ -158,10 +160,129 @@ def test_a_clean_pr_is_pre_merged_mechanically_and_rebuilt_as_v2_when_future_mai
     cols[ST] = [card(2, ST, h['st2'], ['merge-ready'])]  # the queue changed: future main changed
     f2, _ = make(world)
     tips = f2.premerge(cols, s)
+    assert tips == {9: v1} and remote(s, origin, 'b9-v2') is None  # v1 still merges: kept
+    assert flow.load_premerge()['9']['vbranch'] == 'b9-v1'
+    assert any(d.startswith('did: #9 keeps b9-v1') for d in f2.did)
+    f3, _ = make(world)
+    f3.premerge(cols, s)
+    assert not any('keeps' in d for d in f3.did)  # checked once per future main
+    batch = f3.pull_batch({}, cols, s, room=1)
+    assert [p['number'] for p in batch] == [9] and flow.load_pulls()[0]['tip'] == v1
+    work = remote(s, origin, 'work')
+    # work's tree = future main (with #2) + #9, not v1's tree alone
+    assert [run(w, 'show', f'{work}:{x}') for x in ('b.txt', 's.txt', 'z.txt')] == ['hr1', 's', 'z']
+
+
+def test_the_step_pull_of_a_kept_vn_puts_future_main_and_the_tip_in_work(world):
+    """tangentswarm #69, the same class in swarm-flow step (Flow.pull): a kept -vN is built
+    on an older future main, so work gets future main + the tip, never the tip's tree alone."""
+    w, s, h, origin = world
+    f, _ = make(world)
+    f.premerge({HR: [card(1, HR, h['hr1'])], RD: [card(9, RD, h['z'])]}, s)
+    v1 = remote(s, origin, 'b9-v1')
+    f2, _ = make(world)
+    f2.fail = lambda *a, **k: pytest.fail('no relay')
+    cols = {HR: [card(1, HR, h['hr1'])], ST: [card(2, ST, h['st2'])], RD: [card(9, RD, h['z'])]}
+    assert f2.pull({}, cols, s, limit=5)['number'] == 9
+    assert flow.load_pulls()[0]['tip'] == v1 and remote(s, origin, 'b9-v2') is None
+    work = remote(s, origin, 'work')
+    assert [run(w, 'show', f'{work}:{x}') for x in ('b.txt', 's.txt', 'z.txt')] == ['hr1', 's', 'z']
+
+
+def test_a_vn_built_on_a_pr_that_left_the_queue_is_rebuilt_as_v2(world):
+    """The -vN carries #1 (Human Review); #1 is sent back, so the tip is not kept: a new -vN
+    on the new future main, without #1."""
+    w, s, h, origin = world
+    f, _ = make(world)
+    cols = {HR: [card(1, HR, h['hr1'])], RD: [card(9, RD, h['z'])]}
+    v1 = f.premerge(cols, s)[9]
+    f2, _ = make(world)
+    tips = f2.premerge({ST: [card(2, ST, h['st2'])], RD: [card(9, RD, h['z'])]}, s)
     v2 = remote(s, origin, 'b9-v2')
-    assert v2 and tips == {9: v2}
-    for c in (h['hr1'], h['st2'], h['z']):
-        assert subprocess.run(['git', '--git-dir', s.dir, 'merge-base', '--is-ancestor', c, v2]).returncode == 0
+    assert v2 and tips == {9: v2} and v2 != v1
+    assert subprocess.run(['git', '--git-dir', s.dir, 'merge-base', '--is-ancestor', h['hr1'], v2]).returncode != 0
+    assert subprocess.run(['git', '--git-dir', s.dir, 'merge-base', '--is-ancestor', h['st2'], v2]).returncode == 0
+
+
+def test_unchanged_pr_head_pairs_across_two_passes_build_no_new_vn(world):
+    """tangentswarm #69: two passes with the same (PR, head) pairs, in any column order, build
+    no new -vN."""
+    w, s, h, origin = world
+    cols = {HR: [card(1, HR, h['hr1'])], ST: [card(2, ST, h['st2'])], RD: [card(9, RD, h['z'])]}
+    f, _ = make(world)
+    v1 = f.premerge(cols, s)[9]
+    cols2 = {HR: [card(1, HR, h['hr1'])], ST: [card(2, ST, h['st2'])], RD: [card(9, RD, h['z'])]}
+    f2, _ = make(world)
+    assert f2.premerge(cols2, s) == {9: v1}
+    assert remote(s, origin, 'b9-v2') is None and not any('pre-merged onto' in d for d in f2.did)
+
+
+def test_a_pulled_fast_track_pr_keeps_its_future_main_place_until_staging(world):
+    """tangentswarm #69 (platform #518 -v4, -v5, -v6): a fast-track PR in flight sorts with
+    Staging by pick_key, so its card reaching Staging does not change future main."""
+    w, s, h, origin = world
+    run(w, 'checkout', '-q', '-b', 'ft', h['main'])
+    (w / 'f.txt').write_text('f\n')
+    run(w, 'add', '.')
+    run(w, 'commit', '-qm', 'fast-track PR')
+    ft = run(w, 'rev-parse', 'HEAD')
+    pulled = card(15, RD, ft, ['fast-track'])
+    cols = {HR: [card(1, HR, h['hr1'])], ST: [card(2, ST, h['st2'])], RD: [pulled, card(9, RD, h['z'])]}
+    flow.save_pulls([flow.pull_record(pulled, tip=ft, work='w' * 40, started=0)])
+    f, _ = make(world)
+    before = f.future_main(s, cols)
+    assert before[0].split()[1:] == [f"#1@{h['hr1'][:12]}", f"#15@{ft[:12]}", f"#2@{h['st2'][:12]}"]
+    # the record alone (no card in the columns) gives the same place
+    f, _ = make(world)
+    assert f.future_main(s, {HR: cols[HR], ST: cols[ST], RD: [card(9, RD, h['z'])]})[0] == before[0]
+    # the card lands in Staging and the pull ends
+    flow.save_pulls([])
+    f, _ = make(world)
+    after = f.future_main(s, {HR: cols[HR], ST: [card(2, ST, h['st2']), card(15, ST, ft, ['fast-track'])],
+                              RD: [card(9, RD, h['z'])]})
+    assert after[0] == before[0] and after[1] is not None
+    # and #9's -vN, built while #15 was in flight, is the one used after it reached Staging
+    f, _ = make(world)
+    flow.save_pulls([flow.pull_record(pulled, tip=ft, work='w' * 40, started=0)])
+    v1 = f.premerge(cols, s)[9]
+    flow.save_pulls([])
+    f, _ = make(world)
+    cols3 = {HR: cols[HR], ST: [card(2, ST, h['st2']), card(15, ST, ft, ['fast-track'])], RD: [card(9, RD, h['z'])]}
+    assert f.premerge(cols3, s) == {9: v1} and remote(s, origin, 'b9-v2') is None
+    assert not any('#9' in d for d in f.did if 'label' not in d)
+
+
+def test_a_pre_merge_after_a_pull_in_the_same_pass_uses_the_queue_with_the_pull(world):
+    """tangentswarm #69 (platform #518 -v4): the pass pulls #9; the pre-merge of #11 later in
+    that pass is built on future main WITH #9, so the next pass keeps it."""
+    w, s, h, origin = world
+    run(w, 'checkout', '-q', '-b', 'e', h['main'])
+    (w / 'e.txt').write_text('e\n')
+    run(w, 'add', '.')
+    run(w, 'commit', '-qm', 'PR E')
+    e = run(w, 'rev-parse', 'HEAD')
+    cols = {HR: [card(1, HR, h['hr1'])], RD: [card(9, RD, h['z']), card(11, RD, e)]}
+    f, _ = make(world)
+    assert [p['number'] for p in f.pull_batch({}, cols, s, room=1)] == [9]
+    tips = f.premerge(cols, s)
+    assert list(tips) == [11]
+    v11 = remote(s, origin, 'b11-v1')
+    assert tips[11] == v11
+    assert subprocess.run(['git', '--git-dir', s.dir, 'merge-base', '--is-ancestor', h['z'], v11]).returncode == 0
+    f2, _ = make(world)
+    assert f2.premerge(cols, s) == {11: v11} and remote(s, origin, 'b11-v2') is None
+    assert not any('keeps' in d or 'pre-merged onto' in d for d in f2.did)
+
+
+def test_a_dry_run_pre_merge_after_a_dry_pull_counts_the_pull(world):
+    """A dry run saves no pull; its pre-merge still sees the dry pull in future main."""
+    w, s, h, origin = world
+    cols = {HR: [card(1, HR, h['hr1'])], RD: [card(9, RD, h['z']), card(11, RD, h['st2'])]}
+    f, _ = make(world, dry=True)
+    assert [p['number'] for p in f.pull_batch({}, cols, s, room=1)] == [9]
+    assert flow.load_pulls() == []
+    f.premerge(cols, s)
+    assert any(d.startswith('would: #11 pre-merged onto future main') and '#9@' in d for d in f.did)
 
 
 def test_only_the_top_ready_prs_are_pre_merged(world, monkeypatch):

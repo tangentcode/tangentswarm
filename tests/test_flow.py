@@ -230,7 +230,7 @@ def test_pull_takes_only_the_next_ready_pr_in_the_pick_order(monkeypatch):
     f, g = make_flow(prs)
     asked = premerged(monkeypatch, f, {7: 'v7', 9: 'v9'})
     started = []
-    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False: started.append(p['number']))
+    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False, fm=None: started.append(p['number']))
     f.step()
     assert started == [] and asked == [8]
     assert '#8 is next in the pick order and is not merge-ready: nothing behind it is pulled' in f.notes
@@ -240,7 +240,7 @@ def test_pr_that_does_not_merge_onto_main_goes_back_with_a_relay(monkeypatch, tm
     f, g = make_flow(prs, dry=False, clean=lambda a, b: not (a == 'main' and b == prs[7]['head']))
     premerged(monkeypatch, f, {9: 'v9'})
     started = []
-    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False: started.append((p['number'], tip, pre_merged)))
+    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False, fm=None: started.append((p['number'], tip, pre_merged)))
     f.step()
     assert g.moves == [('I7', IP)] and started == [(9, 'v9', True)]
     assert 'merge origin/main' in (flow.RELAY_DIR / 'relay-7-merge-main.md').read_text()
@@ -329,7 +329,7 @@ def test_fast_track_goes_first_in_the_pick_order(monkeypatch):
     f, g = make_flow(prs)
     asked = premerged(monkeypatch, f, {7: 'v7', 8: 'v8'})
     started = []
-    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False: started.append((p['number'], tip)))
+    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False, fm=None: started.append((p['number'], tip)))
     f.step()
     assert started == [(8, 'v8')] and asked == [8]
 
@@ -373,7 +373,7 @@ def test_strict_pull_takes_only_the_next_pr_and_only_when_it_is_merge_ready(monk
     monkeypatch.setattr(f, 'future_main', lambda scratch, cols: ('key', 'fm', None))
     monkeypatch.setattr(f, 'premerge_one', lambda p, scratch, fm: seen.append(p['number']) or ready[p['number']])
     started = []
-    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False: started.append((p['number'], tip, pre_merged)) or True)
+    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False, fm=None: started.append((p['number'], tip, pre_merged)) or True)
     _, cols = f.columns()
     assert f.pull(prs, cols, g['ScratchRepo'](), limit=5, strict=True) is None
     assert seen == [9] and started == [] and g.moves == []
