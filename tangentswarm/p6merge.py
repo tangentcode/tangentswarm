@@ -30,7 +30,9 @@ failed step is reported and the rest go on):
 
 Any check fails: no merge, and one exception POST to MethBot's alert URL with the reasons,
 once per PR and head (alerts.tell_methbot 'exception'). The whole run holds the once-lock of
-the PR and head, so the done report and the comment cannot both merge.
+the PR and head, so the done report and the comment cannot both merge. A MethBot POST after
+the merge (the pull, a cleanup exception) that fails stays in a pending file of the PR and
+head; the next done report or MERGE-READY comment of that head sends it, with no new merge.
 """
 import os
 import re
@@ -228,7 +230,9 @@ class P6Merge:
         once = f"p6merge:{self.repo}#{self.n}@{self.head}"
         with alerts.once_lock(once):
             if alerts.done_now(st, once):
+                left = self.deliver([])  # Codex on PR #90: a POST that failed after the merge goes now
                 return {'merged': True, 'already': True, 'pr': self.n, 'repo': self.repo, 'head': self.head,
+                        'notes': self.notes, 'undelivered': left,
                         'why': f"{self.repo}#{self.n} at {self.head[:8]} was already merged by the swarm"}
             pr, why = self.verify()
             elsewhere = pr.get('state') == 'MERGED' and pr.get('headRefOid') == self.head
@@ -274,7 +278,7 @@ class P6Merge:
 
     def after_merge(self, pr):
         from . import eventdb
-        problems_ = []
+        problems_, notices = [], []
         for step in (self.cards, self.close_windows, self.cleanup_worktree):
             try:
                 step(pr)
@@ -284,13 +288,50 @@ class P6Merge:
                           notes=self.notes + problems_, detail={'head': self.head, 'trigger': self.trigger})
         for step in (self.deploy_note, self.pull):
             try:
-                step(pr)
+                notices += step(pr) or []
             except Exception as e:
                 problems_.append(f"{step.__name__}: {type(e).__name__}: {str(e)[:200]}")
         if problems_:
             self.notes += problems_
-            self.tell('exception', self.repo, self.n, head=self.head, key='cleanup',
-                      reason=f"{self.repo}#{self.n} merged at {self.head[:8]}, but: " + '; '.join(problems_))
+            notices.append({'kind': 'exception', 'key': 'cleanup',
+                            'reason': f"{self.repo}#{self.n} merged at {self.head[:8]}, but: " + '; '.join(problems_)})
+        self.deliver(notices)
+
+    # -- MethBot POSTs after the merge: kept until delivered (Codex on PR #90) -------------------
+    def pending_path(self):
+        import hashlib
+        key = hashlib.sha1(f"{self.repo}#{self.n}@{self.head}".encode()).hexdigest()[:20]
+        return Path(alerts.STATE).parent / 'p6merge-pending' / f"{key}.json"  # read at call time: tests move STATE
+
+    def deliver(self, new):
+        """Add the new notices ({kind, key, reason}) to this PR and head's pending file, then
+        POST each one. A delivered notice (or one MethBot already has) leaves the file; a
+        failed POST stays for the next done report or MERGE-READY comment of this head, which
+        never merges again. Returns the notices still pending."""
+        import json
+        path = self.pending_path()
+        with alerts.once_lock(f"p6merge-pending:{self.repo}#{self.n}@{self.head}"):
+            try:
+                pending = json.loads(path.read_text())
+            except (OSError, ValueError):
+                pending = []
+            pending += new
+            left = []
+            for x in pending:
+                sent = self.tell(x['kind'], self.repo, self.n, head=self.head, reason=x['reason'], key=x.get('key', ''))
+                if sent is True or sent == 'already sent':
+                    self.note(f"MethBot {x['kind']} sent")
+                else:
+                    left.append(x)
+                    self.note(f"MethBot {x['kind']} not sent: {sent}; it is sent again on the next report")
+            if left:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix('.tmp')
+                tmp.write_text(json.dumps(left))
+                os.replace(tmp, path)
+            else:
+                path.unlink(missing_ok=True)
+        return left
 
     # -- after the merge ----------------------------------------------------------------------
     def card(self, n):
@@ -395,11 +436,12 @@ class P6Merge:
             return
         why = (f"tangentcode/tangentswarm#{self.n} merged at {self.head[:8]}: a deploy is needed. "
                "Notify only: deploys need Michal's OK.")
-        self.note(self.wake(why, f"p6-deploy:{self.n}@{self.head}", self.n))
+        self.note(self.wake(why, f"p6-deploy:{self.n}@{self.head}", self.n))  # the wake queue retries a failed POST
 
     def pull(self, pr):
         """The Project 6 Backlog pull: free = LIVE_TARGET - live workers; the next free Backlog
-        issues in pick order go to MethBot in one 'pull' POST (once per merge)."""
+        issues in pick order go to MethBot in one 'pull' POST (once per merge). Returns the
+        notices to deliver."""
         b = board.for_repo(self.repo)
         live = (self._live or live_workers)()
         free = LIVE_TARGET - live
@@ -409,10 +451,10 @@ class P6Merge:
         if not picks:
             return self.note(f"Backlog pull: {live} live workers, Project 6 Backlog is empty")
         line = ', '.join(f"{i['repo']}#{i['number']}" for i in picks)
-        sent = self.tell('pull', self.repo, self.n, head=self.head,
-                         reason=f"Backlog pull after {self.repo}#{self.n} merged: {live} live Project 6 "
-                                  f"workers, target {LIVE_TARGET}; start in this order: {line}")
-        self.note(f"Backlog pull: {line} ({'sent to MethBot' if sent is True else sent})")
+        self.note(f"Backlog pull: {line}")
+        return [{'kind': 'pull', 'key': '',
+                 'reason': f"Backlog pull after {self.repo}#{self.n} merged: {live} live Project 6 workers, "
+                           f"target {LIVE_TARGET}; start in this order: {line}"}]
 
 
 def live_workers(panes=None, root=None):

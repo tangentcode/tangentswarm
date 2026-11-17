@@ -399,3 +399,47 @@ def test_the_executor_runs_the_merge_for_the_comment():
     ex = W.Executor(g={'gql': 'GQL'}, dry=True, p6merge=lambda *a, **k: pytest.fail('dry'))
     ex.run(W.classify('issue_comment', comment(TS, f'MERGE-READY {HEAD}'))[0])
     assert ex.done == [f'would verify and merge {TS}#90 at {HEAD[:8]}']
+
+
+# -- Codex on PR #90: a MethBot POST that fails after the merge is sent again ---------------
+
+def flaky(w, fail_kinds):
+    """A MethBot POST that fails for these kinds until fail_kinds is emptied."""
+    def tell(*a, **k):
+        if a[0] in fail_kinds:
+            return alerts.tell_methbot(*a, post=lambda p: False, **k)
+        return alerts.tell_methbot(*a, post=w.posts.append, **k)
+    return tell
+
+
+def run_with(w, tell, **extra):
+    kw = w.kw(**extra)
+    return M.run(TS, 90, HEAD, 'done', tell=tell, wake=lambda why, key, pr: 'woke', **kw)
+
+
+@pytest.mark.parametrize('remove, kinds', [
+    (None, ['pull']),  # the Backlog pull
+    (lambda repo, branch: (_ for _ in ()).throw(worktrees.WorktreeError('REFUSING: dirty')), ['pull', 'exception']),
+])
+def test_a_failed_post_after_the_merge_is_sent_on_the_next_report_with_no_new_merge(remove, kinds):
+    w = World([full()], remove=remove)
+    fail = set(kinds)
+    r = run_with(w, flaky(w, fail))
+    assert r['merged'] is True and w.posts == [] and len(w.merges()) == 1
+    assert any('not sent' in x for x in r['notes'])
+    again = run_with(w, flaky(w, fail))  # MethBot still down: kept again
+    assert again['already'] is True and len(again['undelivered']) == len(kinds) and w.posts == []
+    fail.clear()
+    again = run_with(w, flaky(w, fail))  # MethBot is back: each pending POST goes once
+    assert again['already'] is True and again['undelivered'] == []
+    assert sorted(p['kind'] for p in w.posts) == sorted(kinds) and len(w.merges()) == 1
+    run_with(w, flaky(w, fail))
+    assert len(w.posts) == len(kinds)  # nothing is sent twice
+    assert len(w.removed) == 1  # the cleanup itself never runs again
+
+
+def test_a_delivered_post_leaves_no_pending_file():
+    w = World([full()])
+    w.run()
+    p = M.P6Merge(TS, 90, HEAD, 'done').pending_path()
+    assert not p.exists() and [x['kind'] for x in w.posts] == ['pull']
