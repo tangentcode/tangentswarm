@@ -199,6 +199,82 @@ def test_a_merge_runs_the_cascade_and_closes_the_issues():
     assert any('tangentcode/other#17' in d for d in ex.done)
 
 
+def merged_payload(base='main', merged=True, n=540):
+    return {'action': 'closed', 'repository': REPO, 'pull_request': pr(n, base=base, merged=merged)}
+
+
+def test_a_merge_into_main_wakes_swarm_promoted_before_the_done_move_and_the_sweeps():
+    """tangentswarm #67 (a): SIGUSR1 to swarm-promoted is the FIRST thing a merge into main
+    does: before the cascade, the Done-card move and active-gate --sweep / --promote-missing."""
+    order = []
+    ex = Fake(col=board.HUMAN_REVIEW, full={'closingIssuesReferences': {'nodes': []}})
+    ex.signal_promoted = lambda: order.append('signal') or 'woken (test)'
+    ex.cascade_fn = lambda: order.append('cascade') or 'queued'
+    ex.sh = lambda argv: order.append(argv) or '[]'
+    W.handle('pull_request', merged_payload(), ex=ex)
+    assert order[0] == 'signal' and order.count('signal') == 1
+    done = next(i for i, c in enumerate(order) if isinstance(c, list) and c[-1] == board.OPTION[board.DONE])
+    sweep = next(i for i, c in enumerate(order) if isinstance(c, list) and c[1:] == ['--sweep', '--demote'])
+    missing = next(i for i, c in enumerate(order) if isinstance(c, list) and c[1:] == ['--promote-missing'])
+    assert 0 < order.index('cascade') < done < sweep < missing
+    assert any('swarm-promoted woken' in d for d in ex.done)
+    assert W.PROMOTED_WOKEN == []  # the injected signal ran, never the module default
+
+
+@pytest.mark.parametrize('payload', [merged_payload(merged=False), merged_payload(base='deploy')])
+def test_an_unmerged_close_or_a_merge_into_another_base_sends_no_signal(payload):
+    """tangentswarm #67 (a): only a merge into main takes the new wake path."""
+    woken = []
+    ex = Fake(col=board.HUMAN_REVIEW)
+    ex.signal_promoted = lambda: woken.append(1) or 'woken (test)'
+    W.handle('pull_request', payload, ex=ex)
+    assert woken == [] and W.PROMOTED_WOKEN == []
+
+
+def test_a_dry_run_or_another_repo_merge_sends_no_signal():
+    woken = []
+    ex = Fake(col=board.HUMAN_REVIEW, full={'closingIssuesReferences': {'nodes': []}})
+    ex.dry = True
+    ex.signal_promoted = lambda: woken.append(1) or 'woken (test)'
+    ex.run(W.Action('merged', 540))
+    assert woken == [] and 'would send SIGUSR1 to swarm-promoted' in ex.done
+    ex = Fake(col=board.HUMAN_REVIEW, full={'closingIssuesReferences': {'nodes': []}})
+    ex.signal_promoted = lambda: woken.append(1) or 'woken (test)'
+    ex.run(W.Action('merged', 3, args={'repo': 'tangentcode/tangentswarm'}))
+    assert woken == []  # swarm-promoted refills Project 4 only
+
+
+def test_a_failed_signal_never_stops_the_merge_handling():
+    ex = Fake(col=board.HUMAN_REVIEW, full={'closingIssuesReferences': {'nodes': []}})
+    ex.signal_promoted = lambda: (_ for _ in ()).throw(OSError('no such process'))
+    ex.run(W.Action('merged', 540))
+    assert ex.errors == [] and ex.cascades == [1]
+    assert any('not woken: OSError: no such process' in d for d in ex.done)
+
+
+def test_signal_promoted_sends_sigusr1_only_to_a_pid_that_catches_it(tmp_path):
+    """The default action of SIGUSR1 ends a process: no MainPID, or a pid with no handler
+    (the daemon before its run() loop, a reused pid), is never sent it. Never a real signal here."""
+    import signal
+    real = W.REAL_SIGNAL_PROMOTED  # conftest stubs W.signal_promoted
+    sent = []
+    proc = tmp_path / 'proc'
+    (proc / '41').mkdir(parents=True)
+    (proc / '41' / 'status').write_text('Name:\tpython\nSigCgt:\t0000000000000200\n')  # bit 10: SIGUSR1
+    (proc / '42').mkdir()
+    (proc / '42' / 'status').write_text('Name:\tother\nSigCgt:\t0000000000004002\n')
+    assert W.catches_sigusr1(41, proc) and not W.catches_sigusr1(42, proc) and not W.catches_sigusr1(43, proc)
+    caught = lambda pid: W.catches_sigusr1(pid, proc)
+    kill = lambda pid, sig: sent.append((pid, sig))
+    assert real(pid_fn=lambda: 41, catches=caught, kill=kill) == 'woken (SIGUSR1 to pid 41)'
+    assert sent == [(41, signal.SIGUSR1)]
+    assert 'no SIGUSR1 handler' in real(pid_fn=lambda: 42, catches=caught, kill=kill)
+    assert 'no MainPID' in real(pid_fn=lambda: None, catches=caught, kill=kill)
+    assert sent == [(41, signal.SIGUSR1)]
+    assert W.promoted_pid(sh=lambda argv: '784477\n') == 784477
+    assert W.promoted_pid(sh=lambda argv: '0\n') is None
+
+
 def test_a_failing_action_wakes_swarmbot_with_the_error():
     ex = Fake()
     ex._g['gql'] = lambda q, **v: (_ for _ in ()).throw(RuntimeError('rate limit'))

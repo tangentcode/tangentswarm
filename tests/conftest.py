@@ -56,6 +56,10 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(_wh, 'SEEN', tmp_path / 'webhook-seen.json')
     monkeypatch.setattr(_wh, 'WAKE_URL_FILE', tmp_path / 'wake-url')
     monkeypatch.setattr(_wh, 'WAKE_KEY_FILE', tmp_path / 'wake-key')
+    promoted_woken = []  # tangentswarm #67: never a real SIGUSR1 to the live swarm-promoted in a test
+    monkeypatch.setattr(_wh, 'REAL_SIGNAL_PROMOTED', _wh.signal_promoted, raising=False)
+    monkeypatch.setattr(_wh, 'signal_promoted', lambda: promoted_woken.append(1) or 'woken (test)')
+    _wh.PROMOTED_WOKEN = promoted_woken
     from tangentswarm import eventdb
     monkeypatch.setattr(eventdb, 'PATH', str(tmp_path / 'webhook-events.sqlite'))
     monkeypatch.setattr(eventdb, '_store', None)

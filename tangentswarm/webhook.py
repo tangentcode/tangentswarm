@@ -26,7 +26,8 @@ SQLite event log (eventdb: a 'received' row before the reply, a 'handled' row af
   relay    a human comment on a PR in work: relay it to the worker, card In Progress
   reject / answered   Michal's card moves (Human Review -> In Progress, Needs Input -> In
            Progress): relay his comments since the head to the worker
-  merged   cascade first, card Done, close each linked issue and its card Done, park the
+  merged   SIGUSR1 to swarm-promoted first (tangentswarm #67: Human Review refills at once),
+           then the cascade, card Done, close each linked issue and its card Done, park the
            worker, active-gate sweeps
   closed   card Canceled
   card     a new PR or issue: Project 4 card with the right Status
@@ -327,9 +328,11 @@ ANSWERS_Q = ('query($owner:String!,$name:String!,$n:Int!){repository(owner:$owne
 class Executor:
     """Runs actions with the swarm's tools. Every tool is injectable for tests."""
 
-    def __init__(self, g=None, dry=False, sh=None, enqueue=None, cascade=None, give=None, wake_post=None):
+    def __init__(self, g=None, dry=False, sh=None, enqueue=None, cascade=None, give=None, wake_post=None,
+                 signal_promoted=None):
         self._g, self.dry = g, dry
         self.sh = sh
+        self.signal_promoted = signal_promoted
         self.enqueue = enqueue
         self.cascade_fn = cascade
         self.give = give
@@ -642,7 +645,20 @@ class Executor:
             return self.wake(n, f"#{n} answered; no worker could take it ({note})", key=f'answered:{n}')
         self.note(f"#{n}: Michal's answer relayed ({note})")
 
+    def wake_promoted(self, n):
+        """tangentswarm #67: SIGUSR1 to swarm-promoted, so it reads the board and refills Human
+        Review now (not at its next 30 s poll). Only a signal: never a restart or a kill."""
+        if self.dry:
+            return self.note('would send SIGUSR1 to swarm-promoted')
+        try:
+            said = (self.signal_promoted or signal_promoted)()
+        except Exception as e:  # the merge handling goes on; the poll still finds the free slot
+            said = f"not woken: {type(e).__name__}: {str(e)[:120]}"
+        self.note(f"#{n} merged: swarm-promoted {said}")
+
     def do_merged(self, a):
+        if self.platform():  # tangentswarm #67: wake swarm-promoted before the slow work below
+            self.wake_promoted(a.pr)
         self.cascade(f'#{a.pr} merged')
         item, _ = self.card(a.pr)
         if item:
@@ -764,6 +780,47 @@ class Executor:
 
     def do_wake(self, a):
         self.wake(a.pr, a.why, key=a.args.get('key'))
+
+
+PROMOTED_UNIT = 'swarm-promoted.service'
+
+
+def promoted_pid(sh=None):
+    """The MainPID of the swarm-promoted user service, or None."""
+    import subprocess
+    run = sh or (lambda argv: subprocess.run(argv, capture_output=True, text=True, timeout=10).stdout)
+    out = (run(['systemctl', '--user', 'show', '-p', 'MainPID', '--value', PROMOTED_UNIT]) or '').strip()
+    return int(out) if out.isdigit() and int(out) > 0 else None
+
+
+def catches_sigusr1(pid, proc=Path('/proc')):
+    """True if process pid has a SIGUSR1 handler (SigCgt in /proc/<pid>/status). The default
+    action of SIGUSR1 ends a process, so a process without the handler (swarm-promoted before
+    its run() loop, or a reused pid) is never sent it."""
+    import signal
+    try:
+        text = (proc / str(pid) / 'status').read_text()
+    except OSError:
+        return False
+    for line in text.splitlines():
+        if line.startswith('SigCgt:'):
+            try:
+                return bool(int(line.split()[1], 16) >> (signal.SIGUSR1 - 1) & 1)
+            except (IndexError, ValueError):
+                return False
+    return False
+
+
+def signal_promoted(pid_fn=None, catches=None, kill=None):
+    """Send SIGUSR1 to swarm-promoted (tangentswarm #67). Returns a short note."""
+    import signal
+    pid = (pid_fn or promoted_pid)()
+    if not pid:
+        return 'not woken: no MainPID'
+    if not (catches or catches_sigusr1)(pid):
+        return f'not woken: pid {pid} has no SIGUSR1 handler'
+    (kill or os.kill)(pid, signal.SIGUSR1)
+    return f'woken (SIGUSR1 to pid {pid})'
 
 
 def _read(path):

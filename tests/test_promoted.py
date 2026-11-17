@@ -525,3 +525,333 @@ def test_wake_state_is_safe_across_processes(tmp_path):
         assert pr_.exitcode == 0
     st = _json.loads(seen.read_text())
     assert len(st['wake']) == 60  # every key recorded, none lost to a stale rewrite
+
+
+# -- tangentswarm #67: fill Human Review until full, re-reading the board after each move ----
+
+H8 = '8' * 40
+LOG8 = LOG + "2026-11-13T19:00:00-05:00\tapply\t#8\t88888888\tPASS\tfail=-\tc\n"
+
+
+def test_a_merge_seen_on_the_post_move_re_read_is_filled_in_the_same_pass(tmp_path, clean):
+    """(b) Human Review is 1/2: #5 fills it. The re-read after that move shows #1 merged
+    (a free slot again), so #8 moves in the same pass."""
+    g = G(tmp_path, details={5: detail(5, H5), 8: detail(8, H8)})
+    (tmp_path / 'hr.log').write_text(LOG8)
+    cols = {board.HUMAN_REVIEW: [dict(number=1, head='a', item='I1')],
+            board.STAGING: [dict(number=5, head=H5, item='I5'), dict(number=8, head=H8, item='I8')]}
+    reads = []
+
+    def reread():
+        reads.append(1)
+        return {board.HUMAN_REVIEW: [dict(number=5, head=H5, item='I5')] if len(reads) == 1 else [],
+                board.STAGING: [dict(number=8, head=H8, item='I8')]}
+    assert P.Promoter(g=g).fast_path(cols, reread=reread) == [5, 8]
+    assert g.moves == [('I5', board.HUMAN_REVIEW), ('I8', board.HUMAN_REVIEW)] and len(reads) == 2
+
+
+def test_a_pass_fills_every_free_slot_and_re_reads_after_each_move(tmp_path, clean):
+    """(b) Two free slots: two moves, one board read after each. A lagging board that still
+    shows the moved PR in Staging never moves it twice, and the cap holds."""
+    g = G(tmp_path, details={5: detail(5, H5), 8: detail(8, H8)})
+    (tmp_path / 'hr.log').write_text(LOG8)
+    stale = {board.STAGING: [dict(number=5, head=H5, item='I5'), dict(number=8, head=H8, item='I8'),
+                             dict(number=7, head='7' * 40, item='I7')]}
+    reads = []
+    assert P.Promoter(g=g).fast_path(stale, reread=lambda: reads.append(1) or stale) == [5, 8]
+    assert g.moves == [('I5', board.HUMAN_REVIEW), ('I8', board.HUMAN_REVIEW)] and len(reads) == 2
+
+
+def test_a_pass_that_starts_at_cap_fills_a_slot_freed_during_the_pass(tmp_path, monkeypatch, own_queue, clean):
+    """(b) Under the lock Human Review is 2/2; a merge lands while the queued work drains.
+    The read after the drain sees the free slot, and #5 moves in this same pass."""
+    full = page(item(1, HR, 'a'), item(2, HR, 'b'), item(5, ST, H5))
+    free = page(item(1, HR, 'a'), item(5, ST, H5))
+    boards = [full, full]  # the idle read and the read under the lock; then the drain frees a slot
+    g = G(tmp_path)
+    det = {'repository': {'p5': detail(5, H5)}}
+    g['gql'] = lambda q, **v: det if 'pullRequest(number:' in q else (boards.pop(0) if boards else free)
+    p = P.Promoter(g=g)
+    monkeypatch.setattr(p, 'main_sha', lambda: None)
+    monkeypatch.setattr(p, 'queue_cascade', lambda why, now=None: None)
+
+    class L:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+    monkeypatch.setattr(P.gatelock, 'gate_lock', lambda name: L())
+    monkeypatch.setattr(P.gatelock, 'run_held', lambda argv: 0)
+    P.gatelock.enqueue(['/b/hr-gate', '--apply', '9'], qdir=own_queue)
+    assert p.once() == 'promoted'
+    assert g.moves == [('I5', board.HUMAN_REVIEW)]
+
+
+# -- tangentswarm #67 (c): no scratch merge for a merge-ready PR on the current future main ---
+
+MAIN = 'c' * 40
+
+
+class GitScratch(Scratch):
+    """A scratch repo over a fake commit graph {sha: [parents]}; revs match by prefix."""
+    def __init__(self, graph):
+        self.graph, self.calls = dict(graph), []
+
+    def ensure_main(self):
+        return MAIN
+
+    def find(self, rev):
+        return next((c for c in self.graph if c.startswith(rev)), None)
+
+    def chain(self, top):  # the first-parent chain from top, newest first
+        out, c = [], self.find(top)
+        while c:
+            out.append(c)
+            c = self.find((self.graph.get(c) or [None])[0] or '~')
+        return out
+
+    def git(self, *a, check=True):
+        import subprocess
+        self.calls.append(a)
+        if a[0] == 'merge-base':
+            base, top = self.find(a[2]), a[3]
+            return subprocess.CompletedProcess(a, 0 if base and base in self.chain(top) else 1, '', '')
+        if '-n' in a:
+            c = self.find(a[-1])
+            return subprocess.CompletedProcess(a, 0 if c else 1, ' '.join([c] + self.graph[c]) if c else '', '')
+        base, top = a[-1].split('..')
+        rows = []
+        for c in self.chain(top):
+            if c.startswith(base):
+                break
+            rows.append(' '.join([c] + self.graph[c]))
+        return subprocess.CompletedProcess(a, 0, '\n'.join(rows) + '\n', '')
+
+
+def full(x):
+    return (x + '0' * 40)[:40]
+
+
+def premerge_graph(base, head=H5, tip='t' * 40, second=None):
+    """The graph of a mechanical pre-merge: future main = base main + one merge per queued
+    head (second: {i: another second parent}, e.g. a resolved tip), then tip = fm + head."""
+    m, *deps = base.split()
+    graph, cur = {full(m): []}, full(m)
+    for i, d in enumerate(deps):
+        c = f'f{i}'.ljust(40, 'e')
+        graph[c] = [cur, (second or {}).get(i) or full(d.split('@', 1)[-1])]
+        cur = c
+    graph[tip] = [cur, head]
+    return graph
+
+
+def premerged(tmp_path, monkeypatch, base, labels=('merge-ready',), d=None, scratch=None, rec=True):
+    """A Promoter for Human Review [#1 at 'a'] and Staging [#5]; returns (promoter, g, merges).
+    The scratch repo holds a mechanical pre-merge of #5 on base unless scratch is given."""
+    from tangentswarm import flow
+    merges = []
+    monkeypatch.setattr(flow, 'merge_commit', lambda s, a, b, m: merges.append((a, b)) or f'{a}+{b}')
+    if rec:
+        flow.set_premerge(5, dict(head=H5, base=base, vbranch='b-v1', tip='t' * 40, status='ready'))
+    g = G(tmp_path, details={5: d or detail(5, H5)})
+    sc = scratch if scratch is not None else GitScratch(premerge_graph(base))
+    g['ScratchRepo'] = lambda: sc
+    p = P.Promoter(g=g)
+    monkeypatch.setattr(p, 'main_sha', lambda: MAIN)
+    cols = {board.HUMAN_REVIEW: [dict(number=1, head='a', item='I1')],
+            board.STAGING: [dict(number=5, head=H5, item='I5', own_labels=list(labels))]}
+    return p, g, merges, cols
+
+
+def test_a_merge_ready_pr_on_the_current_future_main_skips_the_scratch_merge(tmp_path, monkeypatch):
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, f'{MAIN[:12]} #1@a')
+    assert p.fast_path(cols, reread=lambda: cols) == [5]
+    assert merges == [(MAIN, H5)] and g.moves == [('I5', board.HUMAN_REVIEW)]
+
+
+@pytest.mark.parametrize('base, labels, rec', [
+    (f'{MAIN[:12]} #1@a', (), True),                       # no merge-ready label
+    (f'{MAIN[:12]} #1@a', ('merge-ready', 'pre-merging'), True),  # a pre-merge in progress
+    (f'{"d" * 12} #1@a', ('merge-ready',), True),           # stale: main moved since
+    (f'{MAIN[:12]}', ('merge-ready',), True),               # stale: #1 entered Human Review since
+    (f'{MAIN[:12]} #1@a', ('merge-ready',), False),         # no pre-merge record
+])
+def test_without_a_current_pre_merge_the_full_scratch_merge_runs(tmp_path, monkeypatch, base, labels, rec):
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, base, labels=labels, rec=rec)
+    assert p.fast_path(cols, reread=lambda: cols) == [5]
+    assert len(merges) > 1  # the full check ran (and passed)
+
+
+def test_a_new_head_since_the_pre_merge_runs_the_full_check(tmp_path, monkeypatch):
+    from tangentswarm import flow
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, f'{MAIN[:12]} #1@a')
+    flow.set_premerge(5, dict(head='e' * 40, base=f'{MAIN[:12]} #1@a', vbranch='b-v1', tip='t' * 40, status='ready'))
+    p.fast_path(cols, reread=lambda: cols)
+    assert len(merges) > 1
+
+
+def test_a_merge_ready_pr_that_fails_another_cheap_check_is_refused(tmp_path, monkeypatch):
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, f'{MAIN[:12]} #1@a', d=detail(5, H5, draft=True))
+    assert p.fast_path(cols, reread=lambda: cols) == [] and g.moves == []
+    assert p.left == [(5, H5, 'is a draft')]
+
+
+def test_a_queued_pr_merged_since_the_pre_merge_still_matches(tmp_path, monkeypatch):
+    """The pre-merge was built on old main + #2 + #1; #2 merged since (main's one new
+    first-parent commit is the merge of #2's head): the tip still holds the future main."""
+    old = 'd' * 12
+    base = f"{old} #2@{'b' * 12} #1@a"
+    graph = premerge_graph(base)
+    graph[MAIN] = [full(old), 'b' * 40]
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, base, scratch=GitScratch(graph))
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and merges == [(MAIN, H5)]
+    # main also has a commit that is not one of those merges: the full check runs
+    g2 = dict(graph, **{'e' * 40: [full(old), '1' * 40], MAIN: ['e' * 40, 'b' * 40]})
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, base, scratch=GitScratch(g2))
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and len(merges) > 1
+    # the old main is not an ancestor of main: the full check runs
+    g3 = dict(graph, **{MAIN: ['9' * 40, 'b' * 40], '9' * 40: []})
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, base, scratch=GitScratch(g3))
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and len(merges) > 1
+
+
+def test_the_pre_merge_base_must_match_the_queue_in_order(tmp_path, monkeypatch):
+    """(c) Future main is main + the queued PRs merged in queue order (Human Review, then
+    Staging, by the shared pick order). The same PRs in another order, a PR merged since
+    that is not first in the base, or an extra queued PR in the base run the full check."""
+    staging = [dict(number=4, head='4' * 40, item='I4'), dict(number=5, head=H5, item='I5', own_labels=['merge-ready'])]
+    ahead_ok = f"{MAIN[:12]} #1@a #4@{'4' * 12}"
+    for base, skip in ((ahead_ok, True),
+                       (f"{MAIN[:12]} #4@{'4' * 12} #1@a", False),        # the same PRs, another order
+                       (f"{MAIN[:12]} #1@a #4@{'4' * 12} #9@{'9' * 12}", False),  # a PR not ahead any more
+                       (f"{MAIN[:12]} #1@a", False)):                    # #4 is missing
+        p = premerged(tmp_path, monkeypatch, base)[0]
+        assert p.premerge_current(staging[1], {}, [(1, 'a'), (4, '4' * 40)], lambda: MAIN,
+                                  GitScratch(premerge_graph(base)), lambda: MAIN) is skip, base
+    # a merged PR must come first in the base (it was first in the queue)
+    old = 'd' * 12
+    for base, skip in ((f"{old} #2@{'b' * 12} #1@a", True), (f"{old} #1@a #2@{'b' * 12}", False)):
+        p, g, merges, cols = premerged(tmp_path, monkeypatch, base)
+        graph = dict(premerge_graph(base), **{MAIN: [full(old), 'b' * 40]})
+        assert p.premerge_current(cols[board.STAGING][0], {}, [(1, 'a')], lambda: MAIN, GitScratch(graph),
+                                  lambda: MAIN) is skip, base
+
+
+def test_a_moved_pr_with_a_new_head_on_the_re_read_is_checked_at_that_head(tmp_path, monkeypatch):
+    """Codex on PR #68: #5 moved, then got a new head before the re-read. The next candidate
+    is checked against #5's NEW Human Review head, not the Staging copy saved at the move;
+    the saved copy is only for a board that does not show the move yet."""
+    from tangentswarm import flow
+    new5 = 'f' * 40
+    monkeypatch.setattr(flow, 'merge_commit', lambda s, a, b, m: None if new5 in a and b == H8 else f'{a}+{b}')
+    g = G(tmp_path, details={5: detail(5, H5), 8: detail(8, H8)})
+    (tmp_path / 'hr.log').write_text(LOG8)
+    cols = {board.STAGING: [dict(number=5, head=H5, item='I5'), dict(number=8, head=H8, item='I8')]}
+    fresh = {board.HUMAN_REVIEW: [dict(number=5, head=new5, item='I5')],
+             board.STAGING: [dict(number=8, head=H8, item='I8')]}
+    p = P.Promoter(g=g)
+    assert p.fast_path(cols, reread=lambda: fresh) == [5]
+    assert p.left == [(8, H8, 'conflicts with #5 in Human Review')]
+    lag = {board.STAGING: cols[board.STAGING]}  # the move is not on the board yet
+    monkeypatch.setattr(flow, 'merge_commit', lambda s, a, b, m: None if H5 in a and b == H8 else f'{a}+{b}')
+    g = G(tmp_path, details={5: detail(5, H5), 8: detail(8, H8)})
+    (tmp_path / 'hr.log').write_text(LOG8)
+    p = P.Promoter(g=g)
+    assert p.fast_path(cols, reread=lambda: lag) == [5]
+    assert p.left == [(8, H8, 'conflicts with #5 in Human Review')]
+
+
+def test_a_pr_moved_in_this_pass_that_merges_frees_its_slot_again(tmp_path, clean):
+    """Codex on PR #68: #5 moves (the re-read lags: it is still in Staging, so it counts),
+    then #8 moves. The re-read after #8 shows #5 in no column (merged, not lag): its slot
+    is free again, so #9 moves in the same pass."""
+    H9 = '9' * 40
+    g = G(tmp_path, details={5: detail(5, H5), 8: detail(8, H8), 9: detail(9, H9)})
+    (tmp_path / 'hr.log').write_text(LOG8 + "2026-11-13T19:00:00-05:00\tapply\t#9\t99999999\tPASS\tfail=-\tc\n")
+    s5, s8, s9 = (dict(number=n, head=h, item=f'I{n}') for n, h in ((5, H5), (8, H8), (9, H9)))
+    reads = [{board.STAGING: [s5, s8, s9]},  # after #5: the board lags
+             {board.STAGING: [s8, s9]},      # after #8: #5 merged; #8 still lags
+             {board.STAGING: [s8, s9]}]
+    p = P.Promoter(g=g)
+    assert p.fast_path({board.STAGING: [s5, s8, s9]}, reread=lambda: reads.pop(0)) == [5, 8, 9]
+    assert [m[0] for m in g.moves] == ['I5', 'I8', 'I9'] and reads == []
+
+
+def test_a_resolved_pre_merge_never_skips_the_scratch_merge(tmp_path, monkeypatch):
+    """Codex on PR #68: a tip its worker resolved on a -vN (the record has a seed) leaves the
+    head as it was, so it proves nothing about the head: the full check runs. The same when
+    a PR ahead is in future main as its resolved tip."""
+    from tangentswarm import flow
+    base = f'{MAIN[:12]} #1@a'
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, base)
+    flow.set_premerge(5, dict(head=H5, base=base, vbranch='b-v2', seed='s' * 40, tip='t' * 40, status='ready'))
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and len(merges) > 1
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, base)
+    flow.set_premerge(1, dict(head='a', base=MAIN[:12], vbranch='a-v1', seed='s' * 40, tip='u' * 40, status='ready'))
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and len(merges) > 1
+    flow.set_premerge(1, dict(head='a', base=MAIN[:12], vbranch='a-v1', tip='u' * 40, status='ready'))
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, base)
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and merges == [(MAIN, H5)]  # mechanical: skipped
+
+
+def test_a_pre_merge_built_on_a_resolved_tip_ahead_never_skips(tmp_path, monkeypatch):
+    """Codex on PR #68: #1 entered future main as its resolved -vN tip, not its head (its
+    record may be gone by now): the tip proves nothing about #5's head with #1's head. And a
+    tip whose second parent is not the head is no proof either."""
+    base = f'{MAIN[:12]} #1@a'
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, base,
+                                   scratch=GitScratch(premerge_graph(base, second={0: 'r' * 40})))
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and len(merges) > 1
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, base,
+                                   scratch=GitScratch(premerge_graph(base, head='9' * 40)))
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and len(merges) > 1
+
+
+def test_a_pre_merge_that_holds_a_refused_staging_pr_never_skips(tmp_path, monkeypatch):
+    """Codex on PR #68: #4 is ahead of #5 in Staging but is refused (no gate pass), so it
+    stays. #5's pre-merge holds #4, and proves nothing about #5 with Human Review alone:
+    the full check runs."""
+    H4 = '4' * 40
+    base = f"{MAIN[:12]} #1@a #4@{H4[:12]}"
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, base)
+    g['gql'] = lambda q, **v: {'repository': {'p4': detail(4, H4), 'p5': detail(5, H5)}}
+    cols[board.STAGING] = [dict(number=4, head=H4, item='I4')] + cols[board.STAGING]
+    assert p.fast_path(cols, reread=lambda: cols) == [5] and len(merges) > 1
+    assert p.left == [(4, H4, 'head 44444444 has no gate pass')]
+
+
+def test_the_slow_path_sees_the_slots_freed_during_the_fast_path(tmp_path, monkeypatch, clean):
+    """Codex on PR #68: Human Review is [#1]; #5 moves, and the re-read shows #1 and #5
+    merged. once() must count 0 of 2 (not 1 + 1), so the slow path re-gates #7 now."""
+    H7 = '7' * 40
+    boards = [page(item(1, HR, 'a'), item(5, ST, H5), item(7, ST, H7))] * 2 + [page(item(7, ST, H7))]
+    det = {'repository': {'p5': detail(5, H5), 'p7': detail(7, H7)}}
+    g = G(tmp_path)
+    g['gql'] = lambda q, **v: det if 'pullRequest(number:' in q else (boards.pop(0) if len(boards) > 1 else boards[0])
+    p = P.Promoter(g=g)
+    slow = []
+    monkeypatch.setattr(p, 'main_sha', lambda: None)
+    monkeypatch.setattr(p, 'queue_cascade', lambda why, now=None: None)
+    monkeypatch.setattr(p, 'slow_path', lambda: slow.append([n for n, _, _ in p.regate()]))
+
+    class L:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+    monkeypatch.setattr(P.gatelock, 'gate_lock', lambda name: L())
+    assert p.once() == 'promoted'
+    assert g.moves == [('I5', board.HUMAN_REVIEW)] and p.hr_count == 0 and slow == [[7]]
+
+
+def test_a_current_pre_merge_still_runs_the_main_probe(tmp_path, monkeypatch):
+    """Codex on PR #68: a Human Review head can revert an edit on main, so #5 merges onto
+    future main but conflicts with main alone. The main probe runs and refuses it; the
+    pairwise Human Review merges are the only ones the pre-merge replaces."""
+    from tangentswarm import flow
+    p, g, merges, cols = premerged(tmp_path, monkeypatch, f'{MAIN[:12]} #1@a')
+    monkeypatch.setattr(flow, 'merge_commit', lambda s, a, b, m: merges.append((a, b)) or (None if a == MAIN else 'x'))
+    assert p.fast_path(cols, reread=lambda: cols) == [] and g.moves == []
+    assert merges == [(MAIN, H5)] and p.left == [(5, H5, 'conflicts with main')]
