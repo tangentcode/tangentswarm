@@ -1064,6 +1064,40 @@ swarm-watch --once --dry-run     # one pass of every check; print what it would 
 swarm-codex-rounds --days 7      # the PRs with the most Codex rounds, round by round
 ```
 
+### swarm-unit-check: every swarm unit runs from flow-live (methodology #84)
+
+In methodology #84, two MCP units ran from `~/srv/swarm-tmux` while the other swarm units
+ran from `~/ver/tangentswarm.flow-live`, so a deploy did not reach them. `swarm-unit-check`
+reads each swarm user unit (`swarm*.service`) that is enabled or active, with `systemctl
+--user show`: WorkingDirectory, PYTHONPATH and ExecStart. It finds where Python imports
+tangentswarm from: the first sys.path entry (the working directory for `python -m`, or the
+script directory), then PYTHONPATH. That must be flow-live. A WorkingDirectory or an
+ExecStart path in another tangentswarm checkout also fails. When the unit runs, its process
+is checked the same way, with the cwd and environment from `/proc`. A disabled unit that is
+not active is skipped. A running template instance (`swarm@x.service`) or transient unit
+has no unit file of its own; it is found with `systemctl --user list-units` and checked while
+it runs. It exits 1 and names each bad unit; it exits 2 when it cannot read
+systemd.
+
+```sh
+swarm-unit-check                 # one line per unit; exit 1 if any unit fails
+swarm-unit-check --json          # the results as JSON
+swarm-unit-check swarm-webhook.service   # only these units
+```
+
+The flow-live path is `$SWARM_FLOW_LIVE` (default `~/ver/tangentswarm.flow-live`).
+
+Where it runs:
+
+- A deploy script on the host calls it after its restarts, so the deploy fails loudly:
+
+  ```sh
+  ~/ver/tangentswarm.flow-live/bin/swarm-unit-check || exit 1
+  ```
+
+  The host scripts (`~/bin/swarm-flow-live-deploy`, `/usr/local/sbin/swarm-tmux-deploy`)
+  are host config outside this repo, so this line is added there by hand.
+
 ### swarm-lock: one gate operation at a time
 
 Only one merge or gate operation may run at a time: `hr-gate --apply`, `hr-gate

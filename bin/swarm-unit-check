@@ -1,0 +1,7 @@
+#!/bin/sh
+# swarm-unit-check: fail when a swarm user unit does not import tangentswarm from flow-live
+# (methodology #84; tangentswarm.unitcheck). Runs this checkout's tangentswarm with the Python
+# in $TANGENTSWARM_PYTHON (default: python3). A deploy script calls it after its restarts:
+#   ~/ver/tangentswarm.flow-live/bin/swarm-unit-check || exit 1
+here=$(dirname "$(readlink -f "$0")")
+PYTHONPATH="$here/..${PYTHONPATH:+:$PYTHONPATH}" exec "${TANGENTSWARM_PYTHON:-python3}" -m tangentswarm.unitcheck "$@"
