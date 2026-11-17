@@ -79,5 +79,10 @@ Add a rule to `sanity.check`, its row here, and a test.
    same finding is not told or filed again. When it goes away, it is removed. If it
    comes back later, it is a new incident.
 
+If the read of a board fails (a GitHub limit), the other checks still run. The stored
+findings of that board stay as they are (they are not resolved and filed again), and the
+check runs again after `SANITY_RETRY`. A pass that fails as a whole also runs again after
+`SANITY_RETRY`.
+
 A dry run (`swarm-sanity`, or a dry watchdog) prints what it would do. It does not write
 the state, wake swarmbot, or file a ticket.

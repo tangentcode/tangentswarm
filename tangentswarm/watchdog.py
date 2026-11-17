@@ -381,14 +381,21 @@ class Watchdog:
         if not why:
             return []
         self.last_sanity, self.sanity_fp = now, fp
-        return self.sanity_pass(snap, now, why)
+        try:
+            return self.sanity_pass(snap, now, why)
+        except Exception:
+            from . import sanity as _s
+            self.sanity_due = now + _s.RETRY  # a failed read (a GitHub limit) is tried again soon
+            raise
 
     def sanity_pass(self, snap, now, why='run'):
         from . import sanity
-        found = sanity.gather(self.g, snap, now)
+        failed = {}
+        found = sanity.gather(self.g, snap, now, failed=failed)
         lines, self.sanity_due = sanity.report(
             found, now, apply=not self.dry, alert=lambda text, key, pr=None: self.alert(text, key=key, pr=pr, st=self.st),
-            incident=self.incident)
+            incident=self.incident, unread=set(failed))
+        lines = [f"project {b} read failed: {err}" for b, err in sorted(failed.items())] + lines
         return [f"sanity ({why}): {line}" for line in lines or [f"{len(found)} finding(s), nothing new"]]
 
     def sweep_pass(self, snap, now):

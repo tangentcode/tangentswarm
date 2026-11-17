@@ -348,10 +348,12 @@ def incident_what(f, first):
             f"finding key `{f['key']}`.")
 
 
-def report(findings, now, apply=False, alert=None, incident=None, path=None, grace=None):
+def report(findings, now, apply=False, alert=None, incident=None, path=None, grace=None, unread=()):
     """Act on the findings of one pass. Returns (lines, next_due): next_due is when a pass
     must run again (a finding inside its grace, or a capped ticket), else None. A dry run
-    (apply False) reads the state and never writes it, wakes no one and files nothing."""
+    (apply False) reads the state and never writes it, wakes no one and files nothing.
+    unread: boards this pass could not read; their kept findings stay as they are (not
+    resolved), and the pass runs again after RETRY."""
     from . import alerts
     grace = GRACE if grace is None else grace
     path = path or state_path()
@@ -361,9 +363,14 @@ def report(findings, now, apply=False, alert=None, incident=None, path=None, gra
     with _locked(path) as d:
         seen = d['open']
         now_keys = {f['key'] for f in findings}
-        for k in sorted(set(seen) - now_keys):
+        kept = {k: r for k, r in seen.items() if k not in now_keys and r.get('board') in unread}
+        for k in sorted(set(seen) - now_keys - set(kept)):
             lines.append(f"resolved: {seen[k].get('text', k)}")
-        recs = {f['key']: dict(seen.get(f['key']) or {'first': now, 'told': False, 'filed': None}, text=f['text'])
+        for b in sorted(unread):
+            due.append(now + RETRY)
+            lines.append(f"project {b} not read; its findings are kept and the check runs again")
+        recs = {f['key']: dict(seen.get(f['key']) or {'first': now, 'told': False, 'filed': None}, text=f['text'],
+                               board=f.get('board'))
                 for f in findings}
         tell = []
         for f in findings:
@@ -401,7 +408,7 @@ def report(findings, now, apply=False, alert=None, incident=None, path=None, gra
                     recs[f['key']]['told'] = True
                 lines.append(f"told swarmbot: {text}")
         if apply:
-            d['open'] = recs
+            d['open'] = {**kept, **recs}
             d['last'] = now
             _save(path, d)
     return lines, (min(due) if due else None)
@@ -441,13 +448,19 @@ def fingerprint(snap):
     return hashlib.sha1(json.dumps(rows).encode()).hexdigest()
 
 
-def gather(g, snap, now, claudes=None):
+def gather(g, snap, now, claudes=None, failed=None):
     """Every card (Project 4 from the snapshot, the other boards read now), the live Claudes,
-    and the holds; then the findings."""
+    and the holds; then the findings. A board whose read fails is skipped, and its number and
+    error go in failed ({board: error}), so the other checks still run (Codex on PR #79)."""
     from . import slots, watchdog
     cards = cards_from_snap(snap)
     for b in board.BOARDS[1:]:
-        cards += cards_from_board(g['gql'], b)
+        try:
+            cards += cards_from_board(g['gql'], b)
+        except Exception as e:
+            if failed is None:
+                raise
+            failed[b.number] = f"{type(e).__name__}: {str(e)[:200]}"
     st = slots.load()
     hold_issues = watchdog.launching_issues(st, now)
     hold_prs = {int(k) for k in (st.get('unstarted') or {}) if str(k).isdigit()}
@@ -463,14 +476,17 @@ def main(argv=None):
     from .advance import hr_gate
     g = hr_gate()
     now = time.time()
-    found = gather(g, boardcache.snapshot(g['gql']), now)
+    failed = {}
+    found = gather(g, boardcache.snapshot(g['gql']), now, failed=failed)
+    for b, err in sorted(failed.items()):
+        print(f"project {b} not read: {err}", file=sys.stderr)
     if a.json:
         print(json.dumps(found, indent=1))
         return 0
     for f in found:
         print(f"{f['rule']}: {f['text']}")
     print(f"{len(found)} finding(s)")
-    lines, due = report(found, now, apply=a.apply)
+    lines, due = report(found, now, apply=a.apply, unread=set(failed))
     for line in lines:
         print(line)
     if a.apply:

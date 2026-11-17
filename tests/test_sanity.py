@@ -300,7 +300,7 @@ def test_the_default_incident_goes_to_project_6_once_per_key(monkeypatch):
 def test_the_watchdog_runs_the_check_at_startup_on_a_board_change_hourly_and_on_recheck(monkeypatch):
     from boardfake import gql
     runs = []
-    monkeypatch.setattr(sanity, 'gather', lambda g, snap, now: runs.append(now) or [F1])
+    monkeypatch.setattr(sanity, 'gather', lambda g, snap, now, failed=None: runs.append(now) or [F1])
     monkeypatch.setattr(sanity, 'GRACE', 600)
     w = WD.Watchdog(g={'gql': gql([])}, panes=type('P', (), {'latest': {}})(), out=lambda line: None,
                     alert=lambda text, key, pr=None, st=None: True,
@@ -323,7 +323,7 @@ def test_the_watchdog_runs_the_check_at_startup_on_a_board_change_hourly_and_on_
 
 def test_a_dry_watchdog_never_writes_the_sanity_state(monkeypatch):
     from boardfake import gql
-    monkeypatch.setattr(sanity, 'gather', lambda g, snap, now: [F1])
+    monkeypatch.setattr(sanity, 'gather', lambda g, snap, now, failed=None: [F1])
     w = WD.Watchdog(g={'gql': gql([])}, panes=type('P', (), {'latest': {}})(), out=lambda line: None, dry=True)
     w.sanity_tick({'prs': [], 'issues': []}, T0)
     assert not sanity.state_path().exists()
@@ -334,3 +334,48 @@ def test_a_project_board_event_pokes_the_sanity_check():
     W.classify('projects_v2_item', {'action': 'edited', 'projects_v2_item': {'project_node_id': 'other'},
                                     'changes': {'field_value': {'field_node_id': 'f'}}})
     assert sanity.poked_at() > 0
+
+
+def test_a_failed_sanity_pass_is_tried_again_after_the_retry(monkeypatch):
+    from boardfake import gql
+    calls = []
+
+    def gather(g, snap, now, failed=None):
+        calls.append(now)
+        if len(calls) == 1:
+            raise RuntimeError('gh api graphql: rate limited')
+        return []
+    monkeypatch.setattr(sanity, 'gather', gather)
+    lines = []
+    w = WD.Watchdog(g={'gql': gql([])}, panes=type('P', (), {'latest': {}})(), out=lines.append)
+    snap = {'prs': [], 'issues': []}
+    w.step('sanity', w.sanity_tick, snap, T0)
+    assert 'rate limited' in lines[-1]
+    assert w.sanity_tick(snap, T0 + sanity.RETRY - 1) == []
+    assert w.sanity_tick(snap, T0 + sanity.RETRY)[0].startswith('sanity (recheck)')
+
+
+def test_a_failed_board_read_still_runs_the_other_checks_and_keeps_its_findings(monkeypatch):
+    """Codex on PR #79: a Project 6 read error must not stop the Project 4 and Claude
+    checks, and must not resolve (then file again) the Project 6 findings."""
+    from boardfake import gql
+    F6 = sanity.finding('draft', 'PR tangentcode/tangentswarm#5 is in Ready but is a draft', TS, 5, board_no=6)
+    s = Sink()
+    s.run([F1, F6], T0)
+    s.run([F1, F6], T0 + 600)
+    assert len(s.incidents) == 2
+
+    def broken(gql_, b):
+        raise RuntimeError('gh api graphql: rate limited')
+    monkeypatch.setattr(sanity, 'cards_from_board', broken)
+    snap = boardcache.snapshot(gql([node(8, board.PARKED, draft=False, closes=[(1, ())])]), max_age=0)
+    failed = {}
+    found = sanity.gather({'gql': None}, snap, T0 + 700, claudes=[], failed=failed)
+    assert [f['key'] for f in found] == [F1['key']] and 'rate limited' in failed[6]
+    lines, due = sanity.report(found, T0 + 700, apply=True, alert=s.alert, incident=s.incident, grace=600,
+                               unread={6})
+    assert not any(x.startswith('resolved') for x in lines) and due == T0 + 700 + sanity.RETRY
+    s.run([F1, F6], T0 + 1300)  # the read works again: the same finding, not a new incident
+    assert len(s.incidents) == 2 and len(s.alerts) == 1
+    s.run([F1], T0 + 1400)
+    assert F6['key'] not in json.loads(sanity.state_path().read_text())['open']
