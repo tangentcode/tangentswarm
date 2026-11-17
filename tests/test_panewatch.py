@@ -71,6 +71,16 @@ def test_decide(worker):
     assert PW.decide(pane(worker, 'idle', window='meth-26-auto-coordinator-1'), pr) == []  # never a coordinator
 
 
+def sync(fn):
+    """A spawn that runs the handoff at once (the thread is tested on its own)."""
+    box = {}
+    try:
+        box['res'] = fn() or {}
+    except Exception as e:
+        box['res'] = {'done': False, 'why': f'{type(e).__name__}: {e}'}
+    return box
+
+
 class Rig:
     """A PaneWatch over fake panes, with every effect recorded."""
 
@@ -95,7 +105,7 @@ class Rig:
             route=lambda *a: self.routes.append(a) or 'routed',
             wake=lambda why, key, pr=None, detail=None: self.wakes.append((why, detail)),
             incident=lambda key, title, what, **kw: self.incidents.append((key, title, what, kw.get('fix'))),
-            st=self.st, shell_root=lambda pid: shell_root)
+            st=self.st, shell_root=lambda pid: shell_root, spawn=sync)
         self.prs = {'feat': pr} if pr else {}
 
     def run(self, now):
@@ -361,3 +371,58 @@ def test_spool_peek_reads_an_answer_once(tmp_path):
     assert spool.peek('x', spool=tmp_path) is None
     (tmp_path / 'x.res.json').write_text('{"ok": true}')
     assert spool.peek('x', spool=tmp_path) == {'ok': True} and spool.peek('x', spool=tmp_path) is None
+
+
+def test_a_slow_handoff_never_blocks_the_watchdog(worker, monkeypatch):
+    """Codex on PR #129: the handoff runs in its own thread; the pass goes on while it runs,
+    and one that runs past HANDOFF_WAIT goes to swarmbot (no second handoff for the head)."""
+    import threading
+    monkeypatch.setattr(PW, 'HANDOFF_WAIT', 100)
+    gate, started = threading.Event(), threading.Event()
+
+    def slow(wt, t):
+        started.set()
+        gate.wait(5)
+        return {'done': True, 'log': 'moved'}
+    r = Rig(worker, (IDLE, True), pr=dict(AR, col=board.IN_PROGRESS))
+    r.w.handoff, r.w.spawn = slow, PW.run_in_thread
+    r.run(0)
+    assert 'running the handoff' in r.run(60)[0] and started.wait(5)
+    assert r.run(120) == []  # still running: no second thread, no line
+    out = r.run(180)
+    assert 'did not finish in 1 min (still running): woke swarmbot' in out[0] and len(r.wakes) == 1
+    gate.set()
+    assert r.run(240) == [] and r.incidents[0][1].endswith('could not hand off')
+
+
+def test_a_handoff_that_finishes_on_a_later_pass_is_done_then(worker):
+    boxes = []
+    r = Rig(worker, (IDLE, True), pr=dict(AR, col=board.IN_PROGRESS))
+    r.w.spawn = lambda fn: boxes.append(fn) or {}
+    r.run(0)
+    assert 'running the handoff' in r.run(60)[0] and len(boxes) == 1
+    r.w.jobs[next(iter(r.w.jobs))]['res'] = boxes[0]()
+    assert 'ran the handoff (the Stop hook missed it): moved' in r.run(120)[0]
+    assert r.run(180) == [] and len(boxes) == 1
+
+
+@pytest.mark.parametrize('wt_extra,col', [({}, board.IN_PROGRESS), ({'dirty': True}, board.IN_PROGRESS)])
+def test_a_failed_escalation_is_retried_not_marked_done(worker, monkeypatch, wt_extra, col):
+    """Codex on PR #129: the once-key of a timed-out handoff or a dirty worker is saved only
+    after swarmbot was told; a failed wake is tried again next pass (the nudge is not repeated)."""
+    monkeypatch.setattr(PW, 'HANDOFF_WAIT', 0)
+    r = Rig(dict(worker, **wt_extra), (IDLE, True), pr=dict(AR, col=col))
+    r.results = {i: {'done': False, 'why': 'GitHub lag'} for i in range(1, 9)}
+    real = r.w.wake
+
+    def flaky(*a, **k):
+        if not r.wakes and not getattr(flaky, 'failed', False):
+            flaky.failed = True
+            raise OSError('disk full')
+        return real(*a, **k)
+    r.w.wake = flaky
+    r.run(0)
+    assert 'OSError: disk full' in r.run(60)[0] and r.wakes == []
+    out = r.run(120)
+    assert len(r.wakes) == 1 and ('woke swarmbot' in out[0] or 'swarmbot told' in out[0])
+    assert r.run(180) == [] and len(r.wakes) == 1 and len(r.told) == (1 if wt_extra else 0)
