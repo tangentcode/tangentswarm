@@ -55,7 +55,8 @@ SETTLE = int(os.environ.get('SWARM_DEPLOY_SETTLE', '10'))       # s after a rest
 TEST_TIMEOUT = int(os.environ.get('SWARM_DEPLOY_TEST_TIMEOUT', '1200'))
 PASS_EVERY = int(os.environ.get('SWARM_DEPLOY_PASS_EVERY', '300'))  # s between swarm-promoted's checks
 UNIT_PREFIX = 'deploy-tangentswarm-'  # not swarm*: swarm-unit-check does not check the deploy itself
-FINAL = ('deployed', 'not-deployed', 'rolled-back', 'rollback-failed', 'already-live')
+FINAL = ('deployed', 'not-deployed', 'rolled-back', 'rollback-failed', 'already-live', 'already-tried')
+FORWARD = ('SWARM_', 'TANGENTSWARM_')  # env prefixes the deploy unit gets from its caller (Codex on PR #123)
 
 
 def live_path():
@@ -92,8 +93,10 @@ def read_log(path=None):
 
 
 def tried(sha, path=None):
-    """True when the log has a final result for sha (a deploy of it ran to its end)."""
-    return any(r.get('sha') == sha and r.get('result') in FINAL for r in read_log(path))
+    """True when the log has a final result for sha, as the merged sha or as the fetched
+    target (Codex on PR #123: a later merge can make the target differ from the merged sha,
+    and the pass checks the target)."""
+    return any(sha in (r.get('sha'), r.get('target')) and r.get('result') in FINAL for r in read_log(path))
 
 
 def write_log(row, path=None):
@@ -219,6 +222,10 @@ class Deploy:
             row['result'] = 'already-live'
             row['detail'] = f"the live HEAD {prev[:8]} already contains {target[:8]}"
             return
+        if tried(target, self.log):  # checked under the lock: a queued job never repeats a failed target
+            row['result'] = 'already-tried'
+            row['detail'] = f"a deploy of {target[:8]} already ran (see {self.log or log_path()}): not again"
+            return
         rc, out = self.git('status', '--porcelain', '--untracked-files=no')
         if rc or out.strip():
             row['result'] = 'not-deployed'
@@ -279,9 +286,14 @@ def start(sha, pr=None, run=run_cmd, log=None):
     if tried(sha, log):
         return f"no deploy: {sha[:8]} was already tried (see {log or log_path()})"
     live = live_path()
+    # Codex on PR #123: the unit gets the caller's environment from the user manager, not from
+    # this process, so the settings this process resolved (the live checkout, the log and lock
+    # dir) and every SWARM_* / TANGENTSWARM_* setting are passed on explicitly
+    env = {k: v for k, v in os.environ.items() if k.startswith(FORWARD)}
+    env.update(PYTHONPATH=live, PATH=os.environ.get('PATH', '/usr/bin:/bin'), SWARM_FLOW_LIVE=live,
+               SWARM_DEPLOY_STATE=str(Path(log).parent if log else state_dir()))
     argv = ['systemd-run', '--user', '--quiet', '--collect', f'--unit={UNIT_PREFIX}{sha[:12]}',
-            f'--working-directory={live}', f'--setenv=PYTHONPATH={live}',
-            f"--setenv=PATH={os.environ.get('PATH', '/usr/bin:/bin')}",
+            f'--working-directory={live}', *(f'--setenv={k}={v}' for k, v in sorted(env.items())),
             sys.executable, '-m', 'tangentswarm.deploy', 'run', '--sha', sha]
     if pr:
         argv += ['--pr', str(pr)]

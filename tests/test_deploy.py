@@ -2,6 +2,8 @@
 the unit check fails. A fake runner stands in for git, pytest and systemctl: no network."""
 import json
 
+import pytest
+
 from tangentswarm import deploy as D
 from tangentswarm import promoted as P
 from tangentswarm import webhook as W
@@ -205,3 +207,44 @@ def test_the_log_command_prints_one_line_per_deploy(capsys):
     out = capsys.readouterr().out
     assert NEW[:8] in out and 'tests=pass' in out and 'unit_check=fail' in out and 'rolled-back' in out
     assert json.loads(D.log_path().read_text())['sha'] == NEW
+
+
+def test_a_failed_target_is_not_tried_again_when_the_merged_sha_differs(tmp_path, monkeypatch):
+    """Codex on PR #123: a later merge made the fetched target differ from the merged sha.
+    Neighbors: the pass (tried(main)), a queued job of the later merge (under the lock), and
+    a queued job of yet another merged sha that resolves to the same target."""
+    f = Fake(tests=(False,))
+    row, reports = deploy(f, sha=MERGED, tmp_path=tmp_path)
+    assert row['target'] == NEW and row['result'] == 'not-deployed' and len(reports) == 1
+    assert D.tried(NEW)  # the target counts, not only the merged sha
+    # the board pass sees main == NEW: not started again
+    live = tmp_path / 'live'
+    live.mkdir()
+    monkeypatch.setenv('SWARM_FLOW_LIVE', str(live))
+    run = lambda argv, timeout=None: (0, f"{NEW}\trefs/heads/main" if 'ls-remote' in argv else OLD)  # noqa: E731
+    assert D.pass_check(run=run, begin=lambda sha: pytest.fail('started')) is None
+    # a job queued for the later merge (sha NEW) and one for another sha that fetches NEW
+    for sha in (NEW, 'd' * 40):
+        g = Fake(tests=(False,), contains={(NEW, MERGED), (NEW, OLD), (NEW, NEW), (NEW, 'd' * 40)})
+        row, reports = deploy(g, sha=sha, tmp_path=tmp_path)
+        assert row['result'] == 'already-tried' and reports == []
+        assert not any(c[1:3] == ['-m', 'pytest'] for c in g.calls) and g.did('systemctl') == []
+
+
+def test_start_passes_the_resolved_settings_to_the_deploy_unit(tmp_path, monkeypatch):
+    """Codex on PR #123: the transient unit does not inherit this process's environment.
+    Neighbors: the live checkout, the log/lock dir, and any other SWARM_*/TANGENTSWARM_* setting."""
+    live = tmp_path / 'my-live'
+    monkeypatch.setenv('SWARM_FLOW_LIVE', str(live))
+    monkeypatch.setenv('SWARM_DEPLOY_STATE', str(tmp_path / 'st'))
+    monkeypatch.setenv('SWARM_DEPLOY_SETTLE', '3')
+    monkeypatch.setenv('SWARM_WAKE_URL_FILE', '/x/wake')
+    monkeypatch.setenv('UNRELATED_SECRET', 'no')
+    seen = []
+    D.REAL_START(MERGED, run=lambda argv, timeout=None: seen.append(argv) or (0, ''))
+    (argv,) = seen
+    env = dict(a[len('--setenv='):].split('=', 1) for a in argv if a.startswith('--setenv='))
+    assert env['SWARM_FLOW_LIVE'] == str(live) and env['PYTHONPATH'] == str(live)
+    assert env['SWARM_DEPLOY_STATE'] == str(tmp_path / 'st')
+    assert env['SWARM_DEPLOY_SETTLE'] == '3' and env['SWARM_WAKE_URL_FILE'] == '/x/wake'
+    assert 'UNRELATED_SECRET' not in env and f'--working-directory={live}' in argv
