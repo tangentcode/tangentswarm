@@ -581,6 +581,23 @@ class Promoter:
                 out.append(b.number)
         return out
 
+    def deploy_pass(self, now=None, check=None):
+        """tangentswarm #113: every deploy.PASS_EVERY s, start the deploy of tangentswarm main
+        when the live checkout lacks it and no deploy of it was tried (a merge event lost
+        during a restart). One git ls-remote, no GraphQL. Returns the note or None."""
+        from . import deploy
+        now = time.time() if now is None else now
+        if now - getattr(self, 'deploy_at', 0.0) < deploy.PASS_EVERY:
+            return None
+        self.deploy_at = now
+        try:
+            note = (check or deploy.pass_check)()
+        except Exception as e:
+            note = f"deploy pass failed: {type(e).__name__}: {str(e)[:160]}"
+        if note:
+            say(note)
+        return note
+
     def side_work(self, cols):
         """(main SHA, main moved, queued requests): the work of a check that is not a card
         move: git ls-remote of main, the board passes, the deploy-lag check, and the cascade
@@ -590,6 +607,7 @@ class Promoter:
         if not self.dry:
             self.board_passes()
             self.deploy_lag()
+            self.deploy_pass()
         why = self.cascade_due(cols, main_moved) or self.deploy_due()
         if why:
             self.queue_cascade(why)

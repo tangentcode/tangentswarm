@@ -9,6 +9,10 @@ os.environ['TANGENTSWARM_CONFIG'] = os.path.join(os.path.dirname(os.path.dirname
                                                  'tangentswarm', 'config.example.toml')
 
 
+from tangentswarm import deploy as _deploy  # noqa: E402
+_REAL_DEPLOY_START = _deploy.start
+
+
 @pytest.fixture(autouse=True)
 def isolated_state(tmp_path, monkeypatch):
     """Keep logs, auth db and config out of the real home directory. HOME points at an
@@ -60,6 +64,13 @@ def isolated_state(tmp_path, monkeypatch):
     from tangentswarm import spool
     from tangentswarm import webhook as _wh
     monkeypatch.setattr(_wh, 'LOG', tmp_path / 'webhook.log')
+    from tangentswarm import deploy  # tangentswarm #113: never a real deploy unit in a test
+    started = []
+    monkeypatch.setattr(deploy, 'start', lambda sha, pr=None, **kw: started.append((sha, pr)) or f"started {sha[:8]}")
+    monkeypatch.setattr(deploy, 'STARTED', started, raising=False)
+    monkeypatch.setattr(deploy, 'REAL_START', _REAL_DEPLOY_START, raising=False)
+    monkeypatch.setenv('SWARM_DEPLOY_STATE', str(tmp_path / 'deploy-state'))
+    monkeypatch.setenv('SWARM_FLOW_LIVE', str(tmp_path / 'no-flow-live'))
     monkeypatch.setattr(_wh, 'INBOX', tmp_path / 'webhook-inbox')
     monkeypatch.setattr(_wh, 'SEEN', tmp_path / 'webhook-seen.json')
     monkeypatch.setattr(_wh, 'WAKE_URL_FILE', tmp_path / 'wake-url')

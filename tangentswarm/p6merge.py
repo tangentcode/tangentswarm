@@ -33,8 +33,8 @@ step is reported and the rest go on):
     branch in this repo (never a fork's), and only when the local branch has no commit that
     the merged head does not have
   - one events DB row
-  - a tangentswarm merge wakes swarmbot: a deploy is needed. Only a note: deploys need
-    Michal's OK
+  - no deploy note: swarm-webhook starts the deploy of a tangentswarm merge itself
+    (tangentswarm.deploy, #113)
   - the Project 6 Backlog pull: about LIVE_TARGET live workers (launches still queued count
     too); the next Backlog issues in the strict pick order (board.pick_key) are each queued as
     one Project 6 launch (p6launch, tangentswarm #98: branch, draft PR, cards, brief,
@@ -326,7 +326,7 @@ class P6Merge:
                 problems_.append(f"{step.__name__}: {type(e).__name__}: {str(e)[:200]}")
         eventdb.log_event('p6-merge', source='p6merge', action='merged', pr=self.n, repo=self.repo,
                           notes=self.notes + problems_, detail={'head': self.head, 'trigger': self.trigger})
-        for step in (self.deploy_note, self.pull):
+        for step in (self.pull,):
             try:
                 notices += step(pr) or []
             except Exception as e:
@@ -502,13 +502,6 @@ class P6Merge:
             raise RuntimeError(f"local branch {branch} kept: it is not merged into origin/{default}")
         worktrees.git(['branch', '-D', branch], repo_path)
         self.note(f"deleted local branch {branch}")
-
-    def deploy_note(self, pr):
-        if self.repo != 'tangentcode/tangentswarm':
-            return
-        why = (f"tangentcode/tangentswarm#{self.n} merged at {self.head[:8]}: a deploy is needed. "
-               "Notify only: deploys need Michal's OK.")
-        self.note(self.wake(why, f"p6-deploy:{self.n}@{self.head}", self.n))  # the wake queue retries a failed POST
 
     def pull(self, pr):
         """The Project 6 Backlog pull: free = LIVE_TARGET - live workers - launches still queued;

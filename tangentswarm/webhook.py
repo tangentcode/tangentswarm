@@ -36,6 +36,8 @@ SQLite event log (eventdb: a 'received' row before the reply, a 'handled' row af
   p6merge  a worker's `MERGE-READY <sha>` comment on a Project 6 PR: verify, merge and clean
            up at that sha with no AI (p6merge, tangentswarm #89)
   p6cleanup  a Project 6 merge event, after 'merged': p6merge at the merged head, never a merge
+  deploy   a tangentcode/tangentswarm merge into main: start the deploy of main in its own
+           unit (tangentswarm.deploy, #113: tests, restart, unit check, rollback)
   card     a new PR or issue: Project 4 card with the right Status
   wake     an exception (EXCEPTIONS): one deduped, rate-limited POST to swarmbot's wake URL
 
@@ -317,6 +319,10 @@ def _classify(event, p):
                 from . import p6merge  # Codex on PR #90: its own action, so a failed board step cannot stop it
                 if repo in p6merge.REPOS and p6merge.SHA_RE.match(head.get('sha') or ''):
                     acts.append(Action('p6cleanup', n, f"#{n} merged: the Project 6 cleanup", dict(head=head.get('sha'))))
+                if repo == 'tangentcode/tangentswarm' and p6merge.SHA_RE.match(head.get('sha') or ''):
+                    merged = pr.get('merge_commit_sha') or ''  # tangentswarm #113: deploy main after a merge
+                    acts.append(Action('deploy', n, f"#{n} merged: deploy tangentswarm main",
+                                       dict(sha=merged if p6merge.SHA_RE.match(merged) else head.get('sha'))))
                 return acts
             if pr.get('merged'):
                 return [Action('wake', n, f"#{n} merged into {base}, not main", dict(key=f'merge-base:{n}'))]
@@ -391,9 +397,10 @@ class Executor:
     """Runs actions with the swarm's tools. Every tool is injectable for tests."""
 
     def __init__(self, g=None, dry=False, sh=None, enqueue=None, cascade=None, give=None, wake_post=None,
-                 signal_promoted=None, p6merge=None):
+                 signal_promoted=None, p6merge=None, deploy_start=None):
         self._g, self.dry = g, dry
         self.p6merge = p6merge
+        self.deploy_start = deploy_start
         self.sh = sh
         self.signal_promoted = signal_promoted
         self.enqueue = enqueue
@@ -836,6 +843,15 @@ class Executor:
         res = (self.p6merge or p6merge.run)(self.repo, a.pr, head, 'merged', gql=self.g['gql'], sh=self._sh)
         self.note(f"{self.repo}#{a.pr} Project 6 cleanup at {head[:8]}: "
                   + ('; '.join(res.get('notes') or []) or res.get('why') or 'done'))
+
+    def do_deploy(self, a):
+        """tangentswarm #113: start the deploy of tangentswarm main (tangentswarm.deploy). It runs
+        in its own transient unit, so the restart of this service does not stop it."""
+        from . import deploy
+        sha = a.args.get('sha') or ''
+        if self.dry:
+            return self.note(f"would start the deploy of tangentswarm main at {sha[:8]}")
+        self.note((self.deploy_start or deploy.start)(sha, a.pr))
 
     def drop_premerge_labels(self, n):
         """Remove merge-ready and pre-merging from a PR merged to main (tangentswarm #65), and
