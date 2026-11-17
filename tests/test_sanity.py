@@ -68,7 +68,8 @@ def test_in_progress_needs_a_draft_and_a_live_claude_on_its_branch():
     assert rules(sanity.check(cards, [claude(1, '/w/x', 'other')])) == [('no-live-claude', 10)]
     assert rules(sanity.check(cards, [claude(1, '/w/x', 'b10', repo=TS)])) == [('no-live-claude', 10)]  # other repo
     assert sanity.check(cards, [claude(1, '/w/x', 'b10', repo=None)]) == []  # no origin: branch alone
-    assert sanity.check(cards, [], hold_prs={10}) == []  # its Claude is starting now
+    assert sanity.check(cards, [], hold_prs={(P, 10)}) == []  # its Claude is starting now
+    assert rules(sanity.check(cards, [], hold_prs={(TS, 10)})) == [('no-live-claude', 10)]  # another repo's #10
 
 
 def test_human_review_never_holds_more_than_two_per_board():
@@ -86,7 +87,8 @@ def test_active_holds_open_issues_with_exactly_one_flow_pr_and_no_work2():
              issue(4, board.ACTIVE), pr(40, board.PARKED, closes=[(4, ())])]   # Parked is not a flow column
     got = rules(sanity.check(cards, []))
     assert got == [('active-pr-count', 1), ('active-pr-count', 2), ('active-pr-count', 4), ('active-work2', 3)]
-    assert rules(sanity.check(cards[:1], [], hold_issues={1})) == []  # launch in flight
+    assert rules(sanity.check(cards[:1], [], hold_issues={(P, 1)})) == []  # launch in flight
+    assert rules(sanity.check(cards[:1], [], hold_issues={(TS, 1)})) == [('active-pr-count', 1)]
 
 
 def test_a_flow_pr_belongs_to_exactly_one_active_issue():
@@ -379,3 +381,15 @@ def test_a_failed_board_read_still_runs_the_other_checks_and_keeps_its_findings(
     assert len(s.incidents) == 2 and len(s.alerts) == 1
     s.run([F1], T0 + 1400)
     assert F6['key'] not in json.loads(sanity.state_path().read_text())['open']
+
+
+def test_gather_holds_only_the_platform_numbers_of_the_launch_records(monkeypatch):
+    """Codex on PR #79: an unstarted platform #79 must not hide tangentswarm #79."""
+    from tangentswarm import slots
+    monkeypatch.setattr(slots, 'load', lambda: {'unstarted': {'79': {'issue': 43}}})
+    monkeypatch.setattr(sanity, 'cards_from_board', lambda gql_, b: [pr(79, board.IN_PROGRESS, repo=TS, b=6, closes=None)])
+    snap = {'prs': [node(79, board.IN_PROGRESS, draft=True, closes=[(43, ())])],
+            'issues': [node(43, board.ACTIVE, kind='Issue')], 'at': T0}
+    got = rules(sanity.gather({'gql': None}, snap, T0, claudes=[]))
+    assert got == [('no-live-claude', 79)]
+    assert next(f for f in sanity.gather({'gql': None}, snap, T0, claudes=[]))['repo'] == TS

@@ -200,8 +200,9 @@ def live_claudes(proc=Path('/proc'), uid=None, info=git_info):
 # -- the rules --------------------------------------------------------------------------------
 
 def check(cards, claudes, hold_issues=(), hold_prs=()):
-    """[finding] for the cards and the live Claudes. hold_issues: issues with a launch in
-    flight (Active before its draft PR); hold_prs: PRs whose Claude is starting now."""
+    """[finding] for the cards and the live Claudes. hold_issues: {(repo, n)} of issues with
+    a launch in flight (Active before its draft PR); hold_prs: {(repo, n)} of PRs whose Claude
+    is starting now. Keyed by repo (Codex on PR #79: platform #79 must not hold tangentswarm #79)."""
     out, unknown = [], {}
     for c in cards:
         what = f"{'PR' if c['kind'] == 'pr' else 'issue'} {c['repo']}#{c['n']}"
@@ -253,7 +254,7 @@ def _claude_rules(cards, claudes, hold_prs):
                                scope=root))
     live = {(c.get('repo'), c.get('branch')) for c in claudes if c.get('branch')}
     for c in cards:
-        if c['kind'] != 'pr' or c['col'] != board.IN_PROGRESS or c['n'] in hold_prs:
+        if c['kind'] != 'pr' or c['col'] != board.IN_PROGRESS or (c['repo'], c['n']) in hold_prs:
             continue
         if (c['repo'], c['branch']) not in live and (None, c['branch']) not in live:
             out.append(finding('no-live-claude', f"PR {c['repo']}#{c['n']} is in In Progress but no live Claude "
@@ -303,7 +304,7 @@ def _active_rules(cards, hold_issues):
             out.append(finding('active-work2', f"issue {c['repo']}#{c['n']} is in Active with the work2 label",
                                c['repo'], c['n'], board_no=c['board']))
         got = flow_by_issue.get(k, [])
-        if len(got) == 1 or (not got and c['n'] in hold_issues):
+        if len(got) == 1 or (not got and (c['repo'], c['n']) in hold_issues):
             continue
         which = ', '.join(f"#{n}" for n in sorted(got)) or 'none'
         out.append(finding('active-pr-count', f"issue {c['repo']}#{c['n']} is in Active with {len(got)} open PRs "
@@ -452,7 +453,7 @@ def gather(g, snap, now, claudes=None, failed=None):
     """Every card (Project 4 from the snapshot, the other boards read now), the live Claudes,
     and the holds; then the findings. A board whose read fails is skipped, and its number and
     error go in failed ({board: error}), so the other checks still run (Codex on PR #79)."""
-    from . import slots, watchdog
+    from . import boardcache, slots, watchdog
     cards = cards_from_snap(snap)
     for b in board.BOARDS[1:]:
         try:
@@ -462,8 +463,9 @@ def gather(g, snap, now, claudes=None, failed=None):
                 raise
             failed[b.number] = f"{type(e).__name__}: {str(e)[:200]}"
     st = slots.load()
-    hold_issues = watchdog.launching_issues(st, now)
-    hold_prs = {int(k) for k in (st.get('unstarted') or {}) if str(k).isdigit()}
+    # the launch records hold platform numbers only (slots, webhook.Executor.do_closed)
+    hold_issues = {(boardcache.REPO, n) for n in watchdog.launching_issues(st, now)}
+    hold_prs = {(boardcache.REPO, int(k)) for k in (st.get('unstarted') or {}) if str(k).isdigit()}
     return check(cards, live_claudes() if claudes is None else claudes, hold_issues, hold_prs)
 
 
