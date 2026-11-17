@@ -223,6 +223,18 @@ def unhold(n, only_if=None):
         return d.pop(n)
 
 
+def retried(n, h, tried):
+    """Mark the hold h of PR n as retried at time tried, under the lock, only if h is still the
+    hold on disk (Codex on PR #103: a body edit may release it while the retry runs; a
+    retry from its old copy must not bring it back). Returns True when it was marked."""
+    with held_update() as d:
+        cur = d.get(n)
+        if cur is None or not same_hold(h)(cur):
+            return False
+        cur['tried'] = tried
+        return True
+
+
 def same_hold(h):
     """only_if for unhold: the hold on disk is still h (same head, same first hold time)."""
     return lambda cur: cur.get('head') == h.get('head') and cur.get('at') == h.get('at')
@@ -1164,8 +1176,11 @@ class Flow:
                 continue
             rc, said = self.give_worker(n, text)
             if rc != 0:
-                hold(n, h['head'], h.get('why', ''), relay=h['relay'], tried=now)
-                self.note(f"NEEDS_WORKER #{n}: retried the held handoff; still no worker ({said})")
+                if retried(n, h, now):
+                    self.note(f"NEEDS_WORKER #{n}: retried the held handoff; still no worker ({said})")
+                else:
+                    self.note(f"#{n}: retried the held handoff; no worker, but its hold ended meanwhile "
+                              f"(a body edit or a gate pass): not held again ({said})")
                 continue
             unhold(n, only_if=same_hold(h))  # a newer hold set meanwhile stays
             board.move_card(self.g, p['item'], board.IN_PROGRESS, n=n, repo=REPO)

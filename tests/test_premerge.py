@@ -794,3 +794,43 @@ def test_a_retried_handoff_keeps_a_newer_hold_set_while_it_ran(monkeypatch, tmp_
     f.give_worker = give
     f.retry_held({RD: [dict(number=7, head='a' * 40, item='I7')]}, now=10 ** 9)
     assert flow.held()[7]['head'] == 'b' * 40
+
+
+@pytest.mark.parametrize('release', ['edit', 'gate'])
+def test_a_failed_handoff_retry_does_not_bring_back_a_hold_released_while_it_ran(tmp_path, release):
+    """Codex on PR #103 (2d78ac8): a body edit (or a gate pass) released the hold while
+    retry_held was in give_worker; the failed retry re-saved the hold from its old copy."""
+    relay = tmp_path / 'relay-7-gate.md'
+    relay.write_text('fix it\n')
+    flow.hold(7, 'a' * 40, '7b where-to-see line: missing', relay=relay, tried=0)
+    f = flow.Flow(out=lambda line: None, g={}, now=lambda: 10_000)
+
+    def give(n, text, priority=False):
+        if release == 'edit':
+            assert flow.release_on_edit(7)
+        else:
+            assert flow.unhold(7, only_if=flow.same_hold(flow.held()[7]))
+        return 3, 'no worker'
+    f.give_worker = give
+    f.retry_held({RD: [dict(number=7, head='a' * 40, item='I7')]}, now=10 ** 9)
+    assert 7 not in flow.held()
+    assert any('its hold ended meanwhile' in n for n in f.notes)
+
+
+def test_a_failed_handoff_retry_marks_only_the_hold_it_retried(tmp_path):
+    """A failed retry updates 'tried' of its own hold; a newer hold (a new head) set while it
+    ran is kept as it is."""
+    relay = tmp_path / 'relay-7-gate.md'
+    relay.write_text('fix it\n')
+    flow.hold(7, 'a' * 40, 'why', relay=relay, tried=0)
+    f = flow.Flow(out=lambda line: None, g={}, now=lambda: 10_000)
+    f.give_worker = lambda n, text, priority=False: (3, 'no worker')
+    f.retry_held({RD: [dict(number=7, head='a' * 40, item='I7')]}, now=10 ** 9)
+    assert flow.held()[7]['tried'] == 10 ** 9
+
+    def newer(n, text, priority=False):
+        flow.hold(7, 'b' * 40, 'conflicts with main', relay=relay, tried=5)
+        return 3, 'no worker'
+    f.give_worker = newer
+    f.retry_held({RD: [dict(number=7, head='a' * 40, item='I7')]}, now=2 * 10 ** 9)
+    assert flow.held()[7]['head'] == 'b' * 40 and flow.held()[7]['tried'] == 5
