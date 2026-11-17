@@ -602,9 +602,10 @@ def test_the_queue_drops_a_closed_pr_and_a_refused_revive(tmp_path):
         return 1
     prs = {7: {'state': 'MERGED'}, 8: {'state': 'OPEN'}, 9: {'state': 'OPEN'}}
     assert slots.run_queued(out=out.append, prs=prs, revive_fn=fake) == []
-    assert ran == [8, 9] and slots.load()['queued'] == {}  # oldest first; #7 is not open
+    # oldest first; #7 is not open. Codex on PR #109: a refusal keeps the saved feedback
+    assert ran == [8, 9] and sorted(slots.load()['queued']) == ['8', '9']
     assert out[0] == 'revive queue: #7 is not an open board PR: dropped'
-    assert out[1].startswith('NEEDS_WORKER #8: the queued revive was refused')
+    assert out[1].startswith('NEEDS_WORKER #8: the queued revive was refused') and out[1].endswith('it stays queued')
 
 
 def test_a_newer_feedback_replaces_the_queued_one_and_keeps_its_place():
@@ -644,3 +645,46 @@ def test_waiting_counts_queued_and_unstarted():
     slots.unstarted_add(8, branch='b8')
     assert slots.waiting() == {7, 8}
     assert slots.waiting(st={'queued': {'3': {}}, 'unstarted': {}}) == {3}
+
+
+def test_a_refused_queued_revive_stays_until_delivered_then_is_flagged(monkeypatch):
+    """Codex on PR #109: a refusal (a busy resume lock, a shell that is not idle) never drops
+    the saved feedback; every pass retries it. After QUEUE_REFUSALS refusals in a row it
+    no longer counts as waiting, so swarm-tick and the sanity check flag the card."""
+    slots.queue_revive(7, 'Coordinator: #7 merge main', branch='b7', relay='/r/relay-7.md')
+    rcs = [1] * slots.QUEUE_REFUSALS + [0]
+
+    def fake(n, text, out=print, **k):
+        rc = rcs.pop(0)
+        out('refused: another resume of this window is running' if rc else 'sent')
+        return rc
+    for i in range(slots.QUEUE_REFUSALS):
+        assert 7 in slots.waiting()
+        assert slots.run_queued(out=lambda l: None, revive_fn=fake) == []
+        assert slots.load()['queued']['7']['text'] == 'Coordinator: #7 merge main'
+    assert 7 not in slots.waiting() and slots.load()['queued']['7']['refused'] == slots.QUEUE_REFUSALS
+    assert slots.run_queued(out=lambda l: None, revive_fn=fake) == [7] and slots.load()['queued'] == {}
+
+
+def test_a_queued_revive_with_no_worktree_becomes_a_worker_start_with_its_relay(monkeypatch):
+    """Codex on PR #109: "worktree is gone" at the queue drain moves the feedback to a worker
+    start (its relay as the brief) on the PR's branch; with no branch known, GitHub is read;
+    with none at all, it stays queued (never a start on an empty branch)."""
+    from tangentswarm import flow
+    gone = lambda n, text, out=print, **k: out(f'refused: #{n}: worktree /x is gone') or 1
+    slots.queue_revive(7, 't7', branch='b7', relay='/r/relay-7.md', now=1)
+    slots.queue_revive(8, 't8', relay='/r/relay-8.md', now=2)  # branch from GitHub
+    slots.queue_revive(9, 't9', relay='/r/relay-9.md', now=3)  # no branch anywhere
+    monkeypatch.setattr(flow, 'head_branch', lambda n: {8: 'b8'}.get(n, ''))
+    slots.run_queued(out=lambda l: None, revive_fn=gone)
+    st = slots.load()
+    assert {k: (r['branch'], r['brief']) for k, r in st['unstarted'].items()} == \
+        {'7': ('b7', '/r/relay-7.md'), '8': ('b8', '/r/relay-8.md')}
+    assert list(st['queued']) == ['9'] and st['queued']['9']['refused'] == 1
+
+
+def test_start_later_needs_a_branch():
+    slots.queue_revive(7, 't')
+    assert slots.start_later(7, '', '/r/x.md') is False and '7' in slots.load()['queued']
+    assert slots.start_later(7, 'b7', '/r/x.md') is True
+    assert '7' not in slots.load()['queued'] and slots.load()['unstarted']['7']['branch'] == 'b7'

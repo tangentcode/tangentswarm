@@ -970,13 +970,15 @@ def test_no_worker_still_sends_the_card_to_in_progress_to_wait(ar7, revives, tmp
     cascade's start retry runs when capacity frees."""
     from tangentswarm import slots
     revives.rcs.append(1)  # 'refused: worktree is gone'
-    g = Gate(ar7, details={7: dict(codex_pr(), mergeable='CONFLICTING')})
+    # Codex on PR #109: the board record has no branch; the start takes headRefName
+    g = Gate(ar7, details={7: dict(codex_pr(), mergeable='CONFLICTING', headRefName='ptw/b7')})
     out, _ = run(g)
     assert g.moves == [('I7', board.IN_PROGRESS)] and board.DRAFTED == [(7, A.REPO)]
     assert any('WAITING_FOR_CLAUDE' in line and 'a worker start with the relay relay-7-conflict.md' in line
                for line in out)
     rec = slots.load()['unstarted']['7']
     assert rec['brief'] == str(tmp_path / 'relay-7-conflict.md') and rec['setup'] == 'done'
+    assert rec['branch'] == 'ptw/b7' and 'headRefName' in A.CODEX_FIELDS
     assert 'merge origin/main' in (tmp_path / 'relay-7-conflict.md').read_text().lower()
     run(g)  # one revive per head and reason
     assert len(revives) == 1
@@ -1053,3 +1055,14 @@ def test_the_start_retry_starts_waiting_workers_in_pick_order():
     unstarted = {'5': dict(branch='b5', at=1), '6': dict(branch='b6', at=2)}
     assert a.retry_starts(unstarted, 1) == 0
     assert out == ['start: would queue the worker start of #6 (b6)']
+
+
+def test_an_auto_review_pr_with_no_branch_anywhere_keeps_its_feedback_queued(ar7, revives):
+    """Codex on PR #109: no branch in the record or the read: no start on an empty branch.
+    The feedback stays queued (with its relay), and the card still waits in In Progress."""
+    from tangentswarm import slots
+    revives.rcs.append(1)  # 'refused: worktree is gone'
+    g = Gate(ar7, details={7: dict(codex_pr(), mergeable='CONFLICTING')})
+    run(g)
+    assert g.moves == [('I7', board.IN_PROGRESS)]
+    assert slots.load()['unstarted'] == {} and slots.load()['queued']['7']['relay'].endswith('relay-7-conflict.md')

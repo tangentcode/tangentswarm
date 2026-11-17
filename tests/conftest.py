@@ -48,6 +48,7 @@ def isolated_state(tmp_path, monkeypatch):
     from tangentswarm import flow
     monkeypatch.setattr(flow, 'RELAY_DIR', tmp_path)
     monkeypatch.setattr(flow, 'HELD', tmp_path / 'held.json')
+    monkeypatch.setattr(flow, 'head_branch', lambda n: '')  # never a real gh pr view in a test
     monkeypatch.setattr(flow, 'PREMERGE_STATE', tmp_path / 'premerge.json')
     labels_written = []  # tangentswarm #65: never a real minbot label write in a test
     monkeypatch.setattr(flow, 'label_write', lambda n, op, names: labels_written.append((n, op, list(names))))

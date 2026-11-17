@@ -71,6 +71,7 @@ CONFLICT_MAX_CLAUDES = int(os.environ.get('SWARM_CONFLICT_MAX_CLAUDES', '9'))
 CONFLICT_AVAIL_MIN = int(float(os.environ.get('SWARM_CONFLICT_AVAIL_MIN_GB', '1.5')) * 1024 ** 3)
 TMUX_SESSION = 'agents'
 FEEDBACK_MAX = 4000
+QUEUE_REFUSALS = int(os.environ.get('SWARM_QUEUE_REFUSALS', '3'))  # refusals before a waiting PR is flagged
 
 
 # -- state ------------------------------------------------------------------------
@@ -772,22 +773,44 @@ def revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, path
                    notes=lines[-3:] + [one_line_safe(text)[:600]], error=error)
 
 
-def queue_revive(n, text, why='', path=None, now=None):
+def queue_revive(n, text, why='', path=None, now=None, branch=None, relay=None):
     """Keep a held revive of PR n (tangentswarm #102). One entry per PR: a newer feedback
-    replaces the older one, and the entry keeps its place in the queue."""
+    replaces the older one, and the entry keeps its place in the queue. branch and relay
+    (the relay file; tangentswarm #101) let run_queued turn it into a worker start when the
+    worktree is gone; an earlier value is kept when none is given."""
     n = int(str(n).lstrip('#'))
     with update(path) as st:
         old = st['queued'].get(str(n)) or {}
-        st['queued'][str(n)] = dict(text=text, why=str(why)[:200],
-                                    at=old.get('at') or (time.time() if now is None else now))
+        rec = dict(text=text, why=str(why)[:200], at=old.get('at') or (time.time() if now is None else now))
+        for k, v in (('branch', branch), ('relay', relay)):
+            if v or old.get(k):
+                rec[k] = v or old[k]
+        st['queued'][str(n)] = rec
+
+
+def start_later(n, branch, brief, path=None):
+    """Record a worker start for PR n with brief (a relay file) as its brief: the cascade's
+    start retry starts it when capacity frees (tangentswarm #101). The relay goes with the
+    start, so a queued revive of n is dropped. False, and nothing recorded, with no branch
+    (Codex on PR #109: the launcher cannot start a worker on an empty branch)."""
+    if not branch:
+        return False
+    n = int(str(n).lstrip('#'))
+    unqueue(n, path)
+    if str(n) not in load(path)['unstarted']:
+        unstarted_add(n, path=path, branch=branch, brief=str(brief), setup='done', issue=None)
+    return True
 
 
 def waiting(path=None, st=None):
     """{PR number} of the PRs that wait for a Claude: a queued revive or an unstarted worker
-    (tangentswarm #101). An In Progress card of such a PR is valid with no live Claude.
+    (tangentswarm #101). An In Progress card of such a PR is valid with no live Claude. A
+    queued revive refused QUEUE_REFUSALS times in a row does not count: it is still retried,
+    but swarm-tick and the sanity check flag it, so a person looks at it.
     st: the slots state when the caller has it."""
     st = load(path) if st is None else st
-    return {int(k) for k in list(st.get('queued') or {}) + list(st.get('unstarted') or {}) if str(k).isdigit()}
+    queued = [k for k, r in (st.get('queued') or {}).items() if int(r.get('refused') or 0) < QUEUE_REFUSALS]
+    return {int(k) for k in queued + list(st.get('unstarted') or {}) if str(k).isdigit()}
 
 
 def unqueue(n, path=None):
@@ -836,12 +859,23 @@ def run_queued(out=print, prs=None, dry=False, path=None, revive_fn=None):
         if rc == 3:
             out(f"revive queue: #{n} still held ({last}); {len(q) - len(done)} wait")
             break
-        unqueue(n, path)
         if rc == 0:
+            unqueue(n, path)
             done.append(n)
             out(f"revive queue: #{n} revived ({last})")
-        else:
-            out(f"NEEDS_WORKER #{n}: the queued revive was refused ({last}); dropped from the queue")
+            continue
+        # Codex on PR #109: a refusal never drops the saved feedback. No worktree: a worker
+        # start with the relay. Else it stays queued, and the next pass tries again.
+        from .flow import head_branch, no_worker
+        if no_worker(last) and rec.get('relay') and start_later(n, rec.get('branch') or head_branch(n),
+                                                                  rec['relay'], path=path):
+            out(f"revive queue: #{n} has no worktree ({last}); a worker start with its relay is queued")
+            continue
+        with update(path) as st:
+            if str(n) in st['queued']:
+                st['queued'][str(n)]['refused'] = int(st['queued'][str(n)].get('refused') or 0) + 1
+                st['queued'][str(n)]['why'] = str(last)[:200]
+        out(f"NEEDS_WORKER #{n}: the queued revive was refused ({last}); it stays queued")
     return done
 
 

@@ -638,3 +638,21 @@ def test_the_pull_batch_has_no_hold_any_more(monkeypatch):
     f.pull_batch({}, {RD: [card(7, RD)]}, None, room=1)
     assert asked == [7]
     assert not hasattr(flow, 'held') and not hasattr(flow.Flow, 'retry_held')
+
+
+def test_a_no_worktree_pr_with_no_branch_on_its_card_reads_it_from_github(monkeypatch):
+    """Codex on PR #109: the start needs the branch; a card without one gets it from GitHub,
+    and with none at all the feedback stays queued with its relay. Same rule for the -vN
+    worker start (start_worker)."""
+    from tangentswarm import slots
+    monkeypatch.setattr(slots, 'revive', lambda n, text, out=print, **k: out('refused: worktree /x is gone') or 1)
+    monkeypatch.setattr(flow, 'head_branch', lambda n: {7: 'ptw/b7'}.get(n, ''))
+    f, g = make_flow({}, dry=False)
+    for n in (7, 8):
+        assert f.fail(dict(number=n, head='h' * 40, item=f'I{n}', col=RD), 'conflicts', text=f'fix {n}') is True
+    st = slots.load()
+    assert st['unstarted']['7']['branch'] == 'ptw/b7' and '8' not in st['unstarted']
+    assert st['queued']['8']['relay'] == str(flow.RELAY_DIR / 'relay-8-gate.md') and 8 in slots.waiting()
+    monkeypatch.setattr(slots, 'conflict_capacity', lambda: (True, ''))
+    monkeypatch.setattr('tangentswarm.spool.submit', lambda *a, **k: pytest.fail('no start on an empty branch'))
+    assert 'branch is unknown' in f.start_worker(dict(number=9), flow.RELAY_DIR / 'r9.md', 'gone')

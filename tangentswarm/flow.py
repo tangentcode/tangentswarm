@@ -286,6 +286,22 @@ def vn_text(n, branch, rec):
             "the test counts.")
 
 
+def head_branch(n):
+    """The head branch of platform PR n from GitHub, or '' when it cannot be read (Codex on
+    PR #109: a board record may have no branch, and a worker start needs it)."""
+    try:
+        r = proc.sh('gh', 'pr', 'view', str(n), '-R', REPO, '--json', 'headRefName', '--jq', '.headRefName',
+                    check=False, who='swarm-flow')
+    except Exception:
+        return ''
+    return (r.stdout or '').strip() if r.returncode == 0 else ''
+
+
+def pr_branch(p):
+    """The head branch of board PR p: its record, else GitHub (head_branch), else ''."""
+    return p.get('branch') or head_branch(p['number'])
+
+
 def no_worker(said):
     """True when give_worker failed because the PR has no worktree or window to resume."""
     s = said or ''
@@ -1034,7 +1050,8 @@ class Flow:
             return f"no worker to resume ({why}) and no start: {held}"
         if any(int(r.get('pr') or 0) == n for r in spool.in_flight(('start',))) or str(n) in slots.load()['unstarted']:
             return f"no worker to resume ({why}); its worker start is already queued"
-        slots.unstarted_add(n, branch=p.get('branch') or '', brief=str(relay_path), setup='done', issue=None)
+        if not slots.start_later(n, pr_branch(p), relay_path):  # Codex on PR #109: never an empty branch
+            return f"no worker to resume ({why}); its branch is unknown, so no start"
         spool.submit('start', '', pr=n)
         return f"no worker to resume ({why}); queued a worker start with the relay {relay_path.name}"
 
@@ -1053,22 +1070,26 @@ class Flow:
             the cascade runs the queue in pick order when capacity frees (slots.run_queued);
           - no worktree or window to resume: an unstarted record with the relay file as its
             brief, and the cascade's start retry starts its worker (Advance.retry_starts);
-          - any other refusal: the revive is queued, so the next pass tries again.
+          - any other refusal: the revive stays queued, and every pass tries it again
+            (Codex on PR #109: a refusal never drops the saved feedback).
+        The queued record keeps the branch and the relay path, so a later "worktree is
+        gone" refusal turns it into a worker start (slots.run_queued).
         waiting is False when its Claude has the relay now."""
         from . import slots
         n = p['number']
         rc, said = self.give_worker(n, text, queue=True)
         if rc == 0:
             return False, said
+        branch = pr_branch(p)
+        if no_worker(said):
+            if slots.start_later(n, branch, relay_path):  # the start, not a revive, gives its Claude the relay
+                return True, f"waiting for a Claude: a worker start with the relay {relay_path.name} is queued ({said})"
+            # Codex on PR #109: no branch, so no start can be recorded: keep the revive queued;
+            # run_queued tries the start again once the branch can be read
+        slots.queue_revive(n, text, why=said, branch=branch, relay=str(relay_path))
         if rc == 3:
             return True, f"waiting for a Claude: the revive is queued ({said})"
-        if no_worker(said):
-            slots.unqueue(n)  # the start, not a revive, gives this Claude its relay
-            if str(n) not in slots.load()['unstarted']:
-                slots.unstarted_add(n, branch=p.get('branch') or '', brief=str(relay_path), setup='done', issue=None)
-            return True, f"waiting for a Claude: a worker start with the relay {relay_path.name} is queued ({said})"
-        slots.queue_revive(n, text, why=said)
-        return True, f"waiting for a Claude: the revive was refused ({said}); it is queued for the next pass"
+        return True, f"waiting for a Claude: the revive was refused ({said}); it stays queued and is retried"
 
     def give_worker(self, n, text, priority=False, queue=False):
         """(rc, last line) of slots.revive: 0 = its Claude runs and got the text. priority: a
