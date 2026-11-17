@@ -135,14 +135,54 @@ def test_add_idle_info_reads_session_record_and_board():
     branches = {'/w/a2': 'br-a2', '/w/b': 'br-b'}
     seen = []
 
-    def branch(path):
+    def git(path):
         seen.append(path)
-        return branches.get(path, '')
-    ts.add_idle_info(rows, table=table, sess=sess, cards=cards, branch=branch, now=1000 + 125)
+        return 'tangentcode/platform', branches.get(path, '')
+    ts.add_idle_info(rows, table=table, sess=sess, cards=cards, git=git, now=1000 + 125)
     a, b, c = rows
     assert (a.idle_s, a.branch, a.pr, a.draft, a.card) == (125, 'br-a2', 55, False, 'Auto Review')
     assert (b.idle_s, b.branch, b.pr) == (None, 'br-b', None)   # not idle in its record: age unknown
     assert (c.idle_s, c.branch) == (None, '') and '/w/c' not in seen   # working rows are left alone
+
+
+def worktree(tmp_path, name, branch, origin):
+    wt, gd = tmp_path / name, tmp_path / (name + '.gitdir')
+    (wt / 'sub').mkdir(parents=True)
+    gd.mkdir()
+    (wt / '.git').write_text(f'gitdir: {gd}\n')
+    (gd / 'HEAD').write_text(f'ref: refs/heads/{branch}\n')
+    (gd / 'config').write_text(f'[remote "origin"]\n\turl = git@github.com:{origin}.git\n')
+    return wt
+
+
+def idle_row(path):
+    return ts.Window(index=1, name='w', pane='%1', command='claude', cls='idle', activity='done',
+                     path=str(path), pid=10)
+
+
+def add(rows, cards):
+    ts.add_idle_info(rows, table={10: dict(ppid=1, comm='claude', cmd='claude')}, sess={}, cards=cards, now=0)
+
+
+def test_idle_row_of_a_subdirectory_shows_its_worktree_pr(tmp_path):
+    """Codex on #128: a Claude started in a subdirectory still shows its branch and PR."""
+    wt = worktree(tmp_path, 'wt', 'feat', 'tangentcode/platform')
+    assert ts.git_of(str(wt / 'sub')) == ('tangentcode/platform', 'feat')
+    assert ts.git_of('') == (None, '')
+    row = idle_row(wt / 'sub')
+    add([row], {'feat': (9, False, 'Auto Review')})
+    assert (row.branch, row.pr, row.card) == ('feat', 9, 'Auto Review')
+
+
+def test_idle_row_of_another_repo_never_takes_a_board_pr_of_the_same_branch(tmp_path):
+    """Codex on #128: the board holds platform PRs only; a same-named branch elsewhere is not it."""
+    other = idle_row(worktree(tmp_path, 'other', 'feat', 'tangentcode/tangentswarm') / 'sub')
+    no_origin = idle_row(worktree(tmp_path, 'local', 'feat', 'nowhere') / 'sub')
+    (tmp_path / 'local.gitdir' / 'config').write_text('')
+    add([other, no_origin], {'feat': (9, False, 'Auto Review')})
+    assert (other.branch, other.pr, other.card) == ('feat', None, '')
+    assert (no_origin.branch, no_origin.pr) == ('feat', None)
+    assert ts.why_idle(other) == 'idle ?, no open PR on the board for feat'
 
 
 def test_add_idle_info_reads_nothing_without_idle_rows(monkeypatch):

@@ -5,6 +5,8 @@ import json
 import os
 import types
 
+import pytest
+
 from tangentswarm import agents_view as AV, events_view as V, launches, livestate as LS
 
 MB = 1024 ** 2
@@ -34,6 +36,12 @@ SESS = {101: {'status': 'busy', 'cwd': '/w/platform.busy'},
         201: {'status': 'idle', 'cwd': '/w/platform.idle', 'statusUpdatedAt': (NOW - 600) * 1000}}
 CARDS = {'busy': (601, 'In Progress'), 'idle': (602, 'Pending')}
 BRANCH = {'/w/platform.busy': 'busy', '/w/platform.idle': 'idle', '/w/platform.shell': 'shell'}
+
+
+@pytest.fixture(autouse=True)
+def board_repo(monkeypatch):
+    """The fake panes are worktrees of the board's repo (no files on disk to read it from)."""
+    monkeypatch.setattr(LS, 'repo_of', lambda cwd: LS.boardcache.REPO)
 
 
 def rows(**kw):
@@ -157,6 +165,34 @@ def test_sessions_board_cards_and_branch(tmp_path):
     (gd / 'rebase-merge').mkdir()
     (gd / 'rebase-merge' / 'head-name').write_text('refs/heads/agents-screen\n')
     assert LS.branch_of(wt) == 'agents-screen'
+
+
+def test_branch_of_a_subdirectory_is_its_worktree_branch(tmp_path):
+    """Codex on #128: a Claude started in a subdirectory still has the worktree's branch."""
+    wt, gd = tmp_path / 'wt', tmp_path / 'gd'
+    (wt / 'pkg' / 'sub').mkdir(parents=True)
+    gd.mkdir()
+    (wt / '.git').write_text(f'gitdir: {gd}\n')            # a linked worktree
+    (gd / 'HEAD').write_text('ref: refs/heads/feat\n')
+    assert LS.branch_of(wt / 'pkg' / 'sub') == 'feat'
+    assert LS.branch_of(str(wt / 'pkg')) == 'feat'
+    main = tmp_path / 'main'
+    (main / '.git').mkdir(parents=True)                      # a main checkout: .git is a directory
+    (main / '.git' / 'HEAD').write_text('ref: refs/heads/main\n')
+    (main / 'src').mkdir()
+    assert LS.branch_of(main / 'src') == 'main'
+    assert LS.branch_of('') == '' and LS.branch_of(None) == '' and LS.branch_of('relative/dir') == ''
+
+
+def test_agent_rows_take_a_board_card_only_for_the_board_repo():
+    """Codex on #128: the snapshot holds platform PRs only, so a pane of another repo whose
+    branch has the same name gets no card; the repo name is compared without case."""
+    repos = {'/w/platform.busy': 'tangentcode/tangentswarm', '/w/platform.idle': 'TangentCode/Platform'}
+    by = {r['window']: r for r in LS.agent_rows(PANES, TABLE, SESS, CARDS, now=NOW, branch=BRANCH.get,
+                                                 repo=repos.get)}
+    assert [(r['branch'], r['pr'], r['card']) for r in by.values() if r['branch'] == 'busy'] == [('busy', None, None)]
+    assert [(r['pr'], r['card']) for r in by.values() if r['branch'] == 'idle'] == [(602, 'Pending')]
+    assert not LS.on_board(None) and not LS.on_board('') and LS.on_board('tangentcode/platform')
 
 
 def test_tmux_panes_parses_list_panes():

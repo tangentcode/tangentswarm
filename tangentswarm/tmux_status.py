@@ -25,7 +25,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 
-from . import boardcache, livestate, sanity, tmux
+from . import boardcache, livestate, tmux
 
 SESSION = os.environ.get('SWARM_TMUX_SESSION', 'agents')
 SHELLS = {'bash', 'sh', 'zsh', 'fish', 'dash', 'ksh', 'tcsh', 'csh'}
@@ -178,18 +178,21 @@ def board_prs(path=None):
         return {}
 
 
-def branch_of(path):
-    """The branch of the worktree at path, from its files (no git process), or ''."""
+def git_of(path):
+    """(origin repo or None, branch or '') of the worktree that holds path (path may be a
+    subdirectory of it), from its files (no git process)."""
     try:
-        return sanity.git_info(path)[1] or '' if path else ''
+        repo, branch = livestate.git_of(path) if path else (None, None)
     except OSError:
-        return ''
+        repo, branch = None, None
+    return repo, branch or ''
 
 
-def add_idle_info(windows, table=None, sess=None, cards=None, branch=branch_of, now=None):
+def add_idle_info(windows, table=None, sess=None, cards=None, git=git_of, now=None):
     """Fill in why each idle Claude is idle: idle_s from its Claude session record
     (statusUpdatedAt of the claude process in the pane's process tree), and the branch of its
-    directory with the branch's open PR, draft state and board column. Other rows are left as
+    directory with the branch's open PR, draft state and board column. The PR counts only
+    when the worktree's repo is the board's repo (livestate.on_board). Other rows are left as
     they are. The sources are read only when a window is idle."""
     idle = [w for w in windows if w.cls == 'idle']
     if not idle:
@@ -206,8 +209,8 @@ def add_idle_info(windows, table=None, sess=None, cards=None, branch=branch_of, 
                 w.idle_s = max(0, int(now - float(s['statusUpdatedAt']) / 1000))
             except (TypeError, ValueError):
                 w.idle_s = None
-        w.branch = branch(s.get('cwd') or w.path)
-        if w.branch in cards:
+        repo, w.branch = git(s.get('cwd') or w.path)
+        if w.branch in cards and livestate.on_board(repo):
             w.pr, w.draft, w.card = cards[w.branch]
     return windows
 
