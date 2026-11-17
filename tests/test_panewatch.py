@@ -71,6 +71,16 @@ def test_decide(worker):
     assert PW.decide(pane(worker, 'idle', window='meth-26-auto-coordinator-1'), pr) == []  # never a coordinator
 
 
+def sync(fn):
+    """A spawn that runs the handoff at once (the thread is tested on its own)."""
+    box = {}
+    try:
+        box['res'] = fn() or {}
+    except Exception as e:
+        box['res'] = {'done': False, 'why': f'{type(e).__name__}: {e}'}
+    return box
+
+
 class Rig:
     """A PaneWatch over fake panes, with every effect recorded."""
 
@@ -89,13 +99,13 @@ class Rig:
                                 pane_pid='100')],
             cap=lambda pid: (self.screens[0], self.screens[1]), facts=lambda path: dict(self.worker),
             is_claude=lambda p: True, reported=lambda n: False, tell=lambda p, t: self.told.append((p, t)),
-            handoff=lambda wt, t: self.transcripts.append(t) or self.handoffs.append(wt) or f'r{len(self.handoffs)}',
+            handoff=lambda wt, t: self.transcripts.append(t) or self.handoffs.append(wt)
+            or self.results.get(len(self.handoffs), {'done': True, 'state': 'handed', 'log': 'moved'}),
             transcript=lambda wt: transcript,
-            result=lambda rid: self.results.get(rid, {'ok': True}),
             route=lambda *a: self.routes.append(a) or 'routed',
             wake=lambda why, key, pr=None, detail=None: self.wakes.append((why, detail)),
-            incident=lambda key, title, what, **kw: self.incidents.append((key, title, what)),
-            st=self.st, shell_root=lambda pid: shell_root)
+            incident=lambda key, title, what, **kw: self.incidents.append((key, title, what, kw.get('fix'))),
+            st=self.st, shell_root=lambda pid: shell_root, spawn=sync)
         self.prs = {'feat': pr} if pr else {}
 
     def run(self, now):
@@ -141,7 +151,7 @@ def test_the_missed_handoff_carries_the_workers_transcript(worker):
     """Codex on PR #52: the Stop hook's question check (partial scope, a pending decision goes
     to Needs Input, never ready) needs the transcript, also on a retry."""
     r = Rig(worker, (IDLE, True), pr=dict(AR, col=board.IN_PROGRESS))
-    r.results = {'r1': {'ok': False, 'error': 'x'}}
+    r.results = {1: {'done': False, 'why': 'x'}}
     r.run(0)
     r.run(60)
     r.run(120)
@@ -282,7 +292,7 @@ def test_a_failed_action_is_retried_next_pass_not_marked_done(worker, scr, blank
         return real(*a, **k)
     setattr(r.w, attr, flaky)
     r.run(0)
-    assert 'failed: RuntimeError: GitHub 502' in r.run(60)[0]
+    assert 'RuntimeError: GitHub 502' in r.run(60)[0]
     assert r.run(120) and len(calls) == 2  # retried, and done
     r.run(180)
     assert len(calls) == 2  # then never again
@@ -307,22 +317,53 @@ def test_typed_input_under_an_old_question_is_sent_not_routed(worker):
     assert r.calls == [['tmux', 'send-keys', '-t', '%1', 'Enter']] and r.routes == []
 
 
-def test_a_handoff_is_done_only_when_the_spool_answers_ok(worker, monkeypatch):
-    """Codex on PR #51: a queued handoff is not a done handoff."""
-    r = Rig(worker, (IDLE, True), pr=dict(AR, col=board.IN_PROGRESS))
-    r.results = {'r1': None}  # no answer yet
-    r.run(0)
-    r.run(60)
-    assert r.handoffs == [worker['top']] and r.run(120) == []  # waiting
-    r.results['r1'] = {'ok': False, 'error': 'RuntimeError: gh: HTTP 502'}
-    assert 'failed (RuntimeError: gh: HTTP 502): queued it again' in r.run(180)[0]
-    assert len(r.handoffs) == 2
-    r.results['r2'] = None
+def test_a_handoff_that_does_not_finish_is_retried_then_goes_to_swarmbot(worker, monkeypatch):
+    """Codex on PR #51: a tried handoff is not a done handoff. tangentswarm #120: it is retried
+    each pass, and after HANDOFF_WAIT the board's bot gets it once, with an incident."""
     monkeypatch.setattr(PW, 'HANDOFF_WAIT', 100)
-    assert 'no answer in 100 s' in r.run(300)[0] and len(r.handoffs) == 3  # a lost request
-    assert 'the missed handoff ran' in r.run(360)[0]  # r3 answers ok
-    r.run(420)
-    assert len(r.handoffs) == 3 and len(r.incidents) == 1
+    r = Rig(worker, (IDLE, True), pr=dict(AR, col=board.IN_PROGRESS))
+    r.results = {1: {'done': False, 'why': 'GitHub still shows 1234567'}}
+
+    def boom(wt, t):
+        r.handoffs.append(wt)
+        raise RuntimeError('gh: HTTP 502')
+    r.run(0)
+    assert 'did not finish (GitHub still shows 1234567): tries again' in r.run(60)[0]
+    r.w.handoff = boom
+    assert 'RuntimeError: gh: HTTP 502' in r.run(120)[0] and r.wakes == []
+    out = r.run(180)
+    assert 'did not finish in 1 min' in out[0] and 'woke swarmbot' in out[0]
+    assert len(r.handoffs) == 3 and len(r.wakes) == 1 and 'handoff did not finish' in r.wakes[0][0]
+    assert len(r.incidents) == 1 and 'could not hand off' in r.incidents[0][1]
+    assert r.run(240) == [] and len(r.handoffs) == 3  # once per head
+
+
+def test_a_dirty_idle_worker_is_nudged_and_told_to_swarmbot_once(worker):
+    """tangentswarm #120: stray files or unpushed commits: not moved; reported once to the bot."""
+    r = Rig(dict(worker, dirty=True, ahead=2), (IDLE, True), pr=dict(AR, col=board.IN_PROGRESS))
+    r.run(0)
+    out = r.run(60)
+    r.run(120)
+    assert r.handoffs == [] and len(r.told) == 1 and 'swarmbot told' in out[0]
+    assert len(r.wakes) == 1 and 'uncommitted changes, 2 unpushed commit(s)' in r.wakes[0][0]
+    assert len(r.incidents) == 1
+
+
+def test_the_watcher_runs_the_handoff_itself_not_through_the_spool(worker, monkeypatch):
+    """tangentswarm #120: "queued the handoff" and nothing drained it. The default hook calls
+    worker_mcp.do_handoff in this process; no spool request is written."""
+    from tangentswarm import spool, worker_mcp
+    monkeypatch.setattr(spool, 'submit', lambda *a, **k: pytest.fail('no spool request'))
+    calls = []
+    monkeypatch.setattr(worker_mcp, 'do_handoff', lambda wt, transcript=None: calls.append((wt, transcript))
+                        or {'done': True, 'state': 'handed', 'log': '#7 head hhhhhhh pushed. Moved.'})
+    r = Rig(worker, (IDLE, True), pr=dict(AR, col=board.IN_PROGRESS, draft=True))
+    r.w.handoff = PW.PaneWatch._handoff
+    r.run(0)
+    out = r.run(60)
+    assert calls == [(worker['top'], '/t/s.jsonl')]
+    assert 'ran the handoff (the Stop hook missed it): #7 head hhhhhhh pushed. Moved.' in out[0]
+    assert r.incidents[0][3] == 'The pane watcher ran the handoff itself: #7 head hhhhhhh pushed. Moved.'
 
 
 def test_spool_peek_reads_an_answer_once(tmp_path):
@@ -330,3 +371,58 @@ def test_spool_peek_reads_an_answer_once(tmp_path):
     assert spool.peek('x', spool=tmp_path) is None
     (tmp_path / 'x.res.json').write_text('{"ok": true}')
     assert spool.peek('x', spool=tmp_path) == {'ok': True} and spool.peek('x', spool=tmp_path) is None
+
+
+def test_a_slow_handoff_never_blocks_the_watchdog(worker, monkeypatch):
+    """Codex on PR #129: the handoff runs in its own thread; the pass goes on while it runs,
+    and one that runs past HANDOFF_WAIT goes to swarmbot (no second handoff for the head)."""
+    import threading
+    monkeypatch.setattr(PW, 'HANDOFF_WAIT', 100)
+    gate, started = threading.Event(), threading.Event()
+
+    def slow(wt, t):
+        started.set()
+        gate.wait(5)
+        return {'done': True, 'log': 'moved'}
+    r = Rig(worker, (IDLE, True), pr=dict(AR, col=board.IN_PROGRESS))
+    r.w.handoff, r.w.spawn = slow, PW.run_in_thread
+    r.run(0)
+    assert 'running the handoff' in r.run(60)[0] and started.wait(5)
+    assert r.run(120) == []  # still running: no second thread, no line
+    out = r.run(180)
+    assert 'did not finish in 1 min (still running): woke swarmbot' in out[0] and len(r.wakes) == 1
+    gate.set()
+    assert r.run(240) == [] and r.incidents[0][1].endswith('could not hand off')
+
+
+def test_a_handoff_that_finishes_on_a_later_pass_is_done_then(worker):
+    boxes = []
+    r = Rig(worker, (IDLE, True), pr=dict(AR, col=board.IN_PROGRESS))
+    r.w.spawn = lambda fn: boxes.append(fn) or {}
+    r.run(0)
+    assert 'running the handoff' in r.run(60)[0] and len(boxes) == 1
+    r.w.jobs[next(iter(r.w.jobs))]['res'] = boxes[0]()
+    assert 'ran the handoff (the Stop hook missed it): moved' in r.run(120)[0]
+    assert r.run(180) == [] and len(boxes) == 1
+
+
+@pytest.mark.parametrize('wt_extra,col', [({}, board.IN_PROGRESS), ({'dirty': True}, board.IN_PROGRESS)])
+def test_a_failed_escalation_is_retried_not_marked_done(worker, monkeypatch, wt_extra, col):
+    """Codex on PR #129: the once-key of a timed-out handoff or a dirty worker is saved only
+    after swarmbot was told; a failed wake is tried again next pass (the nudge is not repeated)."""
+    monkeypatch.setattr(PW, 'HANDOFF_WAIT', 0)
+    r = Rig(dict(worker, **wt_extra), (IDLE, True), pr=dict(AR, col=col))
+    r.results = {i: {'done': False, 'why': 'GitHub lag'} for i in range(1, 9)}
+    real = r.w.wake
+
+    def flaky(*a, **k):
+        if not r.wakes and not getattr(flaky, 'failed', False):
+            flaky.failed = True
+            raise OSError('disk full')
+        return real(*a, **k)
+    r.w.wake = flaky
+    r.run(0)
+    assert 'OSError: disk full' in r.run(60)[0] and r.wakes == []
+    out = r.run(120)
+    assert len(r.wakes) == 1 and ('woke swarmbot' in out[0] or 'swarmbot told' in out[0])
+    assert r.run(180) == [] and len(r.wakes) == 1 and len(r.told) == (1 if wt_extra else 0)

@@ -100,11 +100,13 @@ OUR_MARKS = ('<!-- swarm-needs-input -->', '### MinBot', 'MinBot pass', 'MinBot 
 WORKER_STATUS = ('MERGE-READY', 'NEEDS-INPUT', 'BLOCKED', 'STEP-DONE')
 
 ROOT_CAUSE = ("ROOT-CAUSE RULE: fix the root cause, list the neighbor cases, add tests, and say which "
-              "ones they cover. Fix and push; do not touch the Codex threads and do not post on GitHub.")
+              "ones they cover. Fix and push; do not touch the Codex threads and do not post on GitHub. "
+              "If a finding is already fixed and you change nothing, still call report_status(state='done').")
 # tangentswarm #99: a Project 6 worker replies on and resolves its Codex threads and asks for
 # the next review itself (its brief says so), so its relay keeps those steps.
 ROOT_CAUSE_P6 = ("ROOT-CAUSE RULE: fix the root cause, list the neighbor cases, add tests, and say which "
-                 "ones they cover. Fix and push, then follow your brief for the Codex threads and the next review.")
+                 "ones they cover. Fix and push, then follow your brief for the Codex threads and the next review. "
+                 "If a finding is already fixed and you change nothing, still report done (the handoff tool).")
 P6_NO_WAKE = ('Codex findings',)  # tangentswarm #99: on Project 6, no live worker is logged only
 
 

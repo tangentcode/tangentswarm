@@ -23,8 +23,11 @@ Actions on a worker pane (~/ver/platform.<slug>, not a coordinator window):
             is handed off (card past In Progress, PR closed, no PR): /exit, the window and
             its shell stay
             card In Progress or draft with a clean, pushed head: the Stop hook missed it,
-            so the handoff runs now (through the spool), and an incident ticket
-            dirty or unpushed: one nudge to commit and push or call needs_input
+            so the pane watcher runs the handoff itself, right then (tangentswarm #120: mark
+            ready, Auto Review, ask Codex, even for a head handed off before), and an
+            incident ticket; a handoff that cannot finish in HANDOFF_WAIT goes to swarmbot
+            dirty or unpushed: one nudge to commit and push or call needs_input, and the
+            case goes once to swarmbot (the board's bot) with an incident ticket
   dialog    press Enter (trust the worktree)
   menu, frozen   swarmbot diagnoses (a wake with the capture), and an incident ticket
 """
@@ -32,6 +35,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -47,7 +51,7 @@ SHELLS = {'bash', 'sh', 'zsh', 'fish', 'dash'}
 PANE_FMT = '\t'.join(['#{pane_id}', '#{window_index}', '#{window_name}', '#{pane_current_command}',
                       '#{pane_current_path}', '#{pane_dead}', '#{pane_pid}'])
 TRUST_RE = re.compile(r'Do you trust the files in this folder|trust this folder', re.I)
-HANDOFF_WAIT = int(os.environ.get('SWARM_HANDOFF_WAIT', '900'))  # s for the spool to answer a handoff
+HANDOFF_WAIT = int(os.environ.get('SWARM_HANDOFF_WAIT', '900'))  # s a missed handoff is retried before swarmbot gets it
 REPORT_QUIET = int(os.environ.get('SWARM_REPORT_QUIET', '600'))  # s an agent's own report holds the watcher off
 NUDGE = ("Coordinator: #{n}: you stopped with {bits} in your worktree. Commit and push your work. "
          "If you need a decision from Michal, call the needs_input tool of the tangentswarm MCP server "
@@ -194,6 +198,20 @@ def root_is_shell(pane_pid):
         return False
 
 
+def run_in_thread(fn):
+    """Run fn in a daemon thread. Returns a box that gets 'res' (fn's dict, or the error as
+    {'done': False, 'why': ...}) when fn returns."""
+    box = {}
+
+    def go():
+        try:
+            box['res'] = fn() or {}
+        except Exception as e:  # tried again next pass, until HANDOFF_WAIT
+            box['res'] = {'done': False, 'why': f'{type(e).__name__}: {str(e)[:200]}'}
+    threading.Thread(target=go, name='panewatch-handoff', daemon=True).start()
+    return box
+
+
 def transcript_of(worktree, projects=None):
     """The newest Claude transcript (JSONL) of a worktree, or None (slots.latest_session)."""
     from . import slots
@@ -209,8 +227,8 @@ class PaneWatch:
     """One pass a minute. Every side effect goes through an injectable hook for tests."""
 
     def __init__(self, dry=False, sh=_sh, panes=None, cap=None, facts=worktree, is_claude=None, tell=None,
-                 handoff=None, result=None, route=None, reported=None, wake=None, incident=None, st=None, shell_root=root_is_shell,
-                 report=None, transcript=None):
+                 handoff=None, route=None, reported=None, wake=None, incident=None, st=None, shell_root=root_is_shell,
+                 report=None, transcript=None, spawn=None):
         from . import alerts
         self.dry, self.sh = dry, sh
         self.panes_fn = panes or (lambda: list_panes(self.sh))
@@ -220,8 +238,9 @@ class PaneWatch:
         self.tell = tell or self._tell
         self.handoff = handoff or self._handoff
         self.transcript = transcript or transcript_of
-        self.result = result or self._result
-        self.inflight = {}  # once-key -> (spool request id, queued at, transcript): handoffs not answered yet
+        self.tries = {}  # once-key -> the time of the first try of a handoff that did not finish
+        self.jobs = {}  # once-key -> the box of a handoff running in its own thread ({'res': ...} when done)
+        self.spawn = spawn or run_in_thread
         self.route = route or self._route
         self.reported = reported or self._reported
         self.wake = wake or alerts.wake_swarmbot
@@ -241,17 +260,15 @@ class PaneWatch:
         from . import agents
         agents.tell_agent(pane, text)
 
-    def _handoff(self, wt, transcript):
-        """Queue the handoff in the spool; returns the request id (the daemon serves it). The
-        transcript lets the Stop hook's own check run: a question, partial scope or a pending
-        decision goes to Needs Input, never ready (Codex on PR #52)."""
-        from . import spool
-        return spool.submit('handoff', wt, transcript=transcript)['queued']
-
     @staticmethod
-    def _result(rid):
-        from . import spool
-        return spool.peek(rid)
+    def _handoff(wt, transcript):
+        """Run the handoff now, in this process (tangentswarm #120: a queued request was
+        answered "already handed off" and nothing moved). The watcher runs in swarm-promoted,
+        outside swarm-workers.slice, so the GitHub calls work here. The transcript lets the
+        Stop hook's own check run: a question, partial scope or a pending decision goes to
+        Needs Input, never ready (Codex on PR #52). Returns worker_mcp.do_handoff's dict."""
+        from . import worker_mcp
+        return worker_mcp.do_handoff(wt, transcript=transcript)
 
     def _route(self, n, question, window):
         """A pane that asks: queue the needs-input report agent_report handles (tangentswarm #53)."""
@@ -356,45 +373,74 @@ class PaneWatch:
                           f"{detail[:600]}", fix=f"The pane watcher routed it: {note}")
             return f"{tag}{where}: asked in the pane (a bug): {note}"
         if action == 'handoff':
-            head = p['wt'].get('head') or ''
-            key = f"watch-handoff:{n}@{head}"
-            if self.seen(key):
-                return None
-            if key in self.inflight:  # Codex on PR #51: done only when the spool says it succeeded
-                rid, at, t = self.inflight[key]
-                res = self.result(rid)
-                if res is None and now - at < HANDOFF_WAIT:
-                    return None
-                del self.inflight[key]
-                if res is not None and res.get('ok'):
-                    self.mark(key)
-                    return f"{tag}{where}: the missed handoff ran: {str(res.get('log') or res.get('why') or 'done')[:160]}"
-                why = (res or {}).get('error') or f'no answer in {HANDOFF_WAIT} s'
-                self.inflight[key] = (self.handoff(p['wt']['top'], t), now, t)
-                return f"{tag}{where}: the missed handoff failed ({str(why)[:160]}): queued it again"
-            t = self.transcript(p['wt']['top'])
-            if not t:  # Codex on PR #52: no handoff without the Stop hook's question check
-                nt = f"watch-handoff-nt:{n}@{head}"  # a later pass with a transcript still hands off
-                if self.seen(nt):
-                    return None
-                self.wake(f"#{n}: the worker is idle with its card {detail}, but no transcript was found for "
-                          "the Stop hook's question check", nt, pr=n,
-                          detail={'pane': p['id'], 'window': p['window'], 'path': p.get('path')})
-                self.mark(nt)
-                return f"{tag}{where}: finished but {detail}: no transcript for the question check: woke swarmbot"
-            self.inflight[key] = (self.handoff(p['wt']['top'], t), now, t)
-            self.incident(f"missed-handoff:{n}@{head[:12]}", f"#{n}: the Stop hook missed a finished worker",
-                          f"The worker of #{n} ({where}) was idle with a clean, pushed head {head[:8]} and the card "
-                          f"still {detail}.", fix='The pane watcher queued the handoff.')
-            return f"{tag}{where}: finished but {detail}: queued the handoff (the Stop hook missed it)"
+            return self.run_handoff(p, n, tag, where, detail, now)
         if action == 'nudge':
             key = f"watch-nudge:{p['id']}:{p['wt'].get('head')}:{detail}"
-            if self.seen(key):
+            told = f"watch-stuck:{p['id']}:{p['wt'].get('head')}:{detail}"
+            if self.seen(key) and self.seen(told):
                 return None
-            self.tell(p['id'], NUDGE.format(n=n or '?', bits=detail))
-            self.mark(key)
-            return f"{tag}{where}: idle with {detail}: nudged"
+            if not self.seen(key):
+                self.tell(p['id'], NUDGE.format(n=n or '?', bits=detail))
+                self.mark(key)
+            self.stuck(p, n, where, f"idle with {detail} in its worktree", 'nudged the worker to commit and push')
+            self.mark(told)  # Codex on PR #129: only after the escalation went through
+            return f"{tag}{where}: idle with {detail}: nudged; swarmbot told"
         return None
+
+    def run_handoff(self, p, n, tag, where, detail, now):
+        head = p['wt'].get('head') or ''
+        key = f"watch-handoff:{n}@{head}"
+        if self.seen(key):
+            return None
+        t = self.transcript(p['wt']['top'])
+        if not t:  # Codex on PR #52: no handoff without the Stop hook's question check
+            nt = f"watch-handoff-nt:{n}@{head}"  # a later pass with a transcript still hands off
+            if self.seen(nt):
+                return None
+            self.wake(f"#{n}: the worker is idle with its card {detail}, but no transcript was found for "
+                      "the Stop hook's question check", nt, pr=n,
+                      detail={'pane': p['id'], 'window': p['window'], 'path': p.get('path')})
+            self.mark(nt)
+            return f"{tag}{where}: finished but {detail}: no transcript for the question check: woke swarmbot"
+        first = self.tries.setdefault(key, now)
+        box = self.jobs.get(key)
+        started = box is None
+        if started:  # Codex on PR #129: in its own thread, so a slow handoff (the branch lock, a
+            top = p['wt']['top']  # MinBot check) never holds up the watchdog and the other panes
+            box = self.jobs[key] = self.spawn(lambda: self.handoff(top, t))
+        if 'res' in box:
+            del self.jobs[key]
+            res = box['res'] or {}
+        elif now - first < HANDOFF_WAIT:
+            return f"{tag}{where}: finished but {detail}: running the handoff" if started else None
+        else:
+            res = {'done': False, 'why': 'still running'}
+        log = str(res.get('log') or res.get('why') or 'nothing was due')[:300]
+        if res.get('done'):
+            self.tries.pop(key, None)
+            self.mark(key)
+            self.incident(f"missed-handoff:{n}@{head[:12]}", f"#{n}: the Stop hook missed a finished worker",
+                          f"The worker of #{n} ({where}) was idle with a clean, pushed head {head[:8]} and the card "
+                          f"still {detail}.", fix=f"The pane watcher ran the handoff itself: {log}")
+            return f"{tag}{where}: finished but {detail}: ran the handoff (the Stop hook missed it): {log}"
+        if now - first < HANDOFF_WAIT:
+            return f"{tag}{where}: finished but {detail}: the handoff did not finish ({log}): tries again"
+        self.jobs.pop(key, None)  # a thread still running is left to finish; no new one for this head
+        self.stuck(p, n, where, f"idle with a clean, pushed head {head[:8]} and the card {detail}, but the "
+                   f"handoff did not finish in {HANDOFF_WAIT // 60} min: {log}", 'the pane watcher tried the handoff')
+        self.tries.pop(key, None)
+        self.mark(key)  # Codex on PR #129: only after the escalation went through
+        return f"{tag}{where}: the handoff did not finish in {HANDOFF_WAIT // 60} min ({log}): woke swarmbot"
+
+    def stuck(self, p, n, where, what, tried):
+        """A worker the watcher cannot hand off: once to the board's bot (swarmbot, for the
+        platform board) and an incident ticket (Michal, tangentswarm #120)."""
+        key = f"stuck:{n}:{p['id']}:{(p['wt'] or {}).get('head')}"
+        why = f"#{n or '?'} ({where}): {what}"
+        self.wake(why, key, pr=n, detail={'pane': p['id'], 'window': p['window'], 'path': p.get('path')})
+        self.incident(key, f"#{n or '?'}: a stopped worker the pane watcher could not hand off",
+                      f"{why}.", fix=f"{tried[0].upper() + tried[1:]}; swarmbot was woken to diagnose and fix it "
+                      "(tokens spent on the fix).")
 
     def exit(self, p, tag, where, why):
         if not self.shell_root(p.get('pane_pid')):

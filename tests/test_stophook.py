@@ -305,3 +305,46 @@ def test_a_pending_needs_input_report_holds_the_handoff(wt):
     agent_report.log('needs-input handled', 7, 'mn-7-feat')
     go()  # not marked seen: once the report is handled, the next Stop hands off
     assert ran == [7]
+
+
+def test_the_539_case_a_head_handed_off_before_is_handed_off_again_when_forced(wt):
+    """tangentswarm #120, platform #539: the head was handed off and Codex-clean; a later
+    finding sent the card back to In Progress as a draft; the worker found it already fixed and
+    pushed nothing. The Stop hook skips the head (once per head), but a forced handoff (the
+    pane watcher, a done report) marks it ready, moves it to Auto Review and runs the next step."""
+    head = run(wt, 'rev-parse', 'HEAD')
+    stophook._mark_seen(f'feat@{head}')  # the first handoff of this head
+    g = G(head, codex=True)  # In Progress, draft, Codex clean on the head
+    calls, ran = [], []
+    kw = dict(g=g, sh=calls.append, merges=lambda c, h: True, sleep=lambda s: None,
+              minbot=lambda n: ran.append(n) or 'MinBot ran')
+    assert stophook.run(wt, **kw) is None and calls == [] and g.moves == []  # the Stop hook: nothing
+    out = {}
+    line = stophook.run(wt, force=True, outcome=out, **kw)
+    assert calls == [['gh', 'pr', 'ready', '7', '-R', stophook.REPO]]
+    assert g.moves == [('ITEM7', 'Auto Review')] and ran == [7] and out == {'state': 'handed'}
+    assert 'Marked the pull request ready' in line
+
+
+def test_a_forced_handoff_asks_codex_again_on_a_head_with_findings(wt):
+    """tangentswarm #120: "the finding is already fixed", nothing pushed: ask Codex again."""
+    head = run(wt, 'rev-parse', 'HEAD')
+    g = G(head, findings=True)
+    g['fetch'](7)['reviews']['nodes'].append({'author': {'login': 'chatgpt-codex-connector'},
+                                              'commit': {'oid': head}, 'comments': {'totalCount': 1}})
+    calls, out = [], {}
+    line = stophook.run(wt, g=g, sh=calls.append, merges=lambda c, h: True, sleep=lambda s: None,
+                        force=True, outcome=out)
+    assert calls == [['gh', 'pr', 'ready', '7', '-R', stophook.REPO],
+                     ['gh', 'pr', 'comment', '7', '-R', stophook.REPO, '--body', '@codex review']]
+    assert g.moves == [('ITEM7', 'Auto Review')] and out == {'state': 'handed'} and 'left to' not in line
+
+
+def test_a_forced_handoff_that_cannot_finish_says_so(wt):
+    """A main conflict is not a handoff: the outcome stays empty (the watcher retries, then
+    tells swarmbot)."""
+    head = run(wt, 'rev-parse', 'HEAD')
+    out = {}
+    line = stophook.run(wt, g=G(head), sh=[].append, merges=lambda c, h: False, sleep=lambda s: None,
+                        force=True, outcome=out)
+    assert out == {} and 'does not merge cleanly' in line

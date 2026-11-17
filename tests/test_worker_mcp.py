@@ -53,7 +53,8 @@ def test_the_spool_handoff_passes_the_transcript_to_the_stop_hook(wt, monkeypatc
     from tangentswarm import spool, stophook
     seen = []
     monkeypatch.setitem(W._G, 'g', G(run(wt, 'rev-parse', 'HEAD')))
-    monkeypatch.setattr(stophook, 'run', lambda cwd, **k: seen.append(k.get('transcript')) or 'ran')
+    monkeypatch.setattr(stophook, 'run', lambda cwd, **k: seen.append(k.get('transcript'))
+                        or k['outcome'].update(state='handed') or 'ran')
     assert spool.execute({'op': 'handoff', 'cwd': str(wt), 'transcript': '/t/s.jsonl'})['done'] is True
     assert spool.execute({'op': 'handoff', 'cwd': str(wt)})['done'] is True  # the worker's own tool
     assert seen == ['/t/s.jsonl', None]
@@ -158,7 +159,7 @@ def test_a_platform_needs_input_or_done_never_posts_to_methbot(wt, monkeypatch):
     posts = []
     monkeypatch.setattr(alerts, 'methbot_post', posts.append)
     monkeypatch.setitem(W._G, 'g', G(run(wt, 'rev-parse', 'HEAD')))
-    monkeypatch.setattr(stophook, 'run', lambda *a, **k: 'ran')
+    monkeypatch.setattr(stophook, 'run', lambda *a, **k: k['outcome'].update(state='handed') or 'ran')
     assert W.do_handoff(wt)['done'] is True
     W.do_needs_input(wt, 7, 'q?', accept=lambda *a, **k: {'ok': True}, window_of=lambda n: 'w')
     assert posts == []

@@ -353,3 +353,12 @@ def test_the_brief_tells_the_worker_to_report():
     assert "report_status(state='done', pr=12" in text
     assert "report_status(state='needs-input', pr=12" in text
     assert 'swarm-agent MCP server' in text and "tmux display-message -p '#W'" in text
+
+
+def test_a_done_report_forces_the_handoff_of_a_head_handed_off_before(monkeypatch):
+    """tangentswarm #120: a worker that found a finding already fixed reports done with the same
+    head; the default handoff runs the Stop hook forced (not skipped once per head)."""
+    seen = []
+    monkeypatch.setattr(stophook, 'run', lambda wt, **k: seen.append(k) or '#12 handed off')
+    assert R.Reporter(g={}, sh=lambda a: None).handoff(WT) == '#12 handed off'
+    assert seen and seen[0]['force'] is True
