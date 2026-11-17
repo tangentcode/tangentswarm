@@ -166,3 +166,22 @@ def test_platform_only_tools_refuse_a_project6_worktree(p6):
 def test_the_worker_mcp_accepts_a_project6_worktree(p6, monkeypatch):
     monkeypatch.setenv('SWARM_WORKER_CWD', str(p6))
     assert W.worktree() == p6
+
+
+def test_handoff_from_a_methodology_worktree_passes_through_via_daemon(wt, monkeypatch):  # noqa: F811
+    """tangentswarm #77: a ~/ver/methodology.<slug> worker gets a done handoff from the MCP
+    tool (via_daemon), not 'not a worker worktree'."""
+    from tangentswarm import alerts, spool
+    m = wt.parent / 'methodology.docs-x'
+    wt.rename(m)
+    head = run(m, 'rev-parse', 'HEAD')
+    monkeypatch.setenv('SWARM_WORKER_CWD', str(m))
+    monkeypatch.setattr(spool, 'submit', lambda op, cwd, wait=0, **extra:
+                        spool.execute(dict(extra, op=op, cwd=str(cwd))))
+    monkeypatch.setattr(W, 'p6_pr', lambda repo, branch, sh=None: (96, head))
+    posts = []
+    monkeypatch.setattr(alerts, 'methbot_post', posts.append)
+    r = W.via_daemon('handoff')
+    assert r['ok'] is True and r['done'] is True, r
+    assert r['repo'] == 'tangentcode/methodology' and r['pr'] == 96 and r['head'] == head
+    assert len(posts) == 1 and posts[0]['repo'] == 'tangentcode/methodology' and posts[0]['kind'] == 'done'
