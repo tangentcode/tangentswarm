@@ -190,8 +190,7 @@ def test_a_clean_done_merges_at_the_head_and_cleans_up():
     assert any('deleted local branch p6-done-automerge' in x for x in r['notes'])
     rows = eventdb.store().rows("source='p6merge'")
     assert [x['action'] for x in rows] == ['merged'] and rows[0]['repo'] == TS
-    assert w.wakes == [(f'{TS}#90 merged at {HEAD[:8]}: a deploy is needed. Notify only: deploys need '
-                        "Michal's OK.", f'p6-deploy:90@{HEAD}', 90)]
+    assert w.wakes == []  # tangentswarm #113: no deploy note; swarm-webhook starts the deploy itself
     assert w.launched == [f'{TS}#95', f'{METH}#120', f'{TS}#99']  # tangentswarm #98: launches, no MethBot pull
     assert any(f'queued launches of {TS}#95, {METH}#120, {TS}#99' in x for x in r['notes'])
     assert w.posts == []  # no exception: everything passed, and no 'pull' POST
@@ -299,7 +298,7 @@ def test_a_dirty_worktree_is_left_and_reported_and_the_rest_goes_on():
     assert r['merged'] is True and any('worktree' in x and 'left' in x for x in r['notes'])
     kinds = [p['kind'] for p in w.posts]
     assert kinds == ['exception'] and 'uncommitted' in w.posts[0]['reason']
-    assert w.wakes  # the deploy note still went
+    assert w.launched  # the Backlog pull still went
     w.prs = [full()]
     w.run()  # the same head again: already merged, no second exception
     assert len(w.posts) == 1
@@ -572,7 +571,8 @@ def test_a_project_6_merge_event_runs_the_cleanup(repo):
     ex = MergedEx(g={'gql': 'GQL'}, sh=lambda argv: '', enqueue=lambda argv, by='': None,
                   p6merge=lambda *a, **k: ran.append(a) or {'merged': True, 'notes': ['closed window swarm-90-x']})
     acts = W.classify('pull_request', merged_event(repo))
-    assert [a.kind for a in acts] == ['merged', 'p6cleanup']
+    # tangentswarm #113: a tangentswarm merge also starts the deploy
+    assert [a.kind for a in acts] == ['merged', 'p6cleanup'] + (['deploy'] if repo == TS else [])
     for a in acts:
         ex.run(a)
     assert ran == [(repo, 90, HEAD, 'merged')] and ex.errors == []
