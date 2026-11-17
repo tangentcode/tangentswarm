@@ -1,29 +1,25 @@
 """swarm-promoted: refill Human Review within seconds, with no LLM in the path.
 
 A systemd user service. Every POLL seconds (or at once on SIGUSR1, which a webhook
-receiver may send) it reads the Project 4 Status column of every PR in one lean
-GraphQL query (through the minbot shim, so on the app quota). An OPEN PR counts; a
+receiver may send) it reads the Project 4 Status column of every PR from the board cache
+(tangentswarm.boardcache: the webhook events keep it current; a sync reads the board every
+SWARM_BOARD_SYNC seconds, 30 min, and logs what the events missed). An OPEN PR counts; a
 merged PR whose card still says Human Review does not. When Human Review holds fewer
 than 2 and Staging is not empty, it takes the one serial lock (non-blocking; if busy
 it retries every RETRY seconds) and:
 
-  1. Fast path, a CHEAP check only (the full checks ran when the PR entered Staging).
-     Staging PRs go fast-track first, then in hr-gate's queue order. One may move to
-     Human Review when:
-       - hr-gate's latest apply line for its current head is PASS or PENDING with no
-         failed condition (the head did not change since the gate),
-       - it is open, not a draft, and not stacked (base main, no stacked banner),
-       - no person (a User, not a bot or app) commented or reviewed after that gate,
-       - for a PR that touches web/, app/ or api/: the static .deploy-sha contains the
-         head (hr-gate condition 6, strict on entry),
-       - it merges cleanly with main, and with main plus each Human Review head
-         (local merge-tree, no API call).
-     The reads are one GraphQL query for the Staging PRs. The card moves and an hr-gate
-     PASS line is written. The board is read again after each move, and this repeats
-     until Human Review is full (tangentswarm #67: a merge during the pass is filled in the
-     same pass). For a PR labelled merge-ready whose pre-merge was built on the current
-     future main (Promoter.premerge_current), only the main probe runs, not the pairwise
-     merges with each Human Review head.
+  1. Fast path (tangentswarm #116, Michal 2026-11-17: "This is what ready means"). Every
+     Human Review check ran when the PR entered Staging, and hr-gate logged the pass with
+     the head. So a move only confirms that hr-gate's latest apply line for the PR's
+     CURRENT head (in the board cache) is PASS or PENDING with no failed condition. No
+     merge probe, no served check, no comment read: nothing is re-checked. The columns come
+     from the board cache (tangentswarm.boardcache), which the webhook events keep current,
+     so there is no board read before the move. Staging PRs go in the shared pick order.
+     The card moves, an hr-gate PASS line is written, and the merge clock logs the time
+     from the merge event to the move (tangentswarm.moves.merge_clock). The cache is read
+     again after each move, and this repeats until Human Review is full (tangentswarm #67).
+     After the moves, off the critical path, one GraphQL read confirms each moved head
+     (confirm); a PR whose head moved, or that became a draft, goes back to Staging.
   2. When main moved (git ls-remote each poll, no API quota): recheck ONLY "merges
      cleanly with main" for each Staging PR left (tangentswarm.mainmerge). A conflict
      goes to In Progress with a merge-main relay; a clean PR is left alone.
@@ -51,17 +47,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import board, gatechecks, gatelock
+from . import board, gatelock
 
 HOME = Path.home()
 BIN = Path(os.environ.get('SWARM_TICK_BIN', str(HOME / 'bin')))
 POLL = int(os.environ.get('SWARM_PROMOTE_POLL', '30'))
 STOP_LOG = Path.home() / '.local' / 'state' / 'swarm-flow' / 'stop-hook.log'
 RETRY = int(os.environ.get('SWARM_PROMOTE_RETRY', '5'))
-# The idle check reads the shared board snapshot when it is younger than this (a GraphQL
-# budget: a full read every 30 s used more than the hourly quota). SIGUSR1 (a webhook event)
-# makes the next check read the board now.
-IDLE_AGE = int(os.environ.get('SWARM_PROMOTE_IDLE_AGE', '120'))
 # An empty Human Review queues the cascade at once when it drops to 0, then again after this
 # many seconds while it stays empty (the cascade escalates: NEEDS_REWORK, STALLED).
 CASCADE_EMPTY_HR = int(os.environ.get('SWARM_CASCADE_EMPTY_HR', '900'))
@@ -193,17 +185,6 @@ def read_details(gql, numbers):
     return out
 
 
-def human_after(pr, since):
-    """Logins of people (not bots or apps) who commented or reviewed after `since`."""
-    who = []
-    for kind, key in (('comments', 'createdAt'), ('reviews', 'submittedAt')):
-        for c in (pr.get(kind) or {}).get('nodes') or []:
-            a, t = c.get('author') or {}, _when(c.get(key) or '')
-            if a.get('__typename') == 'User' and t is not None and t > since:
-                who.append(a.get('login') or '?')
-    return who
-
-
 def pr_labels(pr):
     names = [l['name'] for l in (pr.get('labels') or {}).get('nodes') or []]
     for iss in (pr.get('closingIssuesReferences') or {}).get('nodes') or []:
@@ -228,18 +209,6 @@ def staging_head(cols, queue):
     """The Staging PR that goes next by queue order alone (no labels read)."""
     order = staging_order(cols.get(board.STAGING, []), {}, queue)
     return order[0] if order else None
-
-
-def merge_problem(merge_commit, scratch, main, hr, head):
-    """None if head merges cleanly onto main, and onto main plus each Human Review head
-    (pairwise, like hr-gate's condition 9). Else a short reason. Local merge-tree only."""
-    if merge_commit(scratch, main, head, 'probe main') is None:
-        return 'conflicts with main'
-    for n, sha in hr:
-        base = merge_commit(scratch, main, sha, f'main + #{n}')
-        if base is not None and merge_commit(scratch, base, head, 'probe') is None:
-            return f'conflicts with #{n} in Human Review'
-    return None
 
 
 class Promoter:
@@ -447,206 +416,121 @@ class Promoter:
         except Exception:
             return []
 
-    def cheap_check(self, p, d, gated, merge):
-        """None if PR p may move to Human Review now, else the reason it may not.
-        The full checks ran when it entered Staging; here only what can change since."""
-        n, head = p['number'], p['head']
-        t = gated.get((f'#{n}', head[:8]))
-        if t is None:
+    def head_check(self, p, gated):
+        """None if Staging PR p may move to Human Review now, else why not. tangentswarm #116
+        (Michal 2026-11-17: "they should have been checked before they went into ready. This is
+        what ready means."): every Human Review check ran when the PR entered Staging, and
+        hr-gate logged the pass with the head. A move only confirms that the head in the
+        board cache is still the gated head. No other check runs here."""
+        n, head = p['number'], p['head'] or ''
+        if (f'#{n}', head[:8]) not in gated:
             return f'head {head[:8]} has no gate pass'
-        if not d or d.get('state') != 'OPEN':
-            return 'not open'
-        if d['headRefOid'] != head:
-            return f"head moved to {d['headRefOid'][:8]}"
-        if d.get('isDraft'):
-            return 'is a draft'
-        if d.get('baseRefName') != 'main' or self.g['stacked_base'](d.get('body') or ''):
-            return 'is stacked: waits (no re-merge at promotion)'
-        who = human_after(d, t)
-        if who:
-            return f"human comment after the gate ({', '.join(sorted(set(who)))})"
-        paths = [f['path'] for f in ((d.get('files') or {}).get('nodes') or []) if f.get('path')]
-        return gatechecks.body_problem(paths, d.get('body') or '') or self.served_problem(d, head) or merge(head)
-
-    def served_problem(self, d, head):
-        """None if every staging site serves the head, else why not. Only for a PR that touches served
-        files (web/, app/, api/): hr-gate condition 6, strict on entry (platform #479 entered
-        Human Review before staging served its head). Local reads only: the .deploy-sha file
-        and git merge-base."""
-        paths = [f['path'] for f in ((d.get('files') or {}).get('nodes') or []) if f.get('path')]
-        if not any(gatechecks.SERVED_RE.search(x) for x in paths):
-            return None
-        sites = [(h, s, e) for _, h, s, e in self.g['served_all']()]  # EVERY staging site (#493)
-        ok, why = gatechecks.check_served_sites(paths, True, sites, lambda s: self.g['contains'](head, s))
-        return None if ok else why
+        return None
 
     def fast_path(self, cols, reread=None):
-        """Fill Human Review from Staging with the cheap check only. Returns the moved PRs.
-        tangentswarm #67: after each move the board is read again (reread), and the pass goes
-        on while Human Review has a free slot and Staging has a candidate, so a merge that
-        lands during the pass is filled in the same pass. A PR moved in this pass counts in
-        Human Review even when the re-read does not show it there yet (board lag)."""
-        from . import flow
-        # Codex on PR #68: the latest board read and the Human Review slots in use (this
-        # pass's moves that are still open count), for once()'s slow-path check
+        """Fill Human Review from Staging. Returns the moved PRs. tangentswarm #116: the
+        columns come from the board cache that the events keep current (no board read), and
+        each move only confirms the gated head (head_check). The pass goes on while Human
+        Review has a free slot and Staging has a candidate (tangentswarm #67: a merge during
+        the pass is filled in the same pass); after each move the cache is read again
+        (reread). A PR moved in this pass counts in Human Review even when the cache does not
+        show it there yet. After the moves, off the critical path, confirm() asks GitHub."""
+        from . import moves
         self.board, self.hr_count = cols, len(cols.get(board.HUMAN_REVIEW, []))
         if self.hr_count >= HR_TARGET or not cols.get(board.STAGING):
             return []
-        reread = reread or (lambda: read_columns(self.g['gql'], max_age=0))
+        reread = reread or (lambda: read_columns(self.g['gql']))
         gated = gate_times(self.log_text())
         moved, done = [], {}  # done: {n: the Staging card moved in this pass}
-        with self.g['ScratchRepo']() as scratch:
-            state = {'main': None, 'tip': None}  # the scratch main ref and the origin main SHA it is for
-
-            def tip():
-                if state['tip'] is None:
-                    state['tip'] = self.main_sha() or ''
-                return state['tip'] or None
-
-            def main_ref():
-                if state['main'] is None:
-                    seen = self.g.get('_main_seen')
-                    if isinstance(seen, dict) and tip() and seen.get('sha') != tip():
-                        seen.clear()  # main moved in the last minute: hr-gate's cache would keep the old one
-                    state['main'] = scratch.ensure_main()
-                return state['main']
-
-            while True:
-                hr = list(cols.get(board.HUMAN_REVIEW, []))  # fresh entries win (a new head; Codex on PR #68)
-                # A moved PR the read still shows in Staging is board lag: it counts in Human
-                # Review. One in no column is no longer open (merged during the pass): its slot
-                # is free (Codex on PR #68).
-                lag = {q['number'] for q in cols.get(board.STAGING, [])}
-                hr += [q for n, q in done.items() if n in lag]
-                staging = [q for q in cols.get(board.STAGING, []) if q['number'] not in done]
-                self.board, self.hr_count = cols, len(hr)
-                if len(hr) >= HR_TARGET or not staging:
-                    break
-                details = read_details(self.g['gql'], [q['number'] for q in staging])
-                order = staging_order(staging, details, self.queue(), board.active_fast_track())
-                self.left, pick = [], None
-                for i, p in enumerate(order):
-                    n, head = p['number'], p['head']
-                    ahead = [(q['number'], q['head']) for q in staging_order(hr, details, [], board.active_fast_track())]
-                    # Codex on PR #68: a Staging PR ahead of p in this scan was refused (an
-                    # accepted one moves to Human Review), so it is not promoted with p; a
-                    # pre-merge that holds it proves nothing pairwise with Human Review.
-                    proof = not order[:i]
-
-                    def merge(head, p=p, ahead=ahead, proof=proof):
-                        if proof and self.premerge_current(p, details.get(p['number']), ahead, tip, scratch, main_ref):
-                            # Codex on PR #68: the main-only probe always runs (a queued head can
-                            # revert an edit on main). The pre-merge stands in only for the
-                            # pairwise probes with each Human Review head.
-                            main = main_ref()
-                            scratch.ensure(head)
-                            if flow.merge_commit(scratch, main, head, 'probe main') is None:
-                                return 'conflicts with main'
-                            say(f"#{p['number']}: merge-ready on the current future main: "
-                                "no pairwise Human Review merges")
-                            return None
-                        main = main_ref()
-                        scratch.ensure(head, *[q['head'] for q in hr])
-                        return merge_problem(flow.merge_commit, scratch, main,
-                                             [(q['number'], q['head']) for q in hr], head)
-                    why = self.cheap_check(p, details.get(n), gated, merge)
-                    if why:
-                        say(f"#{n} stays in Staging: {why}")
-                        self.left.append((n, head, why))
-                        continue
-                    pick = p
-                    break
-                if pick is None:
-                    break
-                n, head = pick['number'], pick['head']
-                if self.dry:
-                    say(f"would move #{n} Staging -> Human Review (cheap check passed at {head[:8]})")
-                else:
-                    board.move_card(self.g, pick['item'], board.HUMAN_REVIEW, n=n)
-                    self.g['log']('apply', n, head[:8], 'PASS', [])
-                    from . import moves
-                    moves.log_move(n, 'Staging', 'Human Review', head, note='cheap check')
-                    say(f"moved #{n} Staging -> Human Review (cheap check passed at {head[:8]})")
-                done[n] = pick
-                moved.append(n)
-                try:  # the board again: a merge during this pass frees one more slot
-                    cols = reread()
-                except Exception as e:  # go on with the last read (this pass's moves are in done)
-                    say(f"re-read after #{n} failed: {type(e).__name__}: {e}; the last read is used")
-                state.update(main=None, tip=None)  # main may have moved with that merge
+        while True:
+            hr = list(cols.get(board.HUMAN_REVIEW, []))
+            # A moved PR the read still shows in Staging is cache lag: it counts in Human
+            # Review. One in no column is no longer open (merged during the pass): its slot
+            # is free (Codex on PR #68).
+            lag = {q['number'] for q in cols.get(board.STAGING, [])}
+            hr += [q for n, q in done.items() if n in lag]
+            staging = [q for q in cols.get(board.STAGING, []) if q['number'] not in done]
+            self.board, self.hr_count = cols, len(hr)
+            if len(hr) >= HR_TARGET or not staging:
+                break
+            order = staging_order(staging, {}, self.queue(), board.active_fast_track())
+            self.left, pick = [], None
+            for p in order:
+                why = self.head_check(p, gated)
+                if why:
+                    say(f"#{p['number']} stays in Staging: {why}")
+                    self.left.append((p['number'], p['head'], why))
+                    continue
+                pick = p
+                break
+            if pick is None:
+                break
+            n, head = pick['number'], pick['head']
+            if self.dry:
+                say(f"would move #{n} Staging -> Human Review (gate pass at {head[:8]})")
+            else:
+                board.move_card(self.g, pick['item'], board.HUMAN_REVIEW, n=n)
+                for line in moves.merge_clock([n]):  # tangentswarm #116: event -> move time
+                    say(line.split('\t', 2)[2].replace('\t', ' '))
+                self.g['log']('apply', n, head[:8], 'PASS', [])
+                moves.log_move(n, 'Staging', 'Human Review', head, note='gate pass at this head')
+                say(f"moved #{n} Staging -> Human Review (gate pass at {head[:8]})")
+            done[n] = pick
+            moved.append(n)
+            try:  # the cache again: a merge during this pass frees one more slot
+                cols = reread()
+            except Exception as e:  # go on with the last read (this pass's moves are in done)
+                say(f"re-read after #{n} failed: {type(e).__name__}: {e}; the last read is used")
+        if done and not self.dry:
+            self.confirm(done)
         return moved
 
-    def premerge_current(self, p, d, ahead, tip, scratch, main_ref):
-        """tangentswarm #67 (c): True if Staging PR p carries merge-ready and its pre-merge
-        record (flow.PREMERGE_STATE) is a mechanical merge (no seed) of its current head onto
-        the current future main ahead of it: main and the PRs `ahead` ([(n, head)], Human
-        Review in the shared pick order), each in it as its head. The ordered (PR, head) list
-        must match: the base is the PRs merged since (first in it; each new first-parent
-        commit of main is the merge of one such head, nothing else), then exactly `ahead`.
-        Then the pairwise merges with each Human Review head are skipped; the main probe
-        still runs. Else False: the full scratch merge runs."""
-        from . import flow
-        labels = set(p.get('own_labels') or []) | {l['name'] for l in ((d or {}).get('labels') or {}).get('nodes') or []}
-        if flow.MERGE_READY not in labels or flow.PRE_MERGING in labels:
-            return False
-        recs = flow.load_premerge()
-        rec = recs.get(str(p['number'])) or {}
-        if not (rec.get('status') == 'ready' and rec.get('head') == p['head'] and rec.get('tip')
-                and isinstance(rec.get('base'), str) and rec['base'].split()):
-            return False
-        # Codex on PR #68: only a mechanical pre-merge (the head itself merged cleanly; no
-        # seed) proves the head merges. A tip its worker resolved on a -vN leaves the head as
-        # it was. And each PR ahead must be in future main as its head, not as a resolved tip.
-        if rec.get('seed') or any((recs.get(str(n)) or {}).get('seed') for n, _ in ahead):
-            return False
-        base_main, *deps = rec['base'].split()
-        want = [f"#{n}@{h[:12]}" for n, h in ahead]
-        # Strict queue order (future main = main + the queued PRs merged in queue order): the
-        # base is the PRs merged since (a prefix: they were first in the queue), then exactly
-        # `ahead`, in the same order.
-        if len(deps) < len(want) or deps[len(deps) - len(want):] != want:
-            return False
-        gone = deps[:len(deps) - len(want)]
-        if any(x in want for x in gone):
-            return False
-        main = tip()
-        if not main:
-            return False
+    def confirm(self, done):
+        """tangentswarm #116: after the moves (off the critical path), ONE GraphQL read of the
+        moved PRs. A PR that is open but no longer at the head it moved at, or that became a
+        draft, goes back to Staging (its new head needs its own gate). Returns the PRs sent
+        back. A failed read is logged; the next sync shows any difference."""
+        owner, name = REPO.split('/')
+        parts = ' '.join(f'p{int(n)}: pullRequest(number:{int(n)}){{number state isDraft headRefOid}}' for n in done)
         try:
-            if not self.built_from_heads(scratch, rec['tip'], p['head'], base_main,
-                                         [x.split('@', 1)[-1] for x in deps]):
-                return False
-            if not gone:
-                return main.startswith(base_main)
-            return self.merged_onto(scratch, main_ref(), base_main, [x.split('@', 1)[-1] for x in gone])
-        except Exception:
-            return False
-
-    @staticmethod
-    def merge_rows(scratch, base, top):
-        """flow.merge_rows on the scratch repo (tangentswarm #111: shared with Flow.assumed)."""
-        from . import flow
-        return flow.merge_rows(scratch.git, base, top)
-
-    def built_from_heads(self, scratch, tip, head, base_main, heads):
-        """flow.built_from_heads on the scratch repo (Codex on PR #68)."""
-        from . import flow
-        scratch.ensure(tip)
-        return flow.built_from_heads(scratch.git, tip, head, base_main, heads)
-
-    def merged_onto(self, scratch, main, base_main, heads):
-        """flow.merged_onto on the scratch repo."""
-        from . import flow
-        return flow.merged_onto(scratch.git, main, base_main, heads)
+            data = self.g['gql'](f'query{{repository(owner:"{owner}",name:"{name}"){{{parts}}}}}')['repository']
+        except Exception as e:
+            say(f"confirm: GitHub read failed ({type(e).__name__}: {str(e)[:120]}); the moves stand")
+            return []
+        back = []
+        for n, p in done.items():
+            d = (data or {}).get(f'p{int(n)}') or {}
+            if d.get('state') != 'OPEN':
+                continue
+            why = (f"head is {(d.get('headRefOid') or '-')[:8]}, not {p['head'][:8]}" if d.get('headRefOid') != p['head']
+                   else 'is a draft' if d.get('isDraft') else None)
+            if not why:
+                continue
+            from . import moves
+            try:
+                board.move_card(self.g, p['item'], board.STAGING, n=n)
+            except Exception as e:
+                say(f"confirm: #{n} {why}; the move back to Staging failed: {type(e).__name__}: {str(e)[:120]}")
+                continue
+            moves.log_move(n, 'Human Review', 'Staging', d.get('headRefOid') or '', note=f'confirm: {why}')
+            say(f"confirm: #{n} {why}: moved back to Staging")
+            back.append(n)
+        return back
 
     def fill(self, cols):
         """(latest board, moved PRs, Human Review slots in use) after the fast path, when
         Human Review needs it. The count is from fast_path's last board read (Codex on PR #68:
         a PR moved in this pass that merged since does not hold a slot)."""
+        from . import moves
+        start = time.time()
         if not needs_promotion(cols):
+            if not self.dry:  # tangentswarm #116: a merge that frees no move still gets its clock line
+                moves.merge_clock([], upto=start)
             return cols, [], len(cols.get(board.HUMAN_REVIEW, []))
         self.board = None
         moved = self.fast_path(cols)
+        if not moved and not self.dry:
+            moves.merge_clock([], upto=start)
         if self.board is None:  # no board from the fast path: count as before
             return cols, moved, len(cols.get(board.HUMAN_REVIEW, [])) + len(moved)
         return self.board, moved, self.hr_count
@@ -689,41 +573,53 @@ class Promoter:
                 out.append(b.number)
         return out
 
-    def once(self, retry=False):
-        """One check. Returns 'idle', 'busy' or 'promoted'. A retry after busy goes straight
-        to the lock (the read under the lock is fresh), so a long busy spell costs no reads."""
+    def side_work(self, cols):
+        """(main SHA, main moved, queued requests): the work of a check that is not a card
+        move: git ls-remote of main, the board passes, the deploy-lag check, and the cascade
+        when it is due. It runs after the move (tangentswarm #116)."""
         main = self.main_sha()
         main_moved = main is not None and main != self.last_main
         if not self.dry:
             self.board_passes()
             self.deploy_lag()
+        why = self.cascade_due(cols, main_moved) or self.deploy_due()
+        if why:
+            self.queue_cascade(why)
+        if main_moved:
+            say(f"main is at {main[:8]} (was {(self.last_main or 'unknown')[:8]}): Staging merge recheck")
+        return main, main_moved, gatelock.queued()
+
+    def once(self, retry=False):
+        """One check. Returns 'idle', 'busy' or 'promoted'. A retry after busy goes straight
+        to the lock. tangentswarm #116: the columns come from the event-fed board cache, and
+        when Human Review has a free slot the move runs FIRST: the main SHA (git ls-remote),
+        the board passes, the deploy-lag check and the cascade check run after it."""
+        main = main_moved = None
         waiting = gatelock.queued()
         if not retry:
-            cols = read_columns(self.g['gql'], max_age=IDLE_AGE)
-            why = self.cascade_due(cols, main_moved) or self.deploy_due()
-            if why:
-                self.queue_cascade(why)
-                waiting = gatelock.queued()
-            from . import flow
-            pull_due = needs_pull(cols, flow.load_pull())
-            if not needs_promotion(cols) and not main_moved and not waiting and not pull_due:
-                return 'idle'
-            if waiting:
-                say(f"{len(waiting)} queued gate request(s): draining")
-            hr, st = len(cols.get(board.HUMAN_REVIEW, [])), len(cols.get(board.STAGING, []))
+            cols = read_columns(self.g['gql'])  # tangentswarm #116: the event-fed cache
             if needs_promotion(cols):
+                hr, st = len(cols.get(board.HUMAN_REVIEW, [])), len(cols.get(board.STAGING, []))
                 say(f"Human Review {hr}/{HR_TARGET}, Staging {st}: promoting")
-            if main_moved:
-                say(f"main is at {main[:8]} (was {(self.last_main or 'unknown')[:8]}): Staging merge recheck")
+            else:
+                main, main_moved, waiting = self.side_work(cols)
+                from . import flow
+                pull_due = needs_pull(cols, flow.load_pull())
+                if not main_moved and not waiting and not pull_due:
+                    return 'idle'
+                if waiting:
+                    say(f"{len(waiting)} queued gate request(s): draining")
         try:
             with (gatelock.gate_lock('swarm-promoted') if not self.dry else _null()):
-                cols = read_columns(self.g['gql'], max_age=0)  # fresh, under the lock
+                cols = read_columns(self.g['gql'])  # the cache: our own moves and the events patch it
                 cols, moved, hr = self.fill(cols)
                 if moved:  # a free Staging slot: restock it now (the drain below runs it under our lock)
                     self.queue_cascade(f"promoted {', '.join('#' + str(n) for n in moved)}: restock Staging")
+                if main is None:  # after the move (tangentswarm #116)
+                    main, main_moved, _ = self.side_work(cols)
                 drained = self.drain()
                 if drained:  # a queued run may have moved cards: read again before the rest
-                    cols = read_columns(self.g['gql'], max_age=0)  # the new read already has our moves
+                    cols = read_columns(self.g['gql'])  # the cache already has the drained moves
                     # tangentswarm #67: a slot freed during the drain (a merge) is filled in this pass
                     cols, moved, hr = self.fill(cols)
                     if moved:
@@ -806,9 +702,7 @@ def run(p, poll=POLL, retry=RETRY, sleep=time.sleep):
         pause = limited or (retry if what == 'busy' else poll)
         for _ in range(pause):
             if wake['now'] and not limited:
-                wake['now'] = False
-                from . import boardcache
-                boardcache.invalidate()  # an event: read the board now
+                wake['now'] = False  # an event: the webhook has patched the cache (tangentswarm #116)
                 break
             sleep(1)
         wake['now'] = wake['now'] and not limited

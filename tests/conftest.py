@@ -35,11 +35,14 @@ def isolated_state(tmp_path, monkeypatch):
     from tangentswarm import moves
     monkeypatch.setattr(moves, 'LOG', tmp_path / 'moves.log')
     monkeypatch.setattr(moves, 'SEEN', tmp_path / 'ready-seen.json')
+    monkeypatch.setattr(moves, 'MERGES', tmp_path / 'merge-clock.json')
+    monkeypatch.setattr(moves, 'CLOCK_LOG', tmp_path / 'merge-to-move.log')
     from tangentswarm import conflictmap
     monkeypatch.setattr(conflictmap, 'PATH', tmp_path / 'conflict-map.json')
     from tangentswarm import boardcache
     monkeypatch.setattr(boardcache, 'PATH', tmp_path / 'board-snapshot.json')
     monkeypatch.setattr(boardcache, 'DETAILS', tmp_path / 'pr-details.json')
+    monkeypatch.setattr(boardcache, 'SYNC_LOG', tmp_path / 'board-sync.log')
     from tangentswarm import gqlmeter
     monkeypatch.setattr(gqlmeter, 'LOG', tmp_path / 'gql.log')
     from tangentswarm import advance, gatelock
