@@ -24,6 +24,12 @@ Tools:
                    ticket, the card moves to Needs Input, and this Claude is closed with
                    /exit; it is resumed with his answer. Never ask Michal in the pane.
 
+Project 6 worktrees (tangentswarm #19): a worker in ~/ver/tangentswarm.<slug> or
+~/ver/methodology.<slug> works on a tangentcode/tangentswarm or tangentcode/methodology PR.
+For it, handoff ("done") and needs_input wake MethBot (alerts.tell_methbot: done once per
+PR and head sha, needs-input once per question) and log an events DB row; nothing else
+(no card move, no /exit). worker_status and request_review serve platform worktrees only.
+
 Install (user scope, every Claude on the host):
     claude mcp add --scope user tangentswarm -- ~/bin/swarm-worker-mcp
 Outside a worker worktree ~/ver/platform.<slug> every tool answers "not a worker
@@ -46,6 +52,8 @@ INSTRUCTIONS = """Tools about your own swarm worktree and its pull request. Call
 to see your PR, card, Codex and CI state. When your work is committed and pushed, call
 handoff: it marks the PR ready, asks Codex for a review and moves the card to Auto Review
 (the same as the Stop hook). request_review only posts "@codex review" for your head.
+In a tangentswarm or methodology worktree (Project 6), handoff reports done and needs_input
+sends the question to MethBot; worker_status and request_review are platform-only there.
 Never ask Michal a question in your pane: call needs_input(pr, question), then end your turn."""
 
 REPO = 'tangentcode/platform'
@@ -58,9 +66,84 @@ def worktree():
     start = os.environ.get('SWARM_WORKER_CWD') or os.getcwd()
     r = subprocess.run(['git', '-C', start, 'rev-parse', '--show-toplevel'], capture_output=True, text=True)
     top = Path((r.stdout or '').strip() or start)
-    if r.returncode or not slots.is_platform_worktree(top):
-        raise ToolError(f"not a worker worktree: {top} (only ~/ver/platform.<slug> worktrees have a PR here)")
+    if r.returncode or not (slots.is_platform_worktree(top) or project6_repo(top)):
+        raise ToolError(f"not a worker worktree: {top} (only ~/ver/platform.<slug>, ~/ver/tangentswarm.<slug> "
+                        "and ~/ver/methodology.<slug> worktrees have a PR here)")
     return top
+
+
+P6_PREFIX = {'tangentswarm.': 'tangentcode/tangentswarm', 'methodology.': 'tangentcode/methodology'}
+
+
+def project6_repo(wt):
+    """The Project 6 repo of a worker worktree ~/ver/tangentswarm.<slug> or
+    ~/ver/methodology.<slug> (tangentswarm #19), else None."""
+    from . import slots
+    p = Path(wt or '')
+    if p.parent != slots.WORKTREE_PARENT:
+        return None
+    return next((repo for pre, repo in P6_PREFIX.items() if p.name.startswith(pre) and len(p.name) > len(pre)), None)
+
+
+def p6_pr(repo, branch, sh=None):
+    """(number, head sha) of the open PR of repo whose head branch is branch, or None."""
+    if sh is None:
+        from . import tick
+        sh = lambda argv: tick.sh(argv, check=True).stdout  # noqa: E731
+    out = sh(['gh', 'pr', 'list', '-R', repo, '--head', branch, '--state', 'open',
+              '--json', 'number,headRefOid,headRefName'])
+    for p in json.loads(out or '[]'):
+        if p.get('headRefName') == branch:
+            return int(p['number']), p.get('headRefOid') or ''
+    return None
+
+
+def p6_only(wt, tool):
+    """Refuse a platform-only tool in a Project 6 worktree."""
+    repo = project6_repo(wt)
+    if repo:
+        raise ToolError(f"{tool} serves platform worktrees only; {repo} PRs use handoff (done) and needs_input")
+
+
+def p6_done(wt, repo, sh=None, tell=None):
+    """handoff in a Project 6 worktree: the worker is done. The worktree must be clean and
+    pushed and GitHub must show that head on the open PR; then MethBot is woken once per PR
+    and head (tangentswarm #19)."""
+    from . import alerts, stophook
+    branch, head = stophook.pushed_head(wt)
+    if not branch or len(head or '') != 40:
+        return {'done': False, 'why': f"not finished: {head}"}
+    found = p6_pr(repo, branch, sh)
+    if not found:
+        return {'done': False, 'why': f"no open {repo} PR has branch {branch}"}
+    n, pr_head = found
+    if pr_head != head:
+        return {'done': False, 'pr': n, 'why': f"GitHub does not show head {head[:8]} on #{n} yet; try again in a minute"}
+    sent = (tell or alerts.tell_methbot)('done', repo, n, head=head)
+    if sent is True:
+        return {'done': True, 'pr': n, 'repo': repo, 'head': head, 'log': f"{repo}#{n} done at {head[:8]}: MethBot woken"}
+    return {'done': sent == 'already sent', 'pr': n, 'repo': repo, 'head': head,
+            'why': f"{repo}#{n} done at {head[:8]}: MethBot not woken: {sent}"}
+
+
+def p6_needs_input(wt, repo, pr, question, sh=None, tell=None):
+    """needs_input in a Project 6 worktree: the PR must be the worktree's own open PR; then
+    MethBot is woken with the question (tangentswarm #19)."""
+    from . import alerts, stophook
+    question = (question or '').strip()
+    if not question:
+        return {'posted': False, 'why': 'needs_input needs the question'}
+    branch, _ = stophook.pushed_head(wt)
+    found = p6_pr(repo, branch, sh) if branch else None
+    if not found:
+        return {'posted': False, 'why': f"no open {repo} PR has this branch"}
+    if int(pr) != found[0]:
+        return {'posted': False, 'why': f"#{pr} is not your PR; yours is {repo}#{found[0]}"}
+    sent = (tell or alerts.tell_methbot)('needs-input', repo, found[0], question=question)
+    if sent is True or sent == 'already sent':
+        return {'posted': True, 'pr': found[0], 'repo': repo,
+                'next': 'MethBot has the question; end your turn and wait for the answer'}
+    return {'posted': False, 'pr': found[0], 'repo': repo, 'why': f"MethBot not woken: {sent}"}
 
 
 def gate():
@@ -84,6 +167,7 @@ def checks(n, run=subprocess.run):
 def status(wt=None, g=None, checks_of=checks):
     from . import stophook, tick
     wt = wt or worktree()
+    p6_only(wt, 'worker_status')
     branch, head = stophook.pushed_head(wt)
     _, local = stophook.git(wt, 'rev-parse', 'HEAD')
     out = {'worktree': str(wt), 'branch': branch, 'head': local,
@@ -110,6 +194,9 @@ def do_handoff(wt=None, transcript=None):
     first: a question, partial scope or a pending decision goes to Needs Input, never ready."""
     from . import stophook
     wt = wt or worktree()
+    repo = project6_repo(wt)
+    if repo:
+        return p6_done(wt, repo)
     branch, head = stophook.pushed_head(wt)
     if not branch or len(head) != 40:
         return {'done': False, 'why': f"not finished: {head}"}
@@ -122,6 +209,7 @@ def do_handoff(wt=None, transcript=None):
 def do_request_review(wt=None, sh=None):
     from . import stophook, tick
     wt = wt or worktree()
+    p6_only(wt, 'request_review')
     branch, head = stophook.pushed_head(wt)
     if not branch or len(head) != 40:
         return {'posted': False, 'why': f"push first: {head}"}
@@ -146,6 +234,9 @@ def do_needs_input(wt, pr, question, accept=None, window_of=None, g=None):
     the report_status needs-input of swarm-agent (tangentswarm #53), for a worker that has
     only this stdio server: queued, so the worker's turn can end and the close can run."""
     from . import agent_report, stophook
+    repo = project6_repo(wt)
+    if repo:
+        return p6_needs_input(wt, repo, pr, question)
     branch, _ = stophook.pushed_head(wt)
     found = stophook.find_pr(g or gate(), branch) if branch else None
     if not found:
@@ -190,7 +281,8 @@ async def handoff() -> dict:
     """Call this when your work is committed and pushed: mark the PR ready, ask Codex for a
     review (once per head) and move the card to Auto Review. A head that is already
     Codex-clean gets the MinBot check instead. Nothing happens for a dirty or unpushed
-    worktree. On a problem: {'ok': false, 'error': '...'}."""
+    worktree. In a tangentswarm or methodology worktree (Project 6) it reports done: MethBot
+    is woken once for the pushed head. On a problem: {'ok': false, 'error': '...'}."""
     return await anyio.to_thread.run_sync(via_daemon, 'handoff')
 
 

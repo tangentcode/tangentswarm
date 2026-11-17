@@ -4,13 +4,14 @@ It replaces the deleted LLM Auto Review watchdog and agent stall scan. Once a mi
 thread of the swarm-promoted daemon):
 
   - the pane watcher (tangentswarm.panewatch): capture, compare, classify, act
-  - a new Needs Input card pings Michal in MethBot's chat (item 4c)
-  - Human Review empty while Staging holds PRs for PROMOTE_GRACE: one alert to Michal with
+  - a new Needs Input card (any board) wakes swarmbot (item 4c; never MethBot: tangentswarm #19)
+  - Human Review empty while Staging holds PRs for PROMOTE_GRACE: one alert (a swarmbot wake) with
     the fast path's reason for each Staging PR and a suggested fix (item 4a)
   - hung test or automation processes in worker worktrees are killed, and swarmbot is
     woken to diagnose with the process facts and the pane capture (item 4d)
 Every CODEX_EVERY s: a PR in Auto Review whose "@codex review" got no Codex answer for
 CODEX_SILENT s, or got a usage-limit answer, is a Codex outage: ONE alert per outage (item 3).
+An alert is alerts.alert(): a swarmbot wake and an events DB row, never a MethBot POST.
 Every SWEEP_EVERY s (item 6): issue cards with no PR in a PR column go to Backlog; a Done
 PR whose head is not on main leaves Done (open or merged elsewhere: In Progress; closed
 without a merge: Canceled).
@@ -231,7 +232,7 @@ class Watchdog:
         from . import alerts, hung, panewatch
         self._g, self.promoter, self.dry, self.out = g, promoter, dry, out
         self.st = st or alerts.state()
-        self.alert = alert or alerts.tell_michal
+        self.alert = alert or alerts.alert
         self.wake = wake or alerts.wake_swarmbot
         self.incident = incident or (lambda *a, **k: alerts.incident(*a, st=self.st, **k))
         self.panes = panes or panewatch.PaneWatch(dry=dry, st=self.st, wake=self.wake, incident=self.incident)
@@ -290,7 +291,7 @@ class Watchdog:
                  if boardcache.col(it) == board.NEEDS_INPUT}
         if self.dry:
             return []
-        return [f"pinged Michal: #{n} is new in Needs Input"
+        return [f"woke swarmbot: #{n} is new in Needs Input"
                 for n in needsinput.new_cards(self.st, cards, self.alert, titles=cards)]
 
     def promote_pass(self, snap, now):
@@ -305,10 +306,10 @@ class Watchdog:
             return []
         key = 'promote-stall:' + ','.join(str(n) for n in sorted(cols.get(board.STAGING, [])))
         if self.dry:
-            return [f"would alert Michal: {text}"]
+            return [f"would alert swarmbot: {text}"]
         if self.alert(text, key=key, st=self.st):
             self.incident(key, 'Human Review empty while Staging holds PRs', text)
-            return [f"alerted Michal: {text}"]
+            return [f"alerted swarmbot: {text}"]
         return []
 
     def hung_pass(self, now):
@@ -352,14 +353,14 @@ class Watchdog:
             import types
             scratch = types.SimpleNamespace(data=copy.deepcopy(self.st.data), save=lambda: None)
             text = outage_update(scratch, found, now)
-            return [f"would alert Michal: {text}"] if text else []
+            return [f"would alert swarmbot: {text}"] if text else []
         text = outage_update(self.st, found, now)
         if not text:
             return []
         key = f"codex-outage:{int(now)}"
         self.alert(text, key=key, st=self.st)
         self.incident(key, 'Codex outage', text)
-        return [f"alerted Michal: {text}"]
+        return [f"alerted swarmbot: {text}"]
 
     def sweep_pass(self, snap, now):
         from . import boardcache, slots

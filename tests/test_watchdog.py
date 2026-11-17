@@ -281,7 +281,7 @@ def test_a_dry_run_records_no_outage_and_the_live_pass_still_alerts():
     """Codex on PR #51: a dry run saved the outage, so the daemon never announced it."""
     r = Rig([snap_node(5, board.AUTO_REVIEW)], details={5: pr_full(req=T0)})
     r.w.dry = True
-    assert r.w.codex_pass(_snap(r), T0 + 1900)[0].startswith('would alert Michal')
+    assert r.w.codex_pass(_snap(r), T0 + 1900)[0].startswith('would alert swarmbot')
     assert 'codex_outage' not in alerts.state().data and 'codex_outage' not in r.w.st.data
     r.w.dry = False
     r.w.codex_pass(_snap(r), T0 + 2000)

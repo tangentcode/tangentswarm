@@ -1024,9 +1024,9 @@ did not change for a minute has finished or stopped. It then acts on a worker pa
 - a question in the pane: queued as a needs-input report (a worker never asks in its pane)
 - a menu, a frozen busy screen, or a trust dialog that stays: swarmbot diagnoses
 
-It also pings Michal in MethBot's chat (POST to `~/.config/tangentswarm/methbot-alert-url`)
-for a new Needs Input card, a Codex outage (one alert per outage) and Human Review empty
-while Staging holds PRs (with the reason and a suggested fix). It kills hung test runs in
+It also wakes swarmbot (an `alert` row in the events DB) for a new Needs Input card on any
+board, a Codex outage (one alert per outage) and Human Review empty while Staging holds PRs
+(with the reason and a suggested fix). These never go to MethBot (tangentswarm #19). It kills hung test runs in
 worker worktrees and wakes swarmbot with the process and the pane capture. Every hour it
 sweeps issue cards with no PR back to Backlog and moves Done PRs whose head is not on main
 out of Done. Each failure opens an incident ticket on Project 6 (methodology #81).
@@ -1037,6 +1037,15 @@ The worker MCP tool `needs_input(pr, question)` queues the same needs-input repo
 question goes on the ticket, the card to Needs Input, the Claude closes); Michal's move
 back to In Progress resumes it with his answer. Every `@codex review` round is logged to
 the events DB, with no cap.
+
+MethBot gets exactly two events (tangentswarm #19, Michal 2026-11-16), and only for the
+Project 6 repos (`tangentcode/tangentswarm`, `tangentcode/methodology`): one POST to the URL
+in `~/.config/tangentswarm/methbot-alert-url` with the bearer key in `methbot-alert-key`.
+A worker in `~/ver/tangentswarm.<slug>` or `~/ver/methodology.<slug>` that calls the worker
+MCP `handoff` (done, clean and pushed, the head shown on its open PR) sends
+`{"source":"swarm","kind":"done","repo":...,"pr":N,"head":sha,"at":ET time}` once per PR and
+head; `needs_input` sends `{"source":"swarm","kind":"needs-input","repo":...,"pr":N,"question":...,"at":ET time}`.
+Each is also a `methbot-done` or `methbot-needs-input` row in the events DB.
 
 ```sh
 swarm-watch --panes              # the latest capture class of every pane
