@@ -263,24 +263,96 @@ def test_advance_waits_for_ci_and_screenshots():
     assert flow.load_pull()['pr'] == 7 and any('#7 pull waiting' in n for n in f.notes) and g.moves == []
 
 
-def test_advance_times_out_into_in_progress(monkeypatch, tmp_path):
-    monkeypatch.setattr(flow, 'Path', lambda p: tmp_path / p.replace('/', '_'))
+@pytest.fixture
+def tick_state(tmp_path, monkeypatch):
+    from tangentswarm import tick
+    monkeypatch.setattr(tick, 'STATE_DIR', tmp_path / 'tick')
+    return tmp_path / 'tick'
+
+
+def told(monkeypatch):
+    """Record each text a worker gets (slots.revive)."""
+    from tangentswarm import slots
+    sent = []
+    monkeypatch.setattr(slots, 'revive', lambda n, text, out=print, **k: sent.append((n, text)) or out('sent') or 0)
+    return sent
+
+
+def test_advance_timeout_goes_back_to_ready_not_in_progress(monkeypatch, tick_state):
+    """tangentswarm #83: a timeout is not a conflict: the card stays in Ready."""
     pull_state(started=10_000 - flow.PULL_TIMEOUT - 60)
     prs = {1: card(1, HR), 2: card(2, HR), 7: card(7, RD)}
     f, g = make_flow(prs, dry=False, rows=[('5 CI green (Linux)', False, 'Linux QUEUED')])
     monkeypatch.setattr(f, 'pull', lambda *a: None)
     f.step()
-    assert g.moves == [('I7', IP)] and flow.load_pull() is None
+    assert g.moves == [] and flow.load_pull() is None
+    assert '#7 left the Staging pull, no conflict; the card stays in Ready' in f.did[0]
 
 
-def test_advance_hard_failure_goes_back(monkeypatch, tmp_path):
-    monkeypatch.setattr(flow, 'Path', lambda p: tmp_path / p.replace('/', '_'))
+def test_advance_hard_failure_with_no_conflict_stays_in_ready(monkeypatch, tick_state):
+    """tangentswarm #83 (platform #447): condition 8 failed at the gate, no conflict. The card
+    went to In Progress and its Claude found nothing to fix. Now it stays in Ready, it is not
+    held (it keeps its queue place), and its worker gets the reason once per head."""
     pull_state()
     prs = {1: card(1, HR), 2: card(2, HR), 7: card(7, RD)}
-    f, g = make_flow(prs, dry=False, rows=[('8 no later human request', False, '1 later comment')])
+    rows = [('2 mergeable onto main', True, 'clean onto origin/main (GitHub vs base: MERGEABLE)'),
+            ('8 no later human request', False, '1 later comment')]
+    f, g = make_flow(prs, dry=False, rows=rows)
+    sent = told(monkeypatch)
     monkeypatch.setattr(f, 'pull', lambda *a: None)
     f.step()
-    assert g.moves == [('I7', IP)] and '8 no later human request' in f.did[0]
+    assert g.moves == [] and flow.load_pull() is None and 7 not in flow.held()
+    assert '8 no later human request' in f.did[0] and 'stays in Ready' in f.did[0]
+    assert [n for n, _ in sent] == [7] and 'no conflict' in sent[0][1] and 'merge origin/main' not in sent[0][1]
+    pull_state()  # the same head fails again: no second relay
+    f.step()
+    assert g.moves == [] and len(sent) == 1
+
+
+def test_advance_no_conflict_with_no_worker_still_stays_in_ready(monkeypatch, tick_state):
+    from tangentswarm import slots
+    pull_state()
+    prs = {1: card(1, HR), 2: card(2, HR), 7: card(7, RD)}
+    f, g = make_flow(prs, dry=False, rows=[('7b where-to-see line', False, 'missing'),
+                                           ('8 no later human request', False, '1 later comment')])
+    monkeypatch.setattr(slots, 'revive', lambda n, text, out=print, **k: out('no slot') or 3)
+    monkeypatch.setattr(f, 'pull', lambda *a: None)
+    f.step()
+    assert g.moves == [] and flow.load_pull() is None and 7 not in flow.held()
+    assert any('no worker took the reason' in n for n in f.notes)
+
+
+def test_advance_conflict_with_main_goes_to_in_progress_with_merge_main(monkeypatch, tick_state):
+    """tangentswarm #83: only a real conflict at the final mergeability check is rework."""
+    pull_state()
+    prs = {1: card(1, HR), 2: card(2, HR), 7: card(7, RD)}
+    f, g = make_flow(prs, dry=False, rows=[('2 mergeable onto main', False,
+                                            'CONFLICTS with origin/main (GitHub vs base: MERGEABLE)')])
+    sent = told(monkeypatch)
+    monkeypatch.setattr(f, 'pull', lambda *a: None)
+    f.step()
+    assert g.moves == [('I7', IP)] and flow.load_pull() is None
+    assert 'git merge origin/main' in sent[0][1]
+    assert 'git merge origin/main' in (flow.RELAY_DIR / 'relay-7-merge-main.md').read_text()
+
+
+def test_advance_github_conflicting_is_a_conflict(monkeypatch, tick_state):
+    pull_state()
+    prs = {1: card(1, HR), 2: card(2, HR), 7: card(7, RD)}
+    f, g = make_flow(prs, dry=False, rows=[('2 mergeable onto main', False, 'GitHub mergeable is CONFLICTING'),
+                                           ('8 no later human request', False, '1 later comment')])
+    monkeypatch.setattr(f, 'pull', lambda *a: None)
+    f.step()
+    assert g.moves == [('I7', IP)] and '8 no later' not in f.did[0]
+
+
+def test_gate_conflicts_only_row_2_conflicts():
+    assert flow.gate_conflicts([('2 mergeable onto main', False, 'CONFLICTS with origin/main')]) == [
+        '2 mergeable onto main: CONFLICTS with origin/main']
+    assert flow.gate_conflicts([('2 mergeable onto main', False, 'cannot check merge: no scratch repo')]) == []
+    assert flow.gate_conflicts([('2 mergeable onto main', True, 'clean onto origin/main')]) == []
+    assert flow.gate_conflicts([('8 no later human request', False, 'CONFLICT words in a comment')]) == []
+    assert flow.gate_conflicts([('9 stack-clean', False, 'conflicts with #5 in Human Review')]) == []
 
 
 def test_advance_pass_runs_hr_gate_apply(monkeypatch):
@@ -294,14 +366,35 @@ def test_advance_pass_runs_hr_gate_apply(monkeypatch):
     assert calls[0][-2:] == ['--apply', '7'] and flow.load_pull() is None
 
 
-def test_advance_head_moved_fails_the_pull(monkeypatch, tmp_path):
-    monkeypatch.setattr(flow, 'Path', lambda p: tmp_path / p.replace('/', '_'))
+def test_advance_head_moved_drops_the_pull_and_moves_no_card(monkeypatch, tick_state):
+    """tangentswarm #83: a new head is not a conflict. The pull ends; the card is not sent to
+    In Progress (the webhook moves a new head to Auto Review)."""
     pull_state(head='f' * 40)
     prs = {1: card(1, HR), 2: card(2, HR), 7: card(7, RD)}
     f, g = make_flow(prs, dry=False)
+    sent = told(monkeypatch)
     monkeypatch.setattr(f, 'pull', lambda *a: None)
     f.step()
-    assert g.moves == [('I7', IP)] and 'head moved' in f.did[0]
+    assert g.moves == [] and flow.load_pull() is None and sent == []
+    assert 'head moved' in f.did[0] and 'no conflict' in f.did[0]
+
+
+def test_advance_head_moved_with_the_card_in_auto_review_is_not_moved(monkeypatch, tick_state):
+    pull_state(head='f' * 40)
+    prs = {1: card(1, HR), 2: card(2, HR), 7: card(7, AR)}
+    f, g = make_flow(prs, dry=False)
+    monkeypatch.setattr(f, 'pull', lambda *a: None)
+    f.step()
+    assert g.moves == [] and 'is in ' in f.did[0] and 'not moved' in f.did[0]
+
+
+def test_advance_dry_run_says_it_would_leave(monkeypatch, tick_state):
+    pull_state()
+    prs = {1: card(1, HR), 2: card(2, HR), 7: card(7, RD)}
+    f, g = make_flow(prs, dry=True, rows=[('8 no later human request', False, '1 later comment')])
+    monkeypatch.setattr(f, 'pull', lambda *a: None)
+    f.step()
+    assert g.moves == [] and flow.load_pull()['pr'] == 7 and 'would leave the Staging pull' in f.did[0]
 
 
 def test_advance_finished_when_card_reached_staging():

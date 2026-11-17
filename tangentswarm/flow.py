@@ -18,8 +18,11 @@ One step, under the one global serial lock (a second caller exits 75 "busy"):
      Progress with a merge-main relay. Then merge its head into work (one merge commit,
      pushed as a fast-forward; the push redeploys staging).
   3. Advance a running pull: evaluate hr-gate on the pulled head. All conditions pass:
-     `hr-gate --apply N` puts it into Staging. A hard failure sends it back to In
-     Progress with the reason. Waiting reasons (CI running, screenshots or the
+     `hr-gate --apply N` puts it into Staging. tangentswarm #83 (Michal 2026-11-10): only
+     a real conflict at the final mergeability check (row 2: the head conflicts with
+     origin/main) sends it to In Progress, with a merge-main relay. Any other way out of
+     the pull (a hard failure, a timeout, a new head) drops the pull and the card stays in
+     Ready at its place in the pick order. Waiting reasons (CI running, screenshots or the
      where-to-see section still missing) keep the pull until PULL_TIMEOUT, then fail.
 
 Only the pulled PR is merged, deployed or gated. No -vN copies, no re-merge of the queue.
@@ -252,6 +255,21 @@ def gate_verdict(rows):
         else:
             hard.append(f"{n.strip()}: {why}")
     return ('fail', hard) if hard else ('wait', wait)
+
+
+def gate_conflicts(rows):
+    """tangentswarm #83: the failed hr-gate rows that are a real conflict at the final
+    mergeability check: row 2 says the head conflicts with origin/main (a local merge-tree
+    conflict, or GitHub CONFLICTING). "cannot check merge" is not a conflict."""
+    return [f"{n.strip()}: {why}" for n, ok, why in rows
+            if not ok and n.startswith('2 ') and 'CONFLICT' in (why or '').upper()]
+
+
+def merge_main_text(n, reason):
+    """The relay for a pulled PR that conflicts with origin/main."""
+    return (f"Coordinator: #{n} left the Staging pull: {reason}. Merge origin/main into your branch "
+            "(git fetch origin; git merge origin/main). Do not rebase and do not force-push. Resolve "
+            "the conflicts, run the tests, push, and report the new head and the test counts.")
 
 
 def ready_order(ready, conflicts=None, active=None):
@@ -964,8 +982,9 @@ class Flow:
             if not self.dry:
                 drop_pull(n)
             return
-        if p['head'] != d['head']:
-            self.fail(p, f"head moved during the pull ({d['head'][:8]} -> {p['head'][:8]}): needs Codex and MinBot again")
+        if p['head'] != d['head']:  # tangentswarm #83: not a conflict; the new head goes to Auto Review
+            self.leave(p, f"head moved during the pull ({d['head'][:8]} -> {p['head'][:8]}): needs Codex and "
+                          "MinBot again", tell=False)
             return
         full = self.g['fetch'](n, refresh=True)
         rows, _ = self.g['evaluate'](full, hr_peers=self.g['list_hr_prs'](refresh=True), scratch=scratch)
@@ -983,7 +1002,12 @@ class Flow:
             self.note(f"#{n} pull waiting ({age // 60} min): " + '; '.join(w[:120] for w in why))
             return
         if verdict == 'fail':
-            self.fail(p, '; '.join(why))
+            bad = gate_conflicts(rows)
+            if bad:  # tangentswarm #83: only a real conflict goes to In Progress
+                reason = '; '.join(bad)
+                self.fail(p, reason, relay='merge-main', text=merge_main_text(n, reason))
+            else:
+                self.leave(p, '; '.join(why))
             return
         if self.dry:
             self.change(f"#{n} hr-gate --apply {n} (every condition passes)")
@@ -1080,8 +1104,41 @@ class Flow:
             return 1, f"{type(e).__name__}: {str(e)[:160]}"
         return rc, (lines[-1] if lines else f'rc={rc}')
 
+    def leave(self, p, reason, tell=True):
+        """tangentswarm #83 (Michal 2026-11-10): a pulled PR leaves the Staging pull with no
+        conflict. The pull is dropped and the card stays in Ready, at its place in the pick
+        order; it never goes to In Progress. A card that is not in Ready any more (a new head
+        moved it to Auto Review) is not moved. tell: give its worker the reason, once per head
+        (a timeout reason holds its age, so the key is the head only), so a body or CI fix gets
+        done; the card does not wait for it."""
+        n, head, col = p['number'], p.get('head') or '', p.get('col')
+        where = 'stays in Ready' if col == board.READY else f"is in {col or '?'}: not moved"
+        if self.dry:
+            self.change(f"#{n} would leave the Staging pull, no conflict; the card {where}: {reason[:200]}")
+            return
+        drop_pull(n)
+        self.change(f"#{n} left the Staging pull, no conflict; the card {where}: {reason[:200]}")
+        if not tell or col != board.READY:
+            return
+        from . import tick
+        state = tick.State(tick.STATE_DIR / 'state.json')
+        key = f"left-pull:{n}@{head}"
+        if state.done(key):
+            return
+        text = (f"Coordinator: #{n} left the Staging pull: {reason}. There is no conflict, so the card stays "
+                "in Ready at its place in the queue. If this needs a change in the PR (body, screenshots, CI), "
+                "fix the root cause and push. If not, do nothing.")
+        rc, said = self.give_worker(n, text)
+        if rc == 0:
+            state.mark(key)
+            self.change(f"#{n} its worker has the reason ({said})")
+        else:
+            self.note(f"#{n} left the Staging pull; no worker took the reason ({said}); the card stays in Ready")
+
     def fail(self, p, reason, relay=None, text=None):
-        """Send a pulled PR back to its worker. Michal 2026-11-15: never demote into a
+        """Send a pulled PR back to its worker. tangentswarm #83: only for a real conflict
+        (a PR that does not merge onto main); any other way out of the pull is leave().
+        Michal 2026-11-15: never demote into a
         column with no worker. The card moves to In Progress only once its Claude runs and
         has the relay; else it stays where it is, its head is held from new pulls, and the
         note says NEEDS_WORKER."""
