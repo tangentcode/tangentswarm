@@ -977,7 +977,11 @@ and stops at the first PR that is not merge-ready. Staging and Human Review PRs 
 `merge-ready`; a merge to main removes both labels.
 3. **Advance the pull.** Evaluate hr-gate on the pulled head. All pass: `hr-gate --apply`
    puts it into Staging. CI running or screenshots missing: wait (90 minutes at most). A
-   hard failure or a moved head: back to In Progress with the reason.
+   real conflict at the final mergeability check (row 2: the head conflicts with
+   origin/main): back to In Progress with a merge-main relay. Anything else (a hard
+   failure, a timeout, a moved head) has no conflict: the pull ends and the card stays in
+   Ready at its place in the pick order (tangentswarm #83). Its worker gets the reason once
+   per head; a moved head gets no relay (the webhook moves it to Auto Review).
 
 Only the pulled PR is merged, deployed or gated. swarm-tick runs one step per pass; the
 GitHub hook runs `swarm-flow event` on `projects_v2_item` and merge events.
