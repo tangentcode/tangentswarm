@@ -144,6 +144,12 @@ def snapshot(gql, max_age=None, path=None, now=time.time):
     fresh = dict(fetch(gql), at=t0)
     with _locked(path):
         old = _load(path)
+        try:
+            newer = old is not None and float(old.get('at') or 0) > t0
+        except (TypeError, ValueError):
+            newer = False
+        if newer:  # Codex on PR #117: a read that started later already stored a newer board
+            return old
         late = [p for p in (old or {}).get('patches') or [] if float(p.get('t') or 0) >= t0]
         for p in late:  # an event that arrived while we read: it may be newer than the read
             _apply(fresh, p)

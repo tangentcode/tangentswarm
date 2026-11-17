@@ -491,3 +491,23 @@ def test_an_event_older_than_the_board_read_or_than_its_own_field_is_skipped():
                                            labels=[]))                          # older than "new"
     c = next(c for _, c in B.open_prs(B.snapshot(gql)))
     assert B._names(c) == ['new'] and len(calls) == 1
+
+
+def test_an_older_board_read_never_overwrites_a_newer_one():
+    """Codex on PR #117 (P2): read A starts, #5 moves to Human Review, read B starts later and
+    stores the board with the move first. When A ends with its older answer, the cache keeps
+    B's board (A's answer is dropped, not written)."""
+    old_board = [node(5, ST, H5)]
+    new_board = [node(5, HR, H5)]
+    B._write(B.PATH, {'prs': [], 'issues': [], 'at': 0.0})
+    clock = [100.0]
+
+    def gql_a(q, **v):  # while A waits for GitHub: the move, then read B from start to end
+        B.moved('I5', HR, now=lambda: 110.0)
+        clock[0] = 120.0
+        B.snapshot(boardfake.gql(new_board), max_age=0, now=lambda: clock[0])
+        clock[0] = 130.0
+        return boardfake.answer(old_board)
+    snap = B.snapshot(gql_a, max_age=0, now=lambda: clock[0])
+    assert cols_of(snap) == {5: HR} and snap['at'] == 120.0
+    assert cols_of(B._load(B.PATH)) == {5: HR}
