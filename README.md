@@ -1007,6 +1007,15 @@ seconds while busy) and:
 2. **Slow path:** `pending-promote --apply` if Human Review is still short.
    `SWARM_PROMOTE_PULL=1` runs a full `swarm-flow step` instead (it also pulls).
 
+Every second it also reads the new lines of the relay's GitHub event log
+(`~/relay/github-events.jsonl`, `tangentswarm/events.py`, tangentswarm #31). A submitted
+review or a Codex comment on a PR in a repo that mn-workflow runs for (the `repos` of
+`SWARM_MN_CONFIG`, default `~/ver/mn-workflow/config.json`) starts `mn-workflow.service`
+at once. When a pass is already running, it starts the next pass when that one ends. The
+wanted pass is kept in `SWARM_MN_PENDING` (default `~/.local/state/swarm-flow/mn-pending`),
+so a daemon restart does not lose it. A Codex result on a platform PR also queues
+`swarm-advance --minbot N`. `mn-workflow.timer` is only a slow backstop.
+
 ```sh
 swarm-promoted --once --dry-run      # one check; print what it would move
 systemctl --user kill -s USR1 swarm-promoted   # wake it now

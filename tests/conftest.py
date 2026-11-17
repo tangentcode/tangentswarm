@@ -66,6 +66,8 @@ def isolated_state(tmp_path, monkeypatch):
     from tangentswarm import events as _events
     monkeypatch.setattr(_events, 'EVENTS', tmp_path / 'github-events.jsonl')
     monkeypatch.setattr(_events, 'OFFSET', tmp_path / 'events.offset')
+    monkeypatch.setattr(_events, 'MN_PENDING', tmp_path / 'mn-pending')
+    monkeypatch.setattr(_events, 'MN_CONFIG', tmp_path / 'mn-workflow-config.json')  # absent: platform only
     monkeypatch.setattr(spool, 'SPOOL', tmp_path / 'spool')
     monkeypatch.setattr(advance, 'check_runs', lambda head, repo=None: [])  # no real GitHub read in a test
     from tangentswarm import tick as _tick

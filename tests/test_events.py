@@ -117,3 +117,62 @@ def test_a_file_truncated_in_place_is_pending_and_read_from_the_start(tmp_path):
     with open(ev, 'r+') as f:
         f.truncate(0)
     assert E.pending(ev, off) and E.new_records(ev, off) == [] and not E.pending(ev, off)
+
+
+def test_a_wanted_pass_survives_a_daemon_restart():
+    """#31: the "start again when this pass ends" flag lived only in memory; a swarm-promoted
+    restart during a pass dropped it until the 5-minute timer."""
+    E.new_records()
+    append({'event': 'pull_request_review', 'repo': E.REPO, 'pr': 7, 'reviewer': 'tangentstorm'})
+    sysd = Sys(active=True)
+    E.Events(run=sysd, enqueue=lambda *a, **k: None).poll()
+    assert E.MN_PENDING.read_text() == 'pull_request_review on platform#7 by tangentstorm'
+    sysd.active = False
+    ev = E.Events(run=sysd, enqueue=lambda *a, **k: None)  # the daemon restarted
+    assert ev.mn_pending and ev.poll() == ['pull_request_review on platform#7 by tangentstorm: '
+                                           'started mn-workflow.service']
+    assert not E.MN_PENDING.exists() and E.Events(run=sysd).mn_pending is None
+
+
+def test_a_dry_reader_never_writes_the_pending_file():
+    E.new_records()
+    append(REVIEW)
+    ev = E.Events(dry=True, run=Sys(active=True), enqueue=lambda *a, **k: None)
+    ev.poll()
+    assert ev.mn_pending and not E.MN_PENDING.exists()
+
+
+def test_every_repo_mn_workflow_runs_for_starts_a_pass_but_only_platform_queues_minbot():
+    """mn-workflow's config lists tangentcode/mn-workflow too; its reviews waited for the timer."""
+    E.MN_CONFIG.write_text(json.dumps({'repos': {'tangentcode/platform': {}, 'tangentcode/mn-workflow': {}}}))
+    E.new_records()
+    append({'event': 'pull_request_review', 'action': 'submitted', 'repo': 'tangentcode/mn-workflow', 'pr': 4,
+            'reviewer': 'chatgpt-codex-connector[bot]'})
+    queued, sysd = [], Sys()
+    lines = E.Events(run=sysd, enqueue=lambda argv, by='': queued.append(argv[1:])).poll()
+    assert lines == ['pull_request_review on tangentcode/mn-workflow#4 by chatgpt-codex-connector[bot]: '
+                     'started mn-workflow.service']
+    assert queued == []  # swarm-webhook queues another repo's MinBot check with --repo
+    codex_comment = {'event': 'issue_comment', 'action': 'created', 'repo': 'tangentcode/mn-workflow',
+                     'issue': 5, 'is_pr': True, 'commenter': 'chatgpt-codex-connector[bot]'}
+    assert [k for k, _, _ in E.actions(codex_comment)] == ['mn']
+    # a repo mn-workflow does not run for: nothing (swarm-webhook handles Project 6)
+    assert E.actions({**REVIEW, 'repo': 'tangentcode/tangentswarm'}) == []
+
+
+def test_mn_repos_falls_back_to_platform():
+    assert E.mn_repos() == {E.REPO}  # no config file
+    E.MN_CONFIG.write_text('not json')
+    assert E.mn_repos() == {E.REPO}
+    E.MN_CONFIG.write_text(json.dumps({'repos': {'Tangentcode/Platform': {}}}))
+    assert E.mn_repos() == {E.REPO}
+    assert E.actions({**REVIEW, 'repo': E.REPO}, repos={'tangentcode/mn-workflow'}) == \
+        [('minbot', 514, 'pull_request_review on platform#514 by chatgpt-codex-connector[bot]')]
+
+
+def test_an_edited_or_dismissed_review_or_an_edited_comment_starts_nothing():
+    for action in ('edited', 'dismissed'):
+        assert E.actions({**REVIEW, 'action': action}) == []
+    assert [k for k, _, _ in E.actions({**REVIEW, 'action': 'submitted'})] == ['mn', 'minbot']
+    assert E.actions({**COMMENT, 'action': 'edited'}) == []
+    assert [k for k, _, _ in E.actions({**COMMENT, 'action': 'created'})] == ['mn', 'minbot']
