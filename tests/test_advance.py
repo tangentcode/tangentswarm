@@ -36,7 +36,7 @@ def test_codex_clean_needs_a_receipt_for_the_exact_head():
     assert not A.codex_clean(codex_pr(comments=[receipt(H, login='someone')]))
     state = {'author': {'login': 'chatgpt-codex-connector[bot]'},
              'body': '<!-- codex-review-state:v1 {"code_review":{"commit_sha":"%s","has_any_findings":false,'
-                     '"has_unresolved_findings":false}} -->' % H}
+                     '"has_unresolved_findings":false,"status":"completed"}} -->' % H}
     assert A.codex_clean(codex_pr(comments=[state]))
 
 

@@ -39,7 +39,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import board, gatelock, gqlmeter, proc
+from . import board, codexsummary, gatelock, gqlmeter, proc
 
 REPO = 'tangentcode/platform'
 CODEX = 'chatgpt-codex-connector'
@@ -83,67 +83,49 @@ def _open_codex_threads(pr):
             and _codex(((t.get('comments') or {}).get('nodes') or [{}])[0])]
 
 
-def codex_clean(pr):
-    """hr-gate condition 3 on the exact head: a clean Codex result for the head (receipt,
-    review-state summary with no findings, or a Codex review of the head with no comment),
-    no Codex review with findings on the head, and no open Codex thread on the head. An
-    open thread from an OLDER head does not block once Codex is clean on the new head
-    (MethBot 2026-11-15: the worker pushed the fix but did not resolve the thread); the
-    MinBot pass resolves it (addressed_threads). A thread whose commit is unknown counts as
-    on the head."""
-    head = pr.get('headRefOid') or ''
-    if not head:
-        return False
-    clean = False
-    reviews = [r for r in (pr.get('reviews') or {}).get('nodes') or []
-               if _codex(r) and (r.get('commit') or {}).get('oid') == head]
-    for c in (pr.get('comments') or {}).get('nodes') or []:
-        if not _codex(c):
-            continue
-        body = c.get('body') or ''
-        if 'Reviewed commit' in body and head[:8] in body and "Didn't find any major issues" in body:
-            clean = True
-        m = re.search(r'codex-review-state:v1\s*(\{.*?\})\s*-->', body, re.S)
-        if m:
-            try:
-                st = json.loads(m.group(1)).get('code_review', {})
-            except ValueError:
-                continue
-            if st.get('commit_sha') == head and not st.get('has_any_findings'):
-                clean = True
-    if any(((r.get('comments') or {}).get('totalCount') or 0) == 0 for r in reviews):
-        clean = True
-    findings = [r for r in reviews if ((r.get('comments') or {}).get('totalCount') or 0) > 0]
-    on_head = [t for t in _open_codex_threads(pr) if _thread_commit(t) in (head, None)]
-    return clean and not findings and not on_head
+def _review_comments(r):
+    return ((r.get('comments') or {}).get('totalCount') or 0)
+
+
+def _receipt(body, head):
+    return 'Reviewed commit' in body and head[:8] in body and "Didn't find any major issues" in body
 
 
 def codex_decision(pr):
     """('clean' | 'findings' | 'pending', detail) on the exact head, for every reader that acts
-    on a Codex result (the MinBot pass, swarm-webhook, its replay). Clean is codex_clean(): an
-    open thread from an older head does not count once Codex is clean on the head (Codex on
-    PR #26: the webhook relayed already-fixed findings from an older head and demoted the
-    PR). Findings are only on the head: an open thread on it (or of unknown commit), a Codex
-    review of the head with comments, or a review-state summary of the head with findings."""
+    on a Codex result (the MinBot pass, swarm-webhook, its replay).
+    Findings are only on the head: an open Codex thread on it (or of unknown commit), a Codex
+    review of the head with comments, or a review-state summary of the head with findings.
+    Findings win over every clean signal (tangentswarm #75).
+    Clean is a clean receipt, a completed summary of the head with both findings flags false,
+    or a Codex review of the head with no comment. A running summary, null flags or another
+    sha is never clean (codexsummary.result). An open thread from an OLDER head does not
+    count once Codex is clean on the head (MethBot 2026-11-15; Codex on PR #26: the webhook
+    relayed already-fixed findings from an older head and demoted the PR); the MinBot pass
+    resolves it (addressed_threads)."""
     head = pr.get('headRefOid') or ''
-    if codex_clean(pr):
-        return 'clean', f'Codex clean on {head[:8]}'
+    if not head:
+        return 'pending', 'no head'
     on_head = [t for t in _open_codex_threads(pr) if _thread_commit(t) in (head, None)]
     if on_head:
         return 'findings', f'{len(on_head)} open Codex thread(s) on {head[:8]}'
-    if any(_codex(r) and (r.get('commit') or {}).get('oid') == head and ((r.get('comments') or {}).get('totalCount') or 0)
-           for r in (pr.get('reviews') or {}).get('nodes') or []):
+    reviews = [r for r in (pr.get('reviews') or {}).get('nodes') or []
+               if _codex(r) and (r.get('commit') or {}).get('oid') == head]
+    if any(_review_comments(r) for r in reviews):
         return 'findings', f'a Codex review of {head[:8]} has comments'
-    for c in (pr.get('comments') or {}).get('nodes') or []:
-        m = re.search(r'codex-review-state:v1\s*(\{.*?\})\s*-->', c.get('body') or '', re.S) if _codex(c) else None
-        if m:
-            try:
-                st = json.loads(m.group(1)).get('code_review', {})
-            except ValueError:
-                continue
-            if st.get('commit_sha') == head and st.get('has_any_findings'):
-                return 'findings', f'the Codex summary of {head[:8]} has findings'
+    comments = (pr.get('comments') or {}).get('nodes') or []
+    summary = codexsummary.on_head(comments, head, _codex)
+    if summary == codexsummary.FINDINGS:
+        return 'findings', f'the Codex summary of {head[:8]} has findings'
+    if summary == codexsummary.CLEAN or reviews \
+            or any(_codex(c) and _receipt(c.get('body') or '', head) for c in comments):
+        return 'clean', f'Codex clean on {head[:8]}'
     return 'pending', f'no Codex result on {head[:8]}'
+
+
+def codex_clean(pr):
+    """hr-gate condition 3 on the exact head: codex_decision() is clean."""
+    return codex_decision(pr)[0] == 'clean'
 
 
 def codex_details(gql, n, repo=REPO):
