@@ -9,14 +9,14 @@ from . import board
 ITEMS_Q = """query($org:String!,$n:Int!,$c:String){organization(login:$org){projectV2(number:$n){
  items(first:100, after:$c){pageInfo{hasNextPage endCursor} nodes{id
   fieldValueByName(name:"Status"){...on ProjectV2ItemFieldSingleSelectValue{name optionId}}
-  content{__typename ...on PullRequest{number state isDraft headRefOid mergeable
+  content{__typename ...on PullRequest{number state isDraft headRefName headRefOid mergeable
    repository{nameWithOwner} milestone{title dueOn} labels(first:15){nodes{name}}
    closingIssuesReferences(first:5){nodes{number repository{nameWithOwner} milestone{title dueOn}
     labels(first:10){nodes{name}}}}}}}}}}}"""
 
 
 def open_prs(gql, b, org='tangentcode'):
-    """{column key: [{number, repo, head, item, draft, mergeable, closes, due, milestone}]} of
+    """{column key: [{number, repo, head, branch, item, draft, mergeable, closes, due, milestone}]} of
     the OPEN pull requests of board b's repos."""
     cols, cursor = {}, None
     while True:
@@ -32,7 +32,7 @@ def open_prs(gql, b, org='tangentcode'):
             due, ms = board.soonest_due([c.get('milestone') or {}] + [i.get('milestone') or {} for i in cl])
             names = [l['name'] for x in [c] + cl for l in (x.get('labels') or {}).get('nodes') or []]
             cols.setdefault(board.column(it.get('fieldValueByName')), []).append(dict(
-                number=c['number'], repo=repo, head=c['headRefOid'], item=it['id'], draft=c['isDraft'],
+                number=c['number'], repo=repo, head=c['headRefOid'], branch=c.get('headRefName'), item=it['id'], draft=c['isDraft'],
                 mergeable=c.get('mergeable'), closes=[i['number'] for i in cl], due=due, milestone=ms,
                 labels=names, ft=board.is_fast_track(names)))  # this repo's own labels (Codex on PR #47)
         if not items['pageInfo']['hasNextPage']:
