@@ -189,6 +189,8 @@ def _classify(event, p):
     if event == 'ping':
         return [Action('skip', why='ping')]
     if event == 'projects_v2_item':
+        from . import sanity
+        sanity.poke()  # a board change: the watchdog runs the sanity check (tangentswarm #43)
         return project_move(p)
     if board.for_repo(repo) is None:
         return [Action('skip', why=f'not a swarm repo ({repo or "no repo"})')]

@@ -15,6 +15,9 @@ An alert is alerts.alert(): a swarmbot wake and an events DB row, never a MethBo
 Every SWEEP_EVERY s (item 6): issue cards with no PR in a PR column go to Backlog; a Done
 PR whose head is not on main leaves Done (open or merged elsewhere: In Progress; closed
 without a merge: Canceled).
+The sanity check (tangentswarm.sanity, #43) runs at startup, on a board change (a webhook
+projects_v2_item poke, or a changed Project 4 snapshot), once an hour as a backstop, and
+again when a finding's grace ends: no polling of its own.
 
     swarm-watch --once [--dry-run]    one pass (all checks) and exit
     swarm-watch --panes               the latest capture of every pane, with its class
@@ -244,6 +247,9 @@ class Watchdog:
         self.stall_since = None
         self.last_codex = 0.0
         self.last_sweep = 0.0
+        self.last_sanity = 0.0
+        self.sanity_fp = None
+        self.sanity_due = None
 
     @property
     def g(self):
@@ -276,6 +282,7 @@ class Watchdog:
         if now - self.last_sweep >= SWEEP_EVERY:
             self.last_sweep = now
             self.step('sweep', self.sweep_pass, snap, now)
+        self.step('sanity', self.sanity_tick, snap, now)
 
     # each check returns the lines to log
     def pane_pass(self, snap, now):
@@ -361,6 +368,35 @@ class Watchdog:
         self.alert(text, key=key, st=self.st)
         self.incident(key, 'Codex outage', text)
         return [f"alerted swarmbot: {text}"]
+
+    def sanity_tick(self, snap, now):
+        """Run the sanity check when it is due: at startup, on a board change, every
+        sanity.EVERY s, or when a finding's grace (or a ticket retry) ends."""
+        from . import sanity
+        fp = sanity.fingerprint(snap)
+        why = ('startup' if not self.last_sanity else
+               'hourly' if now - self.last_sanity >= sanity.EVERY else
+               'board change' if fp != self.sanity_fp or sanity.poked_at() > self.last_sanity else
+               'recheck' if self.sanity_due and now >= self.sanity_due else None)
+        if not why:
+            return []
+        self.last_sanity, self.sanity_fp = now, fp
+        try:
+            return self.sanity_pass(snap, now, why)
+        except Exception:
+            from . import sanity as _s
+            self.sanity_due = now + _s.RETRY  # a failed read (a GitHub limit) is tried again soon
+            raise
+
+    def sanity_pass(self, snap, now, why='run'):
+        from . import sanity
+        failed = {}
+        found = sanity.gather(self.g, snap, now, failed=failed)
+        lines, self.sanity_due = sanity.report(
+            found, now, apply=not self.dry, alert=lambda text, key, pr=None: self.alert(text, key=key, pr=pr, st=self.st),
+            incident=self.incident, unread=set(failed))
+        lines = [f"project {b} read failed: {err}" for b, err in sorted(failed.items())] + lines
+        return [f"sanity ({why}): {line}" for line in lines or [f"{len(found)} finding(s), nothing new"]]
 
     def sweep_pass(self, snap, now):
         from . import boardcache, slots
