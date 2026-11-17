@@ -678,8 +678,9 @@ def test_michal_rejecting_from_human_review_makes_the_pr_a_draft():
     assert board.DRAFTED == [(541, W.REPO)] and ex.relays
 
 
-def _real_handoff(monkeypatch, tmp_path, rc, said):
-    """A reject with the real Flow.hand_off (no injected give): only slots is faked."""
+def _real_handoff(monkeypatch, tmp_path, rc, said, ex=None, action=None):
+    """Run an action with the real Flow.hand_off (no injected give): only slots is faked.
+    Default: a reject of #541."""
     from tangentswarm import flow, slots
     monkeypatch.setattr(flow, 'RELAY_DIR', tmp_path)
     got = {'revive': [], 'start': [], 'queue': []}
@@ -690,31 +691,58 @@ def _real_handoff(monkeypatch, tmp_path, rc, said):
     monkeypatch.setattr(slots, 'revive', revive)
     monkeypatch.setattr(slots, 'start_later', lambda n, branch, relay: got['start'].append((n, branch, relay)) or True)
     monkeypatch.setattr(slots, 'queue_revive', lambda n, text, **kw: got['queue'].append((n, kw)))
-    ex = _node_fake('PullRequest')
+    ex = ex or _node_fake('PullRequest')
     ex.give = None
     full = ex._g['gql']
     ex._g['gql'] = lambda q, **v: ({'repository': {'pullRequest': {'headRefName': 'fix-541'}}}
-                                   if 'headRefName}' in q else full(q, **v))
-    ex.run(W.Action('reject', 0, 'x', dict(node='PR_x', board=board.DEFAULT.number)))
+                                   if q.endswith('{headRefName}}}') else full(q, **v))
+    ex.run(action or W.Action('reject', 0, 'x', dict(node='PR_x', board=board.DEFAULT.number)))
     return ex, got
 
 
-def test_a_reject_reaches_the_worker_through_the_real_hand_off(monkeypatch, tmp_path):
-    """tangentswarm #135: do_reject end to end with the real Flow.hand_off. Since PR #109 it
-    takes (p, text, relay_path); the webhook passed (n, text), so every reject raised a
-    TypeError and woke swarmbot. The injected give of the other tests hid it."""
-    ex, got = _real_handoff(monkeypatch, tmp_path, 0, 'resumed')
+def _ci_red(monkeypatch):
+    from tangentswarm import advance
+    monkeypatch.setattr(advance, 'check_runs', lambda sha, repo=None: [{'name': 'Linux mna tests', 'status': 'completed',
+                                                                        'conclusion': 'failure'}])
+    return Fake(col=board.READY, full=codex_pr(head='c' * 40)), W.Action('ci', 541, args={'sha': 'c' * 40, 'conclusion': 'failure'})
+
+
+# tangentswarm #135: every caller of Executor.to_worker, each with the real Flow.hand_off
+TO_WORKER_PATHS = {
+    'reject': (lambda mp: (None, None), 'Michal sent it back from Human Review'),
+    'answered': (lambda mp: (None, W.Action('answered', 0, 'x', dict(node='PR_x', board=board.DEFAULT.number))),
+                 'Michal answered'),
+    'codex': (lambda mp: (Fake(col=board.AUTO_REVIEW, full=codex_pr(findings=True)), W.Action('codex', 541)),
+              'gh pr view 541 --comments'),
+    'ci': (_ci_red, '"Linux mna tests" failure'),
+    'comment': (lambda mp: (Fake(col=board.IN_PROGRESS, full=codex_pr()),
+                            W.Action('relay', 541, args={'author': 'someone', 'url': 'u', 'body': 'fix the typo'})),
+                'fix the typo'),
+}
+
+
+@pytest.mark.parametrize('path', sorted(TO_WORKER_PATHS))
+def test_every_to_worker_path_reaches_the_worker_through_the_real_hand_off(monkeypatch, tmp_path, path):
+    """tangentswarm #135: since PR #109, Flow.hand_off takes (p, text, relay_path); the webhook
+    passed (n, text), so every relay (reject, Needs Input answer, Codex findings, red CI, a
+    comment) raised a TypeError and woke swarmbot. The injected give of the other tests hid it."""
+    build, says = TO_WORKER_PATHS[path]
+    ex, action = build(monkeypatch)
+    ex, got = _real_handoff(monkeypatch, tmp_path, 0, 'resumed', ex=ex, action=action)
     assert ex.errors == [] and ex.wakes == []
     (n, text, kw), = got['revive']
-    assert n == 541 and 'Michal sent it back from Human Review' in text and kw == {'queue': True}
+    assert n == 541 and says in text and kw == {'queue': True}
     assert (tmp_path / 'relay-541-webhook.md').read_text() == text + '\n'
-    assert any("Michal's rejection relayed (resumed)" in d for d in ex.done)
+    assert any('(resumed)' in d for d in ex.done)
 
 
-def test_a_reject_with_no_worktree_queues_a_worker_start_with_the_relay(monkeypatch, tmp_path):
+@pytest.mark.parametrize('path', sorted(TO_WORKER_PATHS))
+def test_every_to_worker_path_with_no_worktree_queues_a_worker_start(monkeypatch, tmp_path, path):
     """tangentswarm #135: no worktree to resume: the relay waits for a Claude (#101), with the
     PR's head branch and the relay file, and no swarmbot wake."""
-    ex, got = _real_handoff(monkeypatch, tmp_path, 1, 'no surviving worktree for #541')
+    build, _ = TO_WORKER_PATHS[path]
+    ex, action = build(monkeypatch)
+    ex, got = _real_handoff(monkeypatch, tmp_path, 1, 'no surviving worktree for #541', ex=ex, action=action)
     assert ex.errors == [] and ex.wakes == []
     assert got['start'] == [(541, 'fix-541', tmp_path / 'relay-541-webhook.md')]
     assert any('waiting for a Claude' in d for d in ex.done)
