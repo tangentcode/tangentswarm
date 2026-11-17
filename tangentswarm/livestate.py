@@ -146,10 +146,28 @@ def capture(pane, run=subprocess.run):
     return r.stdout if r.returncode == 0 else None
 
 
-def branch_of(cwd):
-    """The branch of the worktree at cwd, or ''. During a rebase: the branch it rebases (#94)."""
+def git_of(cwd):
+    """(origin repo 'owner/name' or None, branch or None) of the worktree that holds cwd (cwd
+    may be a subdirectory of it). During a rebase: the branch it rebases (#94)."""
     from . import sanity
-    return sanity.git_info(cwd)[1] or ''
+    root = sanity.worktree_root(str(cwd)) if cwd else None
+    return sanity.git_info(root) if root else (None, None)
+
+
+def branch_of(cwd):
+    """The branch of the worktree that holds cwd, or ''."""
+    return git_of(cwd)[1] or ''
+
+
+def repo_of(cwd):
+    """The origin repo of the worktree that holds cwd, or None."""
+    return git_of(cwd)[0]
+
+
+def on_board(repo):
+    """True if a worktree of `repo` can have a PR in the board snapshot (it holds only
+    boardcache.REPO PRs): a branch of another repo with the same name is not that PR."""
+    return (repo or '').lower() == boardcache.REPO.lower()
 
 
 # -- the 1-minute pane capture and CPU samples --------------------------------------------------
@@ -204,12 +222,12 @@ def state_of(claude, sess, screen_age, every=CAPTURE_EVERY):
     return 'idle'
 
 
-def agent_rows(panes, table, sess, cards, cpu=None, screen=None, now=None, branch=None):
+def agent_rows(panes, table, sess, cards, cpu=None, screen=None, now=None, branch=None, repo=None):
     """[row] for each pane: {pane, index, window, cwd, branch, claude, status, state, idle_s,
     screen_s, tests, other, mem, cpu, pr, card}. tests and other: [(pid, command)]. cpu is
     None (unknown) when cpu is None: no earlier sample."""
     now = time.time() if now is None else now
-    branch = branch or branch_of
+    branch, repo = branch or branch_of, repo or repo_of
     rows = []
     for p in panes:
         pids = tree(table, p['pid'])
@@ -222,7 +240,7 @@ def agent_rows(panes, table, sess, cards, cpu=None, screen=None, now=None, branc
             idle_s = max(0, int(now - float(s['statusUpdatedAt']) / 1000))
         cwd = (s or {}).get('cwd') or p['cwd']
         br = branch(cwd) if cwd else ''
-        pr, card = cards.get(br, (None, None)) if br else (None, None)
+        pr, card = cards.get(br, (None, None)) if br and on_board(repo(cwd)) else (None, None)
         rows.append(dict(
             pane=p['pane'], index=p['index'], window=p['window'], cwd=cwd, branch=br, claude=claude,
             status=(s or {}).get('status') or ('' if claude is None else '?'),
