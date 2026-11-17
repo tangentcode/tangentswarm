@@ -35,6 +35,7 @@ SQLite event log (eventdb: a 'received' row before the reply, a 'handled' row af
   closed   card Canceled
   p6merge  a worker's `MERGE-READY <sha>` comment on a Project 6 PR: verify, merge and clean
            up at that sha with no AI (p6merge, tangentswarm #89)
+  p6cleanup  a Project 6 merge event, after 'merged': p6merge at the merged head, never a merge
   card     a new PR or issue: Project 4 card with the right Status
   wake     an exception (EXCEPTIONS): one deduped, rate-limited POST to swarmbot's wake URL
 
@@ -311,8 +312,12 @@ def _classify(event, p):
                 head = pr.get('head') or {}
                 # a fork's branch name says nothing about this repo's branches (Codex on PR #42)
                 own = ((head.get('repo') or {}).get('full_name') or REPO) == REPO
-                return [Action('merged', n, f"#{n} merged into main", dict(head=head.get('sha'),
+                acts = [Action('merged', n, f"#{n} merged into main", dict(head=head.get('sha'),
                                                                            branch=head.get('ref') if own else None))]
+                from . import p6merge  # Codex on PR #90: its own action, so a failed board step cannot stop it
+                if repo in p6merge.REPOS and p6merge.SHA_RE.match(head.get('sha') or ''):
+                    acts.append(Action('p6cleanup', n, f"#{n} merged: the Project 6 cleanup", dict(head=head.get('sha'))))
+                return acts
             if pr.get('merged'):
                 return [Action('wake', n, f"#{n} merged into {base}, not main", dict(key=f'merge-base:{n}'))]
             return [Action('closed', n, f"#{n} closed without a merge")]
@@ -811,11 +816,11 @@ class Executor:
             except Exception as e:  # the rest of the merge handling is done; report this part
                 self.note(f"#{a.pr}: -vN cleanup failed: {type(e).__name__}: {str(e)[:160]}")
         self.note(f"#{a.pr} merged: cascade, Done, linked issues closed")
-        self.p6_cleanup(a)
 
-    def p6_cleanup(self, a):
+    def do_p6cleanup(self, a):
         """tangentswarm #89 (Codex on PR #90): a Project 6 merge event runs p6merge at the merged
-        head. It is idempotent: after the swarm's own merge it only sends the MethBot POSTs
+        head, as its own action after 'merged' (Executor.run catches each action alone, so a
+        failed card read, card move, issue close or cascade queue in do_merged cannot stop it). It is idempotent: after the swarm's own merge it only sends the MethBot POSTs
         still pending; after a merge it could not confirm (a merge queue) or a merge by hand,
         it does the cleanup (windows, worktree, branch, deploy note, Backlog pull), never a merge."""
         from . import p6merge

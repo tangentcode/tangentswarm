@@ -523,7 +523,9 @@ def test_a_project_6_merge_event_runs_the_cleanup(repo):
     ran = []
     ex = MergedEx(g={'gql': 'GQL'}, sh=lambda argv: '', enqueue=lambda argv, by='': None,
                   p6merge=lambda *a, **k: ran.append(a) or {'merged': True, 'notes': ['closed window swarm-90-x']})
-    for a in W.classify('pull_request', merged_event(repo)):
+    acts = W.classify('pull_request', merged_event(repo))
+    assert [a.kind for a in acts] == ['merged', 'p6cleanup']
+    for a in acts:
         ex.run(a)
     assert ran == [(repo, 90, HEAD, 'merged')] and ex.errors == []
     assert f'{repo}#90 Project 6 cleanup at {HEAD[:8]}: closed window swarm-90-x' in ex.done
@@ -533,9 +535,11 @@ def test_a_platform_merge_event_never_runs_the_project_6_cleanup():
     ex = MergedEx(g={'gql': 'GQL'}, sh=lambda argv: '', enqueue=lambda argv, by='': None,
                   cascade=lambda: 'queued', signal_promoted=lambda: 'woken',
                   p6merge=lambda *a, **k: pytest.fail('platform'))
-    ex.repo = 'tangentcode/platform'
-    ex.p6_cleanup(W.Action('merged', 90, '', {'head': HEAD}))
-    assert ex.errors == []
+    acts = W.classify('pull_request', merged_event('tangentcode/platform'))
+    assert [a.kind for a in acts] == ['merged']
+    for a in acts:
+        ex.run(a)
+    assert 'p6cleanup' not in [a.kind for a in W.classify('pull_request', merged_event(TS, head='abc'))]
 
 
 def test_the_merge_event_after_a_queued_merge_cleans_up_with_no_second_merge():
@@ -602,3 +606,20 @@ def test_tip_problem_reads_the_local_branch(tmp_path, monkeypatch):
     assert 'has commits that are not in the merged head' in run.tip_problem('feat')
     ahead = git('rev-parse', 'HEAD')
     assert M.P6Merge(TS, 90, ahead, 'done').tip_problem('main') is None  # an older tip is in the head
+
+
+# -- Codex on PR #90 (362c4a7): a failed board step of the merge event never stops the cleanup --
+
+@pytest.mark.parametrize('broken', ['card', 'closing_issues', 'cascade'])
+def test_a_failed_merged_step_does_not_stop_the_project_6_cleanup(broken):
+    ran = []
+
+    class Broken(MergedEx):
+        pass
+    setattr(Broken, broken, lambda self, *a, **k: (_ for _ in ()).throw(RuntimeError(f'{broken} down')))
+    ex = Broken(g={'gql': 'GQL'}, sh=lambda argv: '', enqueue=lambda argv, by='': None, wake_post=lambda p: None,
+                p6merge=lambda *a, **k: ran.append(a) or {'merged': True, 'notes': []})
+    for a in W.classify('pull_request', merged_event(TS)):
+        ex.run(a)
+    assert any(e.startswith('merged #90') and f'{broken} down' in e for e in ex.errors)
+    assert ran == [(TS, 90, HEAD, 'merged')]
