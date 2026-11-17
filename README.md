@@ -1073,13 +1073,14 @@ swarm-codex-rounds --days 7      # the PRs with the most Codex rounds, round by 
 A deterministic check (no LLM) of the board column rules of methodology `workflow.md` and of
 one Claude per worktree. The watchdog runs it at startup, on a board change (a webhook
 `projects_v2_item` event, or a changed Project 4 snapshot), and once an hour as a backstop.
-There is no polling of its own. A finding that is still there after 10 minutes wakes
-swarmbot once and opens one incident ticket on Project 6. The same finding is not filed
-again while it stays. [docs/sanity-check.md](docs/sanity-check.md) lists every check.
+There is no polling of its own. A finding must still be there after 10 minutes. Then each
+pass makes one report for all its new findings (#82): one incident ticket on Project 6 and
+one swarmbot wake. The same finding is not reported again while it stays. Cards in the
+Deferred column of Project 4 are not checked. [docs/sanity-check.md](docs/sanity-check.md) lists every check.
 
 ```sh
 swarm-sanity            # dry run: every finding, and what --apply would do now
-swarm-sanity --apply    # tell swarmbot and file the incident tickets
+swarm-sanity --apply    # file the incident ticket and tell swarmbot
 swarm-sanity --json     # the findings as JSON
 ```
 
