@@ -18,8 +18,8 @@ Tools:
   handoff          "I am done and pushed": the Stop-hook handoff now (tangentswarm #28):
                    mark ready, "@codex review" once per head, card to Auto Review; a
                    Codex-clean head gets the MinBot check.
-  request_review   post "@codex review" for the current head (once per head; the key is
-                   shared with swarm-tick and the Stop hook).
+  request_review   post "@codex review" for the current head (once per head, through
+                   codexrounds.ask(), the one guarded poster: tangentswarm #63).
   needs_input      a question only Michal can answer (tangentswarm #40): it goes on the
                    ticket, the card moves to Needs Input, and this Claude is closed with
                    /exit; it is resumed with his answer. Never ask Michal in the pane.
@@ -202,7 +202,7 @@ def do_handoff(wt=None, transcript=None):
 
 
 def do_request_review(wt=None, sh=None):
-    from . import stophook, tick
+    from . import stophook
     wt = wt or worktree()
     p6_only(wt, 'request_review')
     branch, head = stophook.pushed_head(wt)
@@ -215,13 +215,11 @@ def do_request_review(wt=None, sh=None):
     full = gate()['fetch'](n, refresh=True)
     if full.get('headRefOid') != head:
         return {'posted': False, 'why': f"GitHub does not show head {head[:8]} yet; try again in a minute"}
-    state = tick.State(tick.STATE_DIR / 'state.json')
-    key = f"codex-request:{n}@{head}"
-    if state.done(key) or tick.codex_requested(full):
-        return {'posted': False, 'why': f"#{n}: a Codex review was already asked for {head[:8]}"}
-    from . import codexrounds
-    codexrounds.request(n, head, 'worker request_review', sh=sh, state=state)
-    return {'posted': True, 'pr': n, 'head': head}
+    from . import codexrounds  # tangentswarm #63: the one guarded poster
+    res = codexrounds.ask(n, head, 'worker request_review', full, sh=sh)
+    if not res['posted']:
+        return {'posted': False, 'why': f"#{n} head {head[:8]}: {res['why']}"}
+    return {'posted': True, 'pr': n, 'head': head, 'kind': res['kind']}
 
 
 def do_needs_input(wt, pr, question, accept=None, window_of=None, g=None):

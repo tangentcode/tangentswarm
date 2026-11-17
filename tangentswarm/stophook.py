@@ -35,8 +35,8 @@ The handoff (run), only for a worker worktree ~/ver/platform.<slug>:
      (platform #541, 2026-11-15). It is never marked ready.
   6. Codex already clean on the head: `swarm-advance --minbot N` (the MinBot check: CI
      green, mergeable, not a draft; a pass moves the card to Ready; a busy lock queues it
-     for swarm-promoted). Else post "@codex review" once per head (the key is shared with
-     swarm-tick, which does not post it again).
+     for swarm-promoted). Else post "@codex review" once per head through
+     codexrounds.ask(), the one guarded poster (tangentswarm #63).
 Each run writes one line to LOG, for example:
   #514 head 7f3a1c2 pushed. Marked the pull request ready, posted "@codex review", and moved
   the card to Auto Review.
@@ -349,12 +349,9 @@ def _run(cwd, g, dry, out, sh, sleep, merges, minbot, transcript, procs, tell):
         what = (', '.join(did) + ', and ' if did else '') + 'ran the MinBot check'
         line = f"#{n} head {head[:7]} is already Codex-clean. {what[0].upper() + what[1:]}: {last}"
     else:
-        state = tick.State(tick.STATE_DIR / 'state.json')
-        ck = f"codex-request:{n}@{head}"
-        if not (state.done(ck) or tick.codex_requested(full)):
-            if not dry:
-                from . import codexrounds
-                codexrounds.request(n, head, 'stop-hook', sh=sh, state=state)
+        from . import codexrounds  # tangentswarm #63: the one guarded poster
+        res = codexrounds.ask(n, head, 'stop-hook', full, sh=sh, dry=dry)
+        if res['kind'] != 'skip':
             did.append('posted "@codex review"')
         if col == board.IN_PROGRESS:
             if not dry:

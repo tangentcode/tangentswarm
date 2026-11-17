@@ -311,20 +311,6 @@ def codex_reviewed_head(pr):
     return False
 
 
-def codex_requested(pr):
-    """True if someone (not a bot) already posted '@codex review' after the head commit."""
-    nodes = pr['commits']['nodes']
-    if not nodes:
-        return False
-    head_at = nodes[0]['commit']['committedDate']
-    for c in pr['comments']['nodes']:
-        login = (c.get('author') or {}).get('login') or ''
-        if (c.get('body') or '').strip().lower() == '@codex review' and not login.endswith('[bot]') \
-                and c['createdAt'] > head_at:
-            return True
-    return False
-
-
 ROW_REASONS = {
     '2 ': 'head conflicts with origin/main: needs a merge-main',
     '4 ': 'needs a MinBot pass on this head',
@@ -797,13 +783,14 @@ class Tick:
         if not self.dry:
             board.move_card(self.g, pr['item'], board.AUTO_REVIEW, n=pr.get('number'))
         self.change(f"#{n} card In Progress -> Auto Review")
-        key = f"codex-request:{n}@{head}"
-        if codex_clean or self.state.done(key) or codex_requested(full):
+        if codex_clean:
             return
-        if not self.dry:
-            from . import codexrounds
-            codexrounds.request(n, head, 'swarm-tick', state=self.state)
-        self.change(f"#{n} posted \"@codex review\" for head {head[:8]}")
+        from . import codexrounds  # tangentswarm #63: the one guarded poster
+        res = codexrounds.ask(n, head, 'swarm-tick', full, state=self.state, dry=self.dry)
+        if res['kind'] == 'skip':
+            return
+        retry = f" ({res['why']}: retry)" if res['kind'] == 'retry' else ''
+        self.change(f"#{n} posted \"@codex review\" for head {head[:8]}{retry}")
 
     # step 3 ---------------------------------------------------------------
     def hr_pass(self, scratch):

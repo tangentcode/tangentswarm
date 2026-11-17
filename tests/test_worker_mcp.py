@@ -36,7 +36,7 @@ def test_request_review_posts_once_per_head(wt, monkeypatch):  # noqa: F811
     assert W.do_request_review(wt, sh=posted.append)['posted'] is True
     assert posted == [['gh', 'pr', 'comment', '7', '-R', W.REPO, '--body', '@codex review']]
     again = W.do_request_review(wt, sh=posted.append)
-    assert again['posted'] is False and 'already asked' in again['why'] and len(posted) == 1
+    assert again['posted'] is False and 'still pending' in again['why'] and len(posted) == 1
 
 
 def test_handoff_refuses_an_unpushed_head(wt, monkeypatch):  # noqa: F811

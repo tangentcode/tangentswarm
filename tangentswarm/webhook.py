@@ -583,6 +583,25 @@ class Executor:
             self.minbot(a.pr)
             return self.cascade(f'Codex clean on #{a.pr}')
         self.note(f"#{a.pr}: no Codex result on the head yet ({detail})")
+        if a.args.get('commit') is None and full.get('headRefOid'):
+            self.ask_codex(a.pr, full['headRefOid'], full, retry_only=True)  # "Something went wrong": retry
+
+    def ask_codex(self, n, head, full, retry_only=False, col=None):
+        """ "@codex review" for head through the one guarded poster (tangentswarm #63): every
+        ask and retry is logged with its head; a skip is a note. A card in Done, Canceled,
+        Parked or Needs Input gets no ask (Codex on PR #92: a late Codex error reply on
+        stopped work); ask() itself skips a PR that is not open."""
+        from . import codexrounds
+        if col is None:
+            _, col = self.card(n)
+        if col in (board.DONE, board.CANCELED, board.PARKED, board.NEEDS_INPUT):
+            return self.note(f"#{n}: no Codex ask for {(head or '')[:8]}: the card is in {col}")
+        res = codexrounds.ask(n, head, 'swarm-webhook', full, repo=self.repo, sh=self._sh, dry=self.dry,
+                                retry_only=retry_only)
+        if res['kind'] == 'skip':
+            return self.note(f"#{n}: no Codex ask for {(head or '')[:8]}: {res['why']}")
+        retry = f" ({res['why']}: retry)" if res['kind'] == 'retry' else ''
+        self.note(f'#{n}: posted "@codex review" for {head[:8]}{retry}')
 
     def do_ci(self, a):
         from . import advance
@@ -605,8 +624,7 @@ class Executor:
 
     def do_handoff(self, a):
         """A new head on a non-draft PR in In Progress or past it (or ready_for_review): to
-        Auto Review, with "@codex review" once per head (tangentswarm #84)."""
-        from . import tick
+        Auto Review, with "@codex review" once per head (tangentswarm #84, #63)."""
         item, col = self.card(a.pr)
         if col is None and a.args.get('push'):
             return self.note(f"#{a.pr}: a push with no card: not moved")
@@ -621,16 +639,7 @@ class Executor:
             self._sh(['gh', 'pr', 'ready', str(a.pr), '-R', self.repo])
         if col != board.AUTO_REVIEW:
             self.move(a.pr, item, board.AUTO_REVIEW)
-        state = tick.State(tick.STATE_DIR / 'state.json')
-        key = f"codex-request:{a.pr}@{head}" if self.platform() else f"codex-request:{self.repo}#{a.pr}@{head}"
-        if not (state.done(key) or tick.codex_requested(full) or tick.codex_reviewed_head(full)):
-            if not self.dry:
-                self._sh(['gh', 'pr', 'comment', str(a.pr), '-R', self.repo, '--body', '@codex review'])
-                state.mark(key)
-            self.note(f'#{a.pr}: posted "@codex review" for {head[:8]}')
-            if not self.dry:  # every round is logged, with no cap (#40 item 7)
-                from . import codexrounds
-                codexrounds.log_round(a.pr, head, 'swarm-webhook')
+        self.ask_codex(a.pr, head, full, col=col)
         if col in (board.READY, board.STAGING, board.HUMAN_REVIEW):
             self.cascade(f'#{a.pr} left {col} with a new head')
 
