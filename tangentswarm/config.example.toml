@@ -60,3 +60,14 @@ staging = false
 "Done" = "opt6-done"
 "Canceled" = "opt6-canceled"
 "Parked" = "opt6-parked"
+
+# [methlab]
+# The Meth Lab live sandbox (tangentswarm #115, docs/meth-lab.md): a separate Free GitHub
+# org with a private test repo and board, for an on-demand live check. `swarm-methlab
+# live-check` refuses a production org, repo, board, port or secret, and codex = true.
+# org = "tangentcode-methlab"
+# repo = "tangentcode-methlab/sandbox"
+# project_number = 1
+# port = 8782                       # never the production swarm-webhook port (8772)
+# secret_files = ["~/.config/tangentswarm/methlab-webhook-secret"]
+# state_dir = "~/.local/state/methlab"

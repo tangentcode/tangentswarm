@@ -284,6 +284,7 @@ tangentswarm/
   for_all.py       run a command in every worker dir (scialect for-all)
   rule_deps.py     `uses:` closure of prompt guides (scialect rule-deps)
   swarm_state.py   swarm-status deltas         (scialect swarm.mts)
+  methlab.py       Meth Lab: fake GitHub, delivery replay, live sandbox guard
   cloud/           Claude Code cloud sessions  (scialect browser/sessions/server/client/...)
 ```
 
@@ -1317,6 +1318,16 @@ open in tmux:
 
 Private ids, hosts and secret paths are in `~/.config/tangentswarm/config.toml`, never in
 the repo. `tangentswarm/config.example.toml` shows the shape.
+
+## swarm-methlab: Meth Lab, the test environment for the swarm flow
+
+`swarm-methlab` (`tangentswarm/methlab.py`, tangentswarm #115) tests the swarm flow with no
+GitHub and no network. `methlab.FakeGitHub` is an in-memory GitHub (PRs, issues, board cards,
+Codex reviews, CI). The real webhook rules run against it in `tests/test_methlab.py`.
+`swarm-methlab replay --hours H` runs the recorded deliveries of the event DB (read-only)
+through the current rules and lists each decision that changed. `swarm-methlab live-check`
+and `live-env` guard the settings of the on-demand live sandbox (a separate test org). See
+[docs/meth-lab.md](docs/meth-lab.md).
 
 ## swarm-tmux-status: which swarm windows are working
 
