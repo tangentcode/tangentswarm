@@ -196,7 +196,10 @@ def ask(n, head, by, full, repo=REPO, sh=None, state=None, store=None, now=None,
     Returns {'posted', 'kind', 'why', 'round'}."""
     from . import tick
     if full.get('headRefOid') and full['headRefOid'] != head:
-        return {'posted': False, 'kind': 'skip', 'why': f"the PR head is {full['headRefOid'][:8]}, not {head[:8]}"}
+        return {'posted': False, 'kind': 'skip', 'why': f"the PR head is {full['headRefOid'][:8]}, not {head[:8]}",
+                'round': None}
+    if (full.get('state') or 'OPEN') != 'OPEN':  # Codex on PR #92: never ask on a closed or merged PR
+        return {'posted': False, 'kind': 'skip', 'why': f"the PR is {full['state'].lower()}", 'round': None}
     if state is None:
         state = tick.State(tick.STATE_DIR / 'state.json')
     with _lock():

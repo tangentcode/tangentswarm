@@ -545,10 +545,16 @@ class Executor:
         if a.args.get('commit') is None and full.get('headRefOid'):
             self.ask_codex(a.pr, full['headRefOid'], full, retry_only=True)  # "Something went wrong": retry
 
-    def ask_codex(self, n, head, full, retry_only=False):
+    def ask_codex(self, n, head, full, retry_only=False, col=None):
         """ "@codex review" for head through the one guarded poster (tangentswarm #63): every
-        ask and retry is logged with its head; a skip is a note."""
+        ask and retry is logged with its head; a skip is a note. A card in Done, Canceled,
+        Parked or Needs Input gets no ask (Codex on PR #92: a late Codex error reply on
+        stopped work); ask() itself skips a PR that is not open."""
         from . import codexrounds
+        if col is None:
+            _, col = self.card(n)
+        if col in (board.DONE, board.CANCELED, board.PARKED, board.NEEDS_INPUT):
+            return self.note(f"#{n}: no Codex ask for {(head or '')[:8]}: the card is in {col}")
         res = codexrounds.ask(n, head, 'swarm-webhook', full, repo=self.repo, sh=self._sh, dry=self.dry,
                                 retry_only=retry_only)
         if res['kind'] == 'skip':
@@ -592,7 +598,7 @@ class Executor:
             self._sh(['gh', 'pr', 'ready', str(a.pr), '-R', self.repo])
         if col != board.AUTO_REVIEW:
             self.move(a.pr, item, board.AUTO_REVIEW)
-        self.ask_codex(a.pr, head, full)
+        self.ask_codex(a.pr, head, full, col=col)
         if col in (board.READY, board.STAGING, board.HUMAN_REVIEW):
             self.cascade(f'#{a.pr} left {col} with a new head')
 

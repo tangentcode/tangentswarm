@@ -199,3 +199,28 @@ def test_the_once_key_refresh_keeps_the_callers_unsaved_state():
     res, calls = ask(state=st)
     assert not res['posted'] and calls == []
     assert st.data['screens'] == {'pane-1': 'unsaved-hash'} and st.done(CR.once_key(7, H))
+
+
+def test_no_ask_or_retry_on_a_closed_or_merged_pr():
+    """Codex on PR #92: a late Codex error reply restarted asks on stopped work."""
+    for state in ('CLOSED', 'MERGED'):
+        res, calls = ask(dict(full(), state=state))
+        assert not res['posted'] and calls == [] and state.lower() in res['why']
+    t0 = time.time() - 300
+    ask(now=t0)
+    err = {'author': CODEX, 'body': 'Something went wrong.', 'createdAt': iso(t0 + 60)}
+    res, calls = ask(dict(full(comments=[err]), state='CLOSED'))
+    assert not res['posted'] and calls == [] and rows(CR.RETRY) == []
+
+
+def test_the_webhook_does_not_retry_on_a_stopped_card():
+    t0 = time.time() - 300
+    CR.ask(9, H, 'stop-hook', full(), sh=lambda a: None, now=t0)
+    err = {'author': CODEX, 'body': 'Something went wrong.', 'createdAt': iso(t0 + 60)}
+    for col in (board.DONE, board.CANCELED, board.PARKED, board.NEEDS_INPUT):
+        ex = Fake(col=col, full=full(comments=[err]))
+        ex.run(W.Action('codex', 9, 'Codex comment (summary or receipt)'))
+        assert not any('@codex review' in c for c in ex.calls) and any(col in d for d in ex.done)
+    ex = Fake(col=board.AUTO_REVIEW, full=dict(full(comments=[err]), state='CLOSED'))
+    ex.run(W.Action('codex', 9, 'Codex comment (summary or receipt)'))
+    assert not any('@codex review' in c for c in ex.calls) and rows(CR.RETRY) == []
