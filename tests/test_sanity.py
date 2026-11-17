@@ -1,5 +1,5 @@
-"""The sanity check (tangentswarm #43): board column rules, one Claude per worktree, and the
-incident report per finding. Fake GitHub and /proc data only, no network."""
+"""The sanity check (tangentswarm #43): board column rules, one Claude per worktree, and one
+deduped report per pass (#82). Fake GitHub and /proc data only, no network."""
 import json
 import os
 
@@ -54,11 +54,60 @@ def test_each_column_rule_has_its_finding():
 
 
 def test_a_column_that_workflow_md_does_not_name_is_one_finding():
-    cards = [issue(1, 'Deferred'), pr(2, 'Deferred'), issue(3, 'Deferred', b=6)]
+    cards = [issue(1, 'Later'), pr(2, 'Later'), issue(3, 'Later', b=6)]
     got = sanity.check(cards, [])
-    assert [(f['rule'], f['key']) for f in got] == [('unknown-column', 'unknown-column:project 4:Deferred'),
-                                                    ('unknown-column', 'unknown-column:project 6:Deferred')]
+    assert [(f['rule'], f['key']) for f in got] == [('unknown-column', 'unknown-column:project 4:Later'),
+                                                    ('unknown-column', 'unknown-column:project 6:Later')]
     assert '2 open card(s)' in got[0]['text']
+
+
+def test_deferred_is_a_valid_column_of_project_4_and_its_cards_are_never_flagged():
+    """#82 rule 3: Deferred holds tickets from older workflow versions. Not on Project 6."""
+    cards = [issue(1, sanity.DEFERRED), issue(2, sanity.DEFERRED, labels=['work2']),
+             pr(3, sanity.DEFERRED, draft=False, closes=[]), pr(4, sanity.DEFERRED, draft=True, closes=[(9, ())]),
+             pr(5, sanity.DEFERRED, branch='nobody')]
+    assert sanity.check(cards, []) == []
+    got = sanity.check([issue(6, sanity.DEFERRED, b=6, repo=TS)], [])
+    assert [f['key'] for f in got] == ['unknown-column:project 6:Deferred']
+
+
+def test_a_deferred_pr_counts_as_the_pr_of_its_active_issue():
+    """#82 addendum: platform #471 in Active with PR #486 in Deferred is not an active-pr-count finding."""
+    cards = [issue(471, board.ACTIVE), pr(486, sanity.DEFERRED, closes=[(471, ())])]
+    assert sanity.check(cards, []) == []
+    cards.append(pr(487, board.READY, closes=[(471, ())]))  # a second PR is still one too many
+    assert rules(sanity.check(cards, [])) == [('active-pr-count', 471)]
+    assert 'flow column or Deferred (#486, #487' in sanity.check(cards, [])[0]['text']
+
+
+def test_a_flow_pr_of_a_deferred_issue_is_not_flagged():
+    cards = [issue(5, sanity.DEFERRED), pr(50, board.READY, closes=[(5, ())])]
+    assert sanity.check(cards, []) == []
+
+
+def test_an_issue_in_needs_input_goes_to_triage_or_discuss_or_its_pr_goes_there():
+    """#82 rule 4: with no PR, the issue goes in Triage or Discuss; with a PR, the PR goes in
+    Needs Input (and the issue in Active)."""
+    got = sanity.check([issue(1, board.NEEDS_INPUT)], [])
+    assert rules(got) == [('issue-in-needs-input', 1)] and 'Triage' in got[0]['text'] and 'Discuss' in got[0]['text']
+    cards = [issue(2, board.NEEDS_INPUT), pr(20, board.NEEDS_INPUT, closes=[(2, ())])]
+    got = sanity.check(cards, [])
+    assert rules(got) == [('issue-in-needs-input', 2)]  # the PR finding is not sent twice
+    assert 'its PR (#20) goes in Needs Input and the issue in Active' in got[0]['text']
+    cards = [issue(3, board.NEEDS_INPUT), pr(30, board.PARKED, closes=[(3, ())])]
+    assert 'its PR (#30)' in sanity.check(cards, [])[0]['text']
+
+
+def test_an_issue_moves_to_active_as_soon_as_its_pr_is_made():
+    """#82 rule 4: an issue with an open flow-column PR is in Active."""
+    for col in (board.INBOX, board.TRIAGE, board.DISCUSS, board.BACKLOG):
+        cards = [issue(1, col), pr(10, board.IN_PROGRESS, closes=[(1, ())])]
+        got = sanity.check(cards, [claude(1, '/w/x', 'b10')])
+        assert rules(got) == [('issue-not-active', 1)], col  # one finding, not a second one on the PR
+        assert f'is in {col} but has an open PR (#10); it goes in Active' in got[0]['text']
+    assert sanity.check([issue(1, board.BACKLOG), pr(10, board.PARKED, closes=[(1, ())])], []) == []
+    assert sanity.check([issue(1, board.INBOX, labels=['work2']),
+                         pr(10, board.READY, closes=[(1, ['work2'])])], []) == []
 
 
 def test_in_progress_needs_a_draft_and_a_live_claude_on_its_branch():
@@ -97,8 +146,8 @@ def test_a_flow_pr_belongs_to_exactly_one_active_issue():
              issue(2, board.ACTIVE), issue(3, board.ACTIVE),
              pr(12, board.READY, closes=[(2, ()), (3, ())])]               # two Active issues
     got = rules(sanity.check(cards, []))
-    assert ('flow-pr-active-count', 10) in got and ('flow-pr-active-count', 11) in got
-    assert ('flow-pr-active-count', 12) in got
+    assert ('flow-pr-active-count', 10) in got and ('flow-pr-active-count', 12) in got
+    assert ('issue-not-active', 1) in got and ('flow-pr-active-count', 11) not in got  # one finding: the issue card
     assert 'no closing link' in next(f['text'] for f in sanity.check(cards, []) if f['n'] == 10)
 
 
@@ -208,7 +257,7 @@ def test_live_claudes_finds_each_top_claude_with_its_worktree(tmp_path):
     assert [f['rule'] for f in found] == ['duplicate-claudes'] and str(a) in found[0]['text']
 
 
-# -- report: grace, one alert, one incident per finding, dedupe ---------------------------------
+# -- report: grace, one alert and one incident per pass, dedupe --------------------------------
 
 class Sink:
     def __init__(self, results=None):
@@ -234,12 +283,30 @@ def test_a_finding_waits_its_grace_then_is_told_and_filed_once():
     lines, due = s.run([F1, F2], T0)
     assert due == T0 + 600 and s.alerts == [] and s.incidents == [] and all(x.startswith('pending') for x in lines)
     lines, due = s.run([F1, F2], T0 + 600)
-    assert due is None and len(s.alerts) == 1 and len(s.incidents) == 2
+    assert due is None and len(s.alerts) == 1 and len(s.incidents) == 1  # #82: one ticket for the pass
     assert '2 new finding(s)' in s.alerts[0][0] and s.alerts[0][2] == 8
-    assert {k for k, _, _ in s.incidents} == {f"sanity:{F1['key']}:{int(T0)}", f"sanity:{F2['key']}:{int(T0)}"}
-    assert any('Rule `duplicate-claudes`' in what for _, _, what in s.incidents)
+    assert 'issues/1' in s.alerts[0][0]  # the message names the ticket
+    (key, title, what), = s.incidents
+    assert title.startswith('sanity: 2 finding(s)') and '(+1 more)' in title
+    assert F1['text'] in what and F2['text'] in what and 'Rule `duplicate-claudes`' in what and 'Rule `not-draft`' in what
     s.run([F1, F2], T0 + 4200)  # the hourly backstop: same findings, nothing new
-    assert len(s.alerts) == 1 and len(s.incidents) == 2
+    assert len(s.alerts) == 1 and len(s.incidents) == 1
+
+
+def test_only_new_findings_make_a_report_and_each_finding_is_reported_once():
+    """#82 rules 1 and 2: a later pass reports only its new findings, in one ticket and one message."""
+    F3 = sanity.finding('draft', 'PR tangentcode/platform#9 is in Ready but is a draft', P, 9, board_no=4)
+    s = Sink()
+    s.run([F1, F2], T0)
+    s.run([F1, F2], T0 + 600)
+    s.run([F1, F2, F3], T0 + 700)
+    s.run([F1, F2, F3], T0 + 1300)
+    assert len(s.incidents) == 2 and len(s.alerts) == 2
+    _, title, what = s.incidents[1]
+    assert F3['text'] in what and F1['text'] not in what and F2['text'] not in what
+    assert '1 new finding(s)' in s.alerts[1][0] and F1['text'] not in s.alerts[1][0]
+    s.run([F1, F2, F3], T0 + 9000)
+    assert len(s.incidents) == 2 and len(s.alerts) == 2
 
 
 def test_a_finding_that_clears_inside_its_grace_is_never_reported():
@@ -268,8 +335,8 @@ def test_a_finding_that_comes_back_is_a_new_incident():
     s.run([], T0 + 700)
     s.run([F1], T0 + 5000)
     s.run([F1], T0 + 5600)
-    assert [k for k, _, _ in s.incidents] == [f"sanity:{F1['key']}:{int(T0)}", f"sanity:{F1['key']}:{int(T0 + 5000)}"]
-    assert len(s.alerts) == 2
+    assert len(s.incidents) == 2 and len(s.alerts) == 2
+    assert s.incidents[0][0] != s.incidents[1][0]  # a new key: alerts.incident does not drop it as a dup
 
 
 def test_a_dry_run_says_what_it_would_do_and_writes_nothing():
@@ -279,7 +346,7 @@ def test_a_dry_run_says_what_it_would_do_and_writes_nothing():
     s.run([F1], T0)  # the real first sighting
     lines, _ = s.run([F1], T0 + 600, apply=False)
     assert s.alerts == [] and s.incidents == []
-    assert any(x.startswith('would file an incident') for x in lines) and any('would tell swarmbot' in x for x in lines)
+    assert any(x.startswith('would file one incident for 1 finding(s)') for x in lines) and any('would tell swarmbot' in x for x in lines)
     assert json.loads(sanity.state_path().read_text())['open'][F1['key']]['told'] is False
 
 
@@ -365,7 +432,7 @@ def test_a_failed_board_read_still_runs_the_other_checks_and_keeps_its_findings(
     s = Sink()
     s.run([F1, F6], T0)
     s.run([F1, F6], T0 + 600)
-    assert len(s.incidents) == 2
+    assert len(s.incidents) == 1
 
     def broken(gql_, b):
         raise RuntimeError('gh api graphql: rate limited')
@@ -378,7 +445,7 @@ def test_a_failed_board_read_still_runs_the_other_checks_and_keeps_its_findings(
                                unread={6})
     assert not any(x.startswith('resolved') for x in lines) and due == T0 + 700 + sanity.RETRY
     s.run([F1, F6], T0 + 1300)  # the read works again: the same finding, not a new incident
-    assert len(s.incidents) == 2 and len(s.alerts) == 1
+    assert len(s.incidents) == 1 and len(s.alerts) == 1
     s.run([F1], T0 + 1400)
     assert F6['key'] not in json.loads(sanity.state_path().read_text())['open']
 
