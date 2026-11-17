@@ -131,6 +131,7 @@ class P6Launcher:
         self.briefs = Path(briefs) if briefs else None
         self.agent_root = agent_root
         self._wt_branch = wt_branch
+        self.why = ''  # why owner() found a conflict
         self.notes = []
 
     # -- tools ------------------------------------------------------------------------------
@@ -211,10 +212,12 @@ class P6Launcher:
         On origin: 'ours' when its open PR closes this issue, or it has no open PR and its tip
         is this issue's start commit (a launch that stopped before the PR); else 'other'; no
         such branch is 'free'. Local state must agree, because ensure_worktree reuses a local
-        branch and worktree first: a local branch counts only when origin's branch is ours and
-        has its tip; the worktree <root>/<name>.<slug> counts only when origin's branch is ours
-        and the worktree is on that branch. Any other local branch or worktree is 'other', or
-        'conflict' when origin's branch is this issue's (the launch is then refused)."""
+        branch and worktree first and never fast-forwards them: a local branch counts only when
+        origin's branch is ours and the local tip is exactly origin's tip (not behind, not
+        ahead: Codex on PR #108); the worktree <root>/<name>.<slug> counts only when origin's
+        branch is ours and the worktree is on that branch (so its HEAD is that same local tip).
+        Any other local branch or worktree is 'other', or 'conflict' when origin's branch is
+        this issue's (the launch is then refused, and nothing is made)."""
         tip = self.git('ls-remote', 'origin', f'refs/heads/{branch}', check=False).split('\t')[0].strip()
         if tip:
             pr, body = self.open_pr(branch)
@@ -227,22 +230,21 @@ class P6Launcher:
             if remote == 'other':
                 return 'other'
         local = self.git('rev-parse', '--verify', '--quiet', f'refs/heads/{branch}', check=False).strip()
-        if local and (not tip or not self.git_ok('merge-base', '--is-ancestor', local, tip)):
-            # local work that origin's branch does not have: on this issue's own branch it is
-            # an earlier worker's unpushed work (Codex on PR #108), never a reason to pick a new name
-            return 'conflict' if tip else 'other'
+        if local and local != tip:
+            # on this issue's own branch: an earlier worker's unpushed work, or a local branch
+            # behind its PR (the worker would start on stale code). Never a new name, never a
+            # fast-forward: the launch is refused (Codex on PR #108)
+            if tip:
+                self.why = f"its local branch is at {local[:8]}, not at origin's tip {tip[:8]}"
+                return 'conflict'
+            return 'other'
         on = self.wt_branch(self.worktree_path(branch))
         if on is not None and (not tip or on != branch):
-            return 'conflict' if tip else 'other'  # a worktree at this path on another branch
+            if tip:
+                self.why = f"the worktree {self.worktree_path(branch)} is on {on or 'no branch'}, not {branch}"
+                return 'conflict'
+            return 'other'  # a worktree at this path on another branch
         return 'ours' if tip else 'free'
-
-    def git_ok(self, *args):
-        """True when the git command exits 0 (raises nothing)."""
-        try:
-            self.git(*args, check=True)
-            return True
-        except Exception:
-            return False
 
     def pick_branch(self):
         """The first of <slug>, <slug>-<N>, <slug>-<N>-2 ... that is free or this issue's own.
@@ -261,9 +263,10 @@ class P6Launcher:
                            f"{b}-{self.n}-2..5 belong to other work")
 
     def conflict(self, branch):
-        return RuntimeError(f"{self.repo}#{self.n} already has its branch {branch}, and the local branch or "
-                            f"worktree has work that origin does not have (an earlier worker?): no second "
-                            "worker is started")
+        return RuntimeError(f"{self.repo}#{self.n} already has its branch {branch}, but "
+                            f"{self.why or 'local state differs from origin'}: the launch is refused, "
+                            "no second worker is started and nothing is made (sync or remove the local branch "
+                            "and worktree by hand, then launch again)")
 
     def existing_branch(self, node):
         """The head branch of the issue's open PR, or None. An open PR on a branch of local

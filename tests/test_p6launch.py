@@ -73,10 +73,6 @@ class World:
             return f'tip:{b}\trefs/heads/{b}' if b in self.remote else ''
         if args[0] == 'rev-parse':
             return self.local.get(args[-1].removeprefix('refs/heads/'), '')
-        if args[0] == 'merge-base':  # only a local tip equal to origin's is its ancestor here
-            if args[2] != args[3] and check:
-                raise RuntimeError('not an ancestor')
-            return ''
         if args[0] == 'log':
             return self.tips.get(args[-1].removeprefix('tip:'), 'Some other work')
         if args[0] == 'commit-tree':
@@ -380,15 +376,18 @@ def test_local_state_of_our_own_branch_is_reused(tmp_path):
     assert w.worktrees == [('tangentswarm', SLUG)] and not [a for a in w.gits if a[0] == 'push']
 
 
-@pytest.mark.parametrize('kw', [
-    {'local': {SLUG: 'unpushed'}},                              # an earlier worker's unpushed commit
-    {'wts': {f'/ver/tangentswarm.{SLUG}': 'something-else'}},  # its worktree on another branch
+@pytest.mark.parametrize('kw, why', [
+    ({'local': {SLUG: 'unpushed'}}, "local branch is at unpushed, not at origin's tip"),  # ahead (eb00f6b)
+    ({'local': {SLUG: 'behind00'}}, "local branch is at behind00, not at origin's tip"),  # behind (1b255ee)
+    ({'wts': {f'/ver/tangentswarm.{SLUG}': 'something-else'}}, 'is on something-else, not'),
 ])
-def test_unpushed_work_on_the_issues_own_branch_refuses_the_launch(tmp_path, kw):
-    # Codex on PR #108 (eb00f6b): never a new name, PR and second worker for the same issue
+def test_local_state_that_is_not_origins_tip_refuses_the_launch(tmp_path, kw, why):
+    # Codex on PR #108: never a new name, PR and second worker for the same issue (eb00f6b), and
+    # never a worker on a stale local tip, with no fast-forward (1b255ee)
     w = World(tmp_path, remote={SLUG}, prs={SLUG: (108, 'Fixes #98')}, **kw)
-    with pytest.raises(RuntimeError, match='no second worker'):
+    with pytest.raises(RuntimeError, match='no second worker') as e:
         w.launcher().run()
+    assert why in str(e.value) and 'nothing is made' in str(e.value)
     assert w.writes() == [] and w.worktrees == [] and w.starts == []
 
 
@@ -453,3 +452,30 @@ def test_owner_with_real_git_repos(tmp_path, monkeypatch):
     assert lau.owner('started') == 'ours'  # a launch that stopped before its PR
     g('branch', 'started', 'unrelated', cwd=repo)  # but a local 'started' of other work
     assert lau.owner('started') == 'conflict'
+
+
+def test_a_local_branch_behind_its_pr_is_a_conflict_with_real_git(tmp_path, monkeypatch):
+    """Codex's repro on 1b255ee: the PR branch on origin has a commit the local branch lacks."""
+    import subprocess
+
+    def g(*a, cwd=tmp_path):
+        return subprocess.run(['git', *a], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+    root = tmp_path / 'ver'
+    root.mkdir()
+    g('init', '-q', '--bare', '-b', 'main', str(tmp_path / 'origin.git'))
+    g('clone', '-q', str(tmp_path / 'origin.git'), str(root / 'tangentswarm'))
+    repo = root / 'tangentswarm'
+    for k, v in (('user.name', 't'), ('user.email', 't@example.invalid')):
+        g('config', k, v, cwd=repo)
+    g('commit', '-q', '--allow-empty', '-m', 'base', cwd=repo)
+    g('push', '-q', 'origin', 'HEAD:main', cwd=repo)
+    start = g('commit-tree', 'HEAD^{tree}', '-p', 'HEAD', '-m', 'Start work on tangentswarm #98', cwd=repo)
+    g('branch', 'worker', start, cwd=repo)
+    impl = g('commit-tree', 'HEAD^{tree}', '-p', start, '-m', 'implementation', cwd=repo)
+    g('push', '-q', 'origin', f'{impl}:refs/heads/worker', cwd=repo)
+    monkeypatch.setenv('TANGENTSWARM_AGENT_ROOT', str(root))
+    sh = lambda argv, check=True: json.dumps({'number': 108, 'body': 'Fixes #98'})  # noqa: E731
+    lau = L.P6Launcher(TS, 98, TITLE, sh=sh, agent_root=str(root))
+    assert lau.owner('worker') == 'conflict' and 'not at origin' in lau.why
+    g('branch', '-f', 'worker', impl, cwd=repo)  # synced by hand: the same tip is reused
+    assert lau.owner('worker') == 'ours'
