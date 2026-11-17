@@ -22,10 +22,11 @@ class World:
     """GitHub (gql, gh), git, the worktree maker, the Claude start and admission, all fake."""
 
     def __init__(self, tmp_path, repo=TS, issue_state='OPEN', issue_col=board.BACKLOG, remote=(), prs=None,
-                 pr_col=None, admit=(True, 'room'), refuse=None, start=None):
+                 pr_col=None, admit=(True, 'room'), refuse=None, start=None, tips=None):
         self.tmp, self.repo = tmp_path, repo
         self.issue_state, self.issue_col, self.pr_col = issue_state, issue_col, pr_col
         self.remote = set(remote)            # branches on origin
+        self.tips = dict(tips or {})         # branch -> its tip commit subject
         self.prs = dict(prs or {})           # branch -> (number, body)
         self.gh, self.gits, self.worktrees, self.starts = [], [], [], []
         self._admit, self._refuse, self._start = admit, refuse, start
@@ -61,7 +62,10 @@ class World:
     def git(self, args, check=True):
         self.gits.append(args)
         if args[0] == 'ls-remote':
-            return 'x\trefs/heads/b' if args[2].removeprefix('refs/heads/') in self.remote else ''
+            b = args[2].removeprefix('refs/heads/')
+            return f'tip:{b}\trefs/heads/{b}' if b in self.remote else ''
+        if args[0] == 'log':
+            return self.tips.get(args[-1].removeprefix('tip:'), 'Some other work')
         if args[0] == 'commit-tree':
             return 'f' * 40
         if args[0] == 'push':
@@ -259,3 +263,83 @@ def test_a_hand_launch_with_no_merge_tells_nobody():
     out = L.execute({'repo': TS, 'issue': 98}, launcher=Fake(RuntimeError('x')),
                     tell=lambda *a, **k: pytest.fail('no MethBot POST'))
     assert out['ok'] is False and out['methbot'] == 'None'
+
+
+# -- Codex on PR #108: a branch or PR of other work is never reused ----------------------------
+
+def test_both_names_of_other_work_give_the_next_free_name(tmp_path):
+    # Codex's case: the slug and <slug>-98 both belong to other issues' open PRs
+    w = World(tmp_path, remote={SLUG, f'{SLUG}-98'}, prs={SLUG: (50, 'Fixes #980'), f'{SLUG}-98': (60, 'Fixes #7')})
+    w.launcher().run()
+    assert ['push', '-q', 'origin', f"{'f' * 40}:refs/heads/{SLUG}-98-2"] in w.gits
+    assert w.worktrees == [('tangentswarm', f'{SLUG}-98-2')]
+    assert not [a for a in w.gh if a[:3] == ['gh', 'project', 'item-edit'] and 'PR60' in a]
+
+
+def test_a_branch_with_no_pr_is_ours_only_with_this_issues_start_commit(tmp_path):
+    # a launch that stopped after the push and before the PR: the branch is reused, no new push
+    w = World(tmp_path, remote={SLUG}, tips={SLUG: 'Start work on tangentswarm #98'})
+    w.launcher().run()
+    assert not [a for a in w.gits if a[0] == 'push'] and w.worktrees == [('tangentswarm', SLUG)]
+    # a branch with no PR and any other tip (another issue's start, or hand work) is not ours
+    w = World(tmp_path / 'b', remote={SLUG}, tips={SLUG: 'Start work on tangentswarm #9'})
+    w.launcher().run()
+    assert w.worktrees == [('tangentswarm', f'{SLUG}-98')]
+
+
+def test_no_free_name_makes_nothing(tmp_path):
+    names = [SLUG, f'{SLUG}-98'] + [f'{SLUG}-98-{k}' for k in range(2, 6)]
+    w = World(tmp_path, remote=set(names))
+    with pytest.raises(RuntimeError, match='no free branch name'):
+        w.launcher().run()
+    assert w.writes() == [] and w.worktrees == [] and w.starts == []
+
+
+def test_a_reused_pr_that_does_not_close_the_issue_is_refused(tmp_path):
+    w = World(tmp_path, remote={SLUG}, prs={SLUG: (50, 'Fixes #98')})
+    lau = w.launcher()
+    w.prs[SLUG] = (50, 'Fixes #7')  # the branch changed hands after the pick
+    with pytest.raises(RuntimeError, match='PR #50 of .* does not close'):
+        lau.draft_pr(SLUG)
+
+
+# -- Codex on PR #108: a MethBot exception whose POST fails is kept and sent again --------------
+
+@pytest.mark.parametrize('err', [RuntimeError('gh pr create: boom'), L.Deferred('slice full')])
+def test_a_failed_methbot_post_is_kept_until_it_is_delivered(err):
+    req = {'repo': METH, 'issue': 120, 'title': 't', 'after': AFTER}
+    out = L.execute(req, launcher=Fake(err), tell=lambda *a, **k: alerts.tell_methbot(*a, post=lambda p: False, **k))
+    assert 'True' not in out['methbot'] and len(list(L.pending_dir().glob('*.json'))) == 1
+    down = lambda *a, **k: alerts.tell_methbot(*a, post=lambda p: False, **k)  # noqa: E731
+    assert L.retry_pending(tell=down) == (0, 1)  # still down: kept
+    posts = []
+    up = lambda *a, **k: alerts.tell_methbot(*a, post=posts.append, **k)  # noqa: E731
+    assert L.retry_pending(tell=up) == (1, 0)
+    assert len(posts) == 1 and f'{METH}#120 was not started' in posts[0]['reason'] and posts[0]['pr'] == 90
+    assert list(L.pending_dir().glob('*.json')) == [] and L.retry_pending(tell=up) == (0, 0)
+
+
+def test_a_delivered_exception_leaves_no_pending_file():
+    posts = []
+    L.execute({'repo': TS, 'issue': 98, 'after': AFTER}, launcher=Fake(RuntimeError('x')),
+              tell=lambda *a, **k: alerts.tell_methbot(*a, post=posts.append, **k))
+    assert len(posts) == 1 and not list(L.pending_dir().glob('*.json'))
+
+
+def test_an_unreadable_pending_file_is_dropped():
+    L.pending_dir().mkdir(parents=True)
+    (L.pending_dir() / 'bad.json').write_text('{')
+    assert L.retry_pending(tell=lambda *a, **k: pytest.fail('no POST')) == (0, 0)
+    assert not (L.pending_dir() / 'bad.json').exists()
+
+
+def test_the_daemon_retries_kept_exceptions_every_retry_every_seconds(monkeypatch):
+    from tangentswarm import promoted
+    p = promoted.Promoter(g={}, dry_run=False)
+    calls = []
+    retry = lambda: calls.append(1) or (0, 0)  # noqa: E731
+    p.retry_p6launch(now=1000.0, retry=retry)
+    p.retry_p6launch(now=1000.0 + L.RETRY_EVERY - 1, retry=retry)
+    p.retry_p6launch(now=1000.0 + L.RETRY_EVERY, retry=retry)
+    assert len(calls) == 2
+    p.retry_p6launch(now=5000.0, retry=lambda: (_ for _ in ()).throw(OSError('x')))  # never raises

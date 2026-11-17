@@ -181,28 +181,50 @@ class P6Launcher:
         return re.search(rf'(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+(?:{re.escape(self.repo)})?'
                          rf'#{self.n}(?!\d)', body or '') is not None
 
+    def start_message(self):
+        return f'Start work on {self.name} #{self.n}'
+
+    def owner(self, branch):
+        """'free' (no such branch on origin), 'ours' (its open PR closes this issue, or it has
+        no open PR and its tip is this issue's start commit: a launch that stopped before the
+        PR) or 'other' (any other work: never reused). Codex on PR #108."""
+        tip = self.git('ls-remote', 'origin', f'refs/heads/{branch}', check=False).split('\t')[0].strip()
+        if not tip:
+            return 'free'
+        pr, body = self.open_pr(branch)
+        if pr:
+            return 'ours' if self.closes(body) else 'other'
+        self.git('fetch', '-q', 'origin', f'refs/heads/{branch}', check=False)
+        subject = self.git('log', '-1', '--format=%s', tip, check=False)
+        return 'ours' if subject == self.start_message() else 'other'
+
     def pick_branch(self):
-        """The title slug; <slug>-<N> when that branch exists for another issue."""
+        """The first of <slug>, <slug>-<N>, <slug>-<N>-2 ... that is free or this issue's own.
+        A branch of other work is never reused (Codex on PR #108: the -<N> name was taken
+        without a check)."""
         from .launcher import slug
         b = slug(self.title, self.n)
-        if not self.git('ls-remote', 'origin', f'refs/heads/{b}', check=False):
-            return b
-        pr, body = self.open_pr(b)
-        return b if pr and self.closes(body) else f"{b}-{self.n}"
+        for name in [b, f"{b}-{self.n}"] + [f"{b}-{self.n}-{k}" for k in range(2, 6)]:
+            if self.owner(name) != 'other':
+                return name
+        raise RuntimeError(f"no free branch name for {self.repo}#{self.n}: {b}, {b}-{self.n} and "
+                           f"{b}-{self.n}-2..5 belong to other work")
 
     def branch(self, branch):
-        """Push one empty "Start work on <name> #N" commit on origin/main, unless the branch exists."""
+        """Push one empty start commit on origin/main, unless the branch exists (pick_branch
+        has checked that it is this issue's own)."""
         if self.git('ls-remote', 'origin', f'refs/heads/{branch}', check=False):
             return self.note(f"branch {branch} exists")
         self.git('fetch', '-q', 'origin', 'main')
-        sha = self.git('commit-tree', 'origin/main^{tree}', '-p', 'origin/main',
-                       '-m', f'Start work on {self.name} #{self.n}')
+        sha = self.git('commit-tree', 'origin/main^{tree}', '-p', 'origin/main', '-m', self.start_message())
         self.git('push', '-q', 'origin', f'{sha}:refs/heads/{branch}')
-        return self.note(f"pushed branch {branch} ({sha[:8]}: Start work on {self.name} #{self.n})")
+        return self.note(f"pushed branch {branch} ({sha[:8]}: {self.start_message()})")
 
     def draft_pr(self, branch):
-        pr, _ = self.open_pr(branch)
+        pr, body = self.open_pr(branch)
         if pr:
+            if not self.closes(body):  # never another issue's PR, even if the branch changed hands
+                raise RuntimeError(f"the open PR #{pr} of {branch} does not close {self.repo}#{self.n}")
             self.note(f"draft PR #{pr} exists")
             return pr
         url = self.sh(['gh', 'pr', 'create', '-R', self.repo, '--draft', '--base', 'main', '--head', branch,
@@ -312,11 +334,65 @@ def in_flight(spool_dir=None):
     return {(d.get('repo'), int(d.get('issue') or 0)) for d in spool.in_flight(ops=('p6launch',), spool=spool_dir)}
 
 
+def pending_dir():
+    from . import alerts
+    return Path(alerts.STATE).parent / 'p6launch-pending'  # read at call time: tests move STATE
+
+
+def _delivered(sent):
+    return sent is True or sent == 'already sent'
+
+
+def _send(x, tell=None):
+    from . import alerts
+    return (tell or alerts.tell_methbot)('exception', x['repo'], int(x['pr']), head=x['head'], key=x['key'],
+                                         reason=x['reason'])
+
+
+def tell_kept(x, tell=None):
+    """One MethBot exception {repo, pr, head, key, reason}. It is written to pending_dir first
+    and leaves it only once delivered, so a POST that fails is not lost when the spool request
+    ends (Codex on PR #108); retry_pending sends it again. Returns tell's answer."""
+    import hashlib
+    path = pending_dir() / (hashlib.sha1(f"{x['repo']}#{x['pr']}@{x['head']}:{x['key']}".encode())
+                            .hexdigest()[:20] + '.json')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f'.{path.name}.tmp')
+    tmp.write_text(json.dumps(x))
+    tmp.replace(path)
+    sent = _send(x, tell)
+    if _delivered(sent):
+        path.unlink(missing_ok=True)
+    return sent
+
+
+def retry_pending(tell=None):
+    """Send each kept exception again (the daemon calls this every RETRY_EVERY s). A delivered
+    one leaves the dir; an unreadable file is dropped. Returns (sent, left)."""
+    d = pending_dir()
+    sent = left = 0
+    for path in sorted(d.glob('*.json')) if d.is_dir() else []:
+        try:
+            x = json.loads(path.read_text())
+        except (OSError, ValueError):
+            path.unlink(missing_ok=True)
+            continue
+        if _delivered(_send(x, tell)):
+            path.unlink(missing_ok=True)
+            sent += 1
+        else:
+            left += 1
+    return sent, left
+
+
+RETRY_EVERY = 300  # s between retries of the kept MethBot exceptions
+
+
 def execute(req, launcher=None, tell=None):
     """The spool op 'p6launch' (daemon side): {repo, issue, title, after}. A failed or deferred
     launch asked for by a pull is one MethBot exception on the merged PR and head (key
     launch:<repo>#<issue>)."""
-    from . import alerts, eventdb
+    from . import eventdb
     repo, n, title = req.get('repo'), int(req['issue']), req.get('title') or ''
     after = req.get('after') or {}
     try:
@@ -328,9 +404,10 @@ def execute(req, launcher=None, tell=None):
                           repo=repo, error=None if deferred else text, notes=[text] if deferred else ())
         sent = None
         if after.get('repo') and after.get('pr') and after.get('head'):
-            sent = (tell or alerts.tell_methbot)(
-                'exception', after['repo'], int(after['pr']), head=after['head'], key=f"launch:{repo}#{n}",
-                reason=f"Backlog pull after {after['repo']}#{after['pr']} merged: {repo}#{n} was not started: {text}")
+            sent = tell_kept({'repo': after['repo'], 'pr': int(after['pr']), 'head': after['head'],
+                              'key': f"launch:{repo}#{n}",
+                              'reason': f"Backlog pull after {after['repo']}#{after['pr']} merged: {repo}#{n} "
+                                        f"was not started: {text}"}, tell=tell)
         return {'ok': deferred, 'issue': n, 'repo': repo, 'error' if not deferred else 'deferred': text,
                 'methbot': str(sent)}
     eventdb.log_event('p6-launch', source='p6launch', action='launched', pr=n, repo=repo, notes=notes)
