@@ -1,6 +1,8 @@
 """gatechecks: screenshots must render (7a); entry needs staging to serve the head (6)."""
 import urllib.error
 
+import pytest
+
 from tangentswarm import gatechecks as G
 
 REPO = 'owner/repo'
@@ -170,3 +172,85 @@ def test_the_brief_example_image_is_not_screenshot_evidence():
     body = 'Fixes #5\n\n' + brief.section('Task #5\n' + SHOTS_RULE)
     assert '](' in SHOTS_RULE and image_urls(body) == []
     assert image_urls(body + '\n![after](https://example.test/a.png)') == ['https://example.test/a.png']
+
+
+# --- tangentswarm #130: the PR body never says where the PR stands -------------------
+
+PR528 = 'Not on staging yet: work.pawntakesworld.com serves a60245158, which does not have this branch.'
+
+
+@pytest.mark.parametrize('text', [
+    PR528,
+    'Merged into work at 3:10 PM.',
+    'It is live on staging now.',
+    'The fix is deployed to staging.',
+    'This is not in work yet.',
+    'ptw.example.com serves `abcdef12`.',
+    'Staging is serving commit 0123abcd.',
+    'Commit 0123abcd is deployed.',
+    'The static .deploy-sha has it.',
+    'Work does not contain this branch.',
+])
+def test_status_text_is_found(text):
+    assert G.is_status(text)
+
+
+@pytest.mark.parametrize('text', [
+    'Check it on staging: open https://work.pawntakesworld.com/lobby and click Add.',
+    'Where to see: /lobby on staging, then press Enter.',
+    'Served on staging at /lobby.',
+    'Once merged into work, open /lobby.',
+    'After it is deployed to staging, click Save.',
+    'This PR changes the work queue.',
+    'A branch that is not merged is skipped.',
+])
+def test_how_to_see_text_is_not_status(text):
+    assert not G.is_status(text)
+
+
+def test_strip_status_keeps_bullets_fences_and_the_brief():
+    brief = '<!-- swarm-brief:start -->\nNot on staging yet.\n<!-- swarm-brief:end -->\n'
+    body = ('Fixes #1\n\n- First. Not on staging yet.\n- Merged into work.\n\n```\nserves abcdef12\n```\n'
+            'Check it on staging: open /x.\n' + brief)
+    new, gone = G.strip_status(body)
+    assert gone == ['Not on staging yet.', 'Merged into work.']
+    assert new == 'Fixes #1\n\n- First.\n\n```\nserves abcdef12\n```\nCheck it on staging: open /x.\n' + brief
+    assert G.strip_status(new) == (new, [])
+    assert G.status_lines(brief) == []
+
+
+def test_body_problem_flags_status_text():
+    why = G.body_problem(['api/x.py'], 'Where to see: /x on staging.\n' + PR528)
+    assert why and '#130' in why
+    assert G.body_problem(['api/x.py'], 'Where to see: /x on staging.') is None
+
+
+def test_scrub_status_edits_the_body_and_opens_one_incident():
+    patched, tickets = [], []
+    ok, why = G.scrub_status(528, 'Fixes #1\n' + PR528 + '\nCheck it on staging: /x.\n', REPO, head='h' * 40,
+                             patch=lambda n, b: patched.append((n, b)), incident=lambda *a, **k: tickets.append(a))
+    assert ok and 'removed 1' in why
+    assert patched == [(528, 'Fixes #1\nCheck it on staging: /x.\n')]
+    assert len(tickets) == 1 and tickets[0][0] == f'pr-status:{REPO}#528@' + 'h' * 12
+
+
+def test_scrub_status_leaves_a_clean_body_alone_and_dry_run_changes_nothing():
+    never = lambda *a, **k: pytest.fail('no edit or ticket')  # noqa: E731
+    assert G.scrub_status(1, 'Check it on staging: /x.', REPO, patch=never, incident=never) == (True, '')
+    ok, why = G.scrub_status(1, PR528, REPO, dry=True, patch=never, incident=never)
+    assert ok and why.startswith('remove 1 status')
+
+
+def test_scrub_status_fails_when_the_edit_fails_and_a_failed_ticket_does_not():
+    def boom(*a, **k):
+        raise RuntimeError('gh down')
+    ok, why = G.scrub_status(1, PR528, REPO, patch=boom, incident=lambda *a, **k: pytest.fail('no ticket'))
+    assert not ok and 'edit failed' in why
+    assert G.scrub_status(1, PR528, REPO, patch=lambda n, b: None, incident=boom)[0]
+
+
+def test_every_worker_instruction_carries_the_status_rule():
+    from tangentswarm import flow, launcher, launches
+    assert G.STATUS_RULE.isascii() and '\n' not in G.STATUS_RULE
+    for text in (launches.brief_line('/b/1.txt'), launcher.brief_text(1, 't', 'b', 2), flow.shots_text(7)):
+        assert G.STATUS_RULE in text

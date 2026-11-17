@@ -922,6 +922,17 @@ The section starts with `<!-- swarm-brief:start -->` and ends with
 where-to-see line, the served commit, code-only) must skip this section, because a
 brief names those things before they exist. `tangentswarm.brief.strip_brief()` does that.
 
+### The PR body never says where the PR stands (tangentswarm #130)
+
+A PR body must not say whether the PR is merged into work, whether it is on staging, or
+which commit a site serves. That text goes stale and contradicts the board column. The
+where-to-see or "Check it on staging" section says only how to see the change. Every
+worker gets this as `gatechecks.STATUS_RULE`. Before swarm-flow or swarm-tick runs
+`hr-gate --apply`, `gatechecks.scrub_status()` removes such sentences from the live body
+(not the brief section, not code fences) and opens one incident per head. If the body
+edit fails, `--apply` waits for the next pass. A sentence that starts with a condition
+("Once merged into work, open /x") tells how to see the change and is kept.
+
 ### swarm-launch: start a worker
 
 `swarm-start-scoped` exits 3 when the worker slice is short of memory and leaves an

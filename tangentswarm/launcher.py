@@ -69,7 +69,7 @@ REPORT_RULE = (
 
 
 def brief_text(n, title, branch, pr):
-    from .gatechecks import SCRATCH_RULE, SHOTS_RULE
+    from .gatechecks import SCRATCH_RULE, SHOTS_RULE, STATUS_RULE
     return (
         f"Task #{n}: {title}\n\n"
         f"Read the issue first, with its comments: gh issue view {n} --comments --repo {REPO}. "
@@ -88,7 +88,7 @@ def brief_text(n, title, branch, pr):
         "Before your final push, stop every dev server, watcher and background test run you started "
         "(kill the pids you started): the handoff does not run while one is left in your worktree. "
         "When you are done, commit and push, reply with: what changed, the tests you ran and their "
-        f"result, and a short PR body draft (Before, After, how to see it); then call "
+        f"result, and a short PR body draft (Before, After, how to see it). {STATUS_RULE} Then call "
         f"report_status(state='done', pr={pr}, window=<your window>) and end your turn.\n")
 
 

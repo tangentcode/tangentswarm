@@ -174,10 +174,10 @@ RELAY_DIR = Path(os.environ.get('SWARM_RELAY_DIR', '/tmp'))  # relay-<N>-<kind>.
 
 
 def shots_text(n):
-    from .gatechecks import SCRATCH_RULE, SHOTS_RULE
+    from .gatechecks import SCRATCH_RULE, SHOTS_RULE, STATUS_RULE
     return (f"Coordinator: #{n} needs screenshots before Human Review. Take them from staging (it serves "
             f"work with your head) or from a local run of the real app, never an isolated component page. "
-            f"{SCRATCH_RULE} {SHOTS_RULE} Do not change code; push only the PR body edit.")
+            f"{SCRATCH_RULE} {SHOTS_RULE} {STATUS_RULE} Do not change code; push only the PR body edit.")
 
 
 def clear_held():
@@ -1082,6 +1082,8 @@ class Flow:
             else:
                 self.leave(p, '; '.join(why))
             return
+        if not self.scrub_status(n, full, d['head']):
+            return
         if self.dry:
             self.change(f"#{n} hr-gate --apply {n} (every condition passes)")
             return
@@ -1095,6 +1097,16 @@ class Flow:
             moves.log_move(n, p['col'] if p['col'] != board.STAGING else 'Staging', to, d['head'], note='hr-gate --apply')
         if rc == 0 or moved:
             drop_pull(n)
+
+    def scrub_status(self, n, full, head):
+        """tangentswarm #130: before hr-gate --apply, remove text that says where the PR stands
+        (merged into work, on staging, the sha a site serves) from the body and open an
+        incident. False when the body still holds it (the edit failed): no --apply this pass."""
+        from .gatechecks import scrub_status
+        ok, why = scrub_status(n, (full or {}).get('body') or '', REPO, head=head, dry=self.dry)
+        if why:
+            (self.change if ok else self.note)(why)
+        return ok
 
     def screenshot_job(self, n, head, full=None):
         """A UI PR without screenshots: give its worker the screenshot job now, once per

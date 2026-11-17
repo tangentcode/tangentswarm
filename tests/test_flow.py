@@ -656,3 +656,35 @@ def test_a_no_worktree_pr_with_no_branch_on_its_card_reads_it_from_github(monkey
     monkeypatch.setattr(slots, 'conflict_capacity', lambda: (True, ''))
     monkeypatch.setattr('tangentswarm.spool.submit', lambda *a, **k: pytest.fail('no start on an empty branch'))
     assert 'branch is unknown' in f.start_worker(dict(number=9), flow.RELAY_DIR / 'r9.md', 'gone')
+
+
+def test_advance_strips_status_text_before_hr_gate_apply(monkeypatch):
+    """tangentswarm #130: a body that says where the PR stands is cleaned first."""
+    from tangentswarm import brief
+    pull_state()
+    prs = {1: card(1, HR), 2: card(2, HR), 7: card(7, RD)}
+    f, g = make_flow(prs, dry=False, rows=[('1 not draft', True, 'ready')])
+    g['fetch'] = lambda n, refresh=False: {'number': n, 'body': 'Check it on staging: /x.\nNot on staging yet.'}
+    order = []
+    monkeypatch.setattr(brief, 'patch_body', lambda n, b, repo: order.append(('patch', n, b)))
+    monkeypatch.setattr('tangentswarm.alerts.incident', lambda *a, **k: order.append(('incident', a[0])))
+    monkeypatch.setattr(f, 'tool', lambda argv: order.append(('tool', str(argv[-1]))) or (0, '  moved #7 to Pending'))
+    monkeypatch.setattr(f, 'pull', lambda *a: None)
+    f.step()
+    assert order[0] == ('patch', 7, 'Check it on staging: /x.')
+    assert order[1][0] == 'incident' and order[2] == ('tool', '7')
+
+
+def test_advance_does_not_apply_while_the_status_text_stays(monkeypatch):
+    from tangentswarm import brief
+    pull_state()
+    prs = {1: card(1, HR), 2: card(2, HR), 7: card(7, RD)}
+    f, g = make_flow(prs, dry=False, rows=[('1 not draft', True, 'ready')])
+    g['fetch'] = lambda n, refresh=False: {'number': n, 'body': 'Merged into work.'}
+
+    def boom(*a):
+        raise RuntimeError('gh down')
+    monkeypatch.setattr(brief, 'patch_body', boom)
+    monkeypatch.setattr(f, 'tool', lambda argv: pytest.fail('no hr-gate --apply'))
+    f.step()
+    assert flow.load_pull()['pr'] == 7 and any('edit failed' in n for n in f.notes)
