@@ -89,12 +89,23 @@ def fetch(gql):
     return out
 
 
-def _load(path):
+def _raw(path):
+    """The file as a dict: a snapshot, or only a journal of events (patch, before the first
+    board read). None when there is no file or it is not a dict."""
     try:
         d = json.loads(path.read_text())
-        return d if isinstance(d, dict) and 'prs' in d and 'issues' in d else None
+        return d if isinstance(d, dict) else None
     except (OSError, ValueError):
         return None
+
+
+def _snap(d):
+    return d if d is not None and 'prs' in d and 'issues' in d else None
+
+
+def _load(path):
+    """The kept snapshot, or None (no file, or only a journal of events)."""
+    return _snap(_raw(path))
 
 
 def _write(path, d):
@@ -143,16 +154,21 @@ def snapshot(gql, max_age=None, path=None, now=time.time):
     t0 = now()
     fresh = dict(fetch(gql), at=t0)
     with _locked(path):
-        old = _load(path)
+        raw = _raw(path)
+        old = _snap(raw)
         try:
             newer = old is not None and float(old.get('at') or 0) > t0
         except (TypeError, ValueError):
             newer = False
         if newer:  # Codex on PR #117: a read that started later already stored a newer board
             return old
-        late = [p for p in (old or {}).get('patches') or [] if float(p.get('t') or 0) >= t0]
+        late = [p for p in (raw or {}).get('patches') or [] if float(p.get('t') or 0) >= t0]
         for p in late:  # an event that arrived while we read: it may be newer than the read
-            _apply(fresh, p)
+            # tangentswarm #127 (Codex on PR #117): with no snapshot before, the events are in
+            # a journal that no one applied yet. One the answer cannot follow marks it dirty.
+            # (With a snapshot, patch() already marked the cache dirty for such an event.)
+            if not _apply(fresh, p) and old is None:
+                fresh['dirty'] = max(float(fresh.get('dirty') or 0), float(p.get('t') or 0))
         fresh['patches'] = late
         fresh['gone'] = (old or {}).get('gone') or []
         if old and old.get('dirty') and float(old['dirty']) >= t0:
@@ -268,13 +284,20 @@ def _apply(d, op):
 
 def patch(op, path=None, now=time.time):
     """Apply op to the kept snapshot under its lock. Returns True if the cache follows it;
-    False marks the cache dirty (the next snapshot() reads the board). No cache: nothing."""
+    False marks the cache dirty (the next snapshot() reads the board). No snapshot yet: the
+    op is kept in a journal (False), so a first board read that runs now replays it."""
     path = path or PATH
     with _locked(path):
-        d = _load(path)
-        if d is None:
-            return False
+        raw = _raw(path)
+        d = _snap(raw)
         op = dict(op, t=now())
+        if d is None:
+            # tangentswarm #127 (Codex on PR #117): an event during the first board read is not
+            # lost. snapshot() applies the ops at or after its start on top of its answer.
+            kept = (raw or {}).get('patches') if raw is not None else None
+            kept = kept if isinstance(kept, list) else []
+            _write(path, {'patches': (kept + [op])[-KEEP_PATCHES:]})
+            return False
         ok = _apply(d, op)
         if not ok:
             d['dirty'] = op['t']

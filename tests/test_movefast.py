@@ -511,3 +511,51 @@ def test_an_older_board_read_never_overwrites_a_newer_one():
     snap = B.snapshot(gql_a, max_age=0, now=lambda: clock[0])
     assert cols_of(snap) == {5: HR} and snap['at'] == 120.0
     assert cols_of(B._load(B.PATH)) == {5: HR}
+
+
+def test_an_event_during_the_first_board_read_is_kept():
+    """tangentswarm #127 (Codex on PR #117, P2): no snapshot file yet. The merge of #1 and a
+    Status move of #6 arrive while the first read runs; the read still shows the old board.
+    The events are kept in a journal and applied on top of the answer, and the cache is clean."""
+    assert not B.PATH.exists()
+    clock = [100.0]
+
+    def gql(q, **v):
+        clock[0] = 110.0
+        assert B.apply_event('pull_request', pr_event('closed', 1, merged=True), now=lambda: clock[0])
+        assert B.apply_event('projects_v2_item', item_event('I6', ST), now=lambda: clock[0])
+        assert B.sync_due(now=lambda: clock[0])  # a journal is not a snapshot
+        return boardfake.answer([node(1, HR), node(5, ST, H5), node(6, RD, H6)])
+    snap = B.snapshot(gql, now=lambda: clock[0])
+    assert cols_of(snap) == {5: ST, 6: ST} and snap['at'] == 100.0 and not snap.get('dirty')
+    assert cols_of(B._load(B.PATH)) == {5: ST, 6: ST}
+    gql2, calls = counting([])
+    B.snapshot(gql2, now=lambda: clock[0])
+    assert calls == []  # clean: no second read
+
+
+def test_an_event_the_first_read_cannot_follow_marks_it_dirty():
+    """tangentswarm #127: an invalidate (a new card) during the first read: the answer may not
+    have it, so the stored snapshot is dirty and the next reader reads the board again."""
+    clock = [100.0]
+
+    def gql(q, **v):
+        clock[0] = 110.0
+        B.patch({'op': 'dirty'}, now=lambda: 110.0)  # what invalidate() sends
+        return boardfake.answer([node(5, ST, H5)])
+    B.snapshot(gql, now=lambda: clock[0])
+    assert B._load(B.PATH)['dirty'] == 110.0
+    gql2, calls = counting([node(5, ST, H5), node(7, RD)])
+    snap = B.snapshot(gql2, now=lambda: 120.0)
+    assert len(calls) == 1 and cols_of(snap) == {5: ST, 7: RD} and not snap.get('dirty')
+
+
+def test_a_journal_event_older_than_the_first_read_is_dropped_and_no_reader_takes_it_as_a_board():
+    """tangentswarm #127: a journal event from before the read started is in the answer already.
+    Readers of the file see no board while it holds only a journal."""
+    from tangentswarm import livestate, tmux_status
+    B.apply_event('pull_request', pr_event('closed', 5, merged=True), now=lambda: 50.0)
+    assert B._load(B.PATH) is None and B.sync_due()
+    assert livestate.board_cards() == {} and tmux_status.board_prs() == {}
+    snap = B.snapshot(boardfake.gql([node(5, ST, H5)]), now=lambda: 100.0)
+    assert cols_of(snap) == {5: ST} and snap['patches'] == [] and not snap.get('dirty')
