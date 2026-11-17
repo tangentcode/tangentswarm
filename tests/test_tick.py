@@ -205,7 +205,7 @@ def test_a_codex_review_summary_without_findings_is_clean():
     handoff because a reader took this summary comment as findings."""
     assert tick.codex_status(pr(comments=[summary()])) == ('clean', 'review-state clean on head')
     assert tick.codex_status(pr(comments=[summary(head='b' * 40)]))[0] == 'pending'  # another head
-    assert tick.codex_status(pr(comments=[summary(any_findings=True)]))[0] == 'pending'
+    assert tick.codex_status(pr(comments=[summary(any_findings=True)]))[0] == 'findings'  # tangentswarm #75
 
 
 def test_a_codex_review_of_the_head_with_no_open_inline_thread_is_clean():
