@@ -496,3 +496,76 @@ def test_a_merge_deletes_the_vn_siblings_but_not_one_that_heads_an_open_pr():
     assert deletes == [f'repos/{W.REPO}/git/refs/heads/ptw-quiz-v1', f'repos/{W.REPO}/git/refs/heads/ptw-quiz-v10']
     assert any('kept ptw-quiz-v2' in d for d in ex.done)
     assert Fake().delete_vn(1, 'main') == [] and Fake().delete_vn(1, '') == []
+
+
+# -- tangentswarm #76: tangentstorm comments on Project 6 repos are logged only -------------
+
+def comment(repo, body, user=MICHAL, n=73, is_pr=True):
+    issue = {'number': n, 'pull_request': {}} if is_pr else {'number': n}
+    return {'action': 'created', 'repository': {'full_name': repo}, 'issue': issue,
+            'comment': {'user': user, 'body': body, 'html_url': 'u'}}
+
+
+def run_all(event, payload, col=board.IN_PROGRESS):
+    acts = W.classify(event, payload)
+    ex = Fake(col=col, full=codex_pr())
+    for a in acts:
+        ex.run(a)
+    return acts, ex
+
+
+P6 = ('tangentcode/tangentswarm', 'tangentcode/methodology')
+
+
+@pytest.mark.parametrize('repo', P6)
+@pytest.mark.parametrize('body, marker', [
+    ('MERGE-READY c4648b9d0000\nAll checks pass.', 'MERGE-READY'),
+    ('NEEDS-INPUT on 044a9d4: which way?', 'NEEDS-INPUT'),
+    ('\n  **BLOCKED** on the lock', 'BLOCKED'),
+    ('STEP-DONE 3', 'STEP-DONE'),
+])
+def test_worker_status_comment_on_project_6_is_log_only_with_no_wake(repo, body, marker):
+    acts, ex = run_all('issue_comment', comment(repo, body))
+    assert [(a.kind, a.pr) for a in acts] == [('log-only', 73)]
+    assert acts[0].why == f'worker status comment ({marker})' and acts[0].args['repo'] == repo
+    assert ex.wakes == [] and ex.relays == [] and ex.calls == []
+
+
+@pytest.mark.parametrize('repo', P6)
+@pytest.mark.parametrize('is_pr', [True, False])
+def test_michals_plain_comment_on_project_6_is_log_only_with_no_wake(repo, is_pr):
+    acts, ex = run_all('issue_comment', comment(repo, 'Please also cover rejects.', is_pr=is_pr), col=board.TRIAGE)
+    assert [a.kind for a in acts] == ['log-only'] and 'MethBot reads it' in acts[0].why
+    assert ex.wakes == [] and ex.relays == []
+
+
+@pytest.mark.parametrize('repo', P6)
+def test_michals_review_on_project_6_is_log_only_with_no_wake(repo):
+    review = {'action': 'submitted', 'repository': {'full_name': repo}, 'pull_request': pr(73),
+              'review': {'user': MICHAL, 'body': 'MERGE-READY abc', 'html_url': 'u'}}
+    acts, ex = run_all('pull_request_review', review)
+    assert [a.kind for a in acts] == ['log-only'] and ex.wakes == [] and ex.relays == []
+
+
+def test_a_marker_later_in_the_body_is_not_a_worker_status():
+    assert W.worker_status('hi\nMERGE-READY abc') is None
+    assert W.worker_status('Merge-ready abc') == 'MERGE-READY'
+    assert W.worker_status('') is None
+
+
+def test_another_author_on_project_6_is_unchanged():
+    acts = W.classify('issue_comment', comment('tangentcode/methodology', 'MERGE-READY x', user={'login': 'someone'}))
+    assert [a.kind for a in acts] == ['relay']
+
+
+def test_the_swarms_own_comment_on_project_6_is_still_a_skip():
+    acts = W.classify('issue_comment', comment('tangentcode/methodology', '@codex review'))
+    assert [a.kind for a in acts] == ['skip']
+
+
+def test_a_tangentstorm_comment_on_platform_still_relays():
+    acts, ex = run_all('issue_comment', comment('tangentcode/platform', 'MERGE-READY abc', n=541))
+    assert [(a.kind, a.pr) for a in acts] == [('relay', 541)]
+    assert ex.relays and ex.relays[0][0] == 541 and ex.wakes == []
+    acts = W.classify('issue_comment', comment('tangentcode/platform', 'please fix x', n=541))
+    assert [a.kind for a in acts] == ['relay']
