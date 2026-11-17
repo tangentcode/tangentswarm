@@ -151,8 +151,10 @@ query($n:Int!){
       subIssues(first:50){nodes{number state title} pageInfo{hasNextPage}}
       closedByPullRequestsReferences(first:30){
         nodes{number title state isDraft}
+        pageInfo{hasNextPage}
       }
       timelineItems(last:80, itemTypes:[CONNECTED_EVENT, DISCONNECTED_EVENT]){
+        pageInfo{hasPreviousPage}
         nodes{
           __typename
           ...on ConnectedEvent{
@@ -306,6 +308,24 @@ def deferred_pr_nums(pr_nums, pr_board):
     return list(pr_nums)
 
 
+def truncated_lists(issue):
+    """Names of the issue lists that ISSUE_Q read only in part (Codex on PR #142).
+
+    A cut list may hide an open sub-issue or a linked flow PR, so a deferral needs all
+    three lists whole. A missing pageInfo counts as whole.
+    """
+    def more(conn, key):
+        return bool(((conn or {}).get("pageInfo") or {}).get(key))
+    cut = []
+    if more(issue.get("subIssues"), "hasNextPage"):
+        cut.append("sub-issues")
+    if more(issue.get("closedByPullRequestsReferences"), "hasNextPage"):
+        cut.append("closing PRs")
+    if more(issue.get("timelineItems"), "hasPreviousPage"):
+        cut.append("development links")
+    return cut
+
+
 def eval_issue(issue, pr_board=None):
     """Return (rows, ok, kind) for an issue object from ISSUE_Q.
 
@@ -360,6 +380,7 @@ def eval_issue(issue, pr_board=None):
         if num not in seen:
             pr_nums.append(num); seen.add(num)
     all_linked = list(pr_nums)
+    cut = truncated_lists(issue)
     pr_nums = flow_pr_nums(pr_nums, pr_board)
     ignored = [n for n in all_linked if n not in pr_nums]
     pr_ok = bool(pr_nums)
@@ -369,6 +390,8 @@ def eval_issue(issue, pr_board=None):
             why_pr += " (ignored non-flow: " + ",".join(f"#{n}" for n in ignored) + ")"
     elif deferred_pr_nums(all_linked, pr_board):
         why_pr = "all linked open PRs are in Deferred: " + ",".join(f"#{n}" for n in all_linked)
+        if cut:
+            why_pr += " (not deferred: only part of the " + ", ".join(cut) + " was read)"
     elif all_linked:
         why_pr = "linked open PR not in a flow column: " + ",".join(f"#{n}" for n in all_linked)
     else:
@@ -391,7 +414,7 @@ def eval_issue(issue, pr_board=None):
         kind = "closed"
     elif work2:
         kind = "work2"
-    elif not link_ok and deferred_pr_nums(all_linked, pr_board):
+    elif not link_ok and not cut and deferred_pr_nums(all_linked, pr_board):
         kind = "deferred"
     elif pending and not link_ok:
         kind = "pending"

@@ -188,3 +188,30 @@ def test_promote_missing_still_promotes_a_flow_pr_issue(gate):
     board(gate, {471: ('Backlog', issue(471, col='Backlog', prs=[490]))}, {490: 'In Progress'})
     gate.main(['--promote-missing'])
     assert gate.moves == [('ITEM471', 'Active')]
+
+
+@pytest.mark.parametrize('conn,key', [
+    ('subIssues', 'hasNextPage'),                       # Codex on PR #142: a 51st sub-issue may be open
+    ('closedByPullRequestsReferences', 'hasNextPage'),  # a 31st closing PR may be in a flow column
+    ('timelineItems', 'hasPreviousPage'),               # an older development link may be a flow PR
+])
+def test_a_cut_list_is_never_deferred(gate, capsys, conn, key):
+    """Any issue list read only in part keeps the issue out of Deferred (needs-launch, no move)."""
+    iss = issue(471, prs=[486], subs=[(500, 'CLOSED')])
+    iss[conn]['pageInfo'] = {key: True}
+    board(gate, {471: ('Active', iss)}, {486: 'Deferred'})
+    gate.main(['--sweep', '--demote'])
+    assert gate.moves == []
+    assert gate.truncated_lists(iss)
+    _, _, kind = gate.eval_issue(iss, gate.pr_board_from_items(gate.items))
+    assert kind == 'unlinked'
+    assert 'not deferred: only part of the' in capsys.readouterr().out
+
+
+def test_whole_lists_with_page_info_still_defer(gate):
+    iss = issue(471, prs=[486])
+    iss['closedByPullRequestsReferences']['pageInfo'] = {'hasNextPage': False}
+    iss['timelineItems']['pageInfo'] = {'hasPreviousPage': False}
+    board(gate, {471: ('Active', iss)}, {486: 'Deferred'})
+    gate.main(['--sweep', '--demote'])
+    assert gate.moves == [('ITEM471', 'Deferred')]
