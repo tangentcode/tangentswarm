@@ -546,3 +546,19 @@ def test_the_merge_event_after_a_queued_merge_cleans_up_with_no_second_merge():
     assert r['merged'] is True and len(w.merges()) == 1 and w.removed and w.moves()
     again = w.run(trigger='merged')
     assert again['already'] is True and len(w.removed) == 1
+
+
+# -- Codex on PR #90 (6a0f2c6): only the worker's own reply clears an outdated thread ----------
+
+def test_replies_by_other_reviewers_do_not_clear_an_outdated_thread():
+    alice, bob = {'login': 'alice'}, {'login': 'bob'}
+    t = thread(outdated=True, oid=OLD, opener=alice, replies=[bob])
+    assert M.unresolved_threads(full(threads=[t])) == [t['id']]
+    t = thread(outdated=True, oid=OLD, opener=alice, replies=[bob, WORKER])
+    assert M.unresolved_threads(full(threads=[t])) == []
+    t = thread(outdated=False, opener=alice, replies=[WORKER])  # not outdated: a reply never clears it
+    assert M.unresolved_threads(full(threads=[t])) == [t['id']]
+
+
+def test_the_worker_login_is_the_webhook_identity():
+    assert M.WORKER_LOGIN == W.MICHAL

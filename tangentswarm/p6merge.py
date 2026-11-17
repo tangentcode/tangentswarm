@@ -55,6 +55,7 @@ LIVE_TARGET = int(os.environ.get('SWARM_P6_LIVE_TARGET', '4'))
 MERGEABLE_TRIES = 3     # reads of an UNKNOWN mergeable before it fails
 MERGEABLE_WAIT = 3.0    # s between those reads
 EXIT_WAIT = 20          # s to wait for the worker's processes to end after its window closes
+WORKER_LOGIN = 'tangentstorm'  # the workers' gh identity (webhook.MICHAL)
 SHA_RE = re.compile(r'^[0-9a-f]{40}$')
 MERGE_READY_RE = re.compile(r'^\s*MERGE-READY\s+([0-9a-f]{40})\b')
 CI_OK = ('SUCCESS', 'NEUTRAL', 'SKIPPED')
@@ -93,21 +94,17 @@ def _login(node):
     return (((node or {}).get('author') or {}).get('login') or '').lower()
 
 
-def _is_bot(login):
-    return login.endswith('[bot]') or login.startswith('chatgpt-codex-connector')
-
-
 def unresolved_threads(pr):
     """The review threads that block a merge: every thread that is not resolved. An outdated
-    thread counts too, unless the worker replied in it (a comment after the first, by someone
-    other than its opener and not a bot)."""
+    thread counts too, unless the worker replied in it (a comment after the first by
+    WORKER_LOGIN, the gh identity the workers post as). Other reviewers' replies do not count."""
     out = []
     for t in (pr.get('reviewThreads') or {}).get('nodes') or []:
         if t.get('isResolved'):
             continue
         cs = (t.get('comments') or {}).get('nodes') or []
-        opener = _login(cs[0]) if cs else ''
-        replied = any(_login(c) not in (opener, '') and not _is_bot(_login(c)) for c in cs[1:])
+        # Codex on PR #90: only the worker's own login (its gh identity) is a worker reply
+        replied = any(_login(c) == WORKER_LOGIN for c in cs[1:])
         if t.get('isOutdated') and replied:
             continue
         out.append(t.get('id') or '?')
