@@ -239,7 +239,7 @@ class Watchdog:
         self.wake = wake or alerts.wake_swarmbot
         self.incident = incident or (lambda *a, **k: alerts.incident(*a, st=self.st, **k))
         self.panes = panes or panewatch.PaneWatch(dry=dry, st=self.st, wake=self.wake, incident=self.incident)
-        self.move = move or (lambda item, col: board.move_card(self.g, item, col))
+        self.move = move or (lambda item, col, n=None: board.move_card(self.g, item, col, n=n, repo=REPO))
         self.kill = kill or hung.kill
         self.hung_sample = hung_sample or (lambda: hung.sample(worker_root))
         self.on_main = on_main
@@ -427,7 +427,7 @@ class Watchdog:
     def sweep_move(self, n, item, frm, to, why):
         if self.dry:
             return f"would move #{n} {frm} -> {to} ({why})"
-        self.move(item, to)
+        self.move(item, to, n)
         from . import alerts
         alerts.record('sweep', f"#{n} {frm} -> {to}: {why}", pr=n)
         self.incident(f"sweep:{n}:{frm}:{to}", f"#{n} card in {frm}: {why}",

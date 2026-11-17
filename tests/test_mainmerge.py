@@ -20,7 +20,7 @@ def test_conflicts_probe_once_per_main_and_head():
 def test_recheck_moves_and_relays_only_the_conflicting_pr(tmp_path, monkeypatch):
     monkeypatch.setattr(M, 'RELAY_DIR', tmp_path)
     moves, said, sent = [], [], []
-    out = M.recheck(ST, MAIN, lambda m, h: h == A, lambda i, c: moves.append((i, c)), said.append,
+    out = M.recheck(ST, MAIN, lambda m, h: h == A, lambda i, c, n=None: moves.append((i, c)), said.append,
                     details={6: {'headRefName': 'ptw/x'}}, cache_path=tmp_path / 'c.json',
                     send=lambda pr, text: sent.append((pr, text)) or 'sent')
     assert out == [6] and moves == [('I6', board.IN_PROGRESS)]
@@ -36,11 +36,11 @@ def test_a_conflict_moves_the_card_only_once_a_worker_has_the_relay(tmp_path, mo
     from tangentswarm import flow
     monkeypatch.setattr(M, 'RELAY_DIR', tmp_path)
     moves, said, given = [], [], []
-    out = M.recheck(ST, MAIN, lambda m, h: h == A, lambda i, c: moves.append((i, c)), said.append,
+    out = M.recheck(ST, MAIN, lambda m, h: h == A, lambda i, c, n=None: moves.append((i, c)), said.append,
                     cache_path=tmp_path / 'c.json', give=lambda n, t: given.append(n) or (False, 'no worker'))
     assert out == [6] and given == [6] and moves == []
     assert said[-1].startswith('NEEDS_WORKER #6') and flow.held()[6]['head'] == B
-    out = M.recheck(ST, MAIN, lambda m, h: h == A, lambda i, c: moves.append((i, c)), said.append,
+    out = M.recheck(ST, MAIN, lambda m, h: h == A, lambda i, c, n=None: moves.append((i, c)), said.append,
                     cache_path=tmp_path / 'c.json', give=lambda n, t: (True, 'revived'))
     assert moves == [('I6', board.IN_PROGRESS)] and said[-1].endswith('revived')
 

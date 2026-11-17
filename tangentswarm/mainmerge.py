@@ -135,7 +135,7 @@ def recheck(staging, main, clean, move, say, details=None, dry=False, cache_path
             say(f"NEEDS_WORKER #{n}: conflicts with main {main[:8]}; no worker took the merge-main relay "
                 f"{path.name} ({how}); the card stays in Staging, its head is held from new pulls")
             continue
-        move(p['item'], board.IN_PROGRESS)
+        move(p['item'], board.IN_PROGRESS, n)
         say(f"moved #{n} Staging -> In Progress: conflicts with main {main[:8]}; merge-main relay {path.name} {how}")
     if staging and not bad:
         say(f"main {main[:8]}: every Staging PR still merges cleanly ({len(staging)})")

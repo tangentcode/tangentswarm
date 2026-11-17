@@ -420,8 +420,20 @@ class Executor:
     def move(self, n, item, col):
         if self.dry:
             return self.note(f"would move #{n} to {col}")
-        board.move_card(self.g, item, col, self._sh, n=n, b=self.board_)
+        board.move_card(self.g, item, col, self._sh, n=n, b=self.board_, repo=self.repo)
         self.note(f"#{n} -> {col}")
+
+    def draft(self, n):
+        """tangentswarm #95: Michal moved the card into In Progress (reject, answer); In
+        Progress PRs are drafts, so the PR becomes one too. An issue card has no draft state."""
+        if getattr(self, 'node_kind', None) == 'Issue':
+            return
+        if self.dry:
+            return self.note(f"would convert #{n} to a draft")
+        if board.make_draft(n, self.repo, self._sh):
+            self.note(f"#{n} is a draft")
+        else:
+            self.note(f"#{n}: the draft conversion failed (see the event log)")
 
     def minbot(self, n):
         from . import gatelock
@@ -605,13 +617,13 @@ class Executor:
     def pr_of(self, node):
         """The number of a card's PR or issue, only when it is in one of its board's repos
         (else None); the action's repo becomes that repo."""
-        d = self.g['gql']('query($id:ID!){node(id:$id){...on PullRequest{number repository{nameWithOwner}} '
+        d = self.g['gql']('query($id:ID!){node(id:$id){__typename ...on PullRequest{number repository{nameWithOwner}} '
                           '...on Issue{number repository{nameWithOwner}}}}', id=node)
         nd = (d or {}).get('node') or {}
         repo = (nd.get('repository') or {}).get('nameWithOwner')
         if repo not in self.board_.repos:
             return None
-        self.repo = repo
+        self.repo, self.node_kind = repo, nd.get('__typename')
         return nd.get('number')
 
     def pr_full(self, n):
@@ -651,6 +663,7 @@ class Executor:
         n = self.pr_of(a.args['node'])
         if not n:
             return self.note('reject: not a PR')
+        self.draft(n)
         if not self.platform():
             return self.wake(n, f"{self.repo}#{n} rejected from Human Review; no worker relay for this repo yet",
                              key=f'reject:{self.repo}:{n}')
@@ -665,6 +678,7 @@ class Executor:
         n = self.pr_of(a.args['node'])
         if not n:
             return self.wake(0, 'Needs Input answered on an issue with no PR: TRIAGE handoff', key=f"answered:{a.args['node']}")
+        self.draft(n)
         if not self.platform():
             return self.wake(n, f"{self.repo}#{n} answered in Needs Input; no worker relay for this repo yet",
                              key=f'answered:{self.repo}:{n}')

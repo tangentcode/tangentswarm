@@ -205,12 +205,16 @@ def is_active_fast_track(number, closes=(), active=None):
 HR_GATE_COLS = {IN_PROGRESS, AUTO_REVIEW, STAGING, HUMAN_REVIEW, DONE, BACKLOG}  # hr-gate's OPT names
 
 
-def move_card(g, item, col, sh=None, n=None, b=None):
+def move_card(g, item, col, sh=None, n=None, b=None, repo=None, kind='pr'):
     """Move a card to column col, by option id. hr-gate's move() knows only its own
     OPT names (no Ready, Needs Input, Triage...): platform #537/#540/#542/#543 at 11:03 AM ET
     2026-11-15 got their MinBot pass comment, then KeyError 'Ready', and stayed in Auto
     Review. Every mover goes through here. b: the card's board (default: Project 4, the
-    only one hr-gate knows)."""
+    only one hr-gate knows).
+
+    tangentswarm #95: In Progress PRs are drafts. A move of PR n into In Progress also
+    converts the PR to a draft (make_draft). repo: the PR's repo (default: the board's
+    only repo). kind: 'issue' for an issue card, which has no draft state."""
     from . import eventdb
     try:
         _move(g, item, col, sh, b)
@@ -221,6 +225,42 @@ def move_card(g, item, col, sh=None, n=None, b=None):
         raise
     eventdb.log_event('move', source='board', action=col, pr=n, actor=eventdb.SOURCE or None,
                       detail={'item': item, 'col': col, 'board': (b or DEFAULT).number})  # tangentswarm #32
+    if col == IN_PROGRESS and n is not None and kind == 'pr':
+        make_draft(n, repo or _only_repo(b), sh)
+
+
+def _only_repo(b):
+    repos = (b or DEFAULT).repos
+    return repos[0] if len(repos) == 1 else None
+
+
+def make_draft(n, repo, sh=None):
+    """Convert PR n of repo to a draft (tangentswarm #95: the pull sent platform #447 from
+    Staging to In Progress and left it ready for review; the sanity check flagged it).
+    gh does nothing for a PR that is a draft already. Never raises: the card has moved,
+    and a failed conversion is a logged event that the sanity check reports. Returns
+    True if the gh call ran without an error."""
+    from . import eventdb
+    if not repo:
+        eventdb.log_event('draft', source='board', action='undo-ready', pr=n, actor=eventdb.SOURCE or None,
+                          error='no repo for the PR: the board has more than one repo')
+        return False
+    argv = ['gh', 'pr', 'ready', str(n), '-R', repo, '--undo']
+    try:
+        if sh:
+            r = sh(argv)
+            rc = getattr(r, 'returncode', 0)
+            if rc:
+                raise RuntimeError(f"rc={rc}: {(getattr(r, 'stderr', '') or getattr(r, 'stdout', '') or '').strip()[:200]}")
+        else:
+            from . import tick
+            tick.sh(argv, check=True)
+    except Exception as e:
+        eventdb.log_event('draft', source='board', action='undo-ready', pr=n, actor=eventdb.SOURCE or None,
+                          repo=repo, error=f'{type(e).__name__}: {str(e)[:300]}')
+        return False
+    eventdb.log_event('draft', source='board', action='undo-ready', pr=n, actor=eventdb.SOURCE or None, repo=repo)
+    return True
 
 
 def _move(g, item, col, sh=None, b=None):

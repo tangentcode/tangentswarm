@@ -287,9 +287,11 @@ class Sources:
         """The swarm's one card mover (board.move_card): Project 4 through hr-gate's
         namespace, another board by its own project and option ids."""
         if b is board.DEFAULT:
-            board.move_card(self.gate(), card['item'], col, sh=self.sh, n=card['number'])
+            board.move_card(self.gate(), card['item'], col, sh=self.sh, n=card['number'], repo=card.get('repo'),
+                            kind=card.get('kind') or 'pr')
         else:
-            board.move_card({}, card['item'], col, sh=self.sh, n=card['number'], b=b)
+            board.move_card({}, card['item'], col, sh=self.sh, n=card['number'], b=b, repo=card.get('repo'),
+                            kind=card.get('kind') or 'pr')
             self._cards.pop(b.number, None)
 
 

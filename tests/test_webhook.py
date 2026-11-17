@@ -569,3 +569,48 @@ def test_a_tangentstorm_comment_on_platform_still_relays():
     assert ex.relays and ex.relays[0][0] == 541 and ex.wakes == []
     acts = W.classify('issue_comment', comment('tangentcode/platform', 'please fix x', n=541))
     assert [a.kind for a in acts] == ['relay']
+
+
+# -- tangentswarm #95: In Progress PRs are drafts -------------------------------------------
+
+def test_codex_findings_send_the_pr_back_to_in_progress_as_a_draft():
+    ex = Fake(col=board.READY, full=codex_pr(findings=True))
+    ex.run(W.Action('codex', 541))
+    assert ex.calls[0][-1] == board.OPTION[board.IN_PROGRESS] and board.DRAFTED == [(541, W.REPO)]
+
+
+def test_no_draft_when_the_card_is_in_progress_already_or_no_worker_takes_it():
+    Fake(col=board.IN_PROGRESS, full=codex_pr(findings=True)).run(W.Action('codex', 541))
+    Fake(col=board.READY, full=codex_pr(findings=True), worker=False).run(W.Action('codex', 541))
+    assert board.DRAFTED == []
+
+
+def _node_fake(typename, number=541, repo=None):
+    ex = Fake(full=codex_pr())
+    full = ex._g['gql']
+    ex._g['gql'] = lambda q, **v: ({'node': {'__typename': typename, 'number': number,
+                                             'repository': {'nameWithOwner': repo or W.REPO}}}
+                                   if 'node(id:' in q else full(q, **v))
+    return ex
+
+
+def test_michal_rejecting_from_human_review_makes_the_pr_a_draft():
+    ex = _node_fake('PullRequest')
+    ex.run(W.Action('reject', 0, 'x', dict(node='PR_x', board=board.DEFAULT.number)))
+    assert board.DRAFTED == [(541, W.REPO)] and ex.relays
+
+
+def test_michal_answering_needs_input_makes_the_pr_a_draft_but_not_an_issue():
+    ex = _node_fake('PullRequest')
+    ex.run(W.Action('answered', 0, 'x', dict(node='PR_x', board=board.DEFAULT.number)))
+    assert board.DRAFTED == [(541, W.REPO)]
+    ex = _node_fake('Issue', number=600)
+    ex.run(W.Action('answered', 0, 'x', dict(node='I_x', board=board.DEFAULT.number)))
+    assert board.DRAFTED == [(541, W.REPO)]
+
+
+def test_a_dry_run_never_drafts():
+    ex = _node_fake('PullRequest')
+    ex.dry = True
+    ex.draft(541)
+    assert board.DRAFTED == []
