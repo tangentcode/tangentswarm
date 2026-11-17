@@ -129,10 +129,29 @@ state_dir = "~/.local/state/methlab"
 `swarm-methlab live-check` checks the settings. It refuses a production org or repository
 (the board number is read only inside the Meth Lab org), the production webhook port or secret, and `codex = true`.
 
-`swarm-methlab live-env` prints the environment for the test copy of swarm-webhook: its own
-port, secret, log, inbox, seen file and event DB under `state_dir`. The swarmbot wake URL is a
-file that does not exist, so a test exception never wakes the live swarmbot. It refuses to
-print anything when `live-check` finds a problem.
+`live-check` also refuses a `state_dir` that is the home directory, or that is, holds or
+sits inside a production directory (`~/.local/state/swarm-flow`, `~/.cache`, `~/relay`,
+`~/bin`, `~/.config/tangentswarm`, `~/.config/gh` and the tangentswarm state and config
+dirs). The sandbox must never share the production inbox, seen file, log or event DB.
+
+`swarm-methlab live-env` prints the whole environment for the test copy of swarm-webhook.
+Start it with `env -i`, so it inherits nothing from the live service:
+
+    eval "env -i $(swarm-methlab live-env | tr '\n' ' ') python3 -m tangentswarm.webhook"
+
+In that environment:
+
+- HOME is `state_dir/home`. Every default path under `~` is there: the swarm state, the
+  cache, `~/bin`, and the sanity poke file. So a sandbox board event never starts the live
+  sanity check.
+- gh uses its own login dir (`state_dir/gh`). Log in there with the sandbox machine account,
+  never with the production account.
+- The config is `state_dir/config.toml`: the sandbox board's own ids.
+- Each `SWARM_*` path (log, inbox, seen file, event DB, watch state, gate queue, ...) is in
+  `state_dir`. The swarmbot wake URL and the alert URL are files that do not exist, so a test
+  exception never wakes the live swarmbot or MethBot.
+
+It refuses to print anything when `live-check` finds a problem.
 
 The first live end-to-end run, and the config of the sandbox board for it, is a follow-up
 after the organization exists.

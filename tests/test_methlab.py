@@ -259,12 +259,76 @@ def good(**kw):
                      secret_files=['~/.config/tangentswarm/methlab-secret'], state_dir='~/methlab-state'), **kw)
 
 
-def test_safe_live_settings_have_no_problem_and_give_their_own_paths(tmp_path):
-    assert methlab.live_problems(good()) == []
-    env = methlab.live_env(good())
+@pytest.mark.parametrize('state_dir', [
+    '~/.local/state/swarm-flow',            # the production webhook inbox, seen file, log and DB
+    '~/.local/state/swarm-flow/methlab',    # inside it
+    '~/.local/state',                       # above it
+    '~',                                    # the home directory
+    '~/.cache/methlab',                     # the board snapshot and gate queue
+    '~/relay',                              # the relay events
+    '~/bin',                                # the live swarm tools
+    '~/.config/tangentswarm/methlab',       # the private config and secrets
+])
+def test_a_state_dir_that_overlaps_production_is_refused(state_dir):
+    probs = methlab.live_problems(good(state_dir=state_dir))
+    assert any('state_dir' in p for p in probs), probs
+    with pytest.raises(ValueError):
+        methlab.live_env(good(state_dir=state_dir))
+
+
+def test_the_sandbox_process_has_no_path_outside_its_state_dir(tmp_path_factory):
+    """Codex on PR #125: the sandbox wrote the production sanity poke, and could share the
+    production inbox. Every module-level path of every tangentswarm module, imported with the
+    live-env environment (env -i), is inside state_dir; so are the sanity poke and the DB."""
+    import os
+    import pwd
+    import sys as _sys
+    st = tmp_path_factory.mktemp('methlab')  # outside tmp_path, where conftest puts the "production" files
+    env = methlab.live_env(good(state_dir=str(st)))
+    env['PYTHONPATH'] = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    code = r"""
+import importlib, json, os, pkgutil, sys
+from pathlib import Path
+import tangentswarm
+out = []
+for m in pkgutil.iter_modules(tangentswarm.__path__):
+    if m.ispkg:
+        continue
+    try:
+        mod = importlib.import_module('tangentswarm.' + m.name)
+    except Exception:
+        continue
+    for k, v in vars(mod).items():
+        if isinstance(v, (str, Path)) and str(v).startswith('/') and chr(10) not in str(v) and len(str(v)) < 400:
+            out.append((m.name, k, str(v)))
+from tangentswarm import sanity, eventdb, gatelock, promoted
+out += [('sanity', 'poke_path()', str(sanity.poke_path())), ('eventdb', 'PATH', str(eventdb.PATH)),
+        ('gatelock', 'QUEUE_DIR', str(gatelock.QUEUE_DIR)), ('promoted', 'BIN', str(promoted.BIN))]
+print(json.dumps(out))
+"""
+    r = subprocess.run([_sys.executable, '-c', code], env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr
+    found = json.loads(r.stdout.splitlines()[-1])
+    assert len(found) > 20
+    prod = [os.environ['HOME'], pwd.getpwuid(os.getuid()).pw_dir, '/tmp']
+    src = env['PYTHONPATH'].rstrip('/') + '/'  # the package's own source files are not state
+    bad = [f for f in found if not f[1].startswith('__') and not f[2].startswith(src)
+           and not f[2].startswith(str(st.resolve()))
+           and any(f[2] == h or f[2].startswith(h.rstrip('/') + '/') for h in prod)]
+    assert bad == []
+    poke = dict(((m, k), v) for m, k, v in found)[('sanity', 'poke_path()')]
+    assert poke.startswith(str(st.resolve()))
+
+
+def test_safe_live_settings_have_no_problem_and_give_their_own_paths(tmp_path_factory):
+    st = tmp_path_factory.mktemp('sandbox') / 'methlab-state'
+    assert methlab.live_problems(good(state_dir=str(st))) == []
+    env = methlab.live_env(good(state_dir=str(st)))
     assert env['SWARM_WEBHOOK_PORT'] == '8782'
     assert env['SWARM_EVENTS_DB'].endswith('methlab-state/events.sqlite')
-    assert 'swarm-flow' not in ''.join(env.values())  # never the live state dir
+    assert '/.local/state/swarm-flow' not in ''.join(env.values())  # never the live state dir
+    assert env['HOME'].endswith('methlab-state/home') and env['GH_CONFIG_DIR'].endswith('methlab-state/gh')
+    assert env['SWARM_WATCH_STATE'].endswith('methlab-state/watch.json')
     assert env['SWARM_WAKE_URL_FILE'].endswith('no-wake-url')
 
 
@@ -277,7 +341,8 @@ def test_safe_live_settings_have_no_problem_and_give_their_own_paths(tmp_path):
     (dict(org=''), 'org is not set'),
     (dict(state_dir=''), 'state_dir is not set'),
 ])
-def test_live_settings_that_could_touch_production_are_refused(change, problem):
+def test_live_settings_that_could_touch_production_are_refused(change, problem, tmp_path_factory):
+    change.setdefault('state_dir', str(tmp_path_factory.mktemp('sandbox')))
     probs = methlab.live_problems(good(**change))
     assert any(problem in p for p in probs), probs
     with pytest.raises(ValueError):

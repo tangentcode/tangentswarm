@@ -29,9 +29,10 @@ methodology, and that way we can call it meth lab". Two parts:
    names it. live_problems() refuses any setting that could touch production: a production
    org or repository (a board number is only read inside the Meth Lab org), the production
    webhook port or secret, or a Codex connection.
-   `swarm-methlab live-env` prints the environment for a test copy of swarm-webhook with its
-   own port, secret, log, inbox and event DB; it is started by hand for a check and stopped
-   after it, never left running.
+   `swarm-methlab live-env` prints the whole environment for a test copy of swarm-webhook
+   (started with `env -i`): its own HOME, gh login, config, port, secret and every state
+   path inside state_dir, which must not overlap a production directory. It is started by
+   hand for a check and stopped after it, never left running.
 """
 import argparse
 import json
@@ -460,28 +461,90 @@ def live_problems(cfg=None):
     for f in cfg.get('secret_files') or []:
         if Path(os.path.expanduser(str(f))).resolve() in prod_secrets:
             out.append(f'the secret file {f} is a production webhook secret')
+    out += state_dir_problems(cfg.get('state_dir'))
     if cfg.get('codex'):
         out.append('codex is on: do not connect Codex to the Meth Lab repo (it uses the Codex allowance)')
     return out
 
 
+def production_dirs(home=None):
+    """The directories that hold the live swarm's state, cache and config (resolved)."""
+    from . import paths
+    home = Path(home or os.path.expanduser('~'))
+    out = [home / '.local' / 'state' / 'swarm-flow', home / '.local' / 'state' / 'mn-workflow',
+           home / '.cache', home / 'relay', home / 'bin', home / '.config' / 'tangentswarm',
+           home / '.config' / 'gh', paths.state_dir(), paths.config_dir(), Path(W.LOG).parent,
+           Path(W.INBOX).parent, Path(W.SEEN).parent]
+    from . import eventdb
+    out.append(Path(eventdb.PATH).parent)
+    return sorted({p.expanduser().resolve() for p in out})
+
+
+def _overlap(a, b):
+    return a == b or a in b.parents or b in a.parents
+
+
+def state_dir_problems(state_dir, home=None):
+    """Why state_dir could share files with the live swarm: it is the home directory, or it is,
+    holds or sits inside a production state, cache or config directory."""
+    if not state_dir:
+        return []
+    home = Path(home or os.path.expanduser('~')).resolve()
+    st = Path(os.path.expanduser(str(state_dir))).resolve()
+    if st == home or st in home.parents:
+        return [f'the state_dir {state_dir} is the home directory or above it: use a new directory of its own']
+    return [f'the state_dir {state_dir} overlaps the production directory {p}'
+            for p in production_dirs(home) if _overlap(st, p)]
+
+
+# Every SWARM_* path setting of the package, set inside the sandbox state dir as well (with the
+# sandbox HOME, the defaults are there already; this also covers a /tmp default and a value a
+# caller forgets to clear).
+SANDBOX_FILES = {
+    'SWARM_WEBHOOK_LOG': 'webhook.log', 'SWARM_WEBHOOK_INBOX': 'webhook-inbox',
+    'SWARM_WEBHOOK_SEEN': 'webhook-seen.json', 'SWARM_EVENTS_DB': 'events.sqlite',
+    'SWARM_WEBHOOK_DB': 'events.sqlite', 'SWARM_EVENT_SOURCE': None,
+    'SWARM_WAKE_URL_FILE': 'no-wake-url', 'SWARM_WAKE_KEY_FILE': 'no-wake-key',  # never wake the live swarmbot
+    'SWARM_WATCH_STATE': 'watch.json', 'SWARM_ALERT_URL_FILE': 'no-alert-url', 'SWARM_ALERT_KEY_FILE': 'no-alert-key',
+    'SWARM_FLOW_STATE': 'swarm-flow/pull.json', 'SWARM_MOVES_LOG': 'moves.log',
+    'SWARM_MERGE_CLOCK_LOG': 'merge-to-move.log', 'SWARM_READY_SEEN': 'ready-seen.json',
+    'SWARM_RELAY_DIR': 'relay', 'SWARM_CONFLICT_MAP': 'conflict-map.json', 'SWARM_GQL_LOG': 'gql.log',
+    'SWARM_HANDOFF_SPOOL': 'spool', 'SWARM_GITHUB_EVENTS': 'github-events.jsonl',
+    'SWARM_EVENTS_OFFSET': 'events.offset', 'SWARM_MN_PENDING': 'mn-pending', 'SWARM_MN_CONFIG': 'no-mn-config.json',
+    'SWARM_BOARD_SNAPSHOT': 'board-snapshot.json', 'SWARM_BOARD_DETAILS': 'pr-details.json',
+    'SWARM_BOARD_SYNC_LOG': 'board-sync.log', 'SWARM_GATE_LOCK': 'swarm-serial.lock',
+    'SWARM_GATE_QUEUE': 'gate-queue', 'SWARM_CASCADE_LOG': 'cascade.log', 'SWARM_CASCADE_RERUN': 'swarm-serial.rerun',
+    'SWARM_SLOTS_STATE': 'slots.json', 'SWARM_STOP_HOOK_LOG': 'stop-hook.log',
+    'SWARM_STOP_HOOK_SEEN': 'stop-hook-seen.json', 'SWARM_STOP_HOOK_LOCKS': 'stop-hook-locks',
+    'SWARM_TICK_STATE': 'tick-state', 'SWARM_PANES_REPORT': 'panes.json', 'SWARM_HELD': 'held.json',
+    'SWARM_FASTTRACK_STATE': 'fasttrack.json', 'SWARM_MAINMERGE_CACHE': 'mainmerge-cache.json',
+    'SWARM_MERGE_CLOCK': 'merge-clock.json', 'SWARM_FLOW_STATUS_CACHE': 'flow-status.json',
+    'SWARM_HOOK_CACHE': 'hook-cache.json',
+}
+
+
 def live_env(cfg=None):
-    """The environment of a test copy of swarm-webhook for the live sandbox: its own port,
-    secret, log, inbox, seen file and event DB. Raises ValueError with the problems when the
-    settings could touch production."""
+    """The whole environment of a test copy of swarm-webhook for the live sandbox. Start it
+    with `env -i` and only these variables, so nothing of the live service is inherited:
+    HOME is a sandbox home inside state_dir (every default path under ~ is there: the swarm
+    state, the cache, ~/bin, the sanity poke), gh has its own login dir (the sandbox's own
+    machine account), the config is the sandbox's own, and each SWARM_* path is in state_dir.
+    Raises ValueError with the problems when the settings could touch production."""
     cfg = live_config() if cfg is None else cfg
     problems = live_problems(cfg)
     if problems:
         raise ValueError('; '.join(problems))
-    st = Path(os.path.expanduser(str(cfg['state_dir'])))
-    return {'SWARM_WEBHOOK_PORT': str(int(cfg['port'])),
-            'SWARM_WEBHOOK_SECRETS': ':'.join(os.path.expanduser(str(f)) for f in cfg['secret_files']),
-            'SWARM_WEBHOOK_LOG': str(st / 'webhook.log'),
-            'SWARM_WEBHOOK_INBOX': str(st / 'webhook-inbox'),
-            'SWARM_WEBHOOK_SEEN': str(st / 'webhook-seen.json'),
-            'SWARM_EVENTS_DB': str(st / 'events.sqlite'),
-            'SWARM_WAKE_URL_FILE': str(st / 'no-wake-url'),  # never wake the live swarmbot
-            'SWARM_WAKE_KEY_FILE': str(st / 'no-wake-key')}
+    st = Path(os.path.expanduser(str(cfg['state_dir']))).resolve()
+    env = {'HOME': str(st / 'home'), 'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8',
+           'GH_CONFIG_DIR': str(st / 'gh'), 'TANGENTSWARM_CONFIG': str(st / 'config.toml'),
+           'TANGENTSWARM_STATE_DIR': str(st / 'tangentswarm'), 'TANGENTSWARM_CONFIG_DIR': str(st / 'config'),
+           'XDG_STATE_HOME': str(st / 'home' / '.local' / 'state'), 'XDG_CONFIG_HOME': str(st / 'home' / '.config'),
+           'XDG_CACHE_HOME': str(st / 'home' / '.cache'), 'XDG_DATA_HOME': str(st / 'home' / '.local' / 'share'),
+           'SWARM_WEBHOOK_PORT': str(int(cfg['port'])),
+           'SWARM_WEBHOOK_SECRETS': ':'.join(os.path.expanduser(str(f)) for f in cfg['secret_files'])}
+    for k, name in SANDBOX_FILES.items():
+        env[k] = 'methlab' if name is None else str(st / name)
+    return env
 
 
 # -- the command -------------------------------------------------------------------------
@@ -524,8 +587,9 @@ def main(argv=None, out=print):
     except ValueError as e:
         out(f'METHLAB live settings are not safe: {e}')
         return 1
+    import shlex
     for k, v in env.items():
-        out(f'{k}={v}')
+        out(shlex.quote(f'{k}={v}'))
     return 0
 
 
