@@ -55,17 +55,21 @@ def et_stamp(t):
 
 
 def methbot_post(payload):
-    """The real POST to MethBot's URL with its bearer key (webhook.post_wake: retried in a
-    thread, logged only when there is no URL)."""
+    """The real POST to MethBot's URL with its bearer key: synchronous, with webhook.post_wake's
+    retries. A worker MCP report runs in a short-lived spool serve process, so a POST in a
+    daemon thread died with it (Codex on PR #71). True on a 2xx; False with no URL or after
+    the last failed try."""
     from . import webhook
-    return webhook.post_wake(payload, url_file=ALERT_URL_FILE, key_file=ALERT_KEY_FILE)
+    return webhook.post_wake(payload, url_file=ALERT_URL_FILE, key_file=ALERT_KEY_FILE, background=False)
 
 
 def tell_methbot(kind, repo, pr, head=None, question=None, st=None, post=None, now=time.time):
     """Wake MethBot for one of its two events (tangentswarm #19), only for a Project 6 repo.
     kind 'done' needs the full head sha and is sent once per repo, PR and head; kind
     'needs-input' needs the question and is sent once per repo, PR and question. Returns
-    True when sent (or queued for the POST), else the reason it was not sent."""
+    True when MethBot took it, else the reason it was not sent. The once-key is marked only
+    after a delivered POST, so a report repeated after a failed POST tries again (Codex on
+    PR #71). post answers False for a failed POST (anything else is delivered)."""
     if kind not in METHBOT_KINDS:
         return f"not a MethBot event: {kind!r}"
     if repo not in METHBOT_REPOS:
@@ -88,11 +92,13 @@ def tell_methbot(kind, repo, pr, head=None, question=None, st=None, post=None, n
     st = st or state()
     if st.done(once):
         return 'already sent'
-    st.mark(once)
     t = now()
     payload['at'] = et_stamp(t)
+    if (post or methbot_post)(payload) is False:
+        record(f'methbot-{kind}-failed', text, pr=pr, key=once, now=t, repo=repo)
+        return 'the POST to MethBot failed (no URL, or every try failed; see the webhook log)'
+    st.mark(once)
     record(f'methbot-{kind}', text, pr=pr, key=once, now=t, repo=repo)
-    (post or methbot_post)(payload)
     return True
 
 

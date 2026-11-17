@@ -446,6 +446,8 @@ def main(argv=None):
     w = Watchdog(dry=a.dry_run)
     w.last_codex = w.last_sweep = 0.0
     w.once()
+    from . import webhook
+    webhook.drain_posts()  # Codex on PR #71: the wake POST threads die with this process
     return 0
 
 

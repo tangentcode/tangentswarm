@@ -64,11 +64,35 @@ def test_methbot_is_only_for_project_6_and_its_two_events():
     assert sent == [] and eventdb.store().rows("source='watch'") == []
 
 
-def test_methbot_goes_to_the_methbot_url_with_its_key(monkeypatch):
+def test_methbot_goes_to_the_methbot_url_with_its_key_synchronously(monkeypatch):
+    """Codex on PR #71: the spool serve process exits after the tool answer, so the POST
+    must not run in a daemon thread."""
     seen = []
-    monkeypatch.setattr(webhook, 'post_wake', lambda p, url_file=None, key_file=None, **k: seen.append((url_file, key_file)))
-    alerts.tell_methbot('done', 'tangentcode/tangentswarm', 71, head=HEAD)
-    assert seen == [(alerts.ALERT_URL_FILE, alerts.ALERT_KEY_FILE)]
+    monkeypatch.setattr(webhook, 'post_wake', lambda p, url_file=None, key_file=None, background=True:
+                        seen.append((url_file, key_file, background)) or True)
+    assert alerts.tell_methbot('done', 'tangentcode/tangentswarm', 71, head=HEAD) is True
+    assert seen == [(alerts.ALERT_URL_FILE, alerts.ALERT_KEY_FILE, False)]
+
+
+def test_a_failed_methbot_post_is_not_marked_sent_and_a_repeat_tries_again():
+    """Codex on PR #71: the once-key was marked before the POST, so a lost POST was never sent."""
+    tries = []
+    r = alerts.tell_methbot('done', 'tangentcode/tangentswarm', 71, head=HEAD, post=lambda p: tries.append(p) is not None)
+    assert 'failed' in r
+    assert alerts.tell_methbot('done', 'tangentcode/tangentswarm', 71, head=HEAD, post=lambda p: tries.append(p) or True) is True
+    assert alerts.tell_methbot('done', 'tangentcode/tangentswarm', 71, head=HEAD, post=tries.append) == 'already sent'
+    assert len(tries) == 2
+    q = alerts.tell_methbot('needs-input', 'tangentcode/methodology', 9, question='q?', post=lambda p: False)
+    assert 'failed' in q
+    assert alerts.tell_methbot('needs-input', 'tangentcode/methodology', 9, question='q?', post=lambda p: True) is True
+    events = [r['event'] for r in eventdb.store().rows("source='watch'")]
+    assert events == ['methbot-done-failed', 'methbot-done', 'methbot-needs-input-failed', 'methbot-needs-input']
+
+
+def test_no_methbot_url_is_a_failed_post_not_a_sent_one():
+    assert not alerts.ALERT_URL_FILE.exists()
+    assert 'failed' in alerts.tell_methbot('done', 'tangentcode/tangentswarm', 71, head=HEAD)
+    assert not alerts.state().done(f"methbot:done:tangentcode/tangentswarm#71@{HEAD}")
 
 
 def test_the_methbot_post_sends_the_bearer_key_to_the_url(tmp_path):
@@ -93,6 +117,42 @@ def test_the_methbot_post_sends_the_bearer_key_to_the_url(tmp_path):
     assert len(reqs) == 1 and reqs[0].full_url == 'https://methbot.example/wake'
     assert reqs[0].get_header('Authorization') == 'Bearer sekrit'
     assert json.loads(reqs[0].data) == {'source': 'swarm', 'kind': 'done'}
+
+
+def test_a_synchronous_post_answers_whether_it_was_delivered():
+    import urllib.error
+    alerts.ALERT_URL_FILE.write_text('https://methbot.example/wake\n')
+
+    def refuse(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 403, 'no', {}, None)
+    assert webhook.post_wake({'k': 1}, url_file=alerts.ALERT_URL_FILE, urlopen=refuse, background=False) is False
+    assert webhook.post_wake({'k': 1}, url_file=alerts.ALERT_URL_FILE.with_name('none'), background=False) is False
+
+
+def test_drain_posts_waits_for_the_background_posts():
+    """Codex on PR #71, the same bug in swarm-watch --once: its wake POST threads are
+    daemon threads, so the process drains them before it exits."""
+    import threading
+    alerts.ALERT_URL_FILE.write_text('https://swarmbot.example/wake\n')
+    go, done = threading.Event(), []
+
+    class R:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def slow(req, timeout=None):
+        go.wait(5)
+        done.append(1)
+        return R()
+    assert webhook.post_wake({'k': 1}, url_file=alerts.ALERT_URL_FILE, urlopen=slow) is None
+    assert webhook.drain_posts(timeout=0.05) == 1
+    go.set()
+    assert webhook.drain_posts(timeout=5) == 0 and done == [1]
 
 
 def test_a_swarmbot_wake_carries_the_detail():

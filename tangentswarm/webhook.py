@@ -839,6 +839,8 @@ def _retry_after(e):
 
 def post_wake(payload, url_file=None, key_file=None, urlopen=None, sleep=time.sleep, background=True):
     """POST the exception to swarmbot's wake URL (from WAKE_URL_FILE). No URL: logged only.
+    background=False: the POST and its retries run now, and the answer is True (2xx) or
+    False (no URL, or it failed); background=True answers None at once.
     An optional key (WAKE_KEY_FILE, mode 600) goes as "Authorization: Bearer <key>"; the key
     is never logged. A failed POST is retried with board-sync's backoff() (Retry-After
     honored) up to eventdb.WAKE_MAX_ATTEMPTS; a 4xx other than 408/429 is not retried. The
@@ -847,7 +849,8 @@ def post_wake(payload, url_file=None, key_file=None, urlopen=None, sleep=time.sl
     import urllib.request
     url = _read(url_file or WAKE_URL_FILE)
     if not url:
-        return log(decision='wake-not-sent', reason='no wake URL configured', **payload)
+        log(decision='wake-not-sent', reason='no wake URL configured', **payload)
+        return None if background else False
     headers = {'Content-Type': 'application/json', 'User-Agent': 'swarm-webhook'}
     key = _read(key_file or WAKE_KEY_FILE)
     if key:
@@ -869,15 +872,37 @@ def post_wake(payload, url_file=None, key_file=None, urlopen=None, sleep=time.sl
         for attempts in range(1, eventdb.WAKE_MAX_ATTEMPTS + 1):
             code, wait, err = attempt()
             if code is not None and 200 <= code < 300:
-                return log(decision='wake-sent', status=code, attempts=attempts, auth=bool(key), **payload)
+                log(decision='wake-sent', status=code, attempts=attempts, auth=bool(key), **payload)
+                return True
             permanent = code is not None and 400 <= code < 500 and code not in (408, 429)
             if permanent or attempts >= eventdb.WAKE_MAX_ATTEMPTS:
-                return log(decision='wake-failed', status=code, attempts=attempts, error=err, **payload)
+                log(decision='wake-failed', status=code, attempts=attempts, error=err, **payload)
+                return False
             sleep(eventdb.backoff(attempts, wait))
     if background:
-        threading.Thread(target=run, name='wake-post', daemon=True).start()
-    else:
-        run()
+        t = threading.Thread(target=run, name='wake-post', daemon=True)
+        with _posts_lock:
+            _posts[:] = [x for x in _posts if x.is_alive()] + [t]
+        t.start()
+        return None
+    return run()
+
+
+_posts = []  # the background POST threads (drain_posts waits for them)
+_posts_lock = threading.Lock()
+
+
+def drain_posts(timeout=300.0, clock=time.monotonic):
+    """Wait up to timeout s for the background POSTs of this process (with their retries)
+    to end. A short-lived process (swarm-watch --once) calls it before it exits: its POST
+    threads are daemon threads and die with it (Codex on PR #71). Returns the number still
+    running."""
+    end = clock() + timeout
+    with _posts_lock:
+        threads = list(_posts)
+    for t in threads:
+        t.join(max(0.0, end - clock()))
+    return sum(1 for t in threads if t.is_alive())
 
 
 def flush_wakes(post=None, now=time.time):
