@@ -254,17 +254,12 @@ class Events:
 
     def queue_gate(self, n, why):
         """A body edit on a PR whose pull waits (SCREENSHOTS_NEEDED) or is held (NEEDS_WORKER):
-        a hold that is not a conflict ends (tangentswarm #101), and a cascade pass re-runs its
-        gate now (MethBot 2026-11-15: #519 got its images at 2:48
+        a cascade pass re-runs its gate now (MethBot 2026-11-15: #519 got its images at 2:48
         AM ET, and nothing re-ran the gate for 35 min)."""
         from . import advance, flow
-        hd = flow.held()
-        if n not in flow.pulled_prs() and n not in hd:
+        if n not in flow.pulled_prs() and n not in flow.held():
             return None
         if self.dry:
-            free = n in hd and not flow.conflict_hold(hd[n])
-            return f"{why}: would {'release the hold and ' if free else ''}queue a cascade pass"
-        # tangentswarm #101: a body edit releases a hold that is not a conflict (platform #516)
-        free = flow.release_on_edit(n) is not None
+            return f"{why}: would queue a cascade pass"
         advance.flag_rerun(by=f"event: {why}")
-        return f"{why}: {'hold released; ' if free else ''}cascade {(self.cascade or advance.queue_cascade)()}"
+        return f"{why}: cascade {(self.cascade or advance.queue_cascade)()}"
