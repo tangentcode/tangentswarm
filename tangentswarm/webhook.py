@@ -87,6 +87,9 @@ def log_only(event):
 OUR_MARKS = ('<!-- swarm-needs-input -->', '### MinBot', 'MinBot pass', 'MinBot check',
              '<!-- swarm-brief', 'Coordinator: #')
 
+# First-line markers of a worker's status comment (tangentswarm #76; local_step.py reads the same words).
+WORKER_STATUS = ('MERGE-READY', 'NEEDS-INPUT', 'BLOCKED', 'STEP-DONE')
+
 ROOT_CAUSE = ("ROOT-CAUSE RULE: fix the root cause, list the neighbor cases, add tests, and say which "
               "ones they cover. Fix and push; do not touch the Codex threads and do not post on GitHub.")
 
@@ -155,6 +158,25 @@ def ours(body):
     return b.strip().lower() == '@codex review' or any(m in b for m in OUR_MARKS)
 
 
+def worker_status(body):
+    """The worker status marker that starts the first non-blank line of body, or None."""
+    first = next((l.strip() for l in (body or '').splitlines() if l.strip()), '')
+    first = first.lstrip('*_`#> ')
+    return next((m for m in WORKER_STATUS if first.upper().startswith(m)), None)
+
+
+def no_relay_skip(repo, user, body, n):
+    """tangentswarm #76: on a repo with no worker relay (Project 6: tangentswarm, methodology),
+    a tangentstorm comment or review is logged only. It never relays and never wakes swarmbot:
+    the swarm MCP report is the done and needs-input signal there, and MethBot reads the repo.
+    None on platform, or for another author."""
+    if repo == REPO or login(user) != MICHAL:
+        return None
+    m = worker_status(body)
+    why = f'worker status comment ({m})' if m else "Michal's comment on a Project 6 repo: MethBot reads it"
+    return [Action('log-only', n, why)]
+
+
 CODE_REVIEW_STATUS_RE = re.compile(r'"code_review"\s*:\s*\{[^{}]*?"status"\s*:\s*"(\w+)"', re.I)
 STATUS_RE = re.compile(r'"status"\s*:\s*"running"', re.I)
 
@@ -214,6 +236,9 @@ def _classify(event, p):
             return [Action('skip', pr=n, why='the swarm\'s own comment')]
         if login(c.get('user')).endswith('[bot]'):
             return [Action('skip', pr=n, why=f"bot comment by {login(c.get('user'))}")]
+        skip = no_relay_skip(repo, c.get('user'), body, n)
+        if skip:
+            return skip
         if is_pr:
             return [Action('relay', n, f"comment by {login(c.get('user'))} on PR #{n}",
                            dict(author=login(c.get('user')), body=body[:2000], url=c.get('html_url')))]
@@ -232,6 +257,9 @@ def _classify(event, p):
             return [Action('skip', pr=n, why='MinBot review')]
         if pr.get('draft'):
             return [Action('skip', pr=n, why='review on a draft PR')]
+        skip = no_relay_skip(repo, r.get('user'), r.get('body'), n)
+        if skip:
+            return skip
         if (r.get('body') or '').strip():
             return [Action('relay', n, f"review by {login(r.get('user'))}",
                            dict(author=login(r.get('user')), body=(r.get('body') or '')[:2000], url=r.get('html_url')))]
