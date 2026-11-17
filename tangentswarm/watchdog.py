@@ -395,7 +395,7 @@ class Watchdog:
         lines, self.sanity_due = sanity.report(
             found, now, apply=not self.dry, alert=lambda text, key, pr=None: self.alert(text, key=key, pr=pr, st=self.st),
             incident=self.incident, unread=set(failed))
-        lines = [f"project {b} read failed: {err}" for b, err in sorted(failed.items())] + lines
+        lines = [f"{sanity.where(b)} read failed: {err}" for b, err in sorted(failed.items(), key=str)] + lines
         return [f"sanity ({why}): {line}" for line in lines or [f"{len(found)} finding(s), nothing new"]]
 
     def sweep_pass(self, snap, now):

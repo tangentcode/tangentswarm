@@ -42,6 +42,7 @@ Active rules do not run there.
 | `active-pr-count` | An Active issue does not have exactly one open pull request in a flow column that closes it | Exactly one open linked pull request in a flow column |
 | `flow-pr-active-count` | A pull request in a flow column does not belong to exactly one Active issue (no closing link, or zero or two of its non-`work2` issues in Active). A pull request that closes only `work2` issues is correct | A pull request in a flow column belongs to exactly one Active issue |
 | `duplicate-claudes` | Two or more live Claudes run in one git worktree | One Claude per worktree |
+| `unit-source` | A swarm user unit (`swarm*.service`, enabled or active), or its running process, does not import tangentswarm from `~/ver/tangentswarm.flow-live`. One finding for each unit. When `systemctl --user` cannot be read, the unit findings are kept, as for a board that is not read | Every swarm service runs from flow-live (methodology #84; `swarm-unit-check`) |
 
 The flow columns are In Progress, Auto Review, Needs Input, Ready, Staging, and Human
 Review.
