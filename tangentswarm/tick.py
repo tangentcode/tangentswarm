@@ -63,7 +63,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from . import board, brief, flow, gatelock
+from . import board, brief, codexsummary, flow, gatelock
 
 ET = ZoneInfo('America/New_York')
 HOME = Path.home()
@@ -257,10 +257,12 @@ def codex_status(pr):
     Findings only while an inline Codex thread is open (not resolved, not outdated) on the
     head: a thread whose originalCommit is an older head does not count (the MinBot pass
     resolves it once Codex is clean on the head).
+    A review-state summary of the head with findings is findings too, and it wins over every
+    clean signal (tangentswarm #75). The summary is read by codexsummary.result, the same
+    parser as advance.codex_decision: a running summary or null flags is never clean.
     Clean (Michal 2026-11-15: #518/#520/#521 were sent back to In Progress at 12:53 AM ET
     because a reader took Codex's review-summary comment as findings):
-      - a codex-review-state summary for the head with has_any_findings=false (and no
-        unresolved findings), or
+      - a completed codex-review-state summary for the head with both findings flags false, or
       - the "Didn't find any major issues" receipt for the head, or
       - a Codex review of the head with no open inline thread.
     Else pending."""
@@ -275,20 +277,16 @@ def codex_status(pr):
                 and t['comments']['nodes'] and is_codex(t['comments']['nodes'][0]) and on_head(t)]
     if open_thr:
         return 'findings', f"{len(open_thr)} open Codex thread(s)"
-    for c in pr['comments']['nodes']:
-        if not is_codex(c):
-            continue
+    comments = pr['comments']['nodes']
+    summary = codexsummary.on_head(comments, head, is_codex)
+    if summary == codexsummary.FINDINGS:
+        return 'findings', 'review-state findings on head'
+    for c in comments:
         body = c.get('body') or ''
-        if 'Reviewed commit' in body and head[:8] in body and "Didn't find any major issues" in body:
+        if is_codex(c) and 'Reviewed commit' in body and head[:8] in body and "Didn't find any major issues" in body:
             return 'clean', 'clean receipt on head'
-        m = re.search(r'codex-review-state:v1\s*(\{.*?\})\s*-->', body, re.S)
-        if m:
-            try:
-                st = json.loads(m.group(1)).get('code_review', {})
-            except ValueError:
-                continue
-            if st.get('commit_sha') == head and not st.get('has_any_findings') and not st.get('has_unresolved_findings'):
-                return 'clean', 'review-state clean on head'
+    if summary == codexsummary.CLEAN:
+        return 'clean', 'review-state clean on head'
     if any(is_codex(r) and (r.get('commit') or {}).get('oid') == head for r in pr['reviews']['nodes']):
         return 'clean', 'Codex reviewed the head; no open inline thread'
     return 'pending', 'no Codex result on head'
@@ -296,7 +294,7 @@ def codex_status(pr):
 
 def codex_reviewed_head(pr):
     """True when Codex has given a result for the exact head: a review of the head, a
-    review-state summary or a receipt that names it."""
+    completed review-state summary of it or a receipt that names it."""
     head = pr['headRefOid']
     for r in pr['reviews']['nodes']:
         if ((r.get('author') or {}).get('login') or '').startswith(CODEX) and \
@@ -308,13 +306,8 @@ def codex_reviewed_head(pr):
         body = c.get('body') or ''
         if 'Reviewed commit' in body and head[:8] in body:
             return True
-        m = re.search(r'codex-review-state:v1\s*(\{.*?\})\s*-->', body, re.S)
-        if m:
-            try:
-                if json.loads(m.group(1)).get('code_review', {}).get('commit_sha') == head:
-                    return True
-            except ValueError:
-                continue
+        if codexsummary.result(body, head) in (codexsummary.CLEAN, codexsummary.FINDINGS):
+            return True  # tangentswarm #75: a running summary of the head is not a result yet
     return False
 
 
