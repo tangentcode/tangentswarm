@@ -73,6 +73,69 @@ def test_make_draft_without_sh_uses_tick_sh(monkeypatch):
     assert ran == [(['gh', 'pr', 'ready', '5', '-R', PLATFORM, '--undo'], True)]
 
 
+# -- tangentswarm #134: a draft is never merge-ready ---------------------------------------
+
+def test_make_draft_also_removes_merge_ready_and_pre_merging():
+    """platform #528: rejected into In Progress, made a draft, and kept merge-ready."""
+    calls = []
+    assert board.REAL_MAKE_DRAFT(528, PLATFORM, calls.append) is True
+    assert calls == [['gh', 'pr', 'ready', '528', '-R', PLATFORM, '--undo']]
+    assert F.LABELS_WRITTEN == [(528, 'remove', [F.MERGE_READY]), (528, 'remove', [F.PRE_MERGING])]
+
+
+def test_the_labels_go_to_the_prs_own_repo(monkeypatch):
+    seen = []
+    monkeypatch.setattr(F, 'label_write', lambda n, op, names, repo=F.REPO: seen.append((n, op, names, repo)))
+    assert board.REAL_MAKE_DRAFT(9, 'o/b', lambda argv: None) is True
+    assert seen == [(9, 'remove', [F.MERGE_READY], 'o/b'), (9, 'remove', [F.PRE_MERGING], 'o/b')]
+
+
+def test_the_labels_go_also_when_the_draft_conversion_fails():
+    def boom(argv):
+        raise RuntimeError('gh down')
+    assert board.REAL_MAKE_DRAFT(528, PLATFORM, boom) is False
+    assert [w[2] for w in F.LABELS_WRITTEN] == [[F.MERGE_READY], [F.PRE_MERGING]]
+
+
+def test_a_label_the_pr_does_not_carry_is_not_an_error(monkeypatch):
+    monkeypatch.setattr(F, 'label_write', lambda n, op, names, repo=F.REPO: "HTTP 404: Label does not exist")
+    assert board.REAL_MAKE_DRAFT(528, PLATFORM, lambda argv: None) is True
+    monkeypatch.setattr(F, 'label_write', lambda n, op, names, repo=F.REPO: "'merge-ready' not found")
+    assert board.REAL_MAKE_DRAFT(528, PLATFORM, lambda argv: None) is True
+
+
+def test_a_failed_label_removal_is_logged_and_never_raises(monkeypatch):
+    from tangentswarm import eventdb
+    logged = []
+    monkeypatch.setattr(eventdb, 'log_event', lambda kind, **kw: logged.append((kind, kw)))
+    monkeypatch.setattr(F, 'label_write', lambda n, op, names, repo=F.REPO: 'HTTP 502')
+    assert board.REAL_MAKE_DRAFT(528, PLATFORM, lambda argv: None) is False
+    drop = [kw for kind, kw in logged if kw.get('action') == 'drop-labels']
+    assert len(drop) == 1 and 'merge-ready: HTTP 502' in drop[0]['error'] and 'pre-merging' in drop[0]['error']
+
+    def raises(n, op, names, repo=F.REPO):
+        raise OSError('no minbot')
+    monkeypatch.setattr(F, 'label_write', raises)
+    assert board.REAL_MAKE_DRAFT(528, PLATFORM, lambda argv: None) is False
+
+
+def test_no_repo_means_no_label_write():
+    assert board.REAL_MAKE_DRAFT(528, None, lambda argv: None) is False
+    assert F.LABELS_WRITTEN == []
+
+
+def test_the_webhook_reject_drafts_through_make_draft(monkeypatch):
+    """The #528 path: webhook draft() goes through board.make_draft, so it drops the labels."""
+    from tangentswarm import webhook as W
+    monkeypatch.setattr(board, 'make_draft', board.REAL_MAKE_DRAFT)
+    calls = []
+    x = W.Executor(g=_gate(), sh=calls.append)
+    x.draft(528)
+    assert x.done == ['#528 is a draft']
+    assert calls == [['gh', 'pr', 'ready', '528', '-R', x.repo, '--undo']]
+    assert F.LABELS_WRITTEN == [(528, 'remove', [F.MERGE_READY]), (528, 'remove', [F.PRE_MERGING])]
+
+
 # -- the movers ---------------------------------------------------------------------------
 
 def _no_gh_move(monkeypatch):

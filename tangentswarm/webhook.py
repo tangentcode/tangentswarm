@@ -874,10 +874,8 @@ class Executor:
         """Remove merge-ready and pre-merging from a PR merged to main (tangentswarm #65), and
         its pre-merge record. A label the PR does not carry is not an error."""
         from . import flow
-        for name in (flow.MERGE_READY, flow.PRE_MERGING):
-            err = flow.label_write(n, 'remove', [name])
-            if err and 'not found' not in err.lower() and '404' not in err:
-                self.note(f"#{n}: label remove {name}: {err}")
+        for err in flow.drop_premerge_labels(n):
+            self.note(f"#{n}: label remove {err}")
         flow.set_premerge(n, None)  # under the pre-merge lock (Codex on PR #66)
 
     def delete_vn(self, n, branch):

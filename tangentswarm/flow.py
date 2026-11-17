@@ -169,11 +169,22 @@ def set_premerge(n, rec, only_if=None):
         return True
 
 
-def label_write(n, op, names):
-    """minbot label add|remove N NAMES on the platform repo. Returns None, or the error."""
+def label_write(n, op, names, repo=REPO):
+    """minbot label add|remove N NAMES on repo (default: the platform repo). Returns None, or the error."""
     from .labels import MINBOT
-    r = proc.sh(MINBOT, '--apply', 'label', op, str(n), *names, '--repo', REPO, check=False, who='swarm-flow')
+    r = proc.sh(MINBOT, '--apply', 'label', op, str(n), *names, '--repo', repo, check=False, who='swarm-flow')
     return None if r.returncode == 0 else ((r.stderr or r.stdout or '').strip()[:200] or f'rc={r.returncode}')
+
+
+def drop_premerge_labels(n, repo=REPO):
+    """Remove merge-ready and pre-merging from PR n of repo, one write each. A label the PR
+    does not carry is not an error. Returns the errors, as 'name: error' lines."""
+    errs = []
+    for name in (MERGE_READY, PRE_MERGING):
+        err = label_write(n, 'remove', [name], repo=repo)
+        if err and 'not found' not in err.lower() and '404' not in err:
+            errs.append(f"{name}: {err}")
+    return errs
 RELAY_DIR = Path(os.environ.get('SWARM_RELAY_DIR', '/tmp'))  # relay-<N>-<kind>.md for swarm-resume
 
 
