@@ -10,7 +10,7 @@ from test_webhook import Fake, codex_pr
 def test_every_round_is_posted_and_logged_with_no_cap():
     calls, st = [], tick.State(tick.STATE_DIR / 'state.json')
     for k in range(1, 13):
-        assert CR.request(7, f'{k:040d}', 'test', sh=calls.append, state=st) == k
+        assert CR.ask(7, f'{k:040d}', 'test', {}, sh=calls.append, state=st)['round'] == k
     assert len(calls) == 12 and calls[0] == ['gh', 'pr', 'comment', '7', '-R', CR.REPO, '--body', '@codex review']
     assert st.done(f"codex-request:7@{12:040d}")
     rows = CR.rounds(7)
@@ -19,10 +19,10 @@ def test_every_round_is_posted_and_logged_with_no_cap():
 
 def test_the_report_lists_the_prs_with_most_rounds_and_what_round_1_missed():
     sh = lambda argv: None  # noqa: E731
-    CR.request(5, 'a' * 40, 't', sh=sh)
+    CR.ask(5, 'a' * 40, 't', {}, sh=sh)
     CR.result(5, 'a' * 40, 'clean', 'Codex clean')
     for h in ('b', 'c', 'd'):
-        CR.request(6, h * 40, 't', sh=sh)
+        CR.ask(6, h * 40, 't', {}, sh=sh)
     CR.result(6, 'b' * 40, 'findings', '2 open Codex thread(s)')
     CR.result(6, 'c' * 40, 'findings', '1 open Codex thread(s)')
     CR.result(6, 'd' * 40, 'clean', 'Codex clean')

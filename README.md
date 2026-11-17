@@ -1053,6 +1053,13 @@ question goes on the ticket, the card to Needs Input, the Claude closes); Michal
 back to In Progress resumes it with his answer. Every `@codex review` round is logged to
 the events DB, with no cap.
 
+One code path posts `@codex review`: `codexrounds.ask()` (tangentswarm #63). The tick, the
+Stop hook, the worker MCP and the webhook all call it. It holds an interprocess lock and
+posts at most one ask per (repo, PR, head SHA). It skips a head that Codex already answered
+or is reviewing, and a head with a pending ask younger than `SWARM_CODEX_ASK_WAIT` (1800 s).
+It asks again only after a Codex "Something went wrong" reply or that timeout. A re-ask is
+a `codex-retry` row in the events DB, not a new round.
+
 MethBot gets exactly two events (tangentswarm #19, Michal 2026-11-16), and only for the
 Project 6 repos (`tangentcode/tangentswarm`, `tangentcode/methodology`): one POST to the URL
 in `~/.config/tangentswarm/methbot-alert-url` with the bearer key in `methbot-alert-key`.

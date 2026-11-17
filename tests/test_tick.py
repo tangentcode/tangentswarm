@@ -217,12 +217,13 @@ def test_a_codex_review_of_the_head_with_no_open_inline_thread_is_clean():
     assert tick.codex_status(pr(reviews=[review], threads=still))[0] == 'findings'
 
 
-def test_codex_requested_only_after_head():
+def test_codex_asks_count_only_after_head():
     before = {'author': {'login': 'tangentstorm'}, 'body': '@codex review', 'createdAt': '2026-11-11T09:00:00Z'}
     after = dict(before, createdAt='2026-11-11T11:00:00Z')
     bot = dict(after, author={'login': 'minbot[bot]'})
-    assert not tick.codex_requested(pr(comments=[before, bot]))
-    assert tick.codex_requested(pr(comments=[before, after]))
+    from tangentswarm import codexrounds  # tangentswarm #63: the one reader of earlier asks
+    assert not codexrounds.asks_on_github(pr(comments=[before, bot]))
+    assert codexrounds.asks_on_github(pr(comments=[before, after]))
 
 
 def test_gate_reasons_skip_running_ci_and_report_the_rest():
