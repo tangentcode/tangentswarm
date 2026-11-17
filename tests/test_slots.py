@@ -496,3 +496,52 @@ def test_a_revive_is_one_events_row(wt):
                  host=host, claudes=[claude(1, wt, 'b7', 's7')])
     (r,) = eventdb.store().rows("source='slots'")
     assert r['event'] == 'feedback' and r['action'] == 'done' and r['pr'] == 7
+
+
+# -- tangentswarm #99: the live Claude of a Project 6 PR ------------------------------------
+
+def test_project6_repo_names_only_worker_worktrees(tmp_path, monkeypatch):
+    ver = tmp_path / 'ver'
+    monkeypatch.setattr(slots, 'WORKTREE_PARENT', ver)
+    assert slots.project6_repo(ver / 'tangentswarm.a') == 'tangentcode/tangentswarm'
+    assert slots.project6_repo(ver / 'methodology.b') == 'tangentcode/methodology'
+    assert slots.project6_repo(ver / 'tangentswarm') is None and slots.project6_repo(ver / 'platform.a') is None
+    assert slots.project6_repo(tmp_path / 'tangentswarm.a') is None and slots.project6_repo(None) is None
+
+
+def test_p6_worker_finds_the_one_live_claude_on_the_branch(tmp_path, monkeypatch):
+    ver = tmp_path / 'ver'
+    monkeypatch.setattr(slots, 'WORKTREE_PARENT', ver)
+    session(tmp_path, 21, ver / 'tangentswarm.a', 's-a', tmux='agents:@3.%30')
+    session(tmp_path, 22, ver / 'methodology.a', 's-m', tmux='agents:@4.%40')   # another repo, same branch
+    session(tmp_path, 23, ver / 'platform.a', 's-p', tmux='agents:@5.%50')      # a platform worker
+    session(tmp_path, 24, ver / 'tangentswarm.b', 's-b', tmux='agents:@6.%60')  # dead
+    kw = dict(alive=lambda pid: pid != 24, branch_of=lambda cwd: Path(cwd).name.split('.', 1)[1])
+    c, why = slots.p6_worker('tangentcode/tangentswarm', 'a', **kw)
+    assert why is None and (c['pid'], c['pane']) == (21, '%30')
+    c, why = slots.p6_worker('tangentcode/methodology', 'a', **kw)
+    assert (c['pid'], c['pane']) == (22, '%40')
+    assert slots.p6_worker('tangentcode/tangentswarm', 'b', **kw) == (
+        None, 'no live Claude in a tangentcode/tangentswarm worktree on branch b')
+    assert slots.p6_worker('tangentcode/tangentswarm', '', **kw)[1] == 'the PR head branch is unknown'
+
+
+def test_p6_worker_refuses_no_pane_and_two_claudes():
+    one = dict(cwd='/v/tangentswarm.a', branch='a', pane='')
+    assert 'has no agents pane' in slots.p6_worker('r', 'a', claudes=[one])[1]
+    two = [dict(one, pane='%1'), dict(cwd='/v/tangentswarm.b', branch='a', pane='%2')]
+    assert slots.p6_worker('r', 'a', claudes=two)[1].startswith('2 live Claudes on branch a')
+
+
+def test_tell_p6_sends_one_line_and_reports_a_failed_send():
+    c = [dict(cwd='/v/tangentswarm.a', branch='a', pane='%7')]
+    told = []
+    ok, note = slots.tell_p6('tangentcode/tangentswarm', 9, 'a', 'fix\nthis', claudes=c,
+                             tell=lambda pane, text: told.append((pane, text)))
+    assert ok and told == [('%7', 'fix this')] and 'tangentcode/tangentswarm#9' in note
+
+    def boom(pane, text):
+        raise RuntimeError('busy')
+    ok, note = slots.tell_p6('tangentcode/tangentswarm', 9, 'a', 'x', claudes=c, tell=boom)
+    assert not ok and 'not sent: RuntimeError: busy' in note
+    assert slots.tell_p6('r', 9, 'a', '  ', claudes=c, tell=boom) == (False, 'refused: the feedback is empty')

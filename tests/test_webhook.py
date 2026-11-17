@@ -665,3 +665,101 @@ def test_a_dry_run_never_drafts():
     ex.dry = True
     ex.draft(541)
     assert board.DRAFTED == []
+
+
+# -- tangentswarm #99: Codex findings on Project 6 relay to the PR's live worker ------------
+
+class FakeHost:
+    def __init__(self, fail=None):
+        self.told, self.fail = [], fail
+
+    def tell(self, pane, text):
+        if self.fail:
+            raise self.fail
+        self.told.append((pane, text))
+
+
+def p6_fake(monkeypatch, tmp_path, repo, col=board.AUTO_REVIEW, live=True, branch='fix-x', host=None):
+    """A real to_worker (no give) on a Project 6 PR; the Claude sessions and tmux are fakes."""
+    from tangentswarm import slots
+    ver = tmp_path / 'ver'
+    monkeypatch.setattr(slots, 'WORKTREE_PARENT', ver)
+    monkeypatch.setattr(slots, '_branch_of', lambda cwd: 'fix-x')
+    monkeypatch.setattr(slots, '_alive', lambda pid: True)
+    host = host or FakeHost()
+    monkeypatch.setattr(slots, 'parking', lambda: object())
+    monkeypatch.setattr(slots, 'make_host', lambda sp: host)
+    if live:
+        slots.SESSIONS.mkdir(parents=True, exist_ok=True)
+        wt = ver / (repo.split('/')[1] + '.fix-x')
+        (slots.SESSIONS / '41.json').write_text(json.dumps(dict(pid=41, sessionId='s', cwd=str(wt),
+                                                                tmux='agents:@5.%55', status='idle')))
+    ex = Fake(col=col, full=dict(codex_pr(findings=True), headRefName=branch, state='OPEN'))
+    ex.give = None
+    return ex, host
+
+
+@pytest.mark.parametrize('repo', P6)
+def test_codex_findings_on_project_6_reach_the_live_worker(monkeypatch, tmp_path, repo):
+    ex, host = p6_fake(monkeypatch, tmp_path, repo)
+    ex.run(W.Action('codex', 73, args={'repo': repo}))
+    assert ex.errors == [] and ex.wakes == []
+    assert [p for p, _ in host.told] == ['%55']
+    text = host.told[0][1]
+    assert 'Codex found issues' in text and 'ROOT-CAUSE RULE' in text
+    assert 'follow your brief for the Codex threads' in text and 'do not touch the Codex threads' not in text
+    assert any('-> In Progress' in d for d in ex.done) and board.DRAFTED == [(73, repo)]
+    assert any(f'sent to the live Claude of {repo}#73' in d for d in ex.done)
+
+
+@pytest.mark.parametrize('repo', P6)
+@pytest.mark.parametrize('live, branch, host', [
+    (False, 'fix-x', None),                                  # no live Claude
+    (True, 'other-branch', None),                            # a live Claude on another branch
+    (True, 'fix-x', FakeHost(fail=RuntimeError('never reached an empty prompt'))),  # the send failed
+])
+def test_codex_findings_on_project_6_with_no_live_worker_never_wake(monkeypatch, tmp_path, repo, live, branch, host):
+    ex, host = p6_fake(monkeypatch, tmp_path, repo, col=board.READY, live=live, branch=branch, host=host)
+    ex.run(W.Action('codex', 73, args={'repo': repo}))
+    ex.run(W.Action('codex', 73, args={'repo': repo}))
+    assert ex.wakes == [] and ex.errors == [] and host.told == []
+    assert ex.calls == [] and board.DRAFTED == []  # never demoted with no worker
+    logged = [d for d in ex.done if 'logged only, no swarmbot wake' in d]
+    assert len(logged) == 1 and logged[0].startswith(f'{repo}#73: Codex findings')  # one line, deduped
+    assert any(d.startswith('already logged') for d in ex.done)
+    lines = [json.loads(l) for l in W.LOG.read_text().splitlines()]
+    assert [r['decision'] for r in lines].count('logged-no-wake') == 1
+    assert not any(r['decision'] == 'wake' for r in lines)
+
+
+def test_the_no_wake_log_is_per_repo_and_pr(monkeypatch, tmp_path):
+    ex, _ = p6_fake(monkeypatch, tmp_path, P6[0], live=False)
+    for repo, n in ((P6[0], 73), (P6[1], 73), (P6[0], 74)):
+        ex.run(W.Action('codex', n, args={'repo': repo}))
+    assert len([d for d in ex.done if 'logged only' in d]) == 3 and ex.wakes == []
+
+
+def test_a_project_6_ci_failure_with_no_live_worker_still_wakes(monkeypatch, tmp_path):
+    """Only Codex findings are logged only (#99); the other relays keep their wake."""
+    from tangentswarm import advance
+    monkeypatch.setattr(advance, 'check_runs', lambda sha, repo=None: [{'name': 't', 'status': 'completed',
+                                                                         'conclusion': 'failure'}])
+    ex, _ = p6_fake(monkeypatch, tmp_path, P6[0], live=False)
+    ex.run(W.Action('ci', 73, args={'repo': P6[0], 'sha': 'a' * 40}))
+    assert len(ex.wakes) == 1 and 'no live Claude' in ex.wakes[0]['why']
+
+
+def test_codex_findings_on_platform_with_no_worker_still_wake():
+    ex = Fake(col=board.READY, full=codex_pr(findings=True), worker=False)
+    ex.run(W.Action('codex', 541, args={'repo': W.REPO}))
+    assert len(ex.wakes) == 1 and not any('logged only' in d for d in ex.done)
+    assert 'do not touch the Codex threads' in ex.relays[0][1]
+
+
+@pytest.mark.parametrize('repo', P6)
+def test_a_codex_comment_on_project_6_classifies_as_codex_not_log_only(repo):
+    acts = W.classify('issue_comment', comment(repo, "P1: bad thing", user=CODEX))
+    assert [(a.kind, a.pr, a.args['repo']) for a in acts] == [('codex', 73, repo)]
+    review = {'action': 'submitted', 'repository': {'full_name': repo}, 'pull_request': pr(73),
+              'review': {'user': CODEX, 'body': 'P1', 'commit_id': 'a' * 40}}
+    assert [(a.kind, a.args['repo']) for a in W.classify('pull_request_review', review)] == [('codex', repo)]
