@@ -156,6 +156,21 @@ def _state_time(state, key):
     return t if t is not None else 0.0  # a key with no readable time is an old ask
 
 
+def _merge_once_keys(state):
+    """Add the once-keys on disk to state's in-memory keys. Only the 'done' keys: the
+    caller's other unsaved state (the tick's screen hashes) is kept as it is."""
+    data, path = getattr(state, 'data', None), getattr(state, 'path', None)
+    if not isinstance(data, dict) or path is None:
+        return
+    try:
+        disk = json.loads(path.read_text()).get('done') or {}
+    except (OSError, ValueError, AttributeError):
+        return
+    mine = data.setdefault('done', {})
+    for k, v in disk.items():
+        mine.setdefault(k, v)
+
+
 class _lock:
     """The interprocess lock around one decide-post-record (all posters share it)."""
 
@@ -187,10 +202,7 @@ def ask(n, head, by, full, repo=REPO, sh=None, state=None, store=None, now=None,
     with _lock():
         now = time.time() if now is None else now
         key = once_key(n, head, repo)
-        try:
-            state.data = tick.State(state.path).data  # another process may have asked meanwhile
-        except Exception:
-            pass
+        _merge_once_keys(state)  # another process may have asked meanwhile
         logged = asks_logged(n, head, repo, store)
         t = None if logged else _state_time(state, key)  # the key alone: an ask before #63
         times = logged + asks_on_github(full) + ([t] if t is not None else [])

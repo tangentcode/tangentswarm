@@ -187,3 +187,15 @@ def test_a_pending_codex_comment_with_no_earlier_ask_posts_nothing():
     ex = Fake(col=board.AUTO_REVIEW, full=full())
     ex.run(W.Action('codex', 9, 'Codex comment (summary or receipt)'))
     assert not any('@codex review' in c for c in ex.calls)
+
+
+def test_the_once_key_refresh_keeps_the_callers_unsaved_state():
+    """Codex on PR #92: the refresh replaced the tick's whole state and lost its unsaved
+    screen hashes. Only the once-keys on disk are merged in."""
+    st = tick.State(tick.STATE_DIR / 'state.json')
+    other = tick.State(tick.STATE_DIR / 'state.json')
+    other.mark(CR.once_key(7, H))  # another process asked for this head
+    st.data['screens']['pane-1'] = 'unsaved-hash'
+    res, calls = ask(state=st)
+    assert not res['posted'] and calls == []
+    assert st.data['screens'] == {'pane-1': 'unsaved-hash'} and st.done(CR.once_key(7, H))
