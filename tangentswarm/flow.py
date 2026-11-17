@@ -61,8 +61,10 @@ STAGING_MIN = int(os.environ.get('SWARM_STAGING_MIN', str(STAGING_TARGET)))
 STAGING_MAX = int(os.environ.get('SWARM_STAGING_MAX', '5'))
 PULL_TIMEOUT = int(os.environ.get('SWARM_PULL_TIMEOUT', str(90 * 60)))
 WORK = 'work'
-# tangentswarm #65 (Michal 2026-11-16 3:22 PM ET): pre-merge the top Ready PRs onto future main
-PREMERGE_AHEAD = int(os.environ.get('SWARM_PREMERGE_AHEAD', '2'))
+# tangentswarm #65 (Michal 2026-11-16 3:22 PM ET): pre-merge the top Ready PRs onto future main.
+# tangentswarm #111 (Michal 2026-11-17 10:45 AM ET): only the top one. Nothing else in Ready is
+# checked; a PR is pre-merged when it becomes the top.
+PREMERGE_AHEAD = int(os.environ.get('SWARM_PREMERGE_AHEAD', '1'))
 PRE_MERGING, MERGE_READY = 'pre-merging', 'merge-ready'
 # hr-gate rows that mean "wait", not "fail", while a pull is running.
 WAIT_ROWS = ('5 ', '6 ', '7a', '7b')
@@ -381,6 +383,48 @@ def conflict_files(scratch, a, b):
         return []
     lines = [l.strip() for l in (r.stdout or '').splitlines()[1:] if l.strip()]
     return sorted(set(lines))
+
+
+def merge_rows(run, base, top):
+    """[(commit, first parent, second parent)] of each first-parent commit in base..top,
+    oldest first; None if base is not an ancestor of top or a commit there is not a
+    two-parent merge. run: a git runner (run(*args, check=False))."""
+    if run('merge-base', '--is-ancestor', base, top, check=False).returncode != 0:
+        return None
+    r = run('rev-list', '--first-parent', '--parents', f'{base}..{top}', check=False)
+    if r.returncode != 0:
+        return None
+    rows = [line.split() for line in (r.stdout or '').splitlines() if line.strip()]
+    return None if any(len(row) != 3 for row in rows) else rows[::-1]
+
+
+def built_from_heads(run, tip, head, base_main, heads):
+    """Codex on PR #68: True if the pre-merged tip is the merge of future main and the PR
+    head (second parent: the head), and that future main is base_main plus one merge per
+    queued head, in queue order (second parent: that head, never a resolved -vN tip).
+    Then the head itself merged cleanly onto main + the queued heads."""
+    r = run('rev-list', '--parents', '-n', '1', tip, check=False)
+    row = (r.stdout or '').split() if r.returncode == 0 else []
+    if len(row) != 3 or row[2] != head:
+        return False
+    rows = merge_rows(run, base_main, row[1])
+    return (rows is not None and len(rows) == len(heads)
+            and all(x[2].startswith(h) for x, h in zip(rows, heads)))
+
+
+def merged_onto(run, main, base_main, heads):
+    """True if main is base_main plus one merge commit per head (first parent: the main
+    before it; second parent: that head), in any order, and nothing else."""
+    rows = merge_rows(run, base_main, main)
+    if rows is None:
+        return False
+    left = list(heads)
+    for row in rows:
+        hit = next((h for h in left if row[2].startswith(h)), None)
+        if hit is None:
+            return False
+        left.remove(hit)
+    return not left
 
 
 def stack_conflict(scratch, main, bases, head):
@@ -769,6 +813,33 @@ class Flow:
             return None
         return tip if self.onto(scratch, base, tip, 'probe') is not None else None
 
+    def assumed(self, scratch, rec, key, head):
+        """tangentswarm #111 (Michal 2026-11-17 10:45 AM ET): the tip of rec when future main
+        changed only in a way the tip already assumed: some PRs it was built on (the first
+        ones in its base) merged into main as their heads, and the rest of the queue ahead of
+        it is the same. Then the tip needs no probe merge, no new -vN and no record write.
+        Only a mechanical pre-merge counts (no seed: the tip is future main + the head), and
+        its future main must be main + one merge per queued head (built_from_heads), so the
+        new main holds exactly what the tip holds. Else None (kept_tip or a new -vN)."""
+        if not (rec and rec.get('status') == 'ready' and rec.get('head') == head and rec.get('tip')
+                and rec.get('vbranch') and not rec.get('seed') and isinstance(rec.get('base'), str)):
+            return None
+        old_main, *old = rec['base'].split() or ['']
+        new_main, *new = key.split() or ['']
+        cut = len(old) - len(new)
+        gone = old[:cut]
+        if cut < 1 or old[cut:] != new or any(x in new for x in gone):
+            return None
+        run = lambda *a, check=False: git(scratch, *a, check=check)  # noqa: E731
+        try:
+            if not built_from_heads(run, rec['tip'], head, old_main, [x.split('@', 1)[-1] for x in old]):
+                return None
+            if not merged_onto(run, self.sha_of(scratch, new_main), old_main, [x.split('@', 1)[-1] for x in gone]):
+                return None
+        except RuntimeError:
+            return None
+        return rec['tip']
+
     def premerge(self, cols, scratch):
         """Every cascade pass: keep the top PREMERGE_AHEAD Ready PRs pre-merged onto future
         main (premerge_one); every Staging and Human Review PR carries merge-ready; a PR sent
@@ -837,6 +908,11 @@ class Flow:
             self.vn_worker(p, rec)
             self._premerged[n] = None
             return None
+        held = self.assumed(scratch, rec, key, head)
+        if held:  # tangentswarm #111: only PRs it was built on merged: no probe, no write
+            self.set_labels(p, MERGE_READY)
+            self._premerged[n] = held
+            return held
         kept = self.kept_tip(scratch, rec, key, base, head)
         if kept:  # tangentswarm #69: no new -vN for a tip that still merges onto future main
             if rec.get('checked') != key:

@@ -272,7 +272,10 @@ class Promoter:
     def cascade_due(self, cols, main_moved, now=None):
         """Why to queue `swarm-advance --cascade` now, or None (Michal 2026-11-14 9:10 PM ET):
         Human Review dropped to 0 (at once), it stays at 0 (again after CASCADE_EMPTY_HR s), or
-        main moved (the cascade checks each Ready PR against the new main)."""
+        main moved (the cascade checks only the TOP Ready PR; tangentswarm #111: a merge of a
+        PR its pre-merge was built on keeps that pre-merge, and the rest of Ready is not
+        re-checked). There is no rule that Human Review must be empty: a promote fills each
+        free slot, and each promote queues the cascade that pulls the next Ready PR."""
         now = time.time() if now is None else now
         hr = len(cols.get(board.HUMAN_REVIEW, []))
         prev, self.last_hr = self.last_hr, hr
@@ -621,44 +624,20 @@ class Promoter:
 
     @staticmethod
     def merge_rows(scratch, base, top):
-        """[(commit, first parent, second parent)] of each first-parent commit in base..top,
-        oldest first; None if base is not an ancestor of top or a commit there is not a
-        two-parent merge."""
-        if scratch.git('merge-base', '--is-ancestor', base, top, check=False).returncode != 0:
-            return None
-        r = scratch.git('rev-list', '--first-parent', '--parents', f'{base}..{top}', check=False)
-        if r.returncode != 0:
-            return None
-        rows = [line.split() for line in (r.stdout or '').splitlines() if line.strip()]
-        return None if any(len(row) != 3 for row in rows) else rows[::-1]
+        """flow.merge_rows on the scratch repo (tangentswarm #111: shared with Flow.assumed)."""
+        from . import flow
+        return flow.merge_rows(scratch.git, base, top)
 
     def built_from_heads(self, scratch, tip, head, base_main, heads):
-        """Codex on PR #68: True if the pre-merged tip is the merge of future main and the PR
-        head (second parent: the head), and that future main is base_main plus one merge per
-        queued head, in queue order (second parent: that head, never a resolved -vN tip).
-        Then the head itself merged cleanly onto main + the queued heads."""
+        """flow.built_from_heads on the scratch repo (Codex on PR #68)."""
+        from . import flow
         scratch.ensure(tip)
-        r = scratch.git('rev-list', '--parents', '-n', '1', tip, check=False)
-        row = (r.stdout or '').split() if r.returncode == 0 else []
-        if len(row) != 3 or row[2] != head:
-            return False
-        rows = self.merge_rows(scratch, base_main, row[1])
-        return (rows is not None and len(rows) == len(heads)
-                and all(r[2].startswith(h) for r, h in zip(rows, heads)))
+        return flow.built_from_heads(scratch.git, tip, head, base_main, heads)
 
     def merged_onto(self, scratch, main, base_main, heads):
-        """True if main is base_main plus one merge commit per head (first parent: the main
-        before it; second parent: that head), in any order, and nothing else."""
-        rows = self.merge_rows(scratch, base_main, main)
-        if rows is None:
-            return False
-        left = list(heads)
-        for row in rows:
-            hit = next((h for h in left if row[2].startswith(h)), None)
-            if hit is None:
-                return False
-            left.remove(hit)
-        return not left
+        """flow.merged_onto on the scratch repo."""
+        from . import flow
+        return flow.merged_onto(scratch.git, main, base_main, heads)
 
     def fill(self, cols):
         """(latest board, moved PRs, Human Review slots in use) after the fast path, when

@@ -507,6 +507,10 @@ class Cascade(Advance):
                    that order) as a new <branch>-vN (Flow.premerge, tangentswarm #65): a
                    clean one gets the label merge-ready; a real conflict gets pre-merging
                    and a worker resolves it on the -vN only (never on the PR branch).
+                   tangentswarm #111: only the TOP Ready PR (not in a pull) is
+                   pre-merged and checked against main; the rest of Ready is never re-checked.
+                   A pre-merge whose queue ahead only lost PRs that merged into main as
+                   their heads is kept as is (Flow.assumed: no probe, no write).
                    (C) While Staging + pulls in flight is below FLOOR (the WIP target,
                    default 2; --floor, SWARM_STAGING_FLOOR or SWARM_STAGING_TARGET), the
                    Ready PRs are pulled in strict pick order, up to the target, as their
@@ -683,20 +687,25 @@ class Cascade(Advance):
 
     # -- rework: Ready PRs that cannot be pulled (Michal 2026-11-14 9:10 PM ET deadlock) ------
     def main_check(self, cols):
-        """(1) Each Ready PR against origin/main with git merge-tree (local, kept per SHA pair:
-        no GraphQL). A conflict: card to In Progress and a rework relay that lists the files.
-        Returns cols without those PRs in Ready."""
-        ready = [p for p in cols.get(board.READY, []) if not p.get('draft')]
+        """(1) The TOP Ready PR (the shared pick order, not in a pull) against origin/main with
+        git merge-tree (local, kept per SHA pair: no GraphQL). A conflict: card to In Progress
+        and a rework relay that lists the files; then the next one is the top and is checked.
+        The check stops at the first clean PR. tangentswarm #111 (Michal 2026-11-17 10:45 AM
+        ET): nothing else in Ready is checked, so a merge never touches the other Ready PRs'
+        labels, branches or columns. Returns cols without the PRs sent to rework."""
+        from . import flow
+        flying = {d['pr'] for d in flow.load_pulls()}
+        ready = [p for p in cols.get(board.READY, []) if not p.get('draft') and p['number'] not in flying]
         if not ready:
             return cols
         bad = []
         with self.g['ScratchRepo']() as scratch:
             scratch.ensure_main()
             main = self.f.sha_of(scratch, scratch.main)
-            scratch.ensure(*[p['head'] for p in ready])
-            for p in ready:
+            for p in flow.ready_order(ready):
+                scratch.ensure(p['head'])
                 if self.f.clean(scratch, main, p['head']):
-                    continue
+                    break
                 self.rework(p, [('origin/main', self.f.files(scratch, main, p['head']))])
                 bad.append(p['number'])
         self.f.cmap.save()
