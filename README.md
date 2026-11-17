@@ -1089,7 +1089,9 @@ tangentswarm from: the first sys.path entry (the working directory for `python -
 script directory), then PYTHONPATH. That must be flow-live. A WorkingDirectory or an
 ExecStart path in another tangentswarm checkout also fails. When the unit runs, its process
 is checked the same way, with the cwd and environment from `/proc`. A disabled unit that is
-not active is skipped. It exits 1 and names each bad unit; it exits 2 when it cannot read
+not active is skipped. A running template instance (`swarm@x.service`) or transient unit
+has no unit file of its own; it is found with `systemctl --user list-units` and checked while
+it runs. It exits 1 and names each bad unit; it exits 2 when it cannot read
 systemd.
 
 ```sh

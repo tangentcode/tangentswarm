@@ -19,7 +19,9 @@ when its WorkingDirectory, or a path in ExecStart, is inside a tangentswarm chec
 not flow-live. When the unit runs, its process is checked the same way, with the cwd and
 PYTHONPATH from /proc (a drop-in that is not restarted yet shows there).
 
-A disabled unit that is not active is skipped. Template units (name@.service) are skipped.
+A disabled unit that is not active is skipped. Template units (name@.service) are skipped,
+but their running instances (name@x.service) are checked: the units in memory (list-units)
+are added to the unit files, so a running instance or transient unit is not missed.
 
     swarm-unit-check          print one line per unit; exit 1 if any unit fails
     swarm-unit-check --json   the results as JSON
@@ -64,13 +66,23 @@ def _norm(p):
 # -- reading systemd --------------------------------------------------------------------------
 
 def unit_files(run=systemctl):
-    """[(unit, state)] of the swarm*.service unit files."""
+    """[(unit, state)] of the swarm*.service unit files, then the swarm*.service units in
+    memory that have no file row (Codex on PR #80): a running template instance
+    (swarm@x.service; only swarm@.service has a file), a transient unit, or a unit whose
+    file is gone. Their state is None; check() reads it with show."""
     out = run('list-unit-files', '--type=service', '--no-legend', '--plain', '--no-pager', PATTERN)
-    rows = []
+    rows, seen = [], set()
     for line in out.splitlines():
         parts = line.split()
         if len(parts) >= 2 and parts[0].endswith('.service'):
             rows.append((parts[0], parts[1]))
+            seen.add(parts[0])
+    out = run('list-units', '--type=service', '--all', '--no-legend', '--plain', '--no-pager', PATTERN)
+    for line in out.splitlines():
+        parts = line.split()
+        if parts and parts[0].endswith('.service') and parts[0] not in seen:
+            rows.append((parts[0], None))
+            seen.add(parts[0])
     return rows
 
 
@@ -244,7 +256,9 @@ def check(run=systemctl, live=None, has=has_pkg, proc=Path('/proc'), units=None)
         props = show(unit, run)
         if units is None:
             st = props.get('UnitFileState') or state or ''
-            if st in SKIP_STATES and props.get('ActiveState') not in ('active', 'activating', 'reloading'):
+            running = props.get('ActiveState') in ('active', 'activating', 'reloading')
+            # a unit with no file row (an instance, a transient unit) counts only while it runs
+            if not running and (state is None or st in SKIP_STATES):
                 continue
         out.append(check_unit(unit, props, live, has, proc))
     return out

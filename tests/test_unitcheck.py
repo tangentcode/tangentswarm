@@ -44,8 +44,9 @@ GOOD = {
 
 
 class Systemctl:
-    def __init__(self, units):
+    def __init__(self, units, memory=None):
         self.units = units
+        self.memory = memory or {}  # units in memory with no unit file row: {name: props}
         self.calls = []
 
     def __call__(self, *args):
@@ -53,8 +54,12 @@ class Systemctl:
         if args[0] == 'list-unit-files':
             rows = [f"{u} {p['UnitFileState']} enabled" for u, p in self.units.items()]
             return '\n'.join(rows + ['swarm@.service disabled enabled']) + '\n'
+        if args[0] == 'list-units':
+            both = {**self.units, **self.memory}
+            return ''.join(f"{u} loaded {p['ActiveState']} running x\n" for u, p in both.items()
+                           if p['ActiveState'] != 'inactive' or u in self.memory)
         assert args[0] == 'show'
-        p = dict(self.units[args[1]], Id=args[1])
+        p = dict({**self.units, **self.memory}[args[1]], Id=args[1])
         return ''.join(f"{k}={p[k]}\n" for k in U.PROPS if k in p)
 
 
@@ -104,6 +109,18 @@ def test_execstart_script_inside_another_checkout_fails():
     units = {'swarm-events.service': unit(argv=f'{OLD}/bin/swarm-events --follow')}
     r = run_check(units)['swarm-events.service']
     assert any(f'ExecStart runs {OLD}/bin/swarm-events' in p for p in r['problems'])
+
+
+def test_a_running_template_instance_is_checked_and_a_dead_one_is_not():
+    """Codex on PR #80: only swarm@.service has a unit file; its instance is found in memory."""
+    mem = {'swarm@w1.service': unit(state='disabled', wd=OLD, env='', argv=f'{VENV}/python -m tangentswarm.tick'),
+           'swarm@w2.service': unit(state='disabled', active='inactive', wd=OLD, env=''),
+           'swarm-run-x.service': unit(state='transient', wd=OLD, env='')}
+    sc = Systemctl(GOOD, memory=mem)
+    res = {r['unit']: r for r in U.check(run=sc, live=LIVE, has=has)}
+    assert not res['swarm@w1.service']['ok'] and 'swarm@w2.service' not in res
+    assert not res['swarm-run-x.service']['ok']
+    assert all(r['ok'] for u, r in res.items() if u in GOOD)
 
 
 def test_a_disabled_unit_that_runs_is_checked():
