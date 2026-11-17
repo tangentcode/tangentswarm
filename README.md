@@ -927,21 +927,15 @@ brief names those things before they exist. `tangentswarm.brief.strip_brief()` d
 A PR body must not say whether the PR is merged into work, whether it is on staging, or
 which commit a site serves. That text goes stale and contradicts the board column. The
 where-to-see or "Check it on staging" section says only how to see the change. Every
-worker gets this as `gatechecks.STATUS_RULE`. Before swarm-flow or swarm-tick runs
-`hr-gate --apply`, `gatechecks.scrub_status()` removes such sentences from the live body
-(not the brief section, not code fences) and opens one incident per head. If the body
-edit fails, `--apply` waits for the next pass. A sentence with a condition or a describing
-clause before the state words ("Once merged into work, open /x", "This PR changes how code
-is deployed to staging") tells how something works and is kept. So is a bare mention of
-`.deploy-sha`; only a claim about which commit it holds is removed. The same exemption
-applies to both kinds of match. A sentence may wrap over soft line breaks: a line that goes
-on in lower case is the same sentence, and a line that starts with a capital letter, a new
-list item or a heading starts a new one. A sentence may end inside closing inline marks
-(`**Not on staging yet.**`). Code fences close only on a matching run of the same
-character, as long or longer (CommonMark), and a fence inside a blockquote counts too.
-When a cut is not clearly safe (a blockquote, a table row, an HTML line, or a sentence
-that would leave an inline mark unpaired), the text stays: the incident names it for a
-hand edit, and the PR is not held.
+worker gets this as `gatechecks.STATUS_RULE`.
+
+The swarm never edits a PR body (option A, Michal via MethBot on PR #133). Before
+swarm-flow or swarm-tick runs `hr-gate --apply`, `gatechecks.check_status()` reads the body.
+If a sentence states where the PR stands, the PR is held (a pull waits, as for
+screenshots), its worker gets one relay per head that names the sentences, and one
+incident is opened per head. The detector has no wording exemptions: a false match costs
+the worker one rewording. It reads whole sentences over soft line breaks and skips code
+fences (also inside blockquotes) and the brief section.
 
 ### swarm-launch: start a worker
 

@@ -39,8 +39,9 @@ tangentswarm #130 (Michal 2026-11-17 12:21 PM ET): a PR body never says where th
 Platform #528 sat in Human Review while its body said "Not on staging yet: work... serves
 a60245158, which does not have this branch." Merged or not into work, on staging or not, and
 the sha a site serves go stale; the board column is the one place that says them.
-status_lines() finds such sentences, body_problem() flags them, and scrub_status() (run by
-the swarm before hr-gate --apply) removes them from the live body and opens an incident.
+status_lines() finds such sentences and body_problem() flags them. Before hr-gate --apply,
+check_status() holds the PR, the swarm tells the worker to remove them, and an incident is
+opened. The swarm never edits a PR body (Michal via MethBot on PR #133, option A).
 """
 import re
 import urllib.request
@@ -139,14 +140,11 @@ def body_problem(paths, body):
 
 # tangentswarm #130: sentences that say where the PR stands. Two kinds:
 #   _STATE: deploy or merge state ("not on staging yet", "merged into work", "is live on
-#           staging"). When a condition or a describing clause comes before the match
-#           ("Once merged into work, open /x", "This PR changes how code is deployed to
-#           staging", "A branch that is merged into work is skipped"), the sentence tells
-#           how something works, not where this PR stands, so it is kept (_DESCR).
+#           staging").
 #   _SERVES: a site and the commit it serves ("work.example.com serves a6024515",
 #           ".deploy-sha is a6024515", "the .deploy-sha lacks the head"). A bare mention of
-#           the marker ("open /.deploy-sha", "how the deploy SHA is made") is not status
-#           (Codex on PR #133).
+#           the marker ("open /.deploy-sha") is not status.
+# There are no wording exemptions: a false match only costs the worker one rewording.
 _W = r'(?:origin/)?(?:work|staging)\b'
 _STATE = re.compile(
     r"\bnot\s+(?:yet\s+|currently\s+)?(?:(?:merged|deployed|live|served|pushed|landed)\s+)?(?:on|in|into|to|onto)\s+" + _W
@@ -167,191 +165,87 @@ _SERVES = re.compile(
     r"does\s+not\s+(?:have|contain|include)|doesn't\s+(?:have|contain|include))\s+"
     r"(?:the|this|my|our)\s+(?:head|branch|change|changes|pr|fix|commit)\b",
     re.I)
-_DESCR = re.compile(r'\b(?:once|after|when|whenever|if|unless|until|as\s+soon\s+as|before|how|whether|'
-                    r'that|which|who)\b', re.I)
-_BULLET = re.compile(r'^(\s*(?:[-*+]|\d+[.)])\s+|\s*)')
-_BLOCK = re.compile(r'^\s*(?:[-*+]\s|\d+[.)]\s|#)')  # a line that starts a new Markdown block
-# Lines the swarm never edits: a blockquote (it may hold a fence or someone else's words), a
-# table row and an HTML line. A cut there can break the structure (Codex on PR #133). Their
-# status sentences are still found, and reported as left.
-_VERBATIM = re.compile(r'^\s*(?:>|\||<)')
+_BLOCK = re.compile(r'^\s*(?:[-*+]\s|\d+[.)]\s|#|>|\||<)')  # a line that starts a new Markdown block
 _QUOTE = re.compile(r'^\s*(?:>\s?)+')
-# A sentence ends at . ! or ?, or at a line break before a capital letter ("Fixes #1" then a new
-# line). A line that goes on in lower case ("is deployed\nto staging") is the same sentence.
-# Closing inline marks may follow the stop: "**Not on staging yet.** Where-to-see: ..." (Codex on PR #133).
+_FENCE = re.compile(r'^\s*(?:(?:[-*+]|\d+[.)])\s+)?(`{3,}|~{3,})(.*)$')  # list items may indent it
+# A sentence ends at . ! or ? (closing inline marks may follow: "**Not on staging yet.**"), or
+# at a line break before a capital letter. A line that goes on in lower case ("is deployed\n
+# to staging") is the same sentence: Markdown renders soft line breaks as one paragraph.
 _CLOSERS = '*_~`\'")\\]'
 _SENT_END = re.compile(r'(?:(?<=[.!?])|(?<=[.!?][' + _CLOSERS + r'])|(?<=[.!?][' + _CLOSERS + r']{2})'
                        r'|(?<=[.!?][' + _CLOSERS + r']{3}))\s+(?=\S)|(?<![,;:(\-])[ \t]*\n\s*(?=[A-Z])')
-_FENCE = re.compile(r'^\s*(?:(?:[-*+]|\d+[.)])\s+)?(`{3,}|~{3,})(.*)$')  # list items may indent it
 
 
 def is_status(sentence):
-    """True when one sentence says where the PR stands (tangentswarm #130). The first match
-    of either kind decides: a condition or a describing clause before it ("once .deploy-sha
-    contains the head, open /x") makes it how-to text, which is kept (Codex on PR #133)."""
+    """True when one sentence says where the PR stands (tangentswarm #130)."""
     sentence = ' '.join(sentence.split())  # a soft line break is a space
     sentence = re.sub(r'(?<!\w)[_*~]+|[_*~]+(?!\w)', ' ', sentence)  # _Merged_ is Merged; snake_case stays
-    hits = [m for m in (_SERVES.search(sentence), _STATE.search(sentence)) if m]
-    if not hits:
-        return False
-    first = min(hits, key=lambda m: m.start())
-    return not _DESCR.search(sentence[:first.start()])
+    return bool(_SERVES.search(sentence) or _STATE.search(sentence))
 
 
-def _balanced(sentence):
-    """True when cutting this sentence out leaves every inline mark paired: an even number of
-    backticks, ** and ~~ runs, and single * marks. Else the cut could break the formatting."""
-    t = sentence.replace('**', '\0')
-    return all(x % 2 == 0 for x in (sentence.count('`'), t.count('\0'), sentence.count('~~'), t.count('*')))
-
-
-def _scrub_para(lines):
-    """(kept lines, [removed sentences], [status sentences left]) for one Markdown paragraph
-    or list item. Sentences run across soft line breaks (Codex on PR #133), so the check
-    reads the joined text; a removed sentence takes the space before it, and a line left
-    empty is dropped. A status sentence that is not _balanced() is left, not cut."""
-    lead = _BULLET.match(lines[0]).group(1)
-    text = '\n'.join([lines[0][len(lead):]] + lines[1:])
-    cuts, gone, at = [], [], 0
-    spans = []
-    for m in list(_SENT_END.finditer(text)) + [None]:
-        end = m.start() if m else len(text)
-        spans.append((at, end))
-        at = m.end() if m else at
-    left = []
-    for i, (a, b) in enumerate(spans):
-        if is_status(text[a:b]) and not _balanced(text[a:b]):
-            left.append(' '.join(text[a:b].split()))
-        elif is_status(text[a:b]):
-            gone.append(' '.join(text[a:b].split()))
-            # cut from the end of the previous sentence; the first one takes the space after it
-            cuts.append((spans[i - 1][1], b) if i else (a, spans[1][0] if len(spans) > 1 else b))
-    if not gone:
-        return lines, [], left
-    merged = []
-    for a, b in cuts:  # neighbors share a boundary; join them so nothing is cut twice
-        if merged and a <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(b, merged[-1][1]))
-        else:
-            merged.append((a, b))
-    out, at = [], 0
-    for a, b in merged:
-        out.append(text[at:a])
-        at = b
-    out.append(text[at:])
-    kept = [l for l in ''.join(out).split('\n') if l.strip()]
-    if kept:
-        kept[0] = lead + kept[0].lstrip()
-    return kept, gone, left
-
-
-def _scrub_text(text):
-    """(text without status sentences, [removed sentences], [status sentences left]). Lines in
-    code fences are kept and not read; _VERBATIM lines are kept and read."""
-    out, gone, left, fence, para = [], [], [], None, []  # fence: the open fence run, such as '````'
-
-    def flush():
-        if para:
-            kept, g, lf = _scrub_para(para)
-            out.extend(kept)
-            gone.extend(g)
-            left.extend(lf)
-            para.clear()
+def _paragraphs(text):
+    """The Markdown paragraphs and list items of text, each one string. Code fences (also
+    inside a blockquote) are not read: a fence closes only on a run of the same character,
+    as long or longer, with nothing after it (CommonMark)."""
+    paras, para, fence = [], [], None
     for line in text.split('\n'):
-        m = _FENCE.match(_QUOTE.sub('', line))  # a fence inside a blockquote is a fence too
+        m = _FENCE.match(_QUOTE.sub('', line))
         if fence is not None:
-            # Only a run of the same character, as long or longer, with nothing after it closes.
             if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip():
                 fence = None
-            out.append(line)
             continue
         if m and not (m.group(1)[0] == '`' and '`' in m.group(2)):  # a backtick info string has no backtick
-            flush()
             fence = m.group(1)
-            out.append(line)
+        elif line.strip() and not _BLOCK.match(line):
+            para.append(line)
             continue
-        if not line.strip():
-            flush()
-            out.append(line)
-            continue
-        if _VERBATIM.match(line):
-            flush()
-            out.append(line)
-            left.extend(' '.join(x.split()) for x in _SENT_END.split(line) if is_status(x))
-            continue
-        if _BLOCK.match(line):
-            flush()
-        para.append(line)
-    flush()
-    return '\n'.join(out), gone, left
+        if para:
+            paras.append('\n'.join(para))
+        para = [line] if (not m and line.strip()) else []
+    if para:
+        paras.append('\n'.join(para))
+    return paras
 
 
 def status_lines(body):
-    """The sentences of a PR body that say where the PR stands, cut or not. The brief section
-    never counts."""
+    """The sentences of a PR body that say where the PR stands. The brief section and code
+    fences never count. The swarm never edits the body (Michal via MethBot on PR #133,
+    option A): it only flags them."""
     from .brief import strip_brief
-    _, gone, left = _scrub_text(strip_brief(body))
-    return gone + left
+    return [' '.join(x.split()) for p in _paragraphs(strip_brief(body)) for x in _SENT_END.split(p) if is_status(x)]
 
 
-def _strip(body):
-    """(new body, [removed sentences], [status sentences left]). The brief section is kept."""
-    from .brief import SECTION_RE
-    body = body or ''
-    out, gone, left, at = [], [], [], 0
-    for m in list(SECTION_RE.finditer(body)) + [None]:
-        end = m.start() if m else len(body)
-        text, g, lf = _scrub_text(body[at:end])
-        out.append(text)
-        gone += g
-        left += lf
-        if m:
-            out.append(m.group(0))
-            at = m.end()
-    return ''.join(out), gone, left
+def status_text(n, found):
+    """The relay that tells PR n's worker to remove the status sentences."""
+    said = '; '.join(f'"{g[:160]}"' for g in found[:5])
+    return (f"Coordinator: #{n} is held before Human Review: its PR body says where the PR stands: {said}. "
+            f"{STATUS_RULE} Remove or reword those sentences in the PR body. Do not change code; "
+            "push nothing, edit only the PR body.")
 
 
-def strip_status(body):
-    """(new body, [removed sentences]). The brief section is kept as it is."""
-    return _strip(body)[:2]
-
-
-def scrub_status(n, body, repo, head='', dry=False, patch=None, incident=None):
-    """Remove status sentences from PR n's live body and open one incident per head.
-    Returns (ok, why): ok False only when the edit failed; the caller does not run
-    hr-gate --apply then. A status sentence the swarm cannot cut safely (a quote, a table,
-    split inline marks) stays; the incident names it, and the PR is not held for it."""
-    new, gone, left = _strip(body)
-    if not gone and not left:
+def check_status(n, body, repo, head='', dry=False, incident=None):
+    """(ok, why) for the body rule of tangentswarm #130. Not ok when the body states where
+    the PR stands: the caller holds hr-gate --apply and tells the worker. One incident per
+    head. The body is never edited."""
+    found = status_lines(body)
+    if not found:
         return True, ''
-    said = '; '.join(f'"{g[:160]}"' for g in gone[:5])
-    kept = '; '.join(f'"{g[:160]}"' for g in left[:5])
-    why = ' '.join(x for x in (f"{len(gone)} status sentence(s) from #{n}: {said}." if gone else '',
-                               f"Left {len(left)} it cannot cut safely: {kept}." if left else '') if x)
+    said = '; '.join(f'"{g[:160]}"' for g in found[:5])
+    why = f"the body states where the PR stands (tangentswarm #130): {said}"
     if dry:
-        return True, ('remove ' if gone else '') + why
-    if gone:
-        if patch is None:
-            from .brief import patch_body
-            patch = lambda num, b: patch_body(num, b, repo)  # noqa: E731
-        try:
-            patch(n, new)
-        except Exception as e:
-            return False, f"#{n} body states where the PR stands and the edit failed ({type(e).__name__}: {str(e)[:120]})"
+        return False, why
     if incident is None:
         from . import alerts
         incident = alerts.incident
     try:
         incident(f"pr-status:{repo}#{n}@{(head or '')[:12]}", f"{repo}#{n} PR body stated where the PR stands",
-                 f"The body of {repo}#{n} said: " + '; '.join(x for x in (said, kept) if x)
-                 + ". Status text goes stale and contradicts the board.",
+                 f"The body of {repo}#{n} said: {said}. Status text goes stale and contradicts the board.",
                  why="A worker wrote deploy or merge state into the PR body.",
-                 fix=("The swarm removed it from the body before hr-gate --apply. " if gone else '')
-                     + (f"Still in the body (no safe cut, edit it by hand): {kept}" if left else ''),
+                 fix="The swarm held hr-gate --apply and told the worker to remove it.",
                  prevent="Workers get STATUS_RULE: the body says only how to see the change (tangentswarm #130).")
     except Exception:
-        pass  # a failed ticket must not hold the PR
-    return True, ('removed ' if gone else '') + why
+        pass  # a failed ticket must not change the verdict
+    return False, why
 
 
 def needs_screenshots(paths, body=''):

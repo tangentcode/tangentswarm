@@ -1062,6 +1062,9 @@ class Flow:
         full = self.g['fetch'](n, refresh=True)
         rows, _ = self.g['evaluate'](full, hr_peers=self.g['list_hr_prs'](refresh=True), scratch=scratch)
         verdict, why = gate_verdict(rows)
+        held = self.status_hold(n, full, d['head']) if verdict != 'fail' else None
+        if held:  # tangentswarm #130: a body that says where the PR stands waits for its worker
+            verdict, why = 'wait', why + [held]
         age = int(self.now() - d['started'])
         shots = [w for w in why if w.startswith('7a')] if verdict == 'wait' else []
         if shots:  # Michal 2026-11-15: screenshots are a job for a worker now, not a timeout
@@ -1082,8 +1085,6 @@ class Flow:
             else:
                 self.leave(p, '; '.join(why))
             return
-        if not self.scrub_status(n, full, d['head']):
-            return
         if self.dry:
             self.change(f"#{n} hr-gate --apply {n} (every condition passes)")
             return
@@ -1098,15 +1099,29 @@ class Flow:
         if rc == 0 or moved:
             drop_pull(n)
 
-    def scrub_status(self, n, full, head):
-        """tangentswarm #130: before hr-gate --apply, remove text that says where the PR stands
-        (merged into work, on staging, the sha a site serves) from the body and open an
-        incident. False when the body still holds it (the edit failed): no --apply this pass."""
-        from .gatechecks import scrub_status
-        ok, why = scrub_status(n, (full or {}).get('body') or '', REPO, head=head, dry=self.dry)
-        if why:
-            (self.change if ok else self.note)(why)
-        return ok
+    def status_hold(self, n, full, head):
+        """tangentswarm #130 (option A, Michal via MethBot on PR #133): a body that says where
+        the PR stands (merged into work, on staging, the sha a site serves) holds hr-gate
+        --apply. Its worker gets the job to remove the text, once per head, and an incident
+        is opened. The swarm never edits the body. Returns the wait reason, or None."""
+        from . import tick
+        from .gatechecks import check_status, status_lines, status_text
+        body = (full or {}).get('body') or ''
+        ok, why = check_status(n, body, REPO, head=head, dry=self.dry)
+        if ok:
+            return None
+        state = tick.State(tick.STATE_DIR / 'state.json')
+        key = f"status-job:{n}@{head}"
+        if self.dry:
+            self.change(f"#{n} would tell its worker to remove the status text from the PR body")
+        elif not state.done(key):
+            rc, said = self.give_worker(n, status_text(n, status_lines(body)))
+            if rc == 0:
+                state.mark(key)
+                self.change(f"#{n} status-text job sent to its worker ({said})")
+            else:
+                self.note(f"STATUS_TEXT #{n}: no worker could take the job ({said})")
+        return 'body: ' + why
 
     def screenshot_job(self, n, head, full=None):
         """A UI PR without screenshots: give its worker the screenshot job now, once per

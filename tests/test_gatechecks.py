@@ -175,8 +175,11 @@ def test_the_brief_example_image_is_not_screenshot_evidence():
 
 
 # --- tangentswarm #130: the PR body never says where the PR stands -------------------
+# Option A (Michal via MethBot on PR #133): the swarm only flags it; it never edits a body.
 
 PR528 = 'Not on staging yet: work.pawntakesworld.com serves a60245158, which does not have this branch.'
+FOUR = '`' * 4
+THREE = '`' * 3
 
 
 @pytest.mark.parametrize('text', [
@@ -192,6 +195,8 @@ PR528 = 'Not on staging yet: work.pawntakesworld.com serves a60245158, which doe
     'The deploy SHA is still `0123abcd`.',
     'The .deploy-sha lacks the head.',
     'Work does not contain this branch.',
+    '**Not on staging yet.**',
+    '_Merged into work._',
 ])
 def test_status_text_is_found(text):
     assert G.is_status(text)
@@ -201,30 +206,50 @@ def test_status_text_is_found(text):
     'Check it on staging: open https://work.pawntakesworld.com/lobby and click Add.',
     'Where to see: /lobby on staging, then press Enter.',
     'Served on staging at /lobby.',
-    'Once merged into work, open /lobby.',
-    'After it is deployed to staging, click Save.',
     'This PR changes the work queue.',
     'A branch that is not merged is skipped.',
-    # Codex on PR #133: a mention of the marker, or a sentence that describes how things work
     'Where-to-see: open https://work.example.com/.deploy-sha and verify it is plain text.',
     'This PR changes how the deploy SHA is generated.',
-    'This PR changes how code is deployed to staging.',
-    'A branch that is merged into work is skipped.',
-    'The gate checks whether the PR is on staging.',
 ])
 def test_how_to_see_text_is_not_status(text):
     assert not G.is_status(text)
 
 
-def test_strip_status_keeps_bullets_fences_and_the_brief():
-    brief = '<!-- swarm-brief:start -->\nNot on staging yet.\n<!-- swarm-brief:end -->\n'
-    body = ('Fixes #1\n\n- First. Not on staging yet.\n- Merged into work.\n\n```\nserves abcdef12\n```\n'
-            'Check it on staging: open /x.\n' + brief)
-    new, gone = G.strip_status(body)
-    assert gone == ['Not on staging yet.', 'Merged into work.']
-    assert new == 'Fixes #1\n\n- First.\n\n```\nserves abcdef12\n```\nCheck it on staging: open /x.\n' + brief
-    assert G.strip_status(new) == (new, [])
-    assert G.status_lines(brief) == []
+@pytest.mark.parametrize('body, found', [
+    ('Fixes #1\n' + PR528 + '\nCheck it on staging: /x.\n', [PR528]),
+    # soft line breaks: one sentence over two lines; a capital letter starts a new one
+    ('Intro.\nThe fix is deployed\nto staging.\n', ['The fix is deployed to staging.']),
+    ('- First. Not on staging\n  yet.\n- Next.\n', ['Not on staging yet.']),
+    ('## Notes\nMerged into work.\n', ['Merged into work.']),
+    # a sentence may end inside closing marks
+    ('**Not on staging yet.** Where-to-see: open /lobby.', ['**Not on staging yet.**']),
+    # quotes, tables and HTML are read too (nothing is edited, so nothing can break)
+    ('> Not on staging yet.\n', ['> Not on staging yet.']),
+    ('<p>Merged into work.</p>\n', ['<p>Merged into work.</p>']),
+    # the brief section never counts
+    ('<!-- swarm-brief:start -->\nNot on staging yet.\n<!-- swarm-brief:end -->\n', []),
+])
+def test_status_lines(body, found):
+    assert G.status_lines(body) == found
+
+
+@pytest.mark.parametrize('body', [
+    f'{THREE}\nserves abcdef12\n{THREE}\n',
+    f'{FOUR}markdown\n{THREE}python\nx = 1\n{THREE}\nMerged into work.\n{FOUR}\n',
+    f'~~~\n{THREE}\nMerged into work.\n~~~\n',
+    f'{THREE}\n~~~\nMerged into work.\n{THREE}\n',
+    f'{THREE}\n{THREE} not a close\nMerged into work.\n{THREE}\n',
+    f'- step one\n  {THREE}\n  Merged into work.\n  {THREE}\n',
+    '> ```text\n> Merged into work.\n> ```\n',
+    '> > ~~~\n> > Not on staging yet.\n> > ~~~\n',
+])
+def test_text_inside_a_fence_is_not_read(body):
+    assert G.status_lines(body) == []
+
+
+def test_text_after_a_closed_fence_is_read():
+    body = f'{FOUR}\nx\n{FOUR}\nMerged into work.\n{THREE}js\ny\n{THREE}\nNot on staging yet.\n'
+    assert G.status_lines(body) == ['Merged into work.', 'Not on staging yet.']
 
 
 def test_body_problem_flags_status_text():
@@ -233,28 +258,30 @@ def test_body_problem_flags_status_text():
     assert G.body_problem(['api/x.py'], 'Where to see: /x on staging.') is None
 
 
-def test_scrub_status_edits_the_body_and_opens_one_incident():
-    patched, tickets = [], []
-    ok, why = G.scrub_status(528, 'Fixes #1\n' + PR528 + '\nCheck it on staging: /x.\n', REPO, head='h' * 40,
-                             patch=lambda n, b: patched.append((n, b)), incident=lambda *a, **k: tickets.append(a))
-    assert ok and 'removed 1' in why
-    assert patched == [(528, 'Fixes #1\nCheck it on staging: /x.\n')]
+def test_check_status_holds_and_opens_one_incident_but_never_edits():
+    tickets = []
+    ok, why = G.check_status(528, 'Fixes #1\n' + PR528, REPO, head='h' * 40,
+                             incident=lambda *a, **k: tickets.append(a))
+    assert not ok and '#130' in why and 'a60245158' in why
     assert len(tickets) == 1 and tickets[0][0] == f'pr-status:{REPO}#528@' + 'h' * 12
+    assert not hasattr(G, 'strip_status') and not hasattr(G, 'scrub_status')
 
 
-def test_scrub_status_leaves_a_clean_body_alone_and_dry_run_changes_nothing():
-    never = lambda *a, **k: pytest.fail('no edit or ticket')  # noqa: E731
-    assert G.scrub_status(1, 'Check it on staging: /x.', REPO, patch=never, incident=never) == (True, '')
-    ok, why = G.scrub_status(1, PR528, REPO, dry=True, patch=never, incident=never)
-    assert ok and why.startswith('remove 1 status')
+def test_check_status_on_a_clean_body_and_in_a_dry_run():
+    never = lambda *a, **k: pytest.fail('no ticket')  # noqa: E731
+    assert G.check_status(1, 'Check it on staging: /x.', REPO, incident=never) == (True, '')
+    assert G.check_status(1, PR528, REPO, dry=True, incident=never)[0] is False
 
 
-def test_scrub_status_fails_when_the_edit_fails_and_a_failed_ticket_does_not():
+def test_a_failed_ticket_does_not_change_the_verdict():
     def boom(*a, **k):
         raise RuntimeError('gh down')
-    ok, why = G.scrub_status(1, PR528, REPO, patch=boom, incident=lambda *a, **k: pytest.fail('no ticket'))
-    assert not ok and 'edit failed' in why
-    assert G.scrub_status(1, PR528, REPO, patch=lambda n, b: None, incident=boom)[0]
+    assert G.check_status(1, PR528, REPO, incident=boom)[0] is False
+
+
+def test_the_status_relay_names_the_text_and_the_rule():
+    text = G.status_text(7, [PR528])
+    assert 'a60245158' in text and G.STATUS_RULE in text and text.isascii()
 
 
 def test_every_worker_instruction_carries_the_status_rule():
@@ -262,95 +289,3 @@ def test_every_worker_instruction_carries_the_status_rule():
     assert G.STATUS_RULE.isascii() and '\n' not in G.STATUS_RULE
     for text in (launches.brief_line('/b/1.txt'), launcher.brief_text(1, 't', 'b', 2), flow.shots_text(7)):
         assert G.STATUS_RULE in text
-
-
-FOUR = '`' * 4
-THREE = '`' * 3
-
-
-@pytest.mark.parametrize('body', [
-    # Codex on PR #133: an inner fence of another length or character does not close the outer one
-    f'{FOUR}markdown\n{THREE}python\nx = 1\n{THREE}\nMerged into work.\n{FOUR}\n',
-    f'~~~\n{THREE}\nMerged into work.\n~~~\n',
-    f'{THREE}\n~~~\nMerged into work.\n{THREE}\n',
-    f'{THREE}\n{THREE} not a close\nMerged into work.\n{THREE}\n',
-    f'- step one\n  {THREE}\n  Merged into work.\n  {THREE}\n',
-])
-def test_text_inside_a_fence_is_kept(body):
-    assert G.strip_status(body) == (body, [])
-
-
-def test_text_after_a_closed_fence_is_scrubbed():
-    body = f'{FOUR}\nx\n{FOUR}\nMerged into work.\n{THREE}js\ny\n{THREE}\nNot on staging yet.\n'
-    assert G.strip_status(body)[1] == ['Merged into work.', 'Not on staging yet.']
-
-
-@pytest.mark.parametrize('text', [
-    # Codex on PR #133: the condition exemption covers served-commit matches too
-    'Where-to-see: once .deploy-sha contains the head, open /lobby.',
-    'If staging serves 0123abcd or newer, open /lobby.',
-    'When the deploy SHA is 0123abcd, reload /lobby.',
-])
-def test_a_condition_before_a_served_commit_is_kept(text):
-    assert not G.is_status(text) and G.strip_status(text) == (text, [])
-
-
-@pytest.mark.parametrize('body, new, gone', [
-    # Codex on PR #133: a sentence wrapped over soft line breaks is one sentence
-    ('Where-to-see: once the PR is\nmerged into work, open /lobby.\n',
-     'Where-to-see: once the PR is\nmerged into work, open /lobby.\n', []),
-    ('Intro.\nThe fix is deployed\nto staging.\nCheck it on staging: /x.\n',
-     'Intro.\nCheck it on staging: /x.\n', ['The fix is deployed to staging.']),
-    ('- First. The fix is deployed\n  to staging.\n- Next.\n', '- First.\n- Next.\n',
-     ['The fix is deployed to staging.']),
-    # a line break before a capital letter still ends a sentence, so "Fixes #1" stays
-    ('Fixes #1\nNot on staging yet.\nCheck it on staging: /x.\n', 'Fixes #1\nCheck it on staging: /x.\n',
-     ['Not on staging yet.']),
-    # a heading or a new list item never joins the line before it
-    ('## Notes\nMerged into work.\n', '## Notes\n', ['Merged into work.']),
-    ('- is it\n- merged into work. Yes.\n', '- is it\n- Yes.\n', ['merged into work.']),
-])
-def test_soft_line_breaks(body, new, gone):
-    assert G.strip_status(body) == (new, gone)
-
-
-@pytest.mark.parametrize('body, new, gone', [
-    # Codex on PR #133: a sentence may end inside closing inline marks
-    ('**Not on staging yet.** Where-to-see: open /lobby.', 'Where-to-see: open /lobby.', ['**Not on staging yet.**']),
-    ('_Merged into work._ Check it on staging: /x.', 'Check it on staging: /x.', ['_Merged into work._']),
-    ('(Merged into work.) Check it on staging: /x.', 'Check it on staging: /x.', ['(Merged into work.)']),
-    ('"Not on staging yet." Check it on staging: /x.', 'Check it on staging: /x.', ['"Not on staging yet."']),
-    ('Intro. ~~Merged into work.~~ Check it on staging: /x.', 'Intro. Check it on staging: /x.',
-     ['~~Merged into work.~~']),
-])
-def test_sentence_ends_after_closing_marks(body, new, gone):
-    assert G.strip_status(body) == (new, gone)
-
-
-@pytest.mark.parametrize('body', [
-    # Codex on PR #133: a fence inside a blockquote, at any quote depth
-    '> ```text\n> Merged into work.\n> ```\nCheck it on staging: /x.\n',
-    '> > ~~~\n> > Not on staging yet.\n> > ~~~\n',
-])
-def test_a_fence_in_a_blockquote_is_not_read(body):
-    assert G.strip_status(body) == (body, []) and G.status_lines(body) == []
-
-
-@pytest.mark.parametrize('body, left', [
-    # a cut here could break the Markdown: the text stays and is reported
-    ('> Not on staging yet.\n', ['> Not on staging yet.']),
-    ('| site | state |\n| --- | --- |\n| ptw | Merged into work. |\n', ['| ptw | Merged into work.']),
-    ('<p>Not on staging yet.</p>\n', ['<p>Not on staging yet.</p>']),
-    ('**Intro. Not on staging yet.** Check it on staging: /x.\n', ['Not on staging yet.**']),
-    ('`a. Merged into work.` b.\n', ['Merged into work.`']),
-])
-def test_status_that_cannot_be_cut_safely_is_left_and_reported(body, left):
-    assert G.strip_status(body) == (body, [])
-    assert G.status_lines(body) == left
-
-
-def test_scrub_status_with_only_left_text_opens_an_incident_and_does_not_edit():
-    tickets = []
-    ok, why = G.scrub_status(1, '> Not on staging yet.\n', REPO, patch=lambda *a: pytest.fail('no edit'),
-                             incident=lambda *a, **k: tickets.append(k))
-    assert ok and why.startswith('Left 1') and 'by hand' in tickets[0]['fix']
