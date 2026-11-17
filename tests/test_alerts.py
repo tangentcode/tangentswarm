@@ -242,3 +242,13 @@ def test_methbot_exception_and_pull_post_the_reason_once_per_pr_head_and_key():
     assert 'not a Project 6 repo' in alerts.tell_methbot('exception', 'tangentcode/platform', 1, head=HEAD,
                                                          reason='x', post=sent.append)
     assert len(sent) == 4
+
+
+def test_the_incident_title_stamp_is_eastern_time_whatever_the_host_clock():
+    """tangentswarm #105: the host clock is UTC; a localtime stamp labeled ET was 5 h off."""
+    calls = []
+    sh = lambda argv: calls.append(argv) or 'https://github.com/tangentcode/methodology/issues/91\n'  # noqa: E731
+    alerts.incident('et', 'x', 'y', sh=sh, now=lambda: 1794903060.0)  # 2026-11-17 08:11 UTC
+    title = calls[0][calls[0].index('--title') + 1]
+    assert title.startswith('Incident 2026-11-17 3:11 AM ET:')
+    assert alerts.et_stamp(1794903060.0) == '2026-11-17T03:11:00-05:00'
