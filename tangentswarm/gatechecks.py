@@ -170,21 +170,71 @@ _SERVES = re.compile(
 _DESCR = re.compile(r'\b(?:once|after|when|whenever|if|unless|until|as\s+soon\s+as|before|how|whether|'
                     r'that|which|who)\b', re.I)
 _BULLET = re.compile(r'^(\s*(?:[-*+]|\d+[.)])\s+|\s*)')
-_SENT = re.compile(r'(?<=[.!?])\s+(?=\S)')
+_BLOCK = re.compile(r'^\s*(?:[-*+]\s|\d+[.)]\s|#|>|\||<)')  # a line that starts a new Markdown block
+# A sentence ends at . ! or ?, or at a line break before a capital letter ("Fixes #1" then a new
+# line). A line that goes on in lower case ("is deployed\nto staging") is the same sentence.
+_SENT_END = re.compile(r'(?<=[.!?])\s+(?=\S)|(?<![,;:(\-])[ \t]*\n\s*(?=[A-Z])')
 _FENCE = re.compile(r'^\s*(?:(?:[-*+]|\d+[.)])\s+)?(`{3,}|~{3,})(.*)$')  # list items may indent it
 
 
 def is_status(sentence):
-    """True when one sentence says where the PR stands (tangentswarm #130)."""
-    if _SERVES.search(sentence):
-        return True
-    m = _STATE.search(sentence)
-    return bool(m) and not _DESCR.search(sentence[:m.start()])
+    """True when one sentence says where the PR stands (tangentswarm #130). The first match
+    of either kind decides: a condition or a describing clause before it ("once .deploy-sha
+    contains the head, open /x") makes it how-to text, which is kept (Codex on PR #133)."""
+    sentence = ' '.join(sentence.split())  # a soft line break is a space
+    hits = [m for m in (_SERVES.search(sentence), _STATE.search(sentence)) if m]
+    if not hits:
+        return False
+    first = min(hits, key=lambda m: m.start())
+    return not _DESCR.search(sentence[:first.start()])
+
+
+def _scrub_para(lines):
+    """(kept lines, [removed sentences]) for one Markdown paragraph or list item. Sentences
+    run across soft line breaks (Codex on PR #133), so the check reads the joined text; a
+    removed sentence takes the space before it, and a line left empty is dropped."""
+    lead = _BULLET.match(lines[0]).group(1)
+    text = '\n'.join([lines[0][len(lead):]] + lines[1:])
+    cuts, gone, at = [], [], 0
+    spans = []
+    for m in list(_SENT_END.finditer(text)) + [None]:
+        end = m.start() if m else len(text)
+        spans.append((at, end))
+        at = m.end() if m else at
+    for i, (a, b) in enumerate(spans):
+        if is_status(text[a:b]):
+            gone.append(' '.join(text[a:b].split()))
+            # cut from the end of the previous sentence; the first one takes the space after it
+            cuts.append((spans[i - 1][1], b) if i else (a, spans[1][0] if len(spans) > 1 else b))
+    if not gone:
+        return lines, []
+    merged = []
+    for a, b in cuts:  # neighbors share a boundary; join them so nothing is cut twice
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(b, merged[-1][1]))
+        else:
+            merged.append((a, b))
+    out, at = [], 0
+    for a, b in merged:
+        out.append(text[at:a])
+        at = b
+    out.append(text[at:])
+    kept = [l for l in ''.join(out).split('\n') if l.strip()]
+    if kept:
+        kept[0] = lead + kept[0].lstrip()
+    return kept, gone
 
 
 def _scrub_text(text):
     """(text without status sentences, [removed sentences]). Lines in code fences are kept."""
-    out, gone, fence = [], [], None  # fence: the open fence run, such as '````' (CommonMark)
+    out, gone, fence, para = [], [], None, []  # fence: the open fence run, such as '````' (CommonMark)
+
+    def flush():
+        if para:
+            kept, g = _scrub_para(para)
+            out.extend(kept)
+            gone.extend(g)
+            para.clear()
     for line in text.split('\n'):
         m = _FENCE.match(line)
         if fence is not None:
@@ -194,21 +244,18 @@ def _scrub_text(text):
             out.append(line)
             continue
         if m and not (m.group(1)[0] == '`' and '`' in m.group(2)):  # a backtick info string has no backtick
+            flush()
             fence = m.group(1)
             out.append(line)
             continue
         if not line.strip():
+            flush()
             out.append(line)
             continue
-        lead = _BULLET.match(line).group(1)
-        parts = _SENT.split(line[len(lead):])
-        keep = [x for x in parts if not is_status(x)]
-        if len(keep) == len(parts):
-            out.append(line)
-            continue
-        gone += [x.strip() for x in parts if is_status(x)]
-        if keep:
-            out.append(lead + ' '.join(keep))
+        if _BLOCK.match(line):
+            flush()
+        para.append(line)
+    flush()
     return '\n'.join(out), gone
 
 

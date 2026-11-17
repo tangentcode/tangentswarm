@@ -933,8 +933,11 @@ worker gets this as `gatechecks.STATUS_RULE`. Before swarm-flow or swarm-tick ru
 edit fails, `--apply` waits for the next pass. A sentence with a condition or a describing
 clause before the state words ("Once merged into work, open /x", "This PR changes how code
 is deployed to staging") tells how something works and is kept. So is a bare mention of
-`.deploy-sha`; only a claim about which commit it holds is removed. Code fences close only
-on a matching run of the same character, as long or longer (CommonMark).
+`.deploy-sha`; only a claim about which commit it holds is removed. The same exemption
+applies to both kinds of match. A sentence may wrap over soft line breaks: a line that goes
+on in lower case is the same sentence, and a line that starts with a capital letter, a new
+list item or a heading starts a new one. Code fences close only on a matching run of the
+same character, as long or longer (CommonMark).
 
 ### swarm-launch: start a worker
 

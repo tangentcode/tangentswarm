@@ -283,3 +283,32 @@ def test_text_inside_a_fence_is_kept(body):
 def test_text_after_a_closed_fence_is_scrubbed():
     body = f'{FOUR}\nx\n{FOUR}\nMerged into work.\n{THREE}js\ny\n{THREE}\nNot on staging yet.\n'
     assert G.strip_status(body)[1] == ['Merged into work.', 'Not on staging yet.']
+
+
+@pytest.mark.parametrize('text', [
+    # Codex on PR #133: the condition exemption covers served-commit matches too
+    'Where-to-see: once .deploy-sha contains the head, open /lobby.',
+    'If staging serves 0123abcd or newer, open /lobby.',
+    'When the deploy SHA is 0123abcd, reload /lobby.',
+])
+def test_a_condition_before_a_served_commit_is_kept(text):
+    assert not G.is_status(text) and G.strip_status(text) == (text, [])
+
+
+@pytest.mark.parametrize('body, new, gone', [
+    # Codex on PR #133: a sentence wrapped over soft line breaks is one sentence
+    ('Where-to-see: once the PR is\nmerged into work, open /lobby.\n',
+     'Where-to-see: once the PR is\nmerged into work, open /lobby.\n', []),
+    ('Intro.\nThe fix is deployed\nto staging.\nCheck it on staging: /x.\n',
+     'Intro.\nCheck it on staging: /x.\n', ['The fix is deployed to staging.']),
+    ('- First. The fix is deployed\n  to staging.\n- Next.\n', '- First.\n- Next.\n',
+     ['The fix is deployed to staging.']),
+    # a line break before a capital letter still ends a sentence, so "Fixes #1" stays
+    ('Fixes #1\nNot on staging yet.\nCheck it on staging: /x.\n', 'Fixes #1\nCheck it on staging: /x.\n',
+     ['Not on staging yet.']),
+    # a heading or a new list item never joins the line before it
+    ('## Notes\nMerged into work.\n', '## Notes\n', ['Merged into work.']),
+    ('- is it\n- merged into work. Yes.\n', '- is it\n- Yes.\n', ['merged into work.']),
+])
+def test_soft_line_breaks(body, new, gone):
+    assert G.strip_status(body) == (new, gone)
