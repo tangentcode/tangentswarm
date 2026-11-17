@@ -443,3 +443,28 @@ def test_a_delivered_post_leaves_no_pending_file():
     w.run()
     p = M.P6Merge(TS, 90, HEAD, 'done').pending_path()
     assert not p.exists() and [x['kind'] for x in w.posts] == ['pull']
+
+
+# -- Codex on PR #90 (cfd3e08): a part read or a merge into another base never counts ---------
+
+def test_more_than_100_threads_or_checks_is_a_reason():
+    pr = full()
+    pr['reviewThreads']['pageInfo'] = {'hasPreviousPage': True}
+    assert M.problems(pr, HEAD) == ['more than 100 review threads: they cannot all be read']
+    pr = full()
+    pr['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts']['pageInfo'] = {'hasNextPage': True}
+    assert M.problems(pr, HEAD) == ['more than 100 CI checks on the head: the required ones cannot all be read']
+
+
+def test_a_codex_summary_out_of_the_read_is_not_clean():
+    other = [{'author': WORKER, 'body': 'note'}] * 60  # the summary is older than the last 60 comments
+    assert any('Codex is not clean' in r for r in M.problems(full(comments=other), HEAD))
+
+
+def test_a_pr_merged_into_another_base_gets_no_cleanup():
+    w = World([full(state='MERGED', base='work')])
+    r = w.run(trigger='comment')
+    assert r['merged'] is False and 'targets work, not main' in r['why']
+    assert w.merges() == [] and w.moves() == [] and w.tmuxed == [] and w.removed == []
+    assert not any(a[:3] == ['gh', 'issue', 'close'] for a in w.gh)
+    assert [p['kind'] for p in w.posts] == ['exception']

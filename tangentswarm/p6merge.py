@@ -14,6 +14,10 @@ Verify, all on the exact reported head (problems() lists every check that fails)
   - no unresolved review thread; an outdated thread counts too, unless the worker replied
   - every required CI check on the head is green
   - GitHub says the PR is MERGEABLE (UNKNOWN is read again a few times, then fails)
+A read that may be cut off fails closed: more than 100 review threads or CI checks is a
+reason, and a Codex summary or worker reply that is not in the read is not clean.
+A PR that is already MERGED at the head into main gets the cleanup with no merge; one
+merged into another base is a reason.
 
 All pass: `gh pr merge --merge --match-head-commit <sha>`, then (each step on its own; a
 failed step is reported and the rest go on):
@@ -55,8 +59,9 @@ FIELDS = """number state isDraft baseRefName headRefOid headRefName mergeable
  closingIssuesReferences(first:10){nodes{number state repository{nameWithOwner}}}
  comments(last:60){nodes{author{login} body createdAt}}
  reviews(last:30){nodes{author{login} commit{oid} comments{totalCount}}}
- reviewThreads(last:100){nodes{id isResolved isOutdated comments(first:30){nodes{author{login} originalCommit{oid}}}}}
- commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){nodes{__typename
+ reviewThreads(last:100){pageInfo{hasPreviousPage}
+  nodes{id isResolved isOutdated comments(first:30){nodes{author{login} originalCommit{oid}}}}}
+ commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{__typename
   ...on CheckRun{name status conclusion isRequired(pullRequestNumber:%d)}
   ...on StatusContext{context state isRequired(pullRequestNumber:%d)}}}}}}}"""
 
@@ -125,7 +130,10 @@ def ci_problem(pr, head):
     commit = (((pr.get('commits') or {}).get('nodes') or [{}])[-1].get('commit') or {})
     if commit.get('oid') and commit['oid'] != head:
         return f"the CI read is for {commit['oid'][:8]}, not {head[:8]}"
-    ctx = (((commit.get('statusCheckRollup') or {}).get('contexts') or {}).get('nodes') or [])
+    contexts = (commit.get('statusCheckRollup') or {}).get('contexts') or {}
+    if (contexts.get('pageInfo') or {}).get('hasNextPage'):  # a required check may be on the next page
+        return 'more than 100 CI checks on the head: the required ones cannot all be read'
+    ctx = contexts.get('nodes') or []
     bad, running = [], []
     for c in ctx:
         if not c.get('isRequired'):
@@ -167,6 +175,8 @@ def problems(pr, head):
     why = codex_problem(pr, head)
     if why:
         out.append(why)
+    if ((pr.get('reviewThreads') or {}).get('pageInfo') or {}).get('hasPreviousPage'):
+        out.append('more than 100 review threads: they cannot all be read')  # Codex on PR #90: no part read
     threads = unresolved_threads(pr)
     if threads:
         out.append(f"{len(threads)} unresolved review thread(s)")
@@ -235,7 +245,9 @@ class P6Merge:
                         'notes': self.notes, 'undelivered': left,
                         'why': f"{self.repo}#{self.n} at {self.head[:8]} was already merged by the swarm"}
             pr, why = self.verify()
-            elsewhere = pr.get('state') == 'MERGED' and pr.get('headRefOid') == self.head
+            # merged at this head into main (Codex on PR #90: a merge into another base is not done)
+            elsewhere = pr.get('state') == 'MERGED' and pr.get('headRefOid') == self.head \
+                and pr.get('baseRefName') == 'main'
             if why and not elsewhere:
                 return self.refuse(why)
             if elsewhere:
