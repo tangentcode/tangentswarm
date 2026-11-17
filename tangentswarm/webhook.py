@@ -383,12 +383,13 @@ def project_move(p):
         return [Action('skip', why=f"card move by {login(p.get('sender'))}")]
     node = item.get('content_node_id')
     if frm == board.HUMAN_REVIEW and to == board.IN_PROGRESS:
-        return [Action('reject', 0, 'Michal sent the PR back from Human Review', dict(node=node, board=b.number)),
-                Action('cascade', 0, 'Human Review has a free slot', dict(board=b.number))]
+        # tangentswarm #135: the refill first (as for a merge, #67/#116), then the slow relay
+        return [Action('cascade', 0, 'Human Review has a free slot', dict(board=b.number, freed=True)),
+                Action('reject', 0, 'Michal sent the PR back from Human Review', dict(node=node, board=b.number))]
     if frm == board.NEEDS_INPUT and to == board.IN_PROGRESS:
         return [Action('answered', 0, 'Michal answered the question', dict(node=node, board=b.number))]
     if frm == board.HUMAN_REVIEW or to == board.DONE:
-        return [Action('cascade', 0, f"card moved {frm} -> {to}", dict(board=b.number))]
+        return [Action('cascade', 0, f"card moved {frm} -> {to}", dict(board=b.number, freed=frm == board.HUMAN_REVIEW))]
     return [Action('skip', why=f"card moved {frm} -> {to}: his decision")]
 
 
@@ -525,8 +526,15 @@ class Executor:
         if not self.platform():  # #99: the live Claude in a worktree on the PR's head branch
             from . import slots
             return slots.tell_p6(self.repo, n, self.head_branch(n), text)
+        # tangentswarm #135: Flow.hand_off takes the board PR record and a relay file (#109)
         from . import flow
-        return flow.Flow(dry_run=False, out=lambda l: None, g=self.g).hand_off(n, text)
+        relay_path = flow.RELAY_DIR / f"relay-{n}-webhook.md"
+        try:
+            relay_path.write_text(text + '\n')
+        except OSError:
+            pass
+        p = {'number': n, 'branch': self.head_branch(n)}  # a deferred start needs the branch
+        return flow.Flow(dry_run=False, out=lambda l: None, g=self.g).hand_off(p, text, relay_path)
 
     def head_branch(self, n):
         """The head branch name of PR n of this repo, or ''."""
@@ -611,6 +619,10 @@ class Executor:
         self.note(f"skip: {a.why}")
 
     def do_cascade(self, a):
+        # tangentswarm #135: a card move out of Human Review frees a slot: wake swarm-promoted
+        # at once, the same as a merge (#67), so the refill never waits for its next poll
+        if a.args.get('freed') and self.board_ is board.DEFAULT:
+            self.wake_promoted(a.pr, 'a Human Review slot is free')
         self.cascade(a.why)
 
     def do_minbot(self, a):
@@ -791,7 +803,7 @@ class Executor:
             return self.wake(n, f"#{n} answered; no worker could take it ({note})", key=f'answered:{n}')
         self.note(f"#{n}: Michal's answer relayed ({note})")
 
-    def wake_promoted(self, n):
+    def wake_promoted(self, n, why=None):
         """tangentswarm #67: SIGUSR1 to swarm-promoted, so it reads the board and refills Human
         Review now (not at its next 30 s poll). Only a signal: never a restart or a kill."""
         if self.dry:
@@ -800,7 +812,7 @@ class Executor:
             said = (self.signal_promoted or signal_promoted)()
         except Exception as e:  # the merge handling goes on; the poll still finds the free slot
             said = f"not woken: {type(e).__name__}: {str(e)[:120]}"
-        self.note(f"#{n} merged: swarm-promoted {said}")
+        self.note(f"{why or f'#{n} merged'}: swarm-promoted {said}")
 
     def do_merged(self, a):
         if self.platform():  # tangentswarm #67: wake swarm-promoted before the slow work below
