@@ -87,7 +87,7 @@ def test_michal_sends_a_pr_back_from_human_review_with_his_comment():
     f.deliver(f.open_pr(9, draft=False))
     f.cards[(P6, 9)]['col'] = board.HUMAN_REVIEW
     f.deliver(f.comment(9, 'please rename it'))                   # log only on Project 6
-    assert step(f, f.move(9, board.IN_PROGRESS)) == ['reject', 'cascade']
+    assert step(f, f.move(9, board.IN_PROGRESS)) == ['cascade', 'reject']
     assert f.pr(9)['isDraft'] and 'please rename it' in f.relays[-1][1]
     assert f.errors() == []
 

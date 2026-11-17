@@ -76,7 +76,7 @@ def test_michal_card_moves():
                 'changes': {'field_value': {'field_node_id': field, 'from': {'id': board.OPTION[frm]},
                                             'to': {'id': board.OPTION[to]}}}}
     assert [a.kind for a in W.classify('projects_v2_item', move(board.HUMAN_REVIEW, board.IN_PROGRESS))] == \
-        ['reject', 'cascade']
+        ['cascade', 'reject']  # tangentswarm #135: the refill first
     assert [a.kind for a in W.classify('projects_v2_item', move(board.NEEDS_INPUT, board.IN_PROGRESS))] == ['answered']
     assert [a.kind for a in W.classify('projects_v2_item', move(board.READY, board.BACKLOG))] == ['skip']
     assert [a.kind for a in W.classify('projects_v2_item', move(board.HUMAN_REVIEW, board.IN_PROGRESS,
@@ -676,6 +676,81 @@ def test_michal_rejecting_from_human_review_makes_the_pr_a_draft():
     ex = _node_fake('PullRequest')
     ex.run(W.Action('reject', 0, 'x', dict(node='PR_x', board=board.DEFAULT.number)))
     assert board.DRAFTED == [(541, W.REPO)] and ex.relays
+
+
+def _real_handoff(monkeypatch, tmp_path, rc, said):
+    """A reject with the real Flow.hand_off (no injected give): only slots is faked."""
+    from tangentswarm import flow, slots
+    monkeypatch.setattr(flow, 'RELAY_DIR', tmp_path)
+    got = {'revive': [], 'start': [], 'queue': []}
+    def revive(n, text, out=None, **kw):
+        got['revive'].append((n, text, kw))
+        out(said)
+        return rc
+    monkeypatch.setattr(slots, 'revive', revive)
+    monkeypatch.setattr(slots, 'start_later', lambda n, branch, relay: got['start'].append((n, branch, relay)) or True)
+    monkeypatch.setattr(slots, 'queue_revive', lambda n, text, **kw: got['queue'].append((n, kw)))
+    ex = _node_fake('PullRequest')
+    ex.give = None
+    full = ex._g['gql']
+    ex._g['gql'] = lambda q, **v: ({'repository': {'pullRequest': {'headRefName': 'fix-541'}}}
+                                   if 'headRefName}' in q else full(q, **v))
+    ex.run(W.Action('reject', 0, 'x', dict(node='PR_x', board=board.DEFAULT.number)))
+    return ex, got
+
+
+def test_a_reject_reaches_the_worker_through_the_real_hand_off(monkeypatch, tmp_path):
+    """tangentswarm #135: do_reject end to end with the real Flow.hand_off. Since PR #109 it
+    takes (p, text, relay_path); the webhook passed (n, text), so every reject raised a
+    TypeError and woke swarmbot. The injected give of the other tests hid it."""
+    ex, got = _real_handoff(monkeypatch, tmp_path, 0, 'resumed')
+    assert ex.errors == [] and ex.wakes == []
+    (n, text, kw), = got['revive']
+    assert n == 541 and 'Michal sent it back from Human Review' in text and kw == {'queue': True}
+    assert (tmp_path / 'relay-541-webhook.md').read_text() == text + '\n'
+    assert any("Michal's rejection relayed (resumed)" in d for d in ex.done)
+
+
+def test_a_reject_with_no_worktree_queues_a_worker_start_with_the_relay(monkeypatch, tmp_path):
+    """tangentswarm #135: no worktree to resume: the relay waits for a Claude (#101), with the
+    PR's head branch and the relay file, and no swarmbot wake."""
+    ex, got = _real_handoff(monkeypatch, tmp_path, 1, 'no surviving worktree for #541')
+    assert ex.errors == [] and ex.wakes == []
+    assert got['start'] == [(541, 'fix-541', tmp_path / 'relay-541-webhook.md')]
+    assert any('waiting for a Claude' in d for d in ex.done)
+
+
+def test_a_reject_wakes_swarm_promoted_before_the_relay():
+    """tangentswarm #135: a reject frees a Human Review slot, so it refills as fast as a merge
+    (#67, #116): SIGUSR1 to swarm-promoted and the cascade come before the slow relay."""
+    order = []
+    ex = _node_fake('PullRequest')
+    ex.signal_promoted = lambda: order.append('signal') or 'woken (test)'
+    ex.cascade_fn = lambda: order.append('cascade') or 'queued'
+    ex.give = lambda n, text: order.append('relay') or (True, 'sent')
+    payload = {'action': 'edited', 'sender': {'login': W.MICHAL},
+               'projects_v2_item': {'content_node_id': 'PR_x', 'project_node_id': board.PROJECT_ID},
+               'changes': {'field_value': {'field_node_id': board.STATUS_FIELD,
+                                           'from': {'id': board.OPTION[board.HUMAN_REVIEW]},
+                                           'to': {'id': board.OPTION[board.IN_PROGRESS]}}}}
+    W.handle('projects_v2_item', payload, ex=ex)
+    assert order == ['signal', 'cascade', 'relay'] and ex.errors == []
+    assert any('a Human Review slot is free: swarm-promoted woken' in d for d in ex.done)
+    assert W.PROMOTED_WOKEN == []
+
+
+@pytest.mark.parametrize('frm,to,woken', [(board.HUMAN_REVIEW, board.READY, 1), (board.STAGING, board.DONE, 0)])
+def test_only_a_move_out_of_human_review_wakes_swarm_promoted(frm, to, woken):
+    woke = []
+    ex = Fake()
+    ex.signal_promoted = lambda: woke.append(1) or 'woken (test)'
+    (a,) = W.classify('projects_v2_item', {
+        'action': 'edited', 'sender': {'login': W.MICHAL},
+        'projects_v2_item': {'content_node_id': 'PR_x', 'project_node_id': board.PROJECT_ID},
+        'changes': {'field_value': {'field_node_id': board.STATUS_FIELD, 'from': {'id': board.OPTION[frm]},
+                                    'to': {'id': board.OPTION[to]}}}})
+    ex.run(a)
+    assert len(woke) == woken and ex.cascades == [1]
 
 
 def test_michal_answering_needs_input_makes_the_pr_a_draft_but_not_an_issue():
