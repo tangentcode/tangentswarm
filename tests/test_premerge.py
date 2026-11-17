@@ -724,3 +724,73 @@ def test_a_retry_keeps_the_first_hold_time_and_a_new_head_resets_it(monkeypatch)
     assert flow.held()[7]['at'] == 100.0 and flow.held()[7]['tried'] == 150
     flow.hold(7, 'b' * 40, 'why')
     assert flow.held()[7]['at'] == 300.0
+
+
+# --- Codex on PR #103: every held-state read-modify-write is locked ---
+
+def test_a_body_edit_release_waits_for_a_cascade_hold_and_keeps_it():
+    """The event thread releases #7 while the cascade writes a new hold for #8. Before the
+    lock, the release saved its older snapshot and dropped #8's hold."""
+    import threading
+    flow.hold(7, 'a' * 40, '7b where-to-see line: missing', relay='/r/relay-7-gate.md')
+    done = threading.Event()
+    with flow.held_update() as d:  # the cascade is in the middle of a write
+        t = threading.Thread(target=lambda: flow.release_on_edit(7) and done.set())
+        t.start()
+        assert not done.wait(0.3)  # the release waits for the lock
+        d[8] = {'head': 'b' * 40, 'why': 'conflicts with main', 'relay': None, 'tried': 1, 'at': 1}
+    t.join(5)
+    assert done.is_set() and set(flow.held()) == {8}
+
+
+def test_hold_and_unhold_from_many_threads_lose_no_write():
+    import threading
+    ts = [threading.Thread(target=flow.hold, args=(n, f'{n:040d}', 'why')) for n in range(20)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(10)
+    assert set(flow.held()) == set(range(20))
+    ts = [threading.Thread(target=flow.unhold, args=(n,)) for n in range(0, 20, 2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(10)
+    assert set(flow.held()) == set(range(1, 20, 2))
+
+
+def test_a_gate_pass_release_keeps_a_newer_hold_set_after_the_read(world, tmp_path, monkeypatch):
+    """The gate pass was read for the hold at head z; before the release, the cascade held #7
+    again at a new head. The release must not drop the newer hold."""
+    w, s, h, origin = world
+    f, sent = make(world)
+    flow.hold(7, h['z'], '7b where-to-see line: missing', relay='/r/relay-7-gate.md')
+    f.g['LOG'] = str(gate_log(tmp_path, (iso(60), 'apply', '#7', h['z'][:8], 'PASS', 'fail=-')))
+    real = flow.gate_passed_holds
+
+    def late(text, hd=None):
+        out = real(text, hd)
+        flow.hold(7, h['st2'], 'conflicts with main', relay='/r/relay-7-merge-main.md')  # a newer hold
+        return out
+    monkeypatch.setattr(flow, 'gate_passed_holds', late)
+    f.release_gate_passes()
+    assert flow.held()[7]['head'] == h['st2'] and not any('hold released' in d for d in f.did)
+
+
+def test_a_retried_handoff_keeps_a_newer_hold_set_while_it_ran(monkeypatch, tmp_path):
+    """retry_held: the worker got the old relay, but a newer hold (a new head) came while
+    give_worker ran. Only the hold it retried ends."""
+    relay = tmp_path / 'relay-7-gate.md'
+    relay.write_text('fix it\n')
+    flow.hold(7, 'a' * 40, 'why', relay=relay, tried=0)
+    f = flow.Flow(out=lambda line: None, g={}, now=lambda: 10_000)
+    monkeypatch.setattr(flow.board, 'move_card', lambda *a, **k: None)
+    from tangentswarm import moves
+    monkeypatch.setattr(moves, 'log_move', lambda *a, **k: None)
+
+    def give(n, text, priority=False):
+        flow.hold(7, 'b' * 40, 'conflicts with main', relay=relay)
+        return 0, 'sent'
+    f.give_worker = give
+    f.retry_held({RD: [dict(number=7, head='a' * 40, item='I7')]}, now=10 ** 9)
+    assert flow.held()[7]['head'] == 'b' * 40

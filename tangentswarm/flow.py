@@ -187,22 +187,45 @@ def held():
         return {}
 
 
+@contextlib.contextmanager
+def held_update():
+    """One locked read-modify-write of HELD (Codex on PR #103: the event thread of
+    swarm-promoted releases holds while the cascade holds and retries them; an unlocked
+    write could drop a newer hold). Yields the holds; they are saved on a normal exit."""
+    import fcntl
+    HELD.parent.mkdir(parents=True, exist_ok=True)
+    with open(HELD.with_name(HELD.name + '.lock'), 'a') as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        d = held()
+        yield d
+        _save_held(d)
+
+
 def hold(n, head, why, relay=None, tried=None):
     """at: when this head was first held (a retry keeps it; tangentswarm #101: a gate pass
     after it releases the hold)."""
-    d = held()
-    old = d.get(n) or {}
-    now = time.time()
-    d[n] = {'head': head, 'why': why[:200], 'relay': str(relay) if relay else None,
-            'tried': now if tried is None else tried,
-            'at': old.get('at', old.get('tried', now)) if old.get('head') == head else now}
-    _save_held(d)
+    with held_update() as d:
+        old = d.get(n) or {}
+        now = time.time()
+        d[n] = {'head': head, 'why': why[:200], 'relay': str(relay) if relay else None,
+                'tried': now if tried is None else tried,
+                'at': old.get('at', old.get('tried', now)) if old.get('head') == head else now}
 
 
-def unhold(n):
-    d = held()
-    if d.pop(n, None) is not None:
-        _save_held(d)
+def unhold(n, only_if=None):
+    """End the hold of PR n under the lock. only_if(the hold now on disk) must be true (a
+    check against a newer hold, e.g. the same head and hold time the caller read).
+    Returns the dropped hold, or None."""
+    with held_update() as d:
+        h = d.get(n)
+        if h is None or (only_if is not None and not only_if(h)):
+            return None
+        return d.pop(n)
+
+
+def same_hold(h):
+    """only_if for unhold: the hold on disk is still h (same head, same first hold time)."""
+    return lambda cur: cur.get('head') == h.get('head') and cur.get('at') == h.get('at')
 
 
 def conflict_hold(h):
@@ -215,11 +238,7 @@ def release_on_edit(n):
     next cascade can pull it at the same head (platform #516 was held for a 7b body line from
     8:03 PM to 12:41 AM ET after its body was fixed). A conflict hold stays: a body edit
     cannot fix a conflict. Returns the released hold, or None."""
-    h = held().get(n)
-    if not h or conflict_hold(h):
-        return None
-    unhold(n)
-    return h
+    return unhold(n, only_if=lambda h: not conflict_hold(h))  # one locked check and drop
 
 
 def gate_passed_holds(log_text, hd=None):
@@ -238,8 +257,11 @@ def gate_passed_holds(log_text, hd=None):
 
 
 def _save_held(d):
+    """Write the whole file (a tmp file of this process and thread, then a rename). Writers
+    use held_update, which holds the lock."""
+    import threading
     HELD.parent.mkdir(parents=True, exist_ok=True)
-    tmp = HELD.with_name(f'{HELD.name}.{os.getpid()}.tmp')
+    tmp = HELD.with_name(f'{HELD.name}.{os.getpid()}.{threading.get_ident()}.tmp')
     tmp.write_text(json.dumps({str(k): v for k, v in d.items()}))
     os.replace(tmp, HELD)
 
@@ -691,9 +713,10 @@ class Flow:
         except OSError:
             text = ''
         gone = gate_passed_holds(text, hd) if text else {}
-        for n, h in gone.items():
-            if not self.dry:
-                unhold(n)
+        for n, h in list(gone.items()):
+            if not self.dry and unhold(n, only_if=same_hold(h)) is None:
+                gone.pop(n)  # a newer hold came meanwhile: it stays
+                continue
             self.change(f"#{n} hold released: hr-gate passed on its held head {str(h.get('head'))[:8]} "
                         f"(held for: {str(h.get('why') or '')[:100]})")
         return {n: h for n, h in hd.items() if n not in gone}
@@ -1144,7 +1167,7 @@ class Flow:
                 hold(n, h['head'], h.get('why', ''), relay=h['relay'], tried=now)
                 self.note(f"NEEDS_WORKER #{n}: retried the held handoff; still no worker ({said})")
                 continue
-            unhold(n)
+            unhold(n, only_if=same_hold(h))  # a newer hold set meanwhile stays
             board.move_card(self.g, p['item'], board.IN_PROGRESS, n=n, repo=REPO)
             from . import moves
             moves.log_move(n, board.READY, 'In Progress', p.get('head', ''), note=('held: ' + h.get('why', ''))[:120])
