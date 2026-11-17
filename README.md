@@ -967,8 +967,14 @@ One step:
    merge onto main goes back to In Progress with a merge-main relay. Merge the head into
    `work` as one merge commit and push it; the push redeploys staging.
 
-The cascade (`swarm-advance --cascade`) pre-merges the top Ready PRs every pass
-(tangentswarm #65). Future main is main plus every queued PR (Human Review, then Staging,
+The cascade (`swarm-advance --cascade`) pre-merges the top Ready PR every pass
+(tangentswarm #65; tangentswarm #111: only the top one, `SWARM_PREMERGE_AHEAD`, default 1).
+The main check also looks only at the top Ready PR. The rest of Ready is never re-checked:
+a merge does not touch their labels, branches or columns. When a PR ahead of the top one
+merges into main as its head, the top one keeps its `-vN` with no probe and no write
+(`Flow.assumed`). A PR ahead that is sent back, gets a new head, or leaves the queue makes
+it re-check. Human Review holds 2; each Staging to Human Review move queues the cascade at
+once, and the cascade pulls the next Ready PR in pick order into Staging. Future main is main plus every queued PR (Human Review, then Staging,
 then pulls in flight). A new `<branch>-vN` = future main + the PR head is pushed. A clean
 one gets the label `merge-ready`. A real conflict gets `pre-merging`, and the PR's worker
 resolves it on that `-vN` only; nothing is ever merged into the PR's own branch. A new head

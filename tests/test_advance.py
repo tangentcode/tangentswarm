@@ -1066,3 +1066,70 @@ def test_an_auto_review_pr_with_no_branch_anywhere_keeps_its_feedback_queued(ar7
     run(g)
     assert g.moves == [('I7', board.IN_PROGRESS)]
     assert slots.load()['unstarted'] == {} and slots.load()['queued']['7']['relay'].endswith('relay-7-conflict.md')
+
+
+# -- tangentswarm #111: a merge checks only the top Ready PR ----------------------------------
+
+def test_the_main_check_looks_only_at_the_top_ready_pr(monkeypatch, tmp_path):
+    """tangentswarm #111 (Michal 2026-11-17 10:45 AM ET): #484 behind the top conflicts with
+    main, but it is not the top, so it is not checked and stays in Ready."""
+    from tangentswarm import flow as F
+    monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
+    merge_fakes(monkeypatch, main_dirty={484})
+    seen = []
+    clean = F.Flow.clean
+    monkeypatch.setattr(F.Flow, 'clean', lambda self, s, a, b: seen.append(int(b)) or clean(self, s, a, b))
+    out = []
+    c = A.Cascade(g=CascadeGate(served_files=False), dry_run=True, out=out.append, sleep=lambda s: None)
+    cols = {board.READY: [pr(484, board.READY), pr(481, board.READY), pr(490, board.READY, draft=True)]}
+    assert [p['number'] for p in c.main_check(cols)[board.READY]] == [484, 481, 490]
+    assert seen == [481] and not any('NEEDS_REWORK' in l for l in out)
+
+
+def test_a_pr_in_a_pull_is_not_the_top_for_the_main_check(monkeypatch, tmp_path):
+    from tangentswarm import flow as F
+    monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
+    F.save_pulls([dict(pr=3, head='3' * 40, branch='b3', item='I3', work='w' * 40, started=0)])
+    merge_fakes(monkeypatch, main_dirty={3, 9})
+    out = []
+    c = A.Cascade(g=CascadeGate(served_files=False), dry_run=True, out=out.append, sleep=lambda s: None)
+    left = c.main_check({board.READY: [pr(3, board.READY), pr(9, board.READY), pr(10, board.READY)]})
+    assert [p['number'] for p in left[board.READY]] == [3, 10]
+    assert 'NEEDS_REWORK #9 f9.ts' in out and 'NEEDS_REWORK #3 f3.ts' not in out
+
+
+def test_a_human_review_merge_moves_the_next_pr_up_and_checks_no_other_ready_pr(monkeypatch, tmp_path):
+    """tangentswarm #111 done-when: #544 in Human Review merged. The promote moves the
+    pre-merged #447 Staging -> Human Review, and the same pass pulls the next Ready PR (#528)
+    into Staging. Only #528 is checked against main, only the new top (#539) is pre-merged,
+    and #541 and #546 (both conflict with the new main) keep their labels and column."""
+    from tangentswarm import flow as F
+    monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
+    merge_fakes(monkeypatch, main_dirty={541, 546})
+    checked, premerged, labelled = [], [], []
+    clean = F.Flow.clean
+    monkeypatch.setattr(F.Flow, 'clean', lambda self, s, a, b: checked.append(int(b)) or clean(self, s, a, b))
+    monkeypatch.setattr(F.Flow, 'future_main', lambda self, s, cols: ('M F', 'F' * 40, None))
+    monkeypatch.setattr(F.Flow, 'premerge_one', lambda self, p, s, fm: premerged.append(p['number']) or 'T' * 40)
+    monkeypatch.setattr(F.Flow, 'set_labels', lambda self, p, want, drop=True: labelled.append(p['number']))
+    pulled = []
+
+    def pull_batch(self, prs, c, scratch, room):
+        fits = F.ready_order(c.get(board.READY, []))[:room]
+        pulled.extend(q['number'] for q in fits)
+        return fits
+    monkeypatch.setattr(F.Flow, 'pull_batch', pull_batch)
+    ready = [pr(n, board.READY, own_labels=['merge-ready']) for n in (546, 541, 539, 528)]
+    cols = {board.HUMAN_REVIEW: [], board.STAGING: [pr(447, board.STAGING), pr(518, board.STAGING)],
+            board.READY: ready}
+    monkeypatch.setattr(F.Flow, 'columns', lambda self: ({}, {k: list(v) for k, v in cols.items()}))
+    out = []
+    c = A.Cascade(g=CascadeGate(served_files=False), dry_run=True, out=out.append, sleep=lambda s: None)
+    c.moved, c.pulled = [447], []  # the promote step moved #447 up (dry run)
+    after = c.fill()
+    assert [p['number'] for p in after[board.HUMAN_REVIEW]] == [447]
+    assert pulled == [528] and [p['number'] for p in after[board.STAGING]] == [518, 528]
+    assert checked == [528] and premerged == [539]
+    assert 541 not in labelled and 546 not in labelled
+    assert [p['number'] for p in after[board.READY]] == [546, 541, 539]
+    assert not any('NEEDS_REWORK' in l or 'would move' in l for l in out)

@@ -579,3 +579,81 @@ def test_a_worker_tip_with_conflict_markers_is_never_merge_ready_or_pushed_to_wo
     assert f2.premerge(cols, s) == {7: good} and good != bad  # the bad cached tip is skipped
     assert f2.work_commit(s, h['hr1'], bad, [bad], 'm') is None
     assert any('work NOT pushed' in n and 'conflict marker' in n for n in f2.notes)
+
+
+# -- tangentswarm #111: a merge of a PR ahead keeps the pre-merge with no check ------------------
+
+def merge_into_main(w, s, sha, name):
+    """main gets a merge commit of sha (first parent: main, second: sha), as GitHub merges a PR."""
+    run(w, 'checkout', '-q', '-B', 'main', s.main)
+    run(w, 'merge', '-q', '--no-ff', '-m', f'Merge {name}', sha)
+    s.main = run(w, 'rev-parse', 'HEAD')
+    return s.main
+
+
+def no_probe(f):
+    f.kept_tip = lambda *a, **k: pytest.fail('a merge it assumed must not probe the tip')
+    return f
+
+
+def test_a_merge_of_the_pr_ahead_keeps_the_top_pre_merge_with_no_probe_and_no_write(world):
+    """#1 (Human Review) merges into main as its head. #9's b9-v1 was built on main + #1, so
+    nothing changed for it: no probe merge, no new -vN, no record write, no did line."""
+    w, s, h, origin = world
+    f, _ = make(world)
+    v1 = f.premerge({HR: [card(1, HR, h['hr1'])], ST: [card(2, ST, h['st2'])], RD: [card(9, RD, h['z'])]}, s)[9]
+    rec = dict(flow.load_premerge()['9'])
+    merge_into_main(w, s, h['hr1'], '#1')
+    f2 = no_probe(make(world)[0])
+    mr = ['merge-ready']
+    assert f2.premerge({ST: [card(2, ST, h['st2'], mr)], RD: [card(9, RD, h['z'], mr)]}, s) == {9: v1}
+    assert flow.load_premerge()['9'] == rec and remote(s, origin, 'b9-v2') is None
+    assert f2.did == [] and f2.notes == []  # no label, branch or record change
+
+
+def test_a_merge_of_both_prs_ahead_keeps_the_pre_merge(world):
+    w, s, h, origin = world
+    f, _ = make(world)
+    v1 = f.premerge({HR: [card(1, HR, h['hr1'])], ST: [card(2, ST, h['st2'])], RD: [card(9, RD, h['z'])]}, s)[9]
+    merge_into_main(w, s, h['st2'], '#2')  # any order
+    merge_into_main(w, s, h['hr1'], '#1')
+    assert no_probe(make(world)[0]).premerge({RD: [card(9, RD, h['z'])]}, s) == {9: v1}
+
+
+@pytest.mark.parametrize('change', ['direct push', 'new head ahead', 'pr ahead removed'])
+def test_a_change_it_did_not_assume_re_checks_the_top_pr(world, change):
+    """tangentswarm #111 rule 4: a commit on main that is not a queued head, a new head on a PR
+    ahead, or a PR ahead that left without a merge: the tip is checked again (kept_tip or a new -vN)."""
+    w, s, h, origin = world
+    f, _ = make(world)
+    f.premerge({HR: [card(1, HR, h['hr1'])], ST: [card(2, ST, h['st2'])], RD: [card(9, RD, h['z'])]}, s)
+    if change == 'direct push':
+        merge_into_main(w, s, h['hr1'], '#1')
+        run(w, 'checkout', '-q', 'main')
+        (w / 'm.txt').write_text('m\n')
+        run(w, 'add', '.')
+        run(w, 'commit', '-qm', 'direct')
+        s.main = run(w, 'rev-parse', 'HEAD')
+        cols = {ST: [card(2, ST, h['st2'])], RD: [card(9, RD, h['z'])]}
+    elif change == 'new head ahead':
+        merge_into_main(w, s, h['hr1'], '#1')
+        cols = {ST: [card(2, ST, h['c'])], RD: [card(9, RD, h['z'])]}
+    else:
+        cols = {ST: [card(2, ST, h['st2'])], RD: [card(9, RD, h['z'])]}
+    f2, _ = make(world)
+    probed = []
+    real = f2.kept_tip
+    f2.kept_tip = lambda *a: probed.append(a[-1]) or real(*a)
+    f2.premerge(cols, s)
+    assert h['z'] in probed
+
+
+def test_a_resolved_tip_is_never_kept_without_a_check(world):
+    """A tip its worker resolved (a seed) does not prove the head merges: it is checked."""
+    w, s, h, origin = world
+    f, _ = make(world)
+    f.premerge({HR: [card(1, HR, h['hr1'])], RD: [card(9, RD, h['z'])]}, s)
+    flow.set_premerge(9, dict(flow.load_premerge()['9'], seed=h['main']))
+    merge_into_main(w, s, h['hr1'], '#1')
+    f2, _ = make(world)
+    assert f2.assumed(s, flow.load_premerge()['9'], f2.future_main(s, {RD: []})[0], h['z']) is None
