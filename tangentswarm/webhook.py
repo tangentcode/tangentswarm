@@ -723,7 +723,7 @@ class Executor:
         """Michal's comments on the issues PR n closes, after the last needs_input question
         there (needs_input posts the question on the ticket, so he answers there)."""
         from .stophook import QUESTION_MARK
-        owner, name = REPO.split('/')
+        owner, name = self.repo.split('/')  # tangentswarm #105: this PR's repo, not always platform
         try:  # Codex on PR #51: a failed read must never stop the resume
             d = self.g['gql'](ANSWERS_Q, owner=owner, name=name, n=int(n))
         except Exception as e:
@@ -743,12 +743,11 @@ class Executor:
         if not n:
             return self.note('reject: not a PR')
         self.draft(n)
-        if not self.platform():
-            return self.wake(n, f"{self.repo}#{n} rejected from Human Review; no worker relay for this repo yet",
-                             key=f'reject:{self.repo}:{n}')
+        # tangentswarm #105: a Project 6 PR goes to its live worker too (to_worker, #99)
         cs = self.comments_since_head(n)
         said = ' | '.join(' '.join((c.get('body') or '').split())[:400] for c in cs) or '(no comment: see the PR)'
-        ok, note = self.to_worker(n, f"Coordinator: #{n}: Michal sent it back from Human Review: {said} {ROOT_CAUSE}")
+        ok, note = self.to_worker(n, f"Coordinator: #{n}: Michal sent it back from Human Review: {said} "
+                                     f"{self.root_cause()}")
         if not ok:
             return self.wake(n, f"#{n} rejected; no worker could take it ({note})", key=f'reject:{n}')
         self.note(f"#{n}: Michal's rejection relayed ({note})")
@@ -758,9 +757,7 @@ class Executor:
         if not n:
             return self.wake(0, 'Needs Input answered on an issue with no PR: TRIAGE handoff', key=f"answered:{a.args['node']}")
         self.draft(n)
-        if not self.platform():
-            return self.wake(n, f"{self.repo}#{n} answered in Needs Input; no worker relay for this repo yet",
-                             key=f'answered:{self.repo}:{n}')
+        # tangentswarm #105: a Project 6 PR goes to its live worker too (to_worker, #99)
         cs = self.comments_since_head(n)
         said = ' | '.join(' '.join((c.get('body') or '').split())[:600] for c in cs + self.issue_answers(n)) or '(see the issue)'
         ok, note = self.to_worker(n, f"Coordinator: #{n}: Michal answered: {said} Build it, then push.")
@@ -1078,10 +1075,11 @@ def wake_exception(n, why, key=None, now=time.time, dry=False, post=None, source
     """An exception for swarmbot, from the webhook or any other swarm process (the daemon's
     deploy-lag check): deduped by key for WAKE_DEDUPE s, at most one POST per WAKE_EVERY s
     for all keys together. Returns a note line."""
+    from .alerts import et_stamp
     key = key or why[:80]
     t = now()
     payload = {'source': source, 'kind': 'exception', 'pr': n or None, 'why': why,
-               'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'log': str(LOG), **(extra or {})}
+               'at': et_stamp(t), 'log': str(LOG), **(extra or {})}  # #105: ET, as the spec says
     with _lock:
         st = _seen()
         last = st.setdefault('wake', {})

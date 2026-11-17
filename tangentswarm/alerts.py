@@ -84,14 +84,17 @@ def done_now(st, once):
     return False
 
 
-def et_stamp(t):
-    """Epoch seconds t as an ISO time in US Eastern (the 'at' of a MethBot POST)."""
+def et_stamp(t, fmt=None):
+    """Epoch seconds t as an ISO time in US Eastern (the 'at' of a MethBot POST or a
+    swarmbot wake), or in strftime fmt. The host clock is UTC: localtime is not ET
+    (tangentswarm #105)."""
     from datetime import datetime
     try:
         from zoneinfo import ZoneInfo
-        return datetime.fromtimestamp(t, ZoneInfo('America/New_York')).isoformat(timespec='seconds')
+        d = datetime.fromtimestamp(t, ZoneInfo('America/New_York'))
+        return d.strftime(fmt) if fmt else d.isoformat(timespec='seconds')
     except Exception:
-        return time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(t))
+        return time.strftime(fmt or '%Y-%m-%dT%H:%M:%S', time.localtime(t))
 
 
 def methbot_post(payload):
@@ -209,7 +212,7 @@ def _incident(once, key, title, what, why, fix, prevent, st, sh, now):
     if sh is None:
         from . import tick
         sh = lambda argv: tick.sh(argv, check=True).stdout  # noqa: E731
-    stamp = time.strftime('%Y-%m-%d %-I:%M %p ET', time.localtime(t))
+    stamp = et_stamp(t, '%Y-%m-%d %-I:%M %p ET')  # #105: the host clock is UTC
     try:
         url = sh(['gh', 'issue', 'create', '--repo', INCIDENT_REPO, '--title', f"Incident {stamp}: {title}",
                   '--body', incident_body(what, why, fix, prevent)]).strip().splitlines()[-1]

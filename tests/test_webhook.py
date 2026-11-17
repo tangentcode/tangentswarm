@@ -763,3 +763,71 @@ def test_a_codex_comment_on_project_6_classifies_as_codex_not_log_only(repo):
     review = {'action': 'submitted', 'repository': {'full_name': repo}, 'pull_request': pr(73),
               'review': {'user': CODEX, 'body': 'P1', 'commit_id': 'a' * 40}}
     assert [(a.kind, a.args['repo']) for a in W.classify('pull_request_review', review)] == [('codex', repo)]
+
+
+# -- tangentswarm #105: Human Review rejections and Needs Input answers on Project 6 --------
+
+def p6_move_fake(monkeypatch, tmp_path, repo, live=True, issue=None):
+    """p6_fake with a card move: the node is repo's PR 73, Michal commented after the head,
+    and the answer query is recorded."""
+    ex, host = p6_fake(monkeypatch, tmp_path, repo, col=board.IN_PROGRESS, live=live)
+    ex.full['comments'] = {'nodes': [{'author': {'login': W.MICHAL}, 'body': 'Use the ET clock.',
+                                      'createdAt': '2026-11-16T00:00:00Z'}]}
+    ex.answer_reads = []
+    full = ex._g['gql']
+
+    def gql(q, **v):
+        if 'node(id:' in q:
+            return {'node': {'__typename': 'PullRequest', 'number': 73, 'repository': {'nameWithOwner': repo}}}
+        if q == W.ANSWERS_Q:
+            ex.answer_reads.append((v['owner'], v['name']))
+            return {'repository': {'pullRequest': {'closingIssuesReferences': {'nodes': [issue] if issue else []}}}}
+        return full(q, **v)
+    ex._g['gql'] = gql
+    return ex, host
+
+
+def _move(kind, repo):
+    return W.Action(kind, 0, 'x', dict(node='PR_x', board=board.for_repo(repo).number))
+
+
+@pytest.mark.parametrize('repo', P6)
+def test_a_project_6_rejection_reaches_the_live_worker_with_no_wake(monkeypatch, tmp_path, repo):
+    ex, host = p6_move_fake(monkeypatch, tmp_path, repo)
+    ex.run(_move('reject', repo))
+    assert ex.errors == [] and ex.wakes == [] and [p for p, _ in host.told] == ['%55']
+    text = host.told[0][1]
+    assert 'Michal sent it back from Human Review: Use the ET clock.' in text
+    assert text.endswith(W.ROOT_CAUSE_P6) and 'no worker relay' not in ' '.join(ex.done)
+    assert board.DRAFTED == [(73, repo)] and any("rejection relayed" in d for d in ex.done)
+
+
+@pytest.mark.parametrize('repo', P6)
+def test_a_project_6_answer_reaches_the_live_worker_with_no_wake(monkeypatch, tmp_path, repo):
+    from tangentswarm import stophook
+    issue = {'comments': {'nodes': [
+        {'author': {'login': W.MICHAL}, 'body': stophook.QUESTION_MARK + '\nET or UTC?', 'createdAt': '1'},
+        {'author': {'login': W.MICHAL}, 'body': 'ET.', 'createdAt': '2'}]}}
+    ex, host = p6_move_fake(monkeypatch, tmp_path, repo, issue=issue)
+    ex.run(_move('answered', repo))
+    assert ex.errors == [] and ex.wakes == [] and [p for p, _ in host.told] == ['%55']
+    assert 'Michal answered: Use the ET clock. | ET. Build it, then push.' in host.told[0][1]
+    assert ex.answer_reads == [tuple(repo.split('/'))]  # the PR's own repo, not platform
+    assert board.DRAFTED == [(73, repo)] and any("answer relayed" in d for d in ex.done)
+
+
+@pytest.mark.parametrize('repo', P6)
+@pytest.mark.parametrize('kind', ['reject', 'answered'])
+def test_a_project_6_move_with_no_live_worker_wakes_once(monkeypatch, tmp_path, repo, kind):
+    ex, host = p6_move_fake(monkeypatch, tmp_path, repo, live=False)
+    ex.run(_move(kind, repo))
+    ex.run(_move(kind, repo))
+    assert host.told == [] and ex.errors == [] and len(ex.wakes) == 1  # deduped
+    why = ex.wakes[0]['why']
+    assert why.startswith(f'{repo}: #73 ') and 'no worker could take it' in why and 'no live Claude' in why
+
+
+def test_the_wake_at_is_eastern_time_whatever_the_host_clock():
+    sent = []
+    W.wake_exception(103, 'x', now=lambda: 1794903060.0, post=sent.append)  # 08:11 UTC
+    assert sent[0]['at'] == '2026-11-17T03:11:00-05:00'
