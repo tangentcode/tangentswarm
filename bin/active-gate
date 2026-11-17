@@ -1,0 +1,713 @@
+#!/usr/bin/env python3
+"""active-gate: enforce the Active column on the tangentcode/platform board.
+
+  active-gate                dry run: list every Active card and FAIL any that
+                             is not an open issue, assigned to the swarm, and
+                             either has open sub-issues or a linked open PR in
+                             a flow column (In Progress, Auto Review, Needs
+                             Input, Pending, Human Review)
+  active-gate N [N...]       dry run for those issue numbers only
+  active-gate --sweep        same as a dry run of every Active card
+  active-gate --sweep --demote
+                             also move each failing card: a closed issue to
+                             Done; a work2 issue to Inbox; a draft card to
+                             Triage; a PR card to In Progress. An Active
+                             issue with no linked PR or open sub-issue is
+                             not demoted: Michal moving it to Active is the
+                             launch approval, so the card is reported as
+                             needs-launch and left in Active (including
+                             issues with a needs-input or needs-decision
+                             label). An Active issue whose linked open
+                             PRs are all in Deferred, with no open
+                             sub-issue, is kind 'deferred' and moves to
+                             Deferred (tangentswarm #140).
+  active-gate --promote-missing
+                             put each open, swarm-assigned issue that has an
+                             open linked PR in a flow column, or open sub-issues,
+                             into Active. Also promote a Backlog issue that has
+                             an open linked PR in a flow column. An issue
+                             whose linked PRs are all in Deferred is never
+                             promoted.
+  After a sweep, label sync (tangentswarm.labels) copies the human labels and
+  the milestone of each linked issue onto its open PRs (writes only with
+  --demote or --promote-missing; else a dry run).
+
+A "Part of #N" text mention is not a link. A link is a GraphQL closing
+reference (closingIssuesReferences / closedByPullRequestsReferences) or a
+connected-event development link. Assigned to the swarm means the issue's
+Project 4 card is in Active or a later column (option id; the swarm label is
+retired, Michal 2026-11-14 7:23 PM ET). Issues with the `work2` label stay in Inbox: they
+are never promoted to Active, and if found in Active they are demoted
+back to Inbox. Their PRs do not count.
+
+Parked items are never demoted or promoted: #110, #116, #120, #125, #202,
+#203, #204, #117, #21-#38, #344.
+
+Read-only unless --demote or --promote-missing is set. Idempotent.
+Every --demote/--promote decision is appended to ~/.local/state/active-gate.log.
+Exit 0 = all pass, 1 = some fail, 2 = usage/tool error.
+"""
+import fcntl, json, os, subprocess, sys
+import os
+os.environ["PATH"] = os.path.expanduser("~/bin/ghshim") + ":" + os.environ.get("PATH", "")  # reads via tangentcode-minbot quota (Michal 2026-11-13)
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+ET = ZoneInfo("America/New_York")
+
+REPO, OWNER, PROJ_NUM = "tangentcode/platform", "tangentcode", 4
+PROJ_ID = "PVT_kwDOCSzmXs4BmmNr"
+STATUS_FIELD = "PVTSSF_lADOCSzmXs4BmmNrzhlOj8c"
+OPT = {
+    "Inbox": "c45b1427", "Triage": "d810494e", "Backlog": "949e361c",
+    "Active": "b78fd213", "In Progress": "99f45c3f", "Auto Review": "d5518338",
+    "Pending": "d0ab725e", "Needs Input": "a98589f0", "Human Review": "3dbcefec",
+    "Done": "ded16603", "Parked": "e3fa7392", "Canceled": "4f9967fe",
+    "Deferred": "0837891f",
+}
+PARKED = {110, 116, 120, 125, 202, 203, 204, 117, 344} | set(range(21, 39))
+BY_OPT = {v: k for k, v in OPT.items()}
+
+
+def _ts(mod):
+    """tangentswarm.<mod> from SWARM_HOOK_SRC, even when another tangentswarm copy is already
+    imported (swarm-tick runs this script in its own process with an older checkout first on
+    its path: "tangentswarm.labels not loaded", 2026-11-15). Then the SWARM_HOOK_SRC copy is
+    loaded as its own package, tangentswarm_hooksrc."""
+    import importlib, importlib.util
+    src = os.environ.get("SWARM_HOOK_SRC", os.path.expanduser("~/ver/tangentswarm.flow-live"))
+    want = os.path.realpath(os.path.join(src, "tangentswarm"))
+    pkg = sys.modules.get("tangentswarm")
+    if pkg is None or os.path.realpath(os.path.dirname(pkg.__file__ or "")) == want:
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        return importlib.import_module(f"tangentswarm.{mod}")
+    name = "tangentswarm_hooksrc"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, os.path.join(want, "__init__.py"),
+                                                      submodule_search_locations=[want])
+        m = importlib.util.module_from_spec(spec)
+        sys.modules[name] = m
+        spec.loader.exec_module(m)
+    return importlib.import_module(f"{name}.{mod}")
+
+
+def _labels():
+    """tangentswarm.labels from the repo (assigned rule, label sync), or None."""
+    src = os.environ.get("SWARM_HOOK_SRC", os.path.expanduser("~/ver/tangentswarm.flow-live"))
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    try:
+        labels = _ts("labels")
+        return labels
+    except Exception as e:
+        print(f"active-gate: tangentswarm.labels not loaded: {e}", file=sys.stderr)
+        return None
+
+
+def col_of(value):
+    """Column name for a Status value, by option id (the shown name may change)."""
+    value = value or {}
+    return BY_OPT.get(value.get("optionId")) or {"Staging": "Pending"}.get(value.get("name"), value.get("name"))
+WORK2 = "work2"
+FLOW_COLS = {
+    "In Progress", "Auto Review", "Needs Input", "Pending", "Human Review",
+}
+DEFERRED = "Deferred"
+PENDING_LABELS = {"needs-input", "needs-decision"}
+LOCK = os.path.expanduser("~/.cache/active-gate.lock")
+LOG = os.path.expanduser("~/.local/state/active-gate.log")
+
+ITEM_Q = """
+query($c:String){
+  organization(login:"tangentcode"){
+    projectV2(number:4){
+      items(first:100, after:$c){
+        pageInfo{hasNextPage endCursor}
+        nodes{
+          id type
+          fieldValueByName(name:"Status"){
+            ...on ProjectV2ItemFieldSingleSelectValue{name optionId}
+          }
+          content{
+            __typename
+            ...on DraftIssue{title}
+            ...on Issue{number title state id}
+            ...on PullRequest{number title state isDraft id}
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+ISSUE_Q = """
+query($n:Int!){
+  repository(owner:"tangentcode", name:"platform"){
+    issue(number:$n){
+      id number title state
+      labels(first:30){nodes{name}}
+      subIssues(first:50){nodes{number state title} pageInfo{hasNextPage}}
+      closedByPullRequestsReferences(first:30){
+        nodes{number title state isDraft}
+        pageInfo{hasNextPage}
+      }
+      timelineItems(last:80, itemTypes:[CONNECTED_EVENT, DISCONNECTED_EVENT]){
+        pageInfo{hasPreviousPage}
+        nodes{
+          __typename
+          ...on ConnectedEvent{
+            createdAt
+            source{__typename ...on PullRequest{number state} ...on Issue{number}}
+            subject{__typename ...on PullRequest{number state} ...on Issue{number}}
+          }
+          ...on DisconnectedEvent{
+            createdAt
+            source{__typename ...on PullRequest{number state} ...on Issue{number}}
+            subject{__typename ...on PullRequest{number state} ...on Issue{number}}
+          }
+        }
+      }
+      projectItems(first:8){
+        nodes{
+          id project{number}
+          fieldValueByName(name:"Status"){
+            ...on ProjectV2ItemFieldSingleSelectValue{name optionId}
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def sh(*a, check=True):
+    r = subprocess.run(a, capture_output=True, text=True)
+    if check and r.returncode:
+        err = (r.stderr or r.stdout or "").strip()[:300]
+        raise RuntimeError(f"{' '.join(a[:4])}...: {err}")
+    return r
+
+
+# Columns are matched by option id, never by name: the board renames columns (Pending is
+# now shown as Staging, same option id d0ab725e). Every GraphQL result is normalized so a
+# status value with a known optionId carries the internal name this script uses.
+STATUS_BY_ID = {"c45b1427": "Inbox", "d810494e": "Triage", "3eb5de64": "Discuss", "949e361c": "Backlog",
+                "b78fd213": "Active", "99f45c3f": "In Progress", "d5518338": "Auto Review",
+                "a98589f0": "Needs Input", "432e495b": "Ready", "d0ab725e": "Pending",
+                "3dbcefec": "Human Review", "ded16603": "Done", "4f9967fe": "Canceled", "e3fa7392": "Parked"}
+# Timeline status-change events carry the column name at the time of the event.
+STATUS_ALIASES = {"Pending": {"Approved", "Staging"}}
+
+def canon_status(x):
+    if isinstance(x, dict):
+        if x.get("optionId") in STATUS_BY_ID:
+            x["name"] = STATUS_BY_ID[x["optionId"]]
+        for v in x.values():
+            canon_status(v)
+    elif isinstance(x, list):
+        for v in x:
+            canon_status(v)
+    return x
+
+def gql(q, **v):
+    args = ["gh", "api", "graphql", "-f", f"query={q}"]
+    for k, val in v.items():
+        if val is None:
+            continue
+        args += ["-F" if k == "n" or isinstance(val, int) else "-f", f"{k}={val}"]
+    return canon_status(json.loads(sh(*args).stdout)["data"])
+
+
+def caller():
+    try:
+        return " ".join(open(f"/proc/{os.getppid()}/cmdline", "rb")
+                        .read().replace(b"\0", b" ").decode(errors="replace").split())[:200]
+    except OSError:
+        return "?"
+
+
+def now_et():
+    return datetime.now(ET).isoformat(timespec="seconds")
+
+
+def log(mode, n, verdict, detail):
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(f"{now_et()}\t{mode}\t#{n}\t{verdict}\t{detail}\tcaller={caller()}\n")
+
+
+def pr_from_ref(node, issue_n):
+    """Return (pr_number, state) if this connected/disconnected pair links issue_n to a PR."""
+    if not node:
+        return None
+    sides = (node.get("source") or {}, node.get("subject") or {})
+    pr, issue = None, None
+    for s in sides:
+        typ = s.get("__typename")
+        if typ == "PullRequest":
+            pr = (s.get("number"), s.get("state"))
+        elif typ == "Issue" and s.get("number") == issue_n:
+            issue = s.get("number")
+    if pr and issue:
+        return pr
+    return None
+
+
+def development_prs(issue):
+    """Open PRs linked by ConnectedEvent, minus a later DisconnectedEvent for the same PR."""
+    n = issue["number"]
+    linked = {}
+    evs = list(issue["timelineItems"]["nodes"])
+    evs.sort(key=lambda e: e.get("createdAt") or "")
+    for e in evs:
+        pair = pr_from_ref(e, n)
+        if not pair:
+            continue
+        num, state = pair
+        if e["__typename"] == "ConnectedEvent":
+            linked[num] = state
+        elif e["__typename"] == "DisconnectedEvent":
+            linked.pop(num, None)
+    return [(num, state) for num, state in linked.items() if state == "OPEN"]
+
+
+def flow_pr_nums(pr_nums, pr_board):
+    """Linked PR numbers that sit in a flow column. work2 PRs in Inbox do not count.
+
+    If pr_board is None, skip the flow-column filter so in-process callers
+    (swarm-tick --dry-run) still see linked PRs.
+    """
+    if pr_board is None:
+        return list(pr_nums)
+    counted = []
+    for n in pr_nums:
+        info = (pr_board or {}).get(n)
+        if not info:
+            continue
+        _item_id, col, _state, _title = info
+        if col in FLOW_COLS:
+            counted.append(n)
+    return counted
+
+
+def deferred_pr_nums(pr_nums, pr_board):
+    """The linked PR numbers when every one of them sits in Deferred, else [].
+
+    A PR with no Project 4 card is not in Deferred. With pr_board None (no board
+    read) nothing counts as Deferred.
+    """
+    if not pr_nums or pr_board is None:
+        return []
+    for n in pr_nums:
+        info = pr_board.get(n)
+        if not info or info[1] != DEFERRED:
+            return []
+    return list(pr_nums)
+
+
+def truncated_lists(issue):
+    """Names of the issue lists that ISSUE_Q read only in part (Codex on PR #142).
+
+    A cut list may hide an open sub-issue or a linked flow PR, so a deferral needs all
+    three lists whole. A missing pageInfo counts as whole.
+    """
+    def more(conn, key):
+        return bool(((conn or {}).get("pageInfo") or {}).get(key))
+    cut = []
+    if more(issue.get("subIssues"), "hasNextPage"):
+        cut.append("sub-issues")
+    if more(issue.get("closedByPullRequestsReferences"), "hasNextPage"):
+        cut.append("closing PRs")
+    if more(issue.get("timelineItems"), "hasPreviousPage"):
+        cut.append("development links")
+    return cut
+
+
+def eval_issue(issue, pr_board=None):
+    """Return (rows, ok, kind) for an issue object from ISSUE_Q.
+
+    kind is 'closed', 'work2', 'deferred', 'pending', or 'unlinked' for demote
+    routing. Unlinked and pending Active issues are reported as needs-launch
+    and are not demoted. 'deferred' is an open issue with no open sub-issue
+    whose linked open PRs are all in Deferred: the sweep moves it to Deferred. rows is a list of (name, ok, why). A linked open PR counts
+    only when it sits in a flow column; work2 issues always fail (they stay
+    in Inbox).
+    """
+    rows = []
+    state = issue["state"]
+    is_open = state == "OPEN"
+    rows.append(("open issue", is_open, f"state={state}"))
+
+    labels = {l["name"].lower() for l in issue["labels"]["nodes"]}
+    lab = _labels()
+    if lab is not None:
+        swarm, why_swarm = lab.assigned_by_card(issue.get("projectItems"))
+    else:
+        swarm, why_swarm = False, "tangentswarm.labels not loaded"
+    work2 = WORK2 in labels
+    rows.append(("assigned to the swarm", swarm, why_swarm))
+    if work2:
+        rows.append(("not a work2 side-lane issue", False,
+                     "label 'work2'; stays in Inbox and its PRs do not count"))
+
+    sub = issue["subIssues"]["nodes"]
+    if issue["subIssues"]["pageInfo"]["hasNextPage"]:
+        # still count the first page; note the truncation
+        extra = " (first 50 only)"
+    else:
+        extra = ""
+    open_subs = [s for s in sub if s["state"] == "OPEN"]
+    sub_ok = bool(open_subs)
+    if open_subs:
+        why_sub = "open sub-issues: " + ",".join(f"#{s['number']}" for s in open_subs) + extra
+    elif sub:
+        why_sub = "sub-issues are closed" + extra
+    else:
+        why_sub = "no sub-issues"
+
+    closing = [p for p in issue["closedByPullRequestsReferences"]["nodes"] if p["state"] == "OPEN"]
+    connected = development_prs(issue)
+    # connected may overlap closing; unique numbers
+    pr_nums = []
+    seen = set()
+    for p in closing:
+        if p["number"] not in seen:
+            pr_nums.append(p["number"]); seen.add(p["number"])
+    for num, _state in connected:
+        if num not in seen:
+            pr_nums.append(num); seen.add(num)
+    all_linked = list(pr_nums)
+    cut = truncated_lists(issue)
+    pr_nums = flow_pr_nums(pr_nums, pr_board)
+    ignored = [n for n in all_linked if n not in pr_nums]
+    pr_ok = bool(pr_nums)
+    if pr_ok:
+        why_pr = "open linked PR in a flow column: " + ",".join(f"#{n}" for n in pr_nums)
+        if ignored:
+            why_pr += " (ignored non-flow: " + ",".join(f"#{n}" for n in ignored) + ")"
+    elif deferred_pr_nums(all_linked, pr_board):
+        why_pr = "all linked open PRs are in Deferred: " + ",".join(f"#{n}" for n in all_linked)
+        if cut:
+            why_pr += " (not deferred: only part of the " + ", ".join(cut) + " was read)"
+    elif all_linked:
+        why_pr = "linked open PR not in a flow column: " + ",".join(f"#{n}" for n in all_linked)
+    else:
+        why_pr = "no closingIssuesReferences or connected-event development link"
+
+    link_ok = sub_ok or pr_ok
+    if sub_ok and pr_ok:
+        why_link = why_sub + "; " + why_pr
+    elif sub_ok:
+        why_link = why_sub
+    elif pr_ok:
+        why_link = why_pr
+    else:
+        why_link = why_sub + "; " + why_pr + " (a 'Part of' mention is not a link)"
+    rows.append(("open sub-issues or linked open PR", link_ok, why_link))
+
+    allok = all(ok for _, ok, _ in rows)
+    pending = bool(labels & PENDING_LABELS)
+    if not is_open:
+        kind = "closed"
+    elif work2:
+        kind = "work2"
+    elif not link_ok and not cut and deferred_pr_nums(all_linked, pr_board):
+        kind = "deferred"
+    elif pending and not link_ok:
+        kind = "pending"
+    elif not link_ok:
+        kind = "unlinked"
+    elif not swarm:
+        kind = "unassigned"
+    else:
+        kind = "ok"
+    return rows, allok, kind
+
+
+def show(n, title, typ, col, rows, parked=False, kind=None):
+    allok = all(ok for _, ok, _ in rows)
+    flag = "PARKED " if parked else ""
+    print(f"{flag}#{n} {typ} {title[:60]}  card={col}")
+    for name, ok, why in rows:
+        print(f"  {'PASS' if ok else 'FAIL'}  {name:<36} {why}")
+    if not allok and kind in ("unlinked", "pending") and not parked:
+        print("  => needs-launch (no linked PR; leave in Active)\n")
+    else:
+        print(f"  => {'ALL PASS' if allok else 'BLOCKED: ' + str(sum(not ok for _, ok, _ in rows)) + ' failing'}\n")
+    return allok
+
+
+def project_items():
+    items, cursor = [], None
+    while True:
+        data = gql(ITEM_Q, c=cursor)
+        page = data["organization"]["projectV2"]["items"]
+        items.extend(page["nodes"])
+        if not page["pageInfo"]["hasNextPage"]:
+            break
+        cursor = page["pageInfo"]["endCursor"]
+    return items
+
+
+def card_of(issue):
+    for it in issue["projectItems"]["nodes"]:
+        if it["project"]["number"] == PROJ_NUM:
+            return it["id"], col_of(it["fieldValueByName"])
+    return None, None
+
+
+def move(item, status):
+    sh("gh", "project", "item-edit", "--id", item, "--project-id", PROJ_ID,
+       "--field-id", STATUS_FIELD, "--single-select-option-id", OPT[status])
+
+
+def add_to_project(url):
+    out = sh("gh", "project", "item-add", "--owner", OWNER, "--number", str(PROJ_NUM),
+             "--url", url, "--format", "json").stdout
+    return json.loads(out)["id"]
+
+
+def fetch_issue(n):
+    return gql(ISSUE_Q, n=n)["repository"]["issue"]
+
+
+def classify_item(item):
+    """Return a tuple for an Active (or any) project item: typ, number, title, state, id, item_id, col."""
+    col = col_of(item.get("fieldValueByName"))
+    c = item.get("content") or {}
+    typ = c.get("__typename") or item.get("type") or "EMPTY"
+    return typ, c.get("number"), c.get("title") or "", c.get("state"), c.get("id"), item["id"], col
+
+
+def pr_board_from_items(items):
+    board = {}
+    for it in items:
+        typ, num, title, state, _nid, item_id, col = classify_item(it)
+        if typ == "PullRequest" and num:
+            board[num] = (item_id, col, state, title)
+    return board
+
+
+def evaluate_item(item, pr_board=None):
+    typ, num, title, state, _nid, item_id, col = classify_item(item)
+    parked = isinstance(num, int) and num in PARKED
+    if typ == "Issue":
+        issue = fetch_issue(num)
+        rows, ok, kind = eval_issue(issue, pr_board)
+        return dict(typ=typ, number=num, title=title, col=col, item_id=item_id,
+                    rows=rows, ok=ok, kind=kind, parked=parked, issue=issue)
+    if typ == "PullRequest":
+        rows = [
+            ("open issue", False, f"card is a pull request #{num} (state={state})"),
+            ("assigned to the swarm", False, "n/a (not an issue)"),
+            ("open sub-issues or linked open PR", False, "n/a (not an issue)"),
+        ]
+        kind = "pr"
+        return dict(typ=typ, number=num, title=title, col=col, item_id=item_id,
+                    rows=rows, ok=False, kind=kind, parked=parked, issue=None)
+    rows = [
+        ("open issue", False, f"card is a {typ}, not an open issue"),
+        ("assigned to the swarm", False, "n/a"),
+        ("open sub-issues or linked open PR", False, "n/a"),
+    ]
+    return dict(typ=typ, number=num or 0, title=title, col=col, item_id=item_id,
+                rows=rows, ok=False, kind="draft", parked=parked, issue=None)
+
+
+def demote_status(kind):
+    if kind == "closed":
+        return "Done"
+    if kind == "work2":
+        return "Inbox"
+    if kind == "deferred":
+        # tangentswarm #140: every linked PR was deferred, so the issue is not live work.
+        return "Deferred"
+    if kind in ("unlinked", "pending"):
+        # Active means Michal already approved a launch. Do not demote an
+        # issue just because it has no PR or open sub-issue yet, and do not
+        # send a pending-question card out of Active.
+        return None
+    if kind == "pr":
+        # PRs that landed in Active go to In Progress so they stay in the loop.
+        return "In Progress"
+    if kind in ("unassigned", "draft"):
+        return "Triage"
+    return None
+
+
+def main(argv):
+    sweep = "--sweep" in argv
+    demote = "--demote" in argv
+    promote = "--promote-missing" in argv
+    nums = [int(a) for a in argv if a.isdigit()]
+    if demote and not sweep:
+        print("active-gate: --demote requires --sweep", file=sys.stderr)
+        return 2
+    if promote and (demote or sweep or nums):
+        print("active-gate: --promote-missing cannot mix with --sweep, --demote, or issue numbers",
+              file=sys.stderr)
+        return 2
+    if not nums and not sweep and not promote and any(
+            a.startswith("-") and a not in ("--sweep", "--demote", "--promote-missing", "-h", "--help")
+            for a in argv):
+        print(__doc__)
+        return 2
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
+
+    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+    lock = open(LOCK, "w")
+    if demote or promote:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+
+    rc = 0
+    items = project_items()
+
+    if promote:
+        print(f"promote-missing {datetime.now(ET):%-I:%M %p} ET: open swarm-assigned issues with a link")
+        # Swarm-assigned = the card is in Active or a later column; plus Backlog issues (below).
+        assigned_cols = {"Active", "In Progress", "Auto Review", "Needs Input", "Ready", "Pending", "Human Review"}
+        want = set()
+        on_board = {}
+        pr_board = pr_board_from_items(items)
+        for it in items:
+            typ, num, title, state, nid, item_id, col = classify_item(it)
+            if typ == "Issue" and num:
+                on_board[num] = (item_id, col, state, title)
+                # Backlog issues with a linked flow PR must be promotable too.
+                if state == "OPEN" and (col == "Backlog" or col in assigned_cols):
+                    want.add(num)
+        for n in sorted(want):
+            if n in PARKED:
+                print(f"  #{n:<4} parked; leaving in place")
+                continue
+            issue = fetch_issue(n)
+            rows, ok, kind = eval_issue(issue, pr_board)
+            item_id, col = card_of(issue)
+            title = issue["title"]
+            labels = {l["name"].lower() for l in issue["labels"]["nodes"]}
+            if WORK2 in labels:
+                print(f"  #{n:<4} work2  card={col or 'Inbox'}  (side lane stays in Inbox)")
+                continue
+            has_link = any(name.startswith("open sub-issues") and rok for name, rok, _ in rows)
+            # Promote a linked Backlog issue (its card is not yet in Active).
+            promote_ok = (kind == "ok") or (kind == "unassigned" and has_link and col == "Backlog")
+            if not promote_ok:
+                print(f"  #{n:<4} skip  card={col or '-'}  (does not yet pass the Active rule)")
+                for name, rok, why in rows:
+                    if not rok:
+                        print(f"         FAIL  {name}: {why}")
+                continue
+            if col == "Active" and item_id:
+                print(f"  #{n:<4} already Active  {title[:50]}")
+                continue
+            if not item_id:
+                item_id = add_to_project(f"https://github.com/{REPO}/issues/{n}")
+                col = "(added)"
+            move(item_id, "Active")
+            log("promote", n, "PROMOTED", f"from {col}")
+            print(f"  #{n:<4} {col or '-':<16} -> Active  {title[:50]}")
+        return 0
+
+    # dry run / sweep
+    print(f"{'sweep' if sweep or not nums else 'check'} {datetime.now(ET):%-I:%M %p} ET: Active column")
+    pr_board = pr_board_from_items(items)
+    targets = []
+    if nums:
+        # Check those issues, whether or not they are currently Active.
+        for n in nums:
+            found = None
+            for it in items:
+                typ, num, title, state, nid, item_id, col = classify_item(it)
+                if typ == "Issue" and num == n:
+                    found = it
+                    break
+            if found:
+                targets.append(found)
+            else:
+                # Issue may exist but have no card, or the number is a PR, etc.
+                try:
+                    issue = fetch_issue(n)
+                except RuntimeError as e:
+                    print(f"#{n} not found: {e}")
+                    rc = 1
+                    continue
+                item_id, col = card_of(issue)
+                fake = {"id": item_id or "", "type": "ISSUE",
+                        "fieldValueByName": {"name": col or "(no card)"},
+                        "content": {"__typename": "Issue", "number": n,
+                                    "title": issue["title"], "state": issue["state"],
+                                    "id": issue["id"]}}
+                targets.append(fake)
+    else:
+        for it in items:
+            typ, num, title, state, nid, item_id, col = classify_item(it)
+            if col == "Active":
+                targets.append(it)
+
+    if not targets:
+        print("  (no Active cards)" if not nums else "  (no matching cards)")
+        return 0
+
+    linked = []
+    for it in targets:
+        ev = evaluate_item(it, pr_board)
+        for p in ((ev.get("issue") or {}).get("closedByPullRequestsReferences") or {}).get("nodes") or []:
+            if p["state"] == "OPEN" and p["number"] not in linked:
+                linked.append(p["number"])
+        ok = show(ev["number"], ev["title"], ev["typ"], ev["col"], ev["rows"], ev["parked"], ev["kind"])
+        if not ok:
+            rc = 1
+        if not demote:
+            continue
+        if ev["ok"]:
+            continue
+        if ev["parked"]:
+            print(f"        parked; leaving in {ev['col']}")
+            log("demote", ev["number"], "SKIP-PARKED", ev["kind"])
+            continue
+        if ev["kind"] in ("unlinked", "pending"):
+            print(f"        needs-launch (no linked PR; leaving in {ev['col']})")
+            log("demote", ev["number"], "needs-launch", ev["kind"])
+            continue
+        dest = demote_status(ev["kind"])
+        if not dest or not ev["item_id"]:
+            why = "no destination" if not dest else "no project item id"
+            print(f"        not moved ({why})")
+            log("demote", ev["number"], "SKIP", why)
+            continue
+        if ev["col"] == dest:
+            print(f"        already in {dest}")
+            continue
+        # Not assigned only (card not in Active or later), but the issue is otherwise
+        # valid: do not kick a linked in-progress issue out of Active.
+        if ev["kind"] == "unassigned" and ev["issue"]:
+            _, _, link_kind_unused = ev["kind"], None, None
+            has_link = any(name.startswith("open sub-issues") and rok for name, rok, _ in ev["rows"])
+            is_open = any(name == "open issue" and rok for name, rok, _ in ev["rows"])
+            if has_link and is_open:
+                print("        not moved (only the swarm-assigned check fails; it has a link)")
+                log("demote", ev["number"], "SKIP-UNASSIGNED", "has link; card not in Active or later")
+                continue
+        move(ev["item_id"], dest)
+        log("demote", ev["number"], f"DEMOTED-{dest.upper().replace(' ', '-')}", ev["kind"])
+        print(f"        -> moved to {dest} ({ev['kind']})")
+    lab = _labels()
+    if lab is not None and linked:
+        try:  # a PR inherits the human labels and milestone of the issues it fixes (only adds)
+            lab.Sync(apply=demote, out=lambda line: print("  label-sync " + line)).main(linked)
+        except Exception as e:
+            print(f"  label-sync failed: {e}")
+    return rc
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except RuntimeError as e:
+        print(f"active-gate error: {e}", file=sys.stderr)
+        sys.exit(2)
