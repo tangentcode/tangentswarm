@@ -198,3 +198,99 @@ def test_handling_after_midnight_shows_when_the_receipt_was_before(tmp_path):
     (e,) = V.events(today)
     assert e['status'] == 'handled' and e['outcome'] == 'moved #9 to Triage' and e['pr'] == 9
     assert V.events([today[0]]) == []  # only the duplicate: nothing to show
+
+
+# -- #34 Step 2: the skips toggle ------------------------------------------------------------
+
+def test_skips_shows_the_skipped_events_and_dropped_redeliveries(tmp_path):
+    st, path = make(tmp_path)
+    evs = V.events(st.rows(), skips=True)
+    assert [(e['event'], e['status']) for e in evs] == [
+        ('pull_request/closed', 'handled'), ('ping', 'skipped'), ('push', 'skipped'), ('pull_request', 'failed'),
+        ('pull_request_review/submitted', 'queued')]
+    assert evs[1]['outcome'] == 'ping' and evs[2]['outcome'] == 'log-only' and not evs[2]['error']
+    # the default is unchanged (Step 1)
+    assert [e['status'] for e in V.events(st.rows())] == ['handled', 'failed', 'queued']
+    only_dup = [r for r in st.rows() if r.get('reason') == 'duplicate']
+    assert V.events(only_dup) == []
+    (dup,) = V.events(only_dup, skips=True)
+    assert dup['status'] == 'skipped' and dup['outcome'] == 'redelivery'
+    idle = dict(stage='event', source='cascade', event='cascade', received=NOW, received_at='2026-11-15T13:00:00-05:00',
+                notes=json.dumps(['cascade: start; budget 780s', 'promote: Human Review 2/2']))
+    assert V.events([idle]) == []
+    (e,) = V.events([idle], skips=True)
+    assert (e['event'], e['status'], e['outcome']) == ('cascade', 'skipped', 'nothing to do')
+
+
+def test_a_skipped_row_is_drawn_in_the_background():
+    e = dict(at='2026-11-15T13:00:00-05:00', t=NOW, status='skipped', event='ping', pr=None, actor='', outcome='ping')
+    assert V.line(e, NOW).startswith(f'\033[38;5;{V.GRAY_END}m')
+
+
+def test_s_toggles_the_skipped_events_in_a_terminal(tmp_path):
+    st, path = make(tmp_path)
+    presses = iter(['s', '', 'S', 'q'])
+    out = io.StringIO()
+    rc = V.run(path, since='all', out=out, tty=True, color=False, clock=lambda: NOW,
+               keys=lambda t: next(presses), sample=lambda: {}, redraw=1000)
+    frames = out.getvalue().split(V.CLEAR)[1:]
+    assert rc == 0 and len(frames) == 3  # the first draw, then one per toggle (no redraw for '')
+    assert ' ping' not in frames[0] and '2 skipped hidden' in frames[0] and 's show skips' in frames[0]
+    assert ' ping' in frames[1] and 'skipped' in frames[1] and '2 skipped shown' in frames[1]
+    assert 's hide skips' in frames[1] and '5 events' in frames[1]
+    assert ' ping' not in frames[2] and '3 events, 2 skipped hidden' in frames[2]
+
+
+def test_the_toggle_stays_across_the_agents_screen_and_the_footer_fits(tmp_path, monkeypatch):
+    st, path = make(tmp_path)
+    monkeypatch.setattr(V.shutil, 'get_terminal_size', lambda d=None: os.terminal_size((40, 6)))
+    monkeypatch.setattr(V, 'agents_screen', lambda sample, color, height, top: (['AGENTS'], top))
+    presses = iter(['s', 'a', 'e', 'q'])
+    out = io.StringIO()
+    V.run(path, since='all', out=out, tty=True, color=False, clock=lambda: NOW,
+          keys=lambda t: next(presses), sample=lambda: {'agents': []},
+          redraw=1000)
+    frames = [f for f in out.getvalue().split(V.CLEAR)[1:] if 'events,' in f]
+    assert len(frames) == 3 and 'skipped shown' in frames[-1]
+    for f in frames:
+        lines = f.rstrip('\n').split('\n')
+        assert len(lines) <= 5 and all(len(l) <= 40 for l in lines)
+        assert lines[-2] == '' and lines[-1].startswith('3 events' if 'hidden' in f else '5 events')
+
+
+def test_skips_on_a_pipe_and_options_kept_in_a_terminal(tmp_path, monkeypatch):
+    st, path = make(tmp_path)
+    out = io.StringIO()
+    V.run(path, once=True, color=False, out=out, clock=lambda: NOW, since='all', skips=True)
+    assert len(out.getvalue().splitlines()) == 5 and 'ping' in out.getvalue()
+    # the terminal path wraps run() in TermKeys: sources and skips must reach the inner call
+    seen = {}
+    real = V.run
+
+    class FakeKeys:
+        def __init__(self, **kw):
+            pass
+
+        def __enter__(self):
+            return lambda t: 'q'
+
+        def __exit__(self, *a):
+            pass
+
+    def spy(*a, **kw):
+        if kw.get('keys'):
+            seen.update(kw)
+            return 0
+        return real(*a, **kw)
+    monkeypatch.setattr(V, 'TermKeys', FakeKeys)
+    monkeypatch.setattr(V, 'run', spy)
+    real(path, tty=True, out=io.StringIO(), sample=lambda: {}, sources=('slots',), skips=True)
+    assert seen['sources'] == ('slots',) and seen['skips'] is True
+
+
+def test_the_skips_flag(tmp_path):
+    _, path = make(tmp_path)
+    wrapper = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'bin', 'swarm-events')
+    r = subprocess.run([wrapper, '--once', '--no-color', '--since', 'all', '--skips', '--db', path], capture_output=True,
+                       text=True, timeout=30, env=dict(os.environ, TANGENTSWARM_PYTHON=sys.executable))
+    assert r.returncode == 0 and r.stdout.count('\n') == 5 and 'skipped' in r.stdout, r.stderr
