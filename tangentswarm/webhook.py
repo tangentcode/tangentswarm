@@ -21,8 +21,8 @@ SQLite event log (eventdb: a 'received' row before the reply, a 'handled' row af
            card In Progress; clean -> minbot + cascade; no result yet -> nothing
   ci       a completed check suite on the PR head: red -> relay to the worker, card In
            Progress (only with a worker); green -> minbot (Auto Review) or cascade (Staging)
-  handoff  a new head on a card past In Progress: mark ready, "@codex review" once per head,
-           card Auto Review, cascade
+  handoff  a new head on a non-draft PR in In Progress or past it (or ready_for_review): mark
+           ready, "@codex review" once per head, card Auto Review, cascade
   relay    a human comment on a PR in work: relay it to the worker, card In Progress
   reject / answered   Michal's card moves (Human Review -> In Progress, Needs Input -> In
            Progress): relay his comments since the head to the worker
@@ -37,8 +37,9 @@ SQLite event log (eventdb: a 'received' row before the reply, a 'handled' row af
 current state (the Codex result and CI on the head), for events that were missed.
 `swarm-webhook replay --delivery ID` runs them again on a delivery stored in the event DB.
 
-A worker's push to a PR in In Progress is left to the Stop hook: a worker often pushes and
-goes on working, so a push alone is not a handoff.
+A push to a non-draft PR whose card is in In Progress is a handoff (tangentswarm #84): the
+card goes to Auto Review and "@codex review" is posted for that head. A push to a draft PR
+is left to the Stop hook: a worker often pushes a draft and goes on working.
 """
 import argparse
 import hashlib
@@ -550,15 +551,19 @@ class Executor:
         self.note(f"#{a.pr}: CI green; the card is in {col}: nothing to do")
 
     def do_handoff(self, a):
-        """A new head (or ready_for_review) on a card past In Progress: back to Auto Review."""
+        """A new head on a non-draft PR in In Progress or past it (or ready_for_review): to
+        Auto Review, with "@codex review" once per head (tangentswarm #84)."""
         from . import tick
         item, col = self.card(a.pr)
-        if col in (board.IN_PROGRESS, None) and a.args.get('push'):
-            return self.note(f"#{a.pr}: a push in In Progress: left to the Stop hook")
+        if col is None and a.args.get('push'):
+            return self.note(f"#{a.pr}: a push with no card: not moved")
         if col in (board.NEEDS_INPUT, board.DONE, board.CANCELED, board.PARKED):
             return self.note(f"#{a.pr}: card in {col}: not moved")
         full = self.pr_full(a.pr)
         head = full.get('headRefOid')
+        if col == board.IN_PROGRESS and a.args.get('push') and full.get('isDraft'):
+            # the payload said ready, but the PR is a draft now: a draft in work is the Stop hook's
+            return self.note(f"#{a.pr}: a push to a draft PR in In Progress: left to the Stop hook")
         if full.get('isDraft') and not self.dry:
             self._sh(['gh', 'pr', 'ready', str(a.pr), '-R', self.repo])
         if col != board.AUTO_REVIEW:

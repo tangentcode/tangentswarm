@@ -165,10 +165,61 @@ def test_green_ci_in_auto_review_runs_minbot_and_in_staging_the_cascade(monkeypa
     assert ex.cascades == [1]
 
 
-def test_a_push_in_in_progress_is_left_to_the_stop_hook_but_a_new_head_past_it_returns_to_auto_review():
-    ex = Fake(col=board.IN_PROGRESS, full=codex_pr())
+CODEX_REVIEW = ['gh', 'pr', 'comment', '7', '-R', W.REPO, '--body', '@codex review']
+
+
+def test_a_push_to_a_non_draft_pr_in_in_progress_goes_to_auto_review_with_codex_for_the_head():
+    """tangentswarm #84: platform #539 got a push in In Progress (not a draft) and sat there."""
+    payload = {'action': 'synchronize', 'repository': REPO, 'pull_request': pr(head='e' * 40)}
+    acts = W.classify('pull_request', payload)
+    assert [(a.kind, a.args.get('push'), a.args.get('head')) for a in acts] == [('handoff', True, 'e' * 40)]
+    ex = Fake(col=board.IN_PROGRESS, full=dict(codex_pr(head='e' * 40), isDraft=False))
+    ex.run(acts[0])
+    assert ex.calls[0][-1] == board.OPTION[board.AUTO_REVIEW]
+    assert ex.calls.count(CODEX_REVIEW) == 1
+    assert not any(c[:3] == ['gh', 'pr', 'ready'] for c in ex.calls)  # it is ready already
+    assert ex.cascades == [] and any('posted "@codex review" for eeeeeeee' in d for d in ex.done)
+
+
+def test_a_second_delivery_of_the_same_push_posts_codex_once():
+    ex = Fake(col=board.IN_PROGRESS, full=dict(codex_pr(), isDraft=False))
+    ex.run(W.Action('handoff', 7, args={'push': True}))
+    ex.col = board.AUTO_REVIEW
+    ex.run(W.Action('handoff', 7, args={'push': True}))
+    assert ex.calls.count(CODEX_REVIEW) == 1
+    assert [c[-1] for c in ex.calls if c[:3] == ['gh', 'project', 'item-edit']] == [board.OPTION[board.AUTO_REVIEW]]
+
+
+def test_a_push_in_in_progress_skips_codex_when_the_head_already_has_a_request_or_a_review():
+    ex = Fake(col=board.IN_PROGRESS, full=dict(codex_pr(clean=True), isDraft=False))
+    ex.run(W.Action('handoff', 7, args={'push': True}))
+    assert ex.calls[0][-1] == board.OPTION[board.AUTO_REVIEW] and CODEX_REVIEW not in ex.calls
+
+
+def test_a_push_to_a_draft_in_in_progress_is_left_to_the_stop_hook():
+    payload = {'action': 'synchronize', 'repository': REPO, 'pull_request': pr(draft=True)}
+    assert [a.kind for a in W.classify('pull_request', payload)] == ['skip']
+    # the payload said ready, but the PR is a draft by the time the handler reads it
+    ex = Fake(col=board.IN_PROGRESS, full=dict(codex_pr(), isDraft=True))
     ex.run(W.Action('handoff', 7, args={'push': True}))
     assert ex.calls == [] and 'left to the Stop hook' in ex.done[0]
+
+
+@pytest.mark.parametrize('col', [None, board.NEEDS_INPUT, board.DONE, board.CANCELED, board.PARKED])
+def test_a_push_with_no_card_or_in_a_held_column_is_not_moved(col):
+    ex = Fake(col=col, full=dict(codex_pr(), isDraft=False))
+    ex.run(W.Action('handoff', 7, args={'push': True}))
+    assert ex.calls == [] and 'not moved' in ex.done[0]
+
+
+def test_ready_for_review_in_in_progress_marks_ready_and_requests_codex():
+    ex = Fake(col=board.IN_PROGRESS, full=dict(codex_pr(), isDraft=True))
+    ex.run(W.Action('handoff', 7, args={'head': 'a' * 40}))
+    assert ['gh', 'pr', 'ready', '7', '-R', W.REPO] in ex.calls and CODEX_REVIEW in ex.calls
+    assert ex.calls[1][-1] == board.OPTION[board.AUTO_REVIEW]
+
+
+def test_a_new_head_past_in_progress_returns_to_auto_review():
     ex = Fake(col=board.HUMAN_REVIEW, full=dict(codex_pr(), isDraft=False))
     ex.run(W.Action('handoff', 7, args={'push': True}))
     assert ex.calls[0][-1] == board.OPTION[board.AUTO_REVIEW]
