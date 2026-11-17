@@ -66,6 +66,10 @@ WORK = 'work'
 # checked; a PR is pre-merged when it becomes the top.
 PREMERGE_AHEAD = int(os.environ.get('SWARM_PREMERGE_AHEAD', '1'))
 PRE_MERGING, MERGE_READY = 'pre-merging', 'merge-ready'
+# A wait reason that is a job for the PR's worker, not a timeout (screenshots; status text in
+# the body, tangentswarm #130).
+STATUS_ROW = 'body: '
+WORKER_JOB_ROWS = ('7a', STATUS_ROW)
 # hr-gate rows that mean "wait", not "fail", while a pull is running.
 WAIT_ROWS = ('5 ', '6 ', '7a', '7b')
 CI_WAIT_WORDS = ('IN_PROGRESS', 'QUEUED', 'PENDING', 'WAITING', 'REQUESTED', 'no Linux GitHub checks')
@@ -174,10 +178,10 @@ RELAY_DIR = Path(os.environ.get('SWARM_RELAY_DIR', '/tmp'))  # relay-<N>-<kind>.
 
 
 def shots_text(n):
-    from .gatechecks import SCRATCH_RULE, SHOTS_RULE
+    from .gatechecks import SCRATCH_RULE, SHOTS_RULE, STATUS_RULE
     return (f"Coordinator: #{n} needs screenshots before Human Review. Take them from staging (it serves "
             f"work with your head) or from a local run of the real app, never an isolated component page. "
-            f"{SCRATCH_RULE} {SHOTS_RULE} Do not change code; push only the PR body edit.")
+            f"{SCRATCH_RULE} {SHOTS_RULE} {STATUS_RULE} Do not change code; push only the PR body edit.")
 
 
 def clear_held():
@@ -1062,15 +1066,28 @@ class Flow:
         full = self.g['fetch'](n, refresh=True)
         rows, _ = self.g['evaluate'](full, hr_peers=self.g['list_hr_prs'](refresh=True), scratch=scratch)
         verdict, why = gate_verdict(rows)
+        held, status_job = self.status_hold(n, full, d['head']) if verdict != 'fail' else (None, None)
+        if held:  # tangentswarm #130: a body that says where the PR stands waits for its worker
+            verdict, why = 'wait', why + [held]
         age = int(self.now() - d['started'])
         shots = [w for w in why if w.startswith('7a')] if verdict == 'wait' else []
-        if shots:  # Michal 2026-11-15: screenshots are a job for a worker now, not a timeout
-            self.screenshot_job(n, d['head'], full)
-        if verdict == 'wait' and age > PULL_TIMEOUT and len(shots) < len(why):
+        # Michal 2026-11-15: screenshots are a job for a worker now, not a timeout. Every open
+        # job goes in one relay (Codex on PR #133: the revive queue keeps one entry per PR).
+        jobs_now = ([('shots', shots_text(n))] if shots else []) + ([('status', status_job)] if held else [])
+        if jobs_now:
+            self.worker_jobs(n, d['head'], jobs_now, p)
+        # Worker jobs (screenshots, status text) never time out: a fail would drop the pull, and
+        # the next pass would pull and push it to work again (Codex on PR #133).
+        jobs = [w for w in why if w.startswith(WORKER_JOB_ROWS)] if verdict == 'wait' else []
+        if verdict == 'wait' and age > PULL_TIMEOUT and len(jobs) < len(why):
             verdict, why = 'fail', [f"still waiting after {age // 60} min: " + '; '.join(why)]
         elif verdict == 'wait' and age > PULL_TIMEOUT:
-            self.note(f"SCREENSHOTS_NEEDED #{n}: still no screenshots after {age // 60} min; the pull stays "
-                      "open (never demoted into a column with no worker)")
+            if shots:
+                self.note(f"SCREENSHOTS_NEEDED #{n}: still no screenshots after {age // 60} min; the pull stays "
+                          "open (never demoted into a column with no worker)")
+            if held:
+                self.note(f"STATUS_TEXT #{n}: the body still states where the PR stands after {age // 60} min; "
+                          "the pull stays open")
         if verdict == 'wait':
             self.note(f"#{n} pull waiting ({age // 60} min): " + '; '.join(w[:120] for w in why))
             return
@@ -1096,24 +1113,50 @@ class Flow:
         if rc == 0 or moved:
             drop_pull(n)
 
-    def screenshot_job(self, n, head, full=None):
+    def status_hold(self, n, full, head):
+        """tangentswarm #130 (option A, Michal via MethBot on PR #133): a body that says where
+        the PR stands (merged into work, on staging, the sha a site serves) holds hr-gate
+        --apply, and an incident is opened. The swarm never edits the body. Returns (the wait
+        reason, the worker's job text), or (None, None)."""
+        from .gatechecks import check_status, status_lines, status_text
+        body = (full or {}).get('body') or ''
+        ok, why = check_status(n, body, REPO, head=head, dry=self.dry)
+        if ok:
+            return None, None
+        return STATUS_ROW + why, status_text(n, status_lines(body))
+
+    def screenshot_job(self, n, head, full=None, p=None):
         """A UI PR without screenshots: give its worker the screenshot job now, once per
         head (wake its running Claude, or resume its parked one in a rework slot)."""
+        self.worker_jobs(n, head, [('shots', shots_text(n))], p)
+
+    def worker_jobs(self, n, head, jobs, p=None):
+        """Give PR n's worker its open jobs [(kind, text)] while its pull waits. Each kind is
+        sent once per head. When one is new, ALL open jobs go in one relay, saved to
+        relay-<n>-jobs.md (Codex on PR #133): the revive queue keeps one entry per PR and a
+        queued worker start keeps its first brief path, so a message that held only the
+        newest job would drop the others. The relay goes through to_worker: a Claude that
+        cannot take it now gets a queued revive, and a gone worktree gets a worker start
+        with the relay as its brief. A refusal never just repeats every pass."""
         from . import tick
         state = tick.State(tick.STATE_DIR / 'state.json')
-        key = f"shots-job:{n}@{head}"
-        if state.done(key):
+        keys = [f"{kind}-job:{n}@{head}" for kind, _ in jobs]  # shots-job:N@H, status-job:N@H
+        if all(state.done(k) for k in keys):
             return
-        text = shots_text(n)
+        what = ' and '.join({'shots': 'screenshot job', 'status': 'status-text job'}.get(k, k) for k, _ in jobs)
         if self.dry:
-            self.change(f"#{n} would give its worker the screenshot job")
+            self.change(f"#{n} would give its worker the {what}")
             return
-        rc, said = self.give_worker(n, text)
-        if rc == 0:
-            state.mark(key)
-            self.change(f"#{n} screenshot job sent to its worker ({said})")
-        else:
-            self.note(f"SCREENSHOTS_NEEDED #{n}: no worker could take the screenshot job ({said})")
+        text = '\n\n'.join(t for _, t in jobs)
+        relay_path = RELAY_DIR / f"relay-{n}-jobs.md"
+        try:
+            relay_path.write_text(text + '\n')
+        except OSError:
+            pass
+        waiting, said = self.to_worker(p or {'number': n}, text, relay_path)
+        for k in keys:
+            state.mark(k)
+        self.change(f"#{n} {what} " + (said if waiting else f"sent to its worker ({said})"))
 
     def start_worker(self, p, relay_path, why):
         """The PR has no worktree or window to resume: queue a worker start through the

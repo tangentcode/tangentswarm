@@ -1,6 +1,8 @@
 """gatechecks: screenshots must render (7a); entry needs staging to serve the head (6)."""
 import urllib.error
 
+import pytest
+
 from tangentswarm import gatechecks as G
 
 REPO = 'owner/repo'
@@ -170,3 +172,120 @@ def test_the_brief_example_image_is_not_screenshot_evidence():
     body = 'Fixes #5\n\n' + brief.section('Task #5\n' + SHOTS_RULE)
     assert '](' in SHOTS_RULE and image_urls(body) == []
     assert image_urls(body + '\n![after](https://example.test/a.png)') == ['https://example.test/a.png']
+
+
+# --- tangentswarm #130: the PR body never says where the PR stands -------------------
+# Option A (Michal via MethBot on PR #133): the swarm only flags it; it never edits a body.
+
+PR528 = 'Not on staging yet: work.pawntakesworld.com serves a60245158, which does not have this branch.'
+FOUR = '`' * 4
+THREE = '`' * 3
+
+
+@pytest.mark.parametrize('text', [
+    PR528,
+    'Merged into work at 3:10 PM.',
+    'It is live on staging now.',
+    'The fix is deployed to staging.',
+    'This is not in work yet.',
+    'ptw.example.com serves `abcdef12`.',
+    'Staging is serving commit 0123abcd.',
+    'Commit 0123abcd is deployed.',
+    'The static .deploy-sha is a6024515.',
+    'The deploy SHA is still `0123abcd`.',
+    'The .deploy-sha lacks the head.',
+    'Work does not contain this branch.',
+    '**Not on staging yet.**',
+    '_Merged into work._',
+])
+def test_status_text_is_found(text):
+    assert G.is_status(text)
+
+
+@pytest.mark.parametrize('text', [
+    'Check it on staging: open https://work.pawntakesworld.com/lobby and click Add.',
+    'Where to see: /lobby on staging, then press Enter.',
+    'Served on staging at /lobby.',
+    'This PR changes the work queue.',
+    'A branch that is not merged is skipped.',
+    'Where-to-see: open https://work.example.com/.deploy-sha and verify it is plain text.',
+    'This PR changes how the deploy SHA is generated.',
+])
+def test_how_to_see_text_is_not_status(text):
+    assert not G.is_status(text)
+
+
+@pytest.mark.parametrize('body, found', [
+    ('Fixes #1\n' + PR528 + '\nCheck it on staging: /x.\n', [PR528]),
+    # soft line breaks: one sentence over two lines; a capital letter starts a new one
+    ('Intro.\nThe fix is deployed\nto staging.\n', ['The fix is deployed to staging.']),
+    ('- First. Not on staging\n  yet.\n- Next.\n', ['Not on staging yet.']),
+    ('## Notes\nMerged into work.\n', ['Merged into work.']),
+    # a sentence may end inside closing marks
+    ('**Not on staging yet.** Where-to-see: open /lobby.', ['**Not on staging yet.**']),
+    # quotes, tables and HTML are read too (nothing is edited, so nothing can break)
+    ('> Not on staging yet.\n', ['> Not on staging yet.']),
+    ('<p>Merged into work.</p>\n', ['<p>Merged into work.</p>']),
+    # the brief section never counts
+    ('<!-- swarm-brief:start -->\nNot on staging yet.\n<!-- swarm-brief:end -->\n', []),
+])
+def test_status_lines(body, found):
+    assert G.status_lines(body) == found
+
+
+@pytest.mark.parametrize('body', [
+    f'{THREE}\nserves abcdef12\n{THREE}\n',
+    f'{FOUR}markdown\n{THREE}python\nx = 1\n{THREE}\nMerged into work.\n{FOUR}\n',
+    f'~~~\n{THREE}\nMerged into work.\n~~~\n',
+    f'{THREE}\n~~~\nMerged into work.\n{THREE}\n',
+    f'{THREE}\n{THREE} not a close\nMerged into work.\n{THREE}\n',
+    f'- step one\n  {THREE}\n  Merged into work.\n  {THREE}\n',
+    '> ```text\n> Merged into work.\n> ```\n',
+    '> > ~~~\n> > Not on staging yet.\n> > ~~~\n',
+])
+def test_text_inside_a_fence_is_not_read(body):
+    assert G.status_lines(body) == []
+
+
+def test_text_after_a_closed_fence_is_read():
+    body = f'{FOUR}\nx\n{FOUR}\nMerged into work.\n{THREE}js\ny\n{THREE}\nNot on staging yet.\n'
+    assert G.status_lines(body) == ['Merged into work.', 'Not on staging yet.']
+
+
+def test_body_problem_flags_status_text():
+    why = G.body_problem(['api/x.py'], 'Where to see: /x on staging.\n' + PR528)
+    assert why and '#130' in why
+    assert G.body_problem(['api/x.py'], 'Where to see: /x on staging.') is None
+
+
+def test_check_status_holds_and_opens_one_incident_but_never_edits():
+    tickets = []
+    ok, why = G.check_status(528, 'Fixes #1\n' + PR528, REPO, head='h' * 40,
+                             incident=lambda *a, **k: tickets.append(a))
+    assert not ok and '#130' in why and 'a60245158' in why
+    assert len(tickets) == 1 and tickets[0][0] == f'pr-status:{REPO}#528@' + 'h' * 12
+    assert not hasattr(G, 'strip_status') and not hasattr(G, 'scrub_status')
+
+
+def test_check_status_on_a_clean_body_and_in_a_dry_run():
+    never = lambda *a, **k: pytest.fail('no ticket')  # noqa: E731
+    assert G.check_status(1, 'Check it on staging: /x.', REPO, incident=never) == (True, '')
+    assert G.check_status(1, PR528, REPO, dry=True, incident=never)[0] is False
+
+
+def test_a_failed_ticket_does_not_change_the_verdict():
+    def boom(*a, **k):
+        raise RuntimeError('gh down')
+    assert G.check_status(1, PR528, REPO, incident=boom)[0] is False
+
+
+def test_the_status_relay_names_the_text_and_the_rule():
+    text = G.status_text(7, [PR528])
+    assert 'a60245158' in text and G.STATUS_RULE in text and text.isascii()
+
+
+def test_every_worker_instruction_carries_the_status_rule():
+    from tangentswarm import flow, launcher, launches
+    assert G.STATUS_RULE.isascii() and '\n' not in G.STATUS_RULE
+    for text in (launches.brief_line('/b/1.txt'), launcher.brief_text(1, 't', 'b', 2), flow.shots_text(7)):
+        assert G.STATUS_RULE in text

@@ -385,3 +385,14 @@ def test_an_in_progress_pr_that_waits_for_a_claude_is_not_flagged(monkeypatch, t
     for n in (7, 8, 9):
         t.no_claude(n, dict(col='In Progress', head='h' * 40), [])
     assert [n for n, _ in notes] == [9] and 'no Claude working on it' in notes[0][1]
+
+
+def test_hr_pass_holds_a_body_that_states_where_the_pr_stands(monkeypatch):
+    """tangentswarm #130, option A: the tick's hr-gate step holds it too, and edits nothing."""
+    monkeypatch.setattr(tick, 'codex_status', lambda full: ('clean', ''))
+    p = dict(PR, draft=False)
+    t = make_tick({7: p}, [], {'number': 7, 'body': 'Check it on staging: /x.\nNot on staging yet.'})
+    t.g.update(entered_col=lambda full, cols: None, list_hr_prs=lambda refresh=False: [],
+               evaluate=lambda full, **k: ([], None), normal_gates_pass=lambda rows: True)
+    t.hr_pass(FakeScratch())
+    assert t.did == [] and '#130' in t.notes[0][1]

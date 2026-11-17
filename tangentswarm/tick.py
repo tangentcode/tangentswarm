@@ -820,6 +820,12 @@ class Tick:
                 for reason in gate_reasons(rows):
                     self.note(n, pane, 'Codex clean; ' + reason)
                 continue
+            from .gatechecks import check_status  # tangentswarm #130: hold; the body is never edited
+            ok, why = check_status(n, full.get('body') or '', self.g.get('REPO', 'tangentcode/platform'),
+                                   head=self.prs[n].get('head') or '', dry=self.dry)
+            if not ok:
+                self.note(n, pane, 'Codex clean; ' + why + ': the worker removes it')
+                continue
             if self.dry:
                 self.change(f"#{n} hr-gate --apply {n} (conditions 1-8 pass)")
                 continue

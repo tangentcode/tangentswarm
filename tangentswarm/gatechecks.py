@@ -34,6 +34,14 @@ Its milestone picks it ([staging] priority in the config: {milestone word: site 
 default is PTW -> ptw), else [staging] priority_default (default ptw). Condition 6 and every
 column move wait only for that site. The other sites roll out in the background: their lag
 is named in the reason, but it never fails the check.
+
+tangentswarm #130 (Michal 2026-11-17 12:21 PM ET): a PR body never says where the PR stands.
+Platform #528 sat in Human Review while its body said "Not on staging yet: work... serves
+a60245158, which does not have this branch." Merged or not into work, on staging or not, and
+the sha a site serves go stale; the board column is the one place that says them.
+status_lines() finds such sentences and body_problem() flags them. Before hr-gate --apply,
+check_status() holds the PR, the swarm tells the worker to remove them, and an incident is
+opened. The swarm never edits a PR body (Michal via MethBot on PR #133, option A).
 """
 import re
 import urllib.request
@@ -51,6 +59,11 @@ SHOTS_RULE = ("Screenshots in the PR body must be absolute https URLs that rende
 SCRATCH_RULE = ("A worker that does verification or takes screenshots must use a throwaway user or a "
                 "scratch root. Do not sign in as the human, and never write, change, or delete files in "
                 "the real staging tree of the human.")
+# tangentswarm #130: every worker gets this with SHOTS_RULE. Keep it one line.
+STATUS_RULE = ("Never write in the PR body where the PR stands: not whether it is merged into work, not "
+               "whether it is on staging, and not which commit a site serves. The board column shows that. "
+               "The where-to-see or 'Check it on staging' section says only how to see the change (the URL "
+               "and the steps), never whether it is deployed. The swarm removes such text and logs an incident.")
 SERVED_RE = re.compile(r'^(web|api|app)/')
 
 _MD = re.compile(r'!\[[^\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)')
@@ -119,7 +132,120 @@ def body_problem(paths, body):
         return 'no image in body (edited after the gate pass)'
     if not WHERE_RE.search(body):
         return 'no where-to-see line in body (edited after the gate pass)'
+    found = status_lines(body)
+    if found:
+        return f"the body states where the PR stands (tangentswarm #130): {found[0][:120]}"
     return None
+
+
+# tangentswarm #130: sentences that say where the PR stands. Two kinds:
+#   _STATE: deploy or merge state ("not on staging yet", "merged into work", "is live on
+#           staging").
+#   _SERVES: a site and the commit it serves ("work.example.com serves a6024515",
+#           ".deploy-sha is a6024515", "the .deploy-sha lacks the head"). A bare mention of
+#           the marker ("open /.deploy-sha") is not status.
+# There are no wording exemptions: a false match only costs the worker one rewording.
+_W = r'(?:origin/)?(?:work|staging)\b'
+_STATE = re.compile(
+    r"\bnot\s+(?:yet\s+|currently\s+)?(?:(?:merged|deployed|live|served|pushed|landed)\s+)?(?:on|in|into|to|onto)\s+" + _W
+    + r"|\b(?:is|are|was|were|been|now|already|got|went|currently|isn't|aren't|wasn't)\s+"
+      r"(?:now\s+|already\s+|also\s+|not\s+|yet\s+|currently\s+)?(?:(?:merged|deployed|live|up|served|pushed|landed|running)\s+)?"
+      r"(?:on|in|into|to|onto)\s+" + _W
+    + r"|\b(?:merged|deployed|landed|pushed|shipped|rolled\s+out|went\s+live)\s+(?:in|into|to|onto|on)\s+" + _W
+    + r"|\b(?:on|in)\s+(?:work|staging)\s+(?:now|yet|already)\b"
+    + r"|\b(?:does\s+not|doesn't|do\s+not|don't)\s+(?:yet\s+)?(?:have|contain|include|serve)\s+"
+      r"(?:this|my|our)\s+(?:branch|change|changes|pr|head|fix|commit)\b",
+    re.I)
+_SERVES = re.compile(
+    r"\bserv(?:es|ing|ed)\s+(?:commit\s+|sha\s+|head\s+)?`?[0-9a-f]{7,40}\b"
+    r"|\b[0-9a-f]{7,40}`?\s+(?:is|was)\s+(?:now\s+)?(?:served|deployed|live)\b"
+    r"|(?:\.deploy-sha|\bdeploy[- ]sha)`?\s*(?:(?:is|was|=|:|reads|says|shows)\s*)?(?:(?:now|still)\s+)?"
+    r"(?:(?:is|was|=|:|reads|says|shows)\s*)?`?[0-9a-f]{7,40}\b"
+    r"|(?:\.deploy-sha|\bdeploy[- ]sha)`?\s+(?:(?:now|still)\s+)?(?:has|lacks|contains|includes|"
+    r"does\s+not\s+(?:have|contain|include)|doesn't\s+(?:have|contain|include))\s+"
+    r"(?:the|this|my|our)\s+(?:head|branch|change|changes|pr|fix|commit)\b",
+    re.I)
+_BLOCK = re.compile(r'^\s*(?:[-*+]\s|\d+[.)]\s|#|>|\||<)')  # a line that starts a new Markdown block
+_QUOTE = re.compile(r'^\s*(?:>\s?)+')
+_FENCE = re.compile(r'^\s*(?:(?:[-*+]|\d+[.)])\s+)?(`{3,}|~{3,})(.*)$')  # list items may indent it
+# A sentence ends at . ! or ? (closing inline marks may follow: "**Not on staging yet.**"), or
+# at a line break before a capital letter. A line that goes on in lower case ("is deployed\n
+# to staging") is the same sentence: Markdown renders soft line breaks as one paragraph.
+_CLOSERS = '*_~`\'")\\]'
+_SENT_END = re.compile(r'(?:(?<=[.!?])|(?<=[.!?][' + _CLOSERS + r'])|(?<=[.!?][' + _CLOSERS + r']{2})'
+                       r'|(?<=[.!?][' + _CLOSERS + r']{3}))\s+(?=\S)|(?<![,;:(\-])[ \t]*\n\s*(?=[A-Z])')
+
+
+def is_status(sentence):
+    """True when one sentence says where the PR stands (tangentswarm #130)."""
+    sentence = ' '.join(sentence.split())  # a soft line break is a space
+    sentence = re.sub(r'(?<!\w)[_*~]+|[_*~]+(?!\w)', ' ', sentence)  # _Merged_ is Merged; snake_case stays
+    return bool(_SERVES.search(sentence) or _STATE.search(sentence))
+
+
+def _paragraphs(text):
+    """The Markdown paragraphs and list items of text, each one string. Code fences (also
+    inside a blockquote) are not read: a fence closes only on a run of the same character,
+    as long or longer, with nothing after it (CommonMark)."""
+    paras, para, fence = [], [], None
+    for line in text.split('\n'):
+        m = _FENCE.match(_QUOTE.sub('', line))
+        if fence is not None:
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip():
+                fence = None
+            continue
+        if m and not (m.group(1)[0] == '`' and '`' in m.group(2)):  # a backtick info string has no backtick
+            fence = m.group(1)
+        elif line.strip() and not _BLOCK.match(line):
+            para.append(line)
+            continue
+        if para:
+            paras.append('\n'.join(para))
+        para = [line] if (not m and line.strip()) else []
+    if para:
+        paras.append('\n'.join(para))
+    return paras
+
+
+def status_lines(body):
+    """The sentences of a PR body that say where the PR stands. The brief section and code
+    fences never count. The swarm never edits the body (Michal via MethBot on PR #133,
+    option A): it only flags them."""
+    from .brief import strip_brief
+    return [' '.join(x.split()) for p in _paragraphs(strip_brief(body)) for x in _SENT_END.split(p) if is_status(x)]
+
+
+def status_text(n, found):
+    """The relay that tells PR n's worker to remove the status sentences."""
+    said = '; '.join(f'"{g[:160]}"' for g in found[:5])
+    return (f"Coordinator: #{n} is held before Human Review: its PR body says where the PR stands: {said}. "
+            f"{STATUS_RULE} Remove or reword those sentences in the PR body. Do not change code; "
+            "push nothing, edit only the PR body.")
+
+
+def check_status(n, body, repo, head='', dry=False, incident=None):
+    """(ok, why) for the body rule of tangentswarm #130. Not ok when the body states where
+    the PR stands: the caller holds hr-gate --apply and tells the worker. One incident per
+    head. The body is never edited."""
+    found = status_lines(body)
+    if not found:
+        return True, ''
+    said = '; '.join(f'"{g[:160]}"' for g in found[:5])
+    why = f"the body states where the PR stands (tangentswarm #130): {said}"
+    if dry:
+        return False, why
+    if incident is None:
+        from . import alerts
+        incident = alerts.incident
+    try:
+        incident(f"pr-status:{repo}#{n}@{(head or '')[:12]}", f"{repo}#{n} PR body stated where the PR stands",
+                 f"The body of {repo}#{n} said: {said}. Status text goes stale and contradicts the board.",
+                 why="A worker wrote deploy or merge state into the PR body.",
+                 fix="The swarm held hr-gate --apply and told the worker to remove it.",
+                 prevent="Workers get STATUS_RULE: the body says only how to see the change (tangentswarm #130).")
+    except Exception:
+        pass  # a failed ticket must not change the verdict
+    return False, why
 
 
 def needs_screenshots(paths, body=''):
