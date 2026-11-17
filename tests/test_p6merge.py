@@ -59,9 +59,11 @@ class World:
         self.inflight, self.launched, self._launch = set(inflight), [], launch
         self.backlog = backlog if backlog is not None else [
             {'repo': TS, 'number': 95}, {'repo': METH, 'number': 120}, {'repo': TS, 'number': 99}]
+        self.card_reads = []  # (repo, n) of each card read
 
     def gql(self, q, **v):
         if 'issueOrPullRequest' in q:
+            self.card_reads.append((f"{v['owner']}/{v['name']}", v['n']))
             return {'repository': {'issueOrPullRequest': {'projectItems': {'nodes': [
                 {'id': f"ITEM{v['n']}", 'project': {'id': B6.id}}, {'id': 'OTHER', 'project': {'id': 'P4'}}]}}}}
         pr = self.prs.pop(0) if len(self.prs) > 1 else self.prs[0]
@@ -222,10 +224,26 @@ def test_methodology_uses_meth_windows_and_no_deploy_note():
     assert w.moves() == ['ITEM90', 'ITEM7']
 
 
-def test_an_issue_of_another_repo_is_never_closed_or_moved():
-    w = World([full(closes=((89, 'OPEN', METH),))])
-    assert w.run()['merged'] is True
+def test_an_issue_of_a_repo_not_on_project_6_is_never_closed_or_moved():
+    w = World([full(closes=((89, 'OPEN', 'tangentcode/platform'),))])
+    r = w.run()
+    assert r['merged'] is True
     assert w.moves() == ['ITEM90'] and not any(a[:3] == ['gh', 'issue', 'close'] for a in w.gh)
+    assert any('tangentcode/platform#89: not a Project 6 issue' in x for x in r['notes'])
+
+
+@pytest.mark.parametrize('state', ['OPEN', 'CLOSED'])
+def test_a_cross_repo_issue_of_project_6_leaves_active_on_the_merge(state):
+    """tangentswarm #114: methodology #111 "Fixes tangentcode/tangentswarm#107" merged, and #107
+    stayed open in Active. Its card goes to Done and it is closed in its own repo."""
+    w = World([full(closes=((107, state, TS),), hrepo=METH)])
+    r = w.run(repo=METH)
+    assert r['merged'] is True
+    assert w.moves() == ['ITEM90', 'ITEM107']
+    assert (METH, 90) in w.card_reads and (TS, 107) in w.card_reads and (METH, 107) not in w.card_reads
+    closes = [a for a in w.gh if a[:3] == ['gh', 'issue', 'close']]
+    assert closes == ([['gh', 'issue', 'close', '107', '-R', TS, '--reason', 'completed']] if state == 'OPEN' else [])
+    assert f'issue {TS}#107 card -> Done' in r['notes']
 
 
 def test_a_pr_merged_elsewhere_at_the_head_is_cleaned_up_with_no_merge():
