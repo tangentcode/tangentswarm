@@ -416,3 +416,52 @@ def minbot_pass(comments, shas):
                 return True, f"MinBot pass comment names {label} {sha[:8]}"
     want = ', '.join(f"{label} {sha[:8]}" for label, sha in shas if sha)
     return False, f"no MinBot pass comment names {want}"
+
+
+HUMAN = 'tangentstorm'
+
+
+def later_requests(pr):
+    """Condition 8 (as hr-gate evaluate): [(kind, time)] of each tangentstorm comment, review
+    with a body, review comment or review-thread comment newer than the head's commit date,
+    except "@codex review" and a MinBot pass. [] when none, or when the read has no commit
+    date (then hr-gate's own row decides). tangentswarm #136 (Codex on PR #138): Ready does
+    not prove it, so the fast Ready -> Staging move checks it from the fresh PR read."""
+    from datetime import datetime
+
+    def ts(s):
+        try:
+            return datetime.fromisoformat(str(s).replace('Z', '+00:00'))
+        except ValueError:
+            return None
+
+    def human(node):
+        return ((node or {}).get('author') or {}).get('login') == HUMAN
+
+    def codex_only(body):
+        b = (body or '').strip()
+        return b.lower() == '@codex review' or b.startswith('### MinBot pass on ')
+    commits = (pr.get('commits') or {}).get('nodes') or []
+    head = ts(((commits[-1] if commits else {}).get('commit') or {}).get('committedDate') or '')
+    if head is None:
+        return None
+    out = set()
+
+    def check(kind, node, when_key='createdAt', need_body=False):
+        when = ts(node.get(when_key) or '')
+        body = node.get('body')
+        if not human(node) or when is None or when <= head or codex_only(body):
+            return
+        if need_body and not (body or '').strip():
+            return
+        out.add((kind, when))
+    for c in (pr.get('comments') or {}).get('nodes') or []:
+        check('comment', c)
+    for r in (pr.get('reviews') or {}).get('nodes') or []:
+        check('review', r, 'submittedAt', need_body=True)
+        for rc in (r.get('comments') or {}).get('nodes') or []:
+            check('review comment', rc)
+    for t in (pr.get('reviewThreads') or {}).get('nodes') or []:
+        for rc in (t.get('comments') or {}).get('nodes') or []:
+            check('review comment', rc)
+    return sorted(out, key=lambda x: x[1], reverse=True)

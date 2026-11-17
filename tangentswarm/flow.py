@@ -465,6 +465,7 @@ class Flow:
         self._fm, self._premerged = {}, {}  # one future main and one pre-merge per PR per pass
         self.dry_pulls = []  # a dry run's pulls: not saved, but in future main like a real pull
         self.tool_timeout = 1800  # one hr-gate / pending-promote run; the cascade sets less
+        self.stale_ok = False  # the cascade moves cards from a cache that is only stale (tangentswarm #136)
         from .conflictmap import ConflictMap
         self.cmap = ConflictMap()  # merge-tree answers per SHA pair
         self.g = g if g is not None else runpy.run_path(str(BIN / 'hr-gate'), run_name='swarm_flow')
@@ -489,7 +490,8 @@ class Flow:
     # -- board ----------------------------------------------------------------
     def columns(self):
         from . import tick
-        prs = tick.board_prs_open({'gql': self.g['gql'], 'PARKED': self.g.get('PARKED', set())})
+        prs = tick.board_prs_open({'gql': self.g['gql'], 'PARKED': self.g.get('PARKED', set())},
+                                  stale_ok=self.stale_ok)
         cols = {}
         for n, p in prs.items():
             if p['state'] == 'OPEN' and not p['parked']:
@@ -598,6 +600,7 @@ class Flow:
                 return None, f"pre-merged tip {tip[:8]} has a conflict marker"
             if not self.dry:
                 git(scratch, 'push', '--quiet', self.g['origin_url'](), f'{merged}:refs/heads/{WORK}')
+                self.pushed_work(merged, f"#{n}")
             return merged, None
         if git(scratch, 'merge-base', '--is-ancestor', tip, work, check=False).returncode == 0:
             return work, 'already in work'
@@ -608,7 +611,16 @@ class Flow:
             return None, f"{label} {tip[:8]} does not merge cleanly into {WORK} {work[:8]}: {why[0]}"
         if not self.dry:
             git(scratch, 'push', '--quiet', self.g['origin_url'](), f'{merged}:refs/heads/{WORK}')
+            self.pushed_work(merged, f"#{n}")
         return merged, None
+
+    def pushed_work(self, sha, what):
+        """tangentswarm #136: after a push to work, start the staging deploy now (no timer wait).
+        Never raises; the timer stays as the backup."""
+        from . import stagingdeploy
+        note = stagingdeploy.start(f"{WORK} {sha[:8]}: {what}")
+        log('deploy\t' + note)
+        self.note(note)
 
     def start_pull(self, p, scratch, tip=None, pre_merged=False, fm=None):
         """tip: the pre-merged -vN tip to merge into work (default: the head). fm: the future
@@ -620,7 +632,7 @@ class Flow:
             self.note(f"#{n} refused, work NOT pushed: {why}")
             return False
         self.last_work = merged  # the work commit (also for a dry run, where it is not pushed)
-        rec = pull_record(p, tip=tip, work=merged, started=self.now())
+        rec = pull_record(p, tip=tip, work=merged, started=self.now(), **({'pre_merged': True} if pre_merged else {}))
         if self.dry:
             self.dry_pulls.append(rec)
         else:
@@ -686,8 +698,9 @@ class Flow:
             return []
         if not self.dry:
             git(scratch, 'push', '--quiet', self.g['origin_url'](), f'{tip}:refs/heads/{WORK}')
+            self.pushed_work(tip, ', '.join(f"#{p['number']}" for p in batch))
         self.last_work = tip
-        recs = [pull_record(p, tip=tips[p['number']], work=tip, started=self.now()) for p in batch]
+        recs = [pull_record(p, tip=tips[p['number']], work=tip, started=self.now(), pre_merged=True) for p in batch]
         if self.dry:
             self.dry_pulls += recs
         else:
@@ -1057,7 +1070,9 @@ class Flow:
         return 0
 
     # -- 3. advance -----------------------------------------------------------
-    def advance(self, d, prs, scratch):
+    def advance(self, d, prs, scratch, served=False):
+        """served: the caller already confirmed the priority staging site serves the pull
+        (Cascade.gate_pulls), so a pre-merged Ready PR moves at once (stage)."""
         n = d['pr']
         p = prs.get(n)
         if p is None or p['state'] != 'OPEN':
@@ -1075,6 +1090,14 @@ class Flow:
                           "MinBot again", tell=False)
             return
         full = self.g['fetch'](n, refresh=True)
+        if d.get('pre_merged') and p['col'] == board.READY and not p.get('draft'):
+            why = (self.identity_problem(d, full) or self.evidence_problem(full) or self.work_health(full)
+                   or self.main_problem(scratch, d))
+            if not why:
+                return self.stage(d, p, served, full)  # tangentswarm #136: no gate re-run for a Ready PR
+            # Codex on PR #138: Ready does not prove 7a/7b (a UI PR may reach Ready while its
+            # screenshot job runs): the full gate path below waits for it, as before.
+            self.note(f"#{n}: {why}: the full gate runs")
         rows, _ = self.g['evaluate'](full, hr_peers=self.g['list_hr_prs'](refresh=True), scratch=scratch)
         verdict, why = gate_verdict(rows)
         held, status_job = self.status_hold(n, full, d['head']) if verdict != 'fail' else (None, None)
@@ -1123,6 +1146,120 @@ class Flow:
             moves.log_move(n, p['col'] if p['col'] != board.STAGING else 'Staging', to, d['head'], note='hr-gate --apply')
         if rc == 0 or moved:
             drop_pull(n)
+
+    @staticmethod
+    def identity_problem(d, full):
+        """Codex on PR #138: the cache may lag a push or a draft conversion, so the fast move
+        needs the FRESH PR to be open, not a draft, and at the pulled head. Why not, or None."""
+        if (full.get('state') or 'OPEN') != 'OPEN':
+            return f"the PR is {full.get('state')}"
+        if full.get('isDraft'):
+            return 'the PR is a draft'
+        if full.get('headRefOid') != d['head']:
+            return f"the head is {(full.get('headRefOid') or '-')[:8]}, not the pulled {d['head'][:8]}"
+        return None
+
+    def evidence_problem(self, full):
+        """Codex on PR #138: the Human Review conditions that Ready does NOT prove (the MinBot
+        pass checks rows 1, 2, 3 and 5 only): 7a screenshots (every image an absolute https URL
+        that renders, when the PR needs them), 7b the where-to-see line, and 8 no later human
+        request; and the tangentswarm #130 hold (a body that states where the PR stands). Why
+        one fails, or None. The other rows: 1 is identity_problem; 2 and 9 the
+        pre-merge onto future main, and 2 again against the current main (main_problem);
+        3, 4 and 5 the MinBot pass at this head (Ready); 6 the
+        work health (work_health) and the served check in stage(). No hr-gate run; hr-gate's
+        own 7a check when it is loaded."""
+        from . import gatechecks
+        from .brief import strip_brief
+        body = strip_brief(full.get('body') or '')
+        paths = [f.get('path') or '' for f in (full.get('files') or {}).get('nodes') or []]
+        if gatechecks.needs_screenshots(paths, body):
+            if not gatechecks.image_urls(body):
+                return '7a: no image in body'
+            if 'shots_exists' in self.g:
+                ok, why = gatechecks.check_images(body, REPO, self.g['shots_exists'])
+                if not ok:
+                    return f'7a: {why}'
+        if not gatechecks.WHERE_RE.search(body):
+            return '7b: no where-to-see line in body'
+        if gatechecks.status_lines(full.get('body') or ''):  # the full path opens the incident and gives the job
+            return 'the body states where the PR stands (tangentswarm #130)'
+        later = gatechecks.later_requests(full)
+        if later is None:
+            return '8: no head commit date in the PR read'
+        if later:
+            return f"8: {len(later)} later {gatechecks.HUMAN} {later[0][0]}(s) after the head"
+        return None
+
+    def main_problem(self, scratch, d):
+        """Codex on PR #138: row 2 again at the move. Main can move while the pull waits for its
+        deploy, and the pre-merge was built on the main of the pull time. A local merge-tree of
+        the head onto CURRENT origin/main (hr-gate row 2; the conflict map keeps the answer per
+        SHA pair). Why it fails or cannot be checked, or None. A conflict takes the full gate
+        path, which sends the PR to rework with a merge-main relay (gate_conflicts)."""
+        if scratch is None:
+            return '2: no scratch repo for the merge check'
+        try:
+            scratch.ensure_main()
+            main = self.sha_of(scratch, scratch.main)
+            scratch.ensure(d['head'])
+            clean = self.clean(scratch, main, d['head'])
+            self.cmap.save()
+        except Exception as e:
+            return f"2: merge check failed: {type(e).__name__}: {str(e)[:120]}"
+        return None if clean else f"2: head {d['head'][:8]} conflicts with origin/main {str(main)[:8]}"
+
+    def work_health(self, full):
+        """Codex on PR #138: condition 6's entry safeguard (gatechecks.work_problem: conflict
+        markers in origin/work, or a failed latest work Redeploy run). A served .deploy-sha can
+        contain the head while work is broken. Checked for a PR with served files only, as
+        hr-gate does, with hr-gate's own work_broken (one answer per process). Why, or None."""
+        from . import gatechecks
+        paths = [f.get('path') or '' for f in (full.get('files') or {}).get('nodes') or []]
+        if not any(gatechecks.SERVED_RE.search(p) for p in paths):
+            return None
+        if 'work_broken' not in self.g:
+            return '6: no work health check loaded'
+        try:
+            bad = self.g['work_broken'](gatechecks)
+        except Exception as e:
+            return f"6: work health check failed: {type(e).__name__}: {str(e)[:120]}"
+        return f"6: {bad}" if bad else None
+
+    def unserved(self, d, full=None):
+        """'' when the priority staging site serves pull d (or the PR changes no served file),
+        else the sites that lag. File reads and one cached PR read (the changed paths)."""
+        from . import advance, gatechecks
+        files = ((full or self.g['fetch'](d['pr'])).get('files') or {}).get('nodes') or []
+        if not any(gatechecks.SERVED_RE.search(f.get('path') or '') for f in files):
+            return ''
+        lag = advance.lagging(self.g, d, now=self.now)
+        return '; '.join(f"{h} ({(x or '-')[:8]})" for _, h, x, _ in lag)
+
+    def stage(self, d, p, served=False, full=None):
+        """tangentswarm #136 (Michal, #116: "This is what ready means"): a Ready PR passed every
+        Human Review check before it entered Ready, so Ready -> Staging is only the pre-merged
+        tip in work (the pull pushed it) and the card move. No hr-gate run, no board read, no
+        GitHub check beyond one PR read. advance() confirmed the card is in Ready at the pulled
+        head and that its body has the evidence Ready does not prove (evidence_problem: 7a,
+        7b; Codex on PR #138); the only check left is that the priority staging site serves it
+        (served: the caller, such as
+        Cascade.gate_pulls, already did; else unserved() does it here). The gate pass
+        line for the head is written here, so the promote fast path can move it on."""
+        from . import moves
+        n, head = d['pr'], d['head']
+        lag = '' if served else self.unserved(d, full)
+        if lag:
+            self.note(f"#{n} pull waiting: {head[:8]} is not served yet by {lag}")
+            return
+        if self.dry:
+            self.change(f"#{n} Ready -> Staging (pre-merged tip in {WORK}; no gate re-run)")
+            return
+        board.move_card(self.g, p['item'], board.STAGING, n=n)
+        self.g['log']('apply', n, head[:8], 'PASS', [])  # the gate pass the promote fast path reads
+        moves.log_move(n, 'Ready', 'Staging', head, note='pre-merged Ready PR: no gate re-run (#136)')
+        self.change(f"#{n} Ready -> Staging (pre-merged tip in {WORK}; no gate re-run)")
+        drop_pull(n)
 
     def status_hold(self, n, full, head):
         """tangentswarm #130 (option A, Michal via MethBot on PR #133): a body that says where

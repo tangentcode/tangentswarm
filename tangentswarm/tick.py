@@ -432,11 +432,12 @@ BOARD_Q = """query($c:String){organization(login:"tangentcode"){projectV2(number
      closingIssuesReferences(first:10){nodes{number repository{nameWithOwner} milestone{title dueOn} labels(first:20){nodes{name}}}}}}}}}}}"""
 
 
-def board_prs_open(g, max_age=None):
+def board_prs_open(g, max_age=None, stale_ok=False):
     """board_prs for the OPEN PRs only, from the shared board snapshot (boardcache): one
-    batched query per pass instead of a 4-page scan of the whole board."""
+    batched query per pass instead of a 4-page scan of the whole board. stale_ok: a mover
+    (the cascade fill) uses a cache that is only stale (tangentswarm #136)."""
     from . import boardcache
-    snap = boardcache.snapshot(g['gql'], max_age)
+    snap = boardcache.snapshot(g['gql'], max_age, stale_ok=stale_ok)
     active = board.active_fast_track()
     out = {}
     for it, c in boardcache.open_prs(snap):

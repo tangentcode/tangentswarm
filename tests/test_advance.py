@@ -416,7 +416,7 @@ def test_pulls_in_flight_count_toward_the_target(monkeypatch, tmp_path):
     cols = {board.STAGING: [pr(1, board.STAGING)], board.READY: [pr(3, board.READY), pr(9, board.READY)]}
     monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
     F.save_pull(dict(pr=3, head='3' * 40, branch='b', item='I', work='w' * 40, started=0))
-    monkeypatch.setattr(F.Flow, 'advance', lambda self, d, prs, s: self.note(f"#{d['pr']} pull waiting (1 min): CI"))
+    monkeypatch.setattr(F.Flow, 'advance', lambda self, d, prs, s, served=False: self.note(f"#{d['pr']} pull waiting (1 min): CI"))
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False))
     assert pulled == [] and 'fill: Staging 1 + 1 in flight (#3), target 2: no pull needed' in out
 
@@ -544,7 +544,7 @@ def live(monkeypatch, tmp_path, g, advance=None, ready=(9,), staging=(1,), hr=()
                                             work='w' * 40, started=0) for p in got])
         return got
 
-    def adv(self, d, prs, scratch):
+    def adv(self, d, prs, scratch, served=False):
         gated.append(d['pr'])
         F.drop_pull(d['pr'])  # hr-gate --apply moved it
         c[board.READY] = [q for q in c[board.READY] if q['number'] != d['pr']]
@@ -621,7 +621,7 @@ def test_a_dry_run_goes_on_after_a_running_pull_would_end(monkeypatch, tmp_path)
     cols = {board.READY: [pr(9, board.READY)]}
     monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
     F.save_pull(dict(pr=3, head='3' * 40, branch='b', item='I', work='w' * 40, started=0))
-    monkeypatch.setattr(F.Flow, 'advance', lambda self, d, prs, s: self.change(f"#{d['pr']} pull finished"))
+    monkeypatch.setattr(F.Flow, 'advance', lambda self, d, prs, s, served=False: self.change(f"#{d['pr']} pull finished"))
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False))
     assert pulled == [9] and 'pull: would: #3 pull finished' in out
     assert F.load_pull()['pr'] == 3  # a dry run changes nothing
@@ -632,7 +632,7 @@ def test_a_dry_run_stops_at_a_waiting_pull(monkeypatch, tmp_path):
     cols = {board.READY: [pr(9, board.READY)]}
     monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
     F.save_pull(dict(pr=3, head='3' * 40, branch='b', item='I', work='w' * 40, started=0))
-    monkeypatch.setattr(F.Flow, 'advance', lambda self, d, prs, s: self.note(f"#{d['pr']} pull waiting (1 min): CI"))
+    monkeypatch.setattr(F.Flow, 'advance', lambda self, d, prs, s, served=False: self.note(f"#{d['pr']} pull waiting (1 min): CI"))
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False))
     # a waiting pull no longer blocks the fill: Staging 0 + 1 in flight is below the target
     assert pulled == [9] and 'note: #3 pull waiting (1 min): CI' in out
@@ -645,7 +645,7 @@ def test_a_dry_run_counts_a_gated_running_pull_in_staging(monkeypatch, tmp_path)
     cols = {board.READY: [pr(3, board.READY), pr(9, board.READY)]}
     monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
     F.save_pull(dict(pr=3, head='3' * 40, branch='b', item='I', work='w' * 40, started=0))
-    monkeypatch.setattr(F.Flow, 'advance', lambda self, d, prs, s: self.change(f"#{d['pr']} hr-gate --apply {d['pr']}"))
+    monkeypatch.setattr(F.Flow, 'advance', lambda self, d, prs, s, served=False: self.change(f"#{d['pr']} hr-gate --apply {d['pr']}"))
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False))
     assert pulled == [9] and 'fill: #9 pulled in one work merge: Staging 1 + 1, target 2' in out
 
@@ -705,7 +705,7 @@ def lag_pass(monkeypatch, tmp_path, age, logs='ptw=/log/ptw-deploy.log'):
     monkeypatch.setenv('SWARM_DEPLOY_LOGS', logs)
     F.save_pull(dict(pr=480, head='5f6e09a4' + '0' * 32, branch='b', item='I', work='w' * 40, started=1000))
     monkeypatch.setattr(A.time, 'time', lambda: 1000 + age)
-    monkeypatch.setattr(F.Flow, 'advance', lambda *a: pytest.fail('not served: no gate'))
+    monkeypatch.setattr(F.Flow, 'advance', lambda *a, **k: pytest.fail('not served: no gate'))
     monkeypatch.setattr(F.Flow, 'columns', lambda self: ({}, {}))
     out, slept = [], []
     g = CascadeGate(served={'work': 'w' * 40, 'minavo': 'w' * 40, 'ptw': 'o' * 40})

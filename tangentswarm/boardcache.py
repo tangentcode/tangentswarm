@@ -25,6 +25,15 @@ move through invalidate) or older than SYNC_EVERY (30 min): the sync. The sync l
 difference it finds (SYNC_LOG and the events DB): those are events the cache missed.
 Per-PR details are cached per head SHA and updatedAt (detail()), so an unchanged PR is not
 read again.
+
+tangentswarm #136: a refill after a freed Human Review slot read the whole board first, because
+a new issue and an issue label had marked the cache dirty. Now an event that touches only what
+a mover does not use (a new issue or card, a new PR, a body edit) marks the cache STALE, not
+dirty: the movers (the promote fast path, the cascade's promote and fill) read with stale_ok
+and act on the cache at once; every other reader reads the board again as before. Issue and
+PR labels and milestones (the pick order) are followed from the event itself (op 'issue',
+op 'pr'). A card move the cache cannot follow is dirty only when it touches Ready, Staging
+or Human Review (FLIGHT).
 """
 import contextlib
 import fcntl
@@ -49,10 +58,10 @@ REPO = 'tangentcode/platform'
 STATUS = '{...on ProjectV2ItemFieldSingleSelectValue{name optionId}}'
 PR_FIELDS = """number state title isDraft headRefName headRefOid updatedAt body repository{nameWithOwner}
  milestone{title dueOn} labels(first:15){nodes{name}}
- closingIssuesReferences(first:5){nodes{number repository{nameWithOwner} milestone{title dueOn} labels(first:10){nodes{name}}}}
+ closingIssuesReferences(first:5){nodes{number updatedAt repository{nameWithOwner} milestone{title dueOn} labels(first:10){nodes{name}}}}
  timelineItems(last:30,itemTypes:[PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]){nodes{__typename
    ...on ProjectV2ItemStatusChangedEvent{createdAt status}}}"""
-ISSUE_FIELDS = 'number title state repository{nameWithOwner} milestone{title dueOn} labels(first:10){nodes{name}}'
+ISSUE_FIELDS = 'number title state updatedAt repository{nameWithOwner} milestone{title dueOn} labels(first:10){nodes{name}}'
 
 
 def _items(alias, filt, fields, kind, first, cursor_var):
@@ -135,22 +144,30 @@ def _locked(path):
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
-def snapshot(gql, max_age=None, path=None, now=time.time):
+# tangentswarm #136: the columns a mover reads. A card move the cache cannot follow outside
+# them makes the cache stale, not dirty (the movers do not read the board again for it).
+FLIGHT = (board.READY, board.STAGING, board.HUMAN_REVIEW)
+
+
+def snapshot(gql, max_age=None, path=None, now=time.time, stale_ok=False):
     """The board snapshot. tangentswarm #116: the cache is kept current by events (patch,
     apply_event, moved), so it is used while it is younger than max_age seconds (default
     MAX_AGE, the sync period) and not marked dirty. Else the board is read again (a sync):
     patches made while the read ran are applied on top of it, and every difference from the
-    cache is logged (log_sync): those are the events the cache missed."""
+    cache is logged (log_sync): those are the events the cache missed. tangentswarm #136:
+    stale_ok (a mover) uses a STALE cache too (an event only the other readers need); a dirty
+    one is read again for every reader."""
     path = path or PATH
     max_age = MAX_AGE if max_age is None else max_age
     d = _load(path)
     try:
-        if d is not None and not d.get('dirty') and max_age > 0 and now() - float(d['at']) < max_age:
+        if d is not None and not d.get('dirty') and (stale_ok or not d.get('stale')) \
+                and max_age > 0 and now() - float(d['at']) < max_age:
             return d
     except (KeyError, TypeError, ValueError):
         pass
     why = ('first read' if d is None else 'dirty' if d.get('dirty') else
-           'read now' if max_age <= 0 else 'sync')
+           'read now' if max_age <= 0 else 'stale' if d.get('stale') else 'sync')
     t0 = now()
     fresh = dict(fetch(gql), at=t0)
     with _locked(path):
@@ -165,14 +182,17 @@ def snapshot(gql, max_age=None, path=None, now=time.time):
         late = [p for p in (raw or {}).get('patches') or [] if float(p.get('t') or 0) >= t0]
         for p in late:  # an event that arrived while we read: it may be newer than the read
             # tangentswarm #127 (Codex on PR #117): with no snapshot before, the events are in
-            # a journal that no one applied yet. One the answer cannot follow marks it dirty.
-            # (With a snapshot, patch() already marked the cache dirty for such an event.)
+            # a journal that no one applied yet. One the answer cannot follow marks it dirty
+            # (stale, tangentswarm #136, when only the other readers need it).
+            # (With a snapshot, patch() already marked the cache dirty or stale for such an event.)
             if not _apply(fresh, p) and old is None:
-                fresh['dirty'] = max(float(fresh.get('dirty') or 0), float(p.get('t') or 0))
+                flag = 'stale' if _soft(fresh, p) else 'dirty'
+                fresh[flag] = max(float(fresh.get(flag) or 0), float(p.get('t') or 0))
         fresh['patches'] = late
         fresh['gone'] = (old or {}).get('gone') or []
-        if old and old.get('dirty') and float(old['dirty']) >= t0:
-            fresh['dirty'] = old['dirty']
+        for flag in ('dirty', 'stale'):
+            if old and old.get(flag) and float(old[flag]) >= t0:
+                fresh[flag] = old[flag]
         missed = diff(old, fresh) if old else []
         _write(path, fresh)
     if missed:
@@ -223,6 +243,30 @@ def _forget(d, items):
     d['gone'] = ((d.get('gone') or []) + [i for i in items if i])[-KEEP_PATCHES:]
 
 
+def _fresh(c, put, at):
+    """The fields of put that are not older than what node c holds. Codex on PR #117:
+    freshness is kept PER FIELD. A patch changes only some fields (a comment only updatedAt),
+    so one shared updatedAt would make an older event for another field (labels, draft, head)
+    look stale. A field is skipped only when the cache holds a newer value for that same field:
+    its own patch stamp, else the updatedAt of the board read it came from (_base)."""
+    base = c.setdefault('_base', c.get('updatedAt'))
+    stamps = c.get('_at') or {}
+
+    def newer(field):
+        mine = stamps.get(field) or base
+        return bool(at and mine and str(mine) > str(at))
+    return {k: v for k, v in put.items() if not newer(k)}
+
+
+def _put(c, fields, at):
+    """Write fields into node c with their stamp at (see _fresh)."""
+    c.update(fields)
+    if at:
+        c.setdefault('_at', {}).update({k: at for k in fields})
+        if not c.get('updatedAt') or str(at) > str(c['updatedAt']):
+            c['updatedAt'] = at
+
+
 def _apply(d, op):
     """Apply one patch to snapshot d. False: its target is not in the cache (read again)."""
     kind = op.get('op')
@@ -257,29 +301,48 @@ def _apply(d, op):
         put = dict(op.get('set') or {})
         at = put.pop('updatedAt', None)
         for _, c in _content(d, 'PullRequest', op['number']):
-            # Codex on PR #117: freshness is kept PER FIELD. A patch changes only some fields
-            # (a comment only updatedAt), so one shared updatedAt would make an older event for
-            # another field (labels, draft, head) look stale. A field is skipped only when the
-            # cache holds a newer value for that same field: its own patch stamp, else the
-            # updatedAt of the board read it came from (_base).
-            base = c.setdefault('_base', c.get('updatedAt'))
-            stamps = c.setdefault('_at', {})
-
-            def newer(field):
-                mine = stamps.get(field) or base
-                return bool(at and mine and str(mine) > str(at))
-            fields = {k: v for k, v in put.items() if not newer(k)}
+            fields = _fresh(c, put, at)
             if 'before' in op and 'headRefOid' in fields and \
                     c.get('headRefOid') not in (op['before'], fields['headRefOid']):
                 ok = False  # a push the cache did not see the step before: read the board
                 fields.pop('headRefOid')
-            c.update(fields)
-            if at:
-                stamps.update({k: at for k in fields})
-                if not c.get('updatedAt') or str(at) > str(c['updatedAt']):
-                    c['updatedAt'] = at
+            _put(c, fields, at)
         return ok  # a PR that is not in the cache: its own card event brings it
-    return False  # 'dirty'
+    if kind == 'issue':  # tangentswarm #136: an issue's labels or milestone (the pick order)
+        put = dict(op.get('set') or {})
+        at = put.pop('updatedAt', None)
+        if not at:  # Codex on PR #138: no order can be known: never apply it (stale)
+            return False
+        hit = False
+        # Codex on PR #138: the same per-field freshness as a PR, on the issue node AND on
+        # each PR's node of it (closingIssuesReferences), so an older event never rolls back
+        # a newer label or milestone in either place.
+        nodes = [c for _, c in _content(d, 'Issue', op['number'])]
+        for it in d.get('prs') or []:
+            nodes += [i for i in ((it.get('content') or {}).get('closingIssuesReferences') or {}).get('nodes') or []
+                      if i.get('number') == op['number']
+                      and (i.get('repository') or {}).get('nameWithOwner', REPO) == REPO]
+        for c in nodes:
+            _put(c, _fresh(c, put, at), at)
+            hit = True
+        return hit  # not in the cache: a missed issue only the launch picker reads (stale)
+    return False  # 'dirty', 'stale'
+
+
+def _soft(d, op):
+    """tangentswarm #136: True when an op the cache cannot follow touches only what the movers
+    do not read (they read the open PRs in Ready, Staging and Human Review: column, head,
+    draft, labels, milestones). Such an op makes the cache stale, not dirty."""
+    kind = op.get('op')
+    if kind in ('stale', 'issue'):
+        return True
+    if kind == 'col':
+        cols = {board.column({'optionId': op.get('optionId'), 'name': op.get('name')})}
+        if 'frm' in op:
+            cols.add(board.column(op['frm']))
+        cols |= {col(it) for it in (d.get('prs') or []) + (d.get('issues') or []) if it.get('id') == op['item']}
+        return not cols & set(FLIGHT)
+    return False
 
 
 def patch(op, path=None, now=time.time):
@@ -300,7 +363,7 @@ def patch(op, path=None, now=time.time):
             return False
         ok = _apply(d, op)
         if not ok:
-            d['dirty'] = op['t']
+            d['stale' if _soft(d, op) else 'dirty'] = op['t']
         d['patches'] = ((d.get('patches') or []) + [op])[-KEEP_PATCHES:]
         _write(path, d)
     return ok
@@ -313,6 +376,11 @@ def moved(item, col, path=None, now=time.time):
 
 def _labels(names):
     return {'nodes': [{'name': x} for x in names]}
+
+
+def _milestone(m):
+    """A webhook milestone as the GraphQL shape the cache keeps ({title, dueOn}), or None."""
+    return {'title': m.get('title'), 'dueOn': m.get('due_on')} if isinstance(m, dict) and m.get('title') else None
 
 
 def ops_for(event, p):
@@ -338,7 +406,9 @@ def ops_for(event, p):
             return [op]
         if action in ('deleted', 'archived'):
             return [{'op': 'item-gone', 'item': item.get('node_id')}]
-        if action in ('created', 'restored', 'converted'):
+        if action in ('created', 'converted'):  # tangentswarm #136: its Status move follows
+            return [{'op': 'stale'}]
+        if action == 'restored':  # it comes back in its old column, maybe Staging
             return [{'op': 'dirty'}]
         return []
     if ((p.get('repository') or {}).get('full_name') or '') != REPO:
@@ -350,9 +420,13 @@ def ops_for(event, p):
             return []
         if action == 'closed':
             return [{'op': 'gone', 'kind': 'PullRequest', 'number': n}]
-        if action in ('opened', 'reopened', 'milestoned', 'demilestoned'):
+        if action == 'opened':  # tangentswarm #136: a new PR is not in Ready, Staging or Human Review
+            return [{'op': 'stale'}]
+        if action == 'reopened':
             return [{'op': 'dirty'}]
         put = {'updatedAt': upd} if upd else {}
+        if action in ('milestoned', 'demilestoned'):  # tangentswarm #136: followed (the pick order)
+            put['milestone'] = _milestone(pr.get('milestone'))
         if action == 'synchronize':
             put['headRefOid'] = (pr.get('head') or {}).get('sha')
             if p.get('before'):  # applied only onto the head it replaced
@@ -368,14 +442,25 @@ def ops_for(event, p):
                 # Codex on PR #117: a body edit can add or drop "Fixes #N", and the cache cannot
                 # derive closingIssuesReferences (and its labels and milestones) from the body.
                 # A base change is not in the cache either. Only a title-only edit is followed.
-                return [{'op': 'pr', 'number': n, 'set': put}, {'op': 'dirty'}]
+                # tangentswarm #136: stale, not dirty: the closing issues only change the order
+                # of a PR, and a base change is not in the cache; the movers do not wait for it.
+                return [{'op': 'pr', 'number': n, 'set': put}, {'op': 'stale'}]
         return [{'op': 'pr', 'number': n, 'set': put}] if put else []
     if event == 'issues':
         i = p.get('issue') or {}
         if action == 'closed':
             return [{'op': 'gone', 'kind': 'Issue', 'number': i.get('number')}]
-        if action in ('opened', 'reopened', 'transferred', 'milestoned', 'demilestoned', 'labeled', 'unlabeled'):
-            return [{'op': 'dirty'}]  # an issue's labels and milestone change a PR's pick order
+        # tangentswarm #136: an issue's labels and milestone change a PR's pick order: followed
+        # from the event. A new or moved issue is read by the launch picker only: stale.
+        at = {'updatedAt': i['updated_at']} if i.get('updated_at') else {}
+        if action in ('labeled', 'unlabeled'):
+            return [{'op': 'issue', 'number': i.get('number'),
+                     'set': {'labels': _labels([x.get('name') for x in i.get('labels') or [] if x.get('name')]), **at}}]
+        if action in ('milestoned', 'demilestoned'):
+            return [{'op': 'issue', 'number': i.get('number'),
+                     'set': {'milestone': _milestone(i.get('milestone')), **at}}]
+        if action in ('opened', 'reopened', 'transferred'):
+            return [{'op': 'stale'}]
         return []
     if event == 'issue_comment':
         i = p.get('issue') or {}
@@ -463,7 +548,7 @@ def sync_due(path=None, now=time.time, every=None):
     every = SYNC_EVERY if every is None else every
     d = _load(path or PATH)
     try:
-        return d is None or bool(d.get('dirty')) or now() - float(d['at']) >= every
+        return d is None or bool(d.get('dirty')) or bool(d.get('stale')) or now() - float(d['at']) >= every
     except (KeyError, TypeError, ValueError):
         return True
 

@@ -11,6 +11,8 @@ os.environ['TANGENTSWARM_CONFIG'] = os.path.join(os.path.dirname(os.path.dirname
 
 from tangentswarm import deploy as _deploy  # noqa: E402
 _REAL_DEPLOY_START = _deploy.start
+from tangentswarm import stagingdeploy as _stagingdeploy  # noqa: E402
+_REAL_STAGING_START = _stagingdeploy.start
 
 
 @pytest.fixture(autouse=True)
@@ -69,6 +71,11 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(deploy, 'start', lambda sha, pr=None, **kw: started.append((sha, pr)) or f"started {sha[:8]}")
     monkeypatch.setattr(deploy, 'STARTED', started, raising=False)
     monkeypatch.setattr(deploy, 'REAL_START', _REAL_DEPLOY_START, raising=False)
+    from tangentswarm import stagingdeploy  # tangentswarm #136: never a real sudo systemctl start in a test
+    staged = []
+    monkeypatch.setattr(stagingdeploy, 'REAL_START', _REAL_STAGING_START, raising=False)
+    monkeypatch.setattr(stagingdeploy, 'start', lambda why='', sh=None: staged.append(why) or f"started (test) ({why})")
+    monkeypatch.setattr(stagingdeploy, 'STARTED', staged, raising=False)
     monkeypatch.setenv('SWARM_DEPLOY_STATE', str(tmp_path / 'deploy-state'))
     monkeypatch.setenv('SWARM_FLOW_LIVE', str(tmp_path / 'no-flow-live'))
     monkeypatch.setattr(_wh, 'INBOX', tmp_path / 'webhook-inbox')

@@ -299,9 +299,10 @@ def test_a_merge_into_main_wakes_swarm_promoted_before_the_done_move_and_the_swe
     assert W.PROMOTED_WOKEN == []  # the injected signal ran, never the module default
 
 
-@pytest.mark.parametrize('payload', [merged_payload(merged=False), merged_payload(base='deploy')])
-def test_an_unmerged_close_or_a_merge_into_another_base_sends_no_signal(payload):
-    """tangentswarm #67 (a): only a merge into main takes the new wake path."""
+@pytest.mark.parametrize('payload', [merged_payload(base='deploy')])
+def test_a_merge_into_another_base_sends_no_signal(payload):
+    """tangentswarm #67 (a): a merge into another base takes no wake path. (tangentswarm #136:
+    an unmerged close does: it may free a Human Review slot; see test_refill.)"""
     woken = []
     ex = Fake(col=board.HUMAN_REVIEW)
     ex.signal_promoted = lambda: woken.append(1) or 'woken (test)'
