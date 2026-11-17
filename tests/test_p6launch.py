@@ -23,13 +23,14 @@ class World:
 
     def __init__(self, tmp_path, repo=TS, issue_state='OPEN', issue_col=board.BACKLOG, remote=(), prs=None,
                  pr_col=None, admit=(True, 'room'), refuse=None, start=None, tips=None,
-                 local=None, wts=None):
+                 local=None, wts=None, linked=()):
         self.tmp, self.repo = tmp_path, repo
         self.issue_state, self.issue_col, self.pr_col = issue_state, issue_col, pr_col
         self.remote = set(remote)            # branches on origin
         self.tips = dict(tips or {})         # branch -> its tip commit subject
         self.local = dict(local or {})       # local branch -> its tip ('tip:<b>' is origin's tip)
         self.wts = dict(wts or {})           # worktree path -> the branch it has
+        self.linked = list(linked)           # [(PR, branch, state, repo)] PRs that close #98
         self.prs = dict(prs or {})           # branch -> (number, body)
         self.gh, self.gits, self.worktrees, self.starts = [], [], [], []
         self._admit, self._refuse, self._start = admit, refuse, start
@@ -40,7 +41,10 @@ class World:
         if n == 98:
             items = [{'id': 'ISSUE98', 'project': {'id': B6.id}, 'fieldValueByName': status(self.issue_col)}] \
                 if self.issue_col else []
-            return {'repository': {'issueOrPullRequest': {'state': self.issue_state, 'projectItems': {'nodes': items}}}}
+            refs = {'nodes': [{'number': p, 'headRefName': b, 'state': st, 'repository': {'nameWithOwner': rp}}
+                              for p, b, st, rp in self.linked]}
+            return {'repository': {'issueOrPullRequest': {'state': self.issue_state, 'projectItems': {'nodes': items},
+                                                          'closedByPullRequestsReferences': refs}}}
         items = [{'id': 'OTHER', 'project': {'id': 'P4'}, 'fieldValueByName': None}]
         if self.pr_col:
             items.append({'id': f'PR{n}', 'project': {'id': B6.id}, 'fieldValueByName': status(self.pr_col)})
@@ -376,14 +380,48 @@ def test_local_state_of_our_own_branch_is_reused(tmp_path):
     assert w.worktrees == [('tangentswarm', SLUG)] and not [a for a in w.gits if a[0] == 'push']
 
 
-def test_local_work_that_origin_does_not_have_or_a_worktree_on_another_branch_is_other(tmp_path):
-    w = World(tmp_path, remote={SLUG}, prs={SLUG: (108, 'Fixes #98')}, local={SLUG: 'unrelated'})
+@pytest.mark.parametrize('kw', [
+    {'local': {SLUG: 'unpushed'}},                              # an earlier worker's unpushed commit
+    {'wts': {f'/ver/tangentswarm.{SLUG}': 'something-else'}},  # its worktree on another branch
+])
+def test_unpushed_work_on_the_issues_own_branch_refuses_the_launch(tmp_path, kw):
+    # Codex on PR #108 (eb00f6b): never a new name, PR and second worker for the same issue
+    w = World(tmp_path, remote={SLUG}, prs={SLUG: (108, 'Fixes #98')}, **kw)
+    with pytest.raises(RuntimeError, match='no second worker'):
+        w.launcher().run()
+    assert w.writes() == [] and w.worktrees == [] and w.starts == []
+
+
+@pytest.mark.parametrize('kw', [
+    {'local': {'renamed-branch': 'unpushed'}},
+    {},
+])
+def test_an_open_pr_of_the_issue_on_another_name_is_used_or_refused(tmp_path, kw):
+    # the issue's open PR is on a branch the title slug does not give (the title changed)
+    linked = [(77, 'renamed-branch', 'OPEN', TS)]
+    w = World(tmp_path, remote={'renamed-branch'}, prs={'renamed-branch': (77, 'Fixes #98')}, linked=linked, **kw)
+    if kw:
+        with pytest.raises(RuntimeError, match='no second worker'):
+            w.launcher().run()
+        assert w.writes() == [] and w.starts == []
+        return
+    notes = w.launcher().run()
+    assert f'{TS}#98 already has open PR #77 on renamed-branch' in notes
+    assert w.worktrees == [('tangentswarm', 'renamed-branch')] and w.starts[0][0] == 'swarm-77-renamed-branch'
+    assert not [a for a in w.gh if a[:3] == ['gh', 'pr', 'create']]
+
+
+def test_an_open_pr_of_the_issue_on_a_branch_of_other_work_is_refused(tmp_path):
+    w = World(tmp_path, remote={'x'}, prs={'x': (77, 'Fixes #5')}, linked=[(77, 'x', 'OPEN', TS)])
+    with pytest.raises(RuntimeError, match='already has open PR #77 on x'):
+        w.launcher().run()
+    assert w.writes() == [] and w.starts == []
+
+
+def test_closed_prs_and_other_repos_prs_do_not_count(tmp_path):
+    w = World(tmp_path, linked=[(70, 'old', 'CLOSED', TS), (71, 'm', 'OPEN', METH)])
     w.launcher().run()
-    assert w.worktrees == [('tangentswarm', f'{SLUG}-98')]
-    w = World(tmp_path / 'b', remote={SLUG}, prs={SLUG: (108, 'Fixes #98')},
-              wts={f'/ver/tangentswarm.{SLUG}': 'something-else'})
-    w.launcher().run()
-    assert w.worktrees == [('tangentswarm', f'{SLUG}-98')]
+    assert w.worktrees == [('tangentswarm', SLUG)]
 
 
 def test_owner_with_real_git_repos(tmp_path, monkeypatch):
@@ -414,4 +452,4 @@ def test_owner_with_real_git_repos(tmp_path, monkeypatch):
     g('push', '-q', 'origin', f'{sha}:refs/heads/started', cwd=repo)
     assert lau.owner('started') == 'ours'  # a launch that stopped before its PR
     g('branch', 'started', 'unrelated', cwd=repo)  # but a local 'started' of other work
-    assert lau.owner('started') == 'other'
+    assert lau.owner('started') == 'conflict'

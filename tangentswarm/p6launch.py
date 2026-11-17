@@ -36,7 +36,9 @@ CHECKS = {'tangentcode/tangentswarm': 'the full suite: ~/.venvs/swarm-tmux/bin/p
 
 ITEM_Q = """query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){
   issueOrPullRequest(number:$n){
-   ...on Issue{state projectItems(first:20){nodes{id project{id}
+   ...on Issue{state closedByPullRequestsReferences(first:20, includeClosedPrs:false){
+     nodes{number state headRefName repository{nameWithOwner}}}
+    projectItems(first:20){nodes{id project{id}
     fieldValueByName(name:"Status"){...on ProjectV2ItemFieldSingleSelectValue{name optionId}}}}}
    ...on PullRequest{state projectItems(first:20){nodes{id project{id}
     fieldValueByName(name:"Status"){...on ProjectV2ItemFieldSingleSelectValue{name optionId}}}}}}}}"""
@@ -157,11 +159,20 @@ class P6Launcher:
         return line
 
     # -- the steps --------------------------------------------------------------------------
-    def issue_item(self, n):
-        """(state, item id, column) of issue or PR n on this board; item is None with no card."""
+    def node(self, n):
         owner, name = self.repo.split('/')
         d = self.gql(ITEM_Q, owner=owner, name=name, n=int(n))
-        node = ((d or {}).get('repository') or {}).get('issueOrPullRequest') or {}
+        return ((d or {}).get('repository') or {}).get('issueOrPullRequest') or {}
+
+    def linked_prs(self, node):
+        """[(PR number, head branch)] of the open PRs of this repo that close the issue."""
+        return [(p['number'], p.get('headRefName') or '')
+                for p in ((node.get('closedByPullRequestsReferences') or {}).get('nodes') or [])
+                if p.get('state') == 'OPEN' and (p.get('repository') or {}).get('nameWithOwner') == self.repo]
+
+    def issue_item(self, n, node=None):
+        """(state, item id, column) of issue or PR n on this board; item is None with no card."""
+        node = self.node(n) if node is None else node
         for it in (node.get('projectItems') or {}).get('nodes') or []:
             if ((it.get('project') or {}).get('id')) == self.board.id:
                 return node.get('state'), it['id'], board.column(it.get('fieldValueByName'))
@@ -196,13 +207,14 @@ class P6Launcher:
         return r.stdout.strip() if r.returncode == 0 else ''
 
     def owner(self, branch):
-        """'free', 'ours' or 'other' (never reused) for a candidate name (Codex on PR #108).
+        """'free', 'ours', 'other' (never reused) or 'conflict' for a candidate name (Codex on PR #108).
         On origin: 'ours' when its open PR closes this issue, or it has no open PR and its tip
         is this issue's start commit (a launch that stopped before the PR); else 'other'; no
         such branch is 'free'. Local state must agree, because ensure_worktree reuses a local
         branch and worktree first: a local branch counts only when origin's branch is ours and
         has its tip; the worktree <root>/<name>.<slug> counts only when origin's branch is ours
-        and the worktree is on that branch. Any other local branch or worktree is 'other'."""
+        and the worktree is on that branch. Any other local branch or worktree is 'other', or
+        'conflict' when origin's branch is this issue's (the launch is then refused)."""
         tip = self.git('ls-remote', 'origin', f'refs/heads/{branch}', check=False).split('\t')[0].strip()
         if tip:
             pr, body = self.open_pr(branch)
@@ -216,10 +228,12 @@ class P6Launcher:
                 return 'other'
         local = self.git('rev-parse', '--verify', '--quiet', f'refs/heads/{branch}', check=False).strip()
         if local and (not tip or not self.git_ok('merge-base', '--is-ancestor', local, tip)):
-            return 'other'  # local work that origin's branch of this issue does not have
+            # local work that origin's branch does not have: on this issue's own branch it is
+            # an earlier worker's unpushed work (Codex on PR #108), never a reason to pick a new name
+            return 'conflict' if tip else 'other'
         on = self.wt_branch(self.worktree_path(branch))
         if on is not None and (not tip or on != branch):
-            return 'other'  # a worktree of other work (or of a branch origin does not have) at this path
+            return 'conflict' if tip else 'other'  # a worktree at this path on another branch
         return 'ours' if tip else 'free'
 
     def git_ok(self, *args):
@@ -233,14 +247,39 @@ class P6Launcher:
     def pick_branch(self):
         """The first of <slug>, <slug>-<N>, <slug>-<N>-2 ... that is free or this issue's own.
         A branch of other work is never reused (Codex on PR #108: the -<N> name was taken
-        without a check)."""
+        without a check). A 'conflict' (this issue's own branch with local work origin does
+        not have) refuses the launch: another name would start a second worker for the issue."""
         from .launcher import slug
         b = slug(self.title, self.n)
         for name in [b, f"{b}-{self.n}"] + [f"{b}-{self.n}-{k}" for k in range(2, 6)]:
-            if self.owner(name) != 'other':
+            o = self.owner(name)
+            if o == 'conflict':
+                raise self.conflict(name)
+            if o != 'other':
                 return name
         raise RuntimeError(f"no free branch name for {self.repo}#{self.n}: {b}, {b}-{self.n} and "
                            f"{b}-{self.n}-2..5 belong to other work")
+
+    def conflict(self, branch):
+        return RuntimeError(f"{self.repo}#{self.n} already has its branch {branch}, and the local branch or "
+                            f"worktree has work that origin does not have (an earlier worker?): no second "
+                            "worker is started")
+
+    def existing_branch(self, node):
+        """The head branch of the issue's open PR, or None. An open PR on a branch of local
+        work origin does not have refuses the launch (Codex on PR #108)."""
+        linked = self.linked_prs(node)
+        if not linked:
+            return None
+        pr, branch = linked[0]
+        o = self.owner(branch) if branch else 'other'
+        if o == 'ours':
+            self.note(f"{self.repo}#{self.n} already has open PR #{pr} on {branch}")
+            return branch
+        if o == 'conflict':
+            raise self.conflict(branch)
+        raise RuntimeError(f"{self.repo}#{self.n} already has open PR #{pr} on {branch or 'an unknown branch'}, "
+                           "which this launcher cannot reuse: no second PR or worker is started")
 
     def branch(self, branch):
         """Push one empty start commit on origin/main, unless the branch exists (pick_branch
@@ -332,7 +371,8 @@ class P6Launcher:
         step's error (the steps before it stay, and a run again goes on from there)."""
         from . import alerts
         with alerts.once_lock(f"p6launch:{self.repo}#{self.n}"):  # never two launches of one issue at once
-            state, _, _ = self.issue_item(self.n)
+            node = self.node(self.n)
+            state, _, _ = self.issue_item(self.n, node)
             if state and state != 'OPEN':
                 self.note(f"{self.repo}#{self.n} is {state.lower()}: no launch")
                 return self.notes
@@ -340,7 +380,7 @@ class P6Launcher:
             if not ok:
                 raise Deferred(f"memory or CPU admission holds the start ({why}); "
                                f"{self.repo}#{self.n} stays in Backlog")
-            branch = self.pick_branch()
+            branch = self.existing_branch(node) or self.pick_branch()
             self.branch(branch)
             pr = self.draft_pr(branch)
             self.cards(pr)
