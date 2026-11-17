@@ -891,6 +891,11 @@ idle-dirty, asking, input, menu, exited). It then does the safe mechanical moves
   the pushed PR head, no open Codex findings, head merges cleanly onto origin/main) is
   marked ready and moved to Auto Review, with one `@codex review` per head.
 - `active-gate --sweep --demote` and `active-gate --promote-missing` run as they are.
+  The source of `active-gate` is `bin/active-gate` in this repo (tangentswarm #140). An
+  Active issue whose linked open PRs are all in Deferred, with no open sub-issue, moves to
+  Deferred; an issue with no linked PR stays needs-launch. The live copy is `~/bin/active-gate`.
+  A human installs a new version with `cp bin/active-gate ~/bin/active-gate` (or
+  `ln -sf "$PWD/bin/active-gate" ~/bin/active-gate` from the live checkout).
 - One `swarm-flow step` runs (see below). Ready PRs are never gated by the tick.
 
 Candidates in the priority milestone (`ptw 15`; override with
