@@ -58,6 +58,12 @@ SCOPE_AGENT = 'tangentswarm:agent'
 # what the builtin authorization server registers clients for and issues; the token's
 # resource decides which server accepts it
 ISSUABLE_SCOPES = ALL_SCOPES + [SCOPE_AGENT]
+# swarm-api (status_api.py, tangentswarm #24): status reads; act is a human action and needs
+# a token issued with --subject (the human it represents). Only `swarm auth token issue`
+# gives them: no OAuth client registers for them, so no MCP token carries them.
+SCOPE_STATUS = 'tangentswarm:status'
+SCOPE_ACT = 'tangentswarm:act'
+API_SCOPES = [SCOPE_STATUS, SCOPE_ACT]
 
 TOKEN_PREFIX = 'tsw_'          # locally issued opaque tokens
 JWT_ALGORITHMS = ['RS256', 'RS384', 'RS512', 'PS256', 'PS384', 'PS512',

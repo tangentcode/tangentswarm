@@ -35,6 +35,8 @@ This installs four commands:
 - `swarm-mcp`, an MCP server for tmux, agents and cloud sessions (see [MCP server](#mcp-server)).
 - `swarm-hub`, the message queue agents report to, and `swarm-agent`, the MCP server agents
   use to reach it (see [swarm-agent](#swarm-agent-the-agents-own-mcp-server)).
+- `swarm-api`, the Swarm status API for the control panel (see
+  [swarm-api](#swarm-api-the-swarm-status-api-tangentswarm-24)).
 
 ## Usage
 
@@ -1090,6 +1092,44 @@ swarm-hookgate wait                # return once the REST quota has a reserve; s
 - Below 300 REST calls left it waits for the reset time instead of failing mid-run.
 
 The `SWARM_HOOK_*` variables override these limits. The state is in `~/.cache/swarm-hook`.
+
+## swarm-api: the Swarm status API (tangentswarm #24)
+
+`swarm-api` is a loopback HTTP service (default `127.0.0.1:8779`) for the platform `swarm`
+app (the Petri-net control panel) and, later, a coordinator. The front proxy on the swarm
+host routes `/api/` to it. It answers only `/api/*`; the app (`/`) and the MCP routes
+(`/mcp/*`, `/login`, `/token`, `/authorize`, `/register`, `/revoke`, `/.well-known/`) are not
+its routes. It refuses to bind a non-loopback address.
+
+Read (per swarm; `{b}` is the board number): `GET /api/swarms`, `/api/swarms/{b}/places`
+(each column with its open cards and a count), `/transitions` (the steps, who fires each,
+the rules and the limits such as Human Review at 2), `/events` (the events DB, each row
+handled, unhandled, pending, dropped or error; `?since=&limit=&source=&pr=`), `/messages`
+(the swarm-hub messages; read = handled) and `/lease` (the coordinator lease: none until
+#23 adds one; and the serial gate lock's holder note and queue). `GET /api/health` needs
+no auth; `GET /api/whoami` shows the caller.
+
+Human actions (JSON bodies): `POST /api/swarms/{b}/cards/{n}/triage {"action": "approve" |
+"backlog" | "active" | "discuss"}` (approve = Backlog, where the launcher takes work),
+`POST /api/swarms/{b}/cards/{n}/answer {"body"}` (a comment on the ticket, then Needs Input
+-> In Progress, which swarm-webhook relays to the worker) and `POST
+/api/swarms/{b}/messages/{id}/answer {"body"}` (a hub reply to a question or blocker). Each
+one uses the swarm's own tools (`board.move_card`, `tick.sh` for the gh write, the hub
+client) and logs a `human-action` row with the human as actor.
+
+Auth:
+
+- Work login (browser): the front proxy does the work login and forwards `X-Swarm-User:
+  <login>` and `X-Swarm-Proxy-Secret: <secret>`. The secret is in
+  `~/.config/tangentswarm/api-proxy-secret` (`$TANGENTSWARM_API_PROXY_SECRET_FILE`; mode
+  0600, 32+ characters). Without the right secret the user header is ignored. Proxy users
+  read and write; `$TANGENTSWARM_API_HUMANS=a,b` limits writes to those logins.
+- Machine credential: `Authorization: Bearer <token>` from `swarm auth token issue --client
+  NAME --scopes tangentswarm:status` (read). A write also needs `tangentswarm:act`, which
+  the CLI issues only with `--subject LOGIN` (the human the token acts for). A token with
+  another resource (an MCP token) does not count.
+- A write must be `Content-Type: application/json` and, when the browser sends `Origin`,
+  same-origin (`Host` or `X-Forwarded-Host`). There is no CORS.
 
 ## swarm-webhook, the events DB and swarm-events
 
