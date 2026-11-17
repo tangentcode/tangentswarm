@@ -17,9 +17,11 @@ follows new rows. One row per event:
 - The Agents screen (tangentswarm #44; agents_view, livestate): each tmux pane of the swarm,
   with its Claude, active or idle, tests and other processes, memory, CPU, PR and card, under
   the host load and the start capacity. In a terminal the keys are: a agents, e events, q quit.
+- Step 2: in a terminal, s shows the skipped events (dim, status 'skipped') and hides them
+  again; a footer line counts them. --skips starts with them shown (also on a pipe).
 
   swarm-events [--since today|all|YYYY-MM-DD] [--source S[,S...]] [-v] [--once] [--db PATH]
-               [--color|--no-color] [--redraw S] [--agents]
+               [--color|--no-color] [--redraw S] [--agents] [--skips]
 """
 import argparse
 import json
@@ -113,10 +115,11 @@ def outcome(notes):
 
 # -- events from rows (pure) ----------------------------------------------------------------
 
-def events(rows):
+def events(rows, skips=False):
     """[event dict] from DB rows, oldest first: a delivery's received and handled rows merged,
-    skipped events and dropped redeliveries left out. An event: {t, at, status, event, pr,
-    repo, actor, outcome, sig_bad, error, rows}."""
+    skipped events and dropped redeliveries left out (with skips, kept with the status
+    'skipped': #34 Step 2). An event: {t, at, status, event, pr, repo, actor, outcome, sig_bad,
+    error, rows}."""
     by_delivery, order = {}, []
     for r in rows:
         rejected = r.get('stage') == 'received' and (r.get('sig_ok') == 0 or r.get('reason') not in (None, 'duplicate'))
@@ -136,10 +139,10 @@ def events(rows):
     out = []
     for kind, v in order:
         if kind == 'd':
-            e = _delivery(by_delivery[v])
+            e = _delivery(by_delivery[v], skips)
             key = ('d', v)
         else:
-            e = _delivery([v]) if kind == 's' else _action(v)
+            e = _delivery([v], skips) if kind == 's' else _action(v, skips)
             key = ('r', v.get('id'))
         if e:
             e['key'] = key
@@ -147,12 +150,39 @@ def events(rows):
     return out
 
 
-def _delivery(rs):
+def _skipped(r, outcome_):
+    """An event dict for a hidden row that the skips toggle shows (#34 Step 2)."""
+    ev = r.get('event') or '-'
+    if r.get('action'):
+        ev += '/' + r['action']
+    return dict(t=r.get('received') or 0, at=r.get('received_at') or '', status='skipped', event=ev,
+                pr=r.get('pr'), repo=r.get('repo'), actor=r.get('sender') or r.get('actor'), outcome=outcome_,
+                sig_bad=False, error='', rows=[r])
+
+
+def _skip_words(rs):
+    """Why an event was skipped, in short words: its skip notes, else its decisions."""
+    out = []
+    for r in rs:
+        for n in _list(r.get('notes')):
+            w = re.sub(r'^skip:?\s*', '', str(n)).strip()
+            if w and w not in out:
+                out.append(w)
+    if not out:
+        out = list(dict.fromkeys(str(d) for r in rs for d in _list(r.get('decisions')))) or ['skip']
+    return '; '.join(out)[:80]
+
+
+def _delivery(rs, skips=False):
     # a duplicate receipt is GitHub redelivering a queued event: never the event itself, but
     # its handled rows still count (Codex on PR #36: the first receipt may be before --since)
     rec = [r for r in rs if r.get('stage') == 'received' and r.get('reason') != 'duplicate']
     rest = [r for r in rs if r.get('stage') != 'received']
     if not rec and not rest:
+        if skips and rs:
+            e = _skipped(rs[0], 'redelivery')
+            e['rows'] = rs
+            return e
         return None
     rs = rec + rest
     first = rec[0] if rec else rest[0]
@@ -164,7 +194,13 @@ def _delivery(rs):
     sig_bad = first.get('sig_ok') == 0
     decisions = [d for r in rs for d in _list(r.get('decisions'))]
     if not sig_bad and (first.get('reason') == 'log-only' or (decisions and all(d in HIDDEN for d in decisions))):
-        return None
+        if not skips:
+            return None
+        e = _skipped(first, _skip_words(rs))
+        e['rows'] = rs
+        if not e['pr']:
+            e['pr'] = next((r.get('pr') for r in done if r.get('pr')), None)
+        return e
     error = '; '.join(r['error'] for r in rs if r.get('error'))
     if sig_bad or error or first.get('reason'):
         status = 'failed'
@@ -182,7 +218,7 @@ def _delivery(rs):
                 error=error or (first.get('reason') or '' if status == 'failed' and not sig_bad else ''), rows=rs)
 
 
-def _action(r):
+def _action(r, skips=False):
     """A server action row (#32: move, park, cascade, ...): one row, no empty columns."""
     if r.get('stage') in ('received', 'handled', 'replay'):
         return None  # a webhook row without a delivery id: nothing to merge it with
@@ -191,7 +227,9 @@ def _action(r):
     ev = ' '.join(str(x) for x in words if x) or '-'
     notes = outcome(_list(r.get('notes')))
     if src == 'cascade' and what == 'cascade' and not notes and not r.get('error'):
-        return None  # a cascade pass that did nothing
+        if not skips:
+            return None  # a cascade pass that did nothing
+        return dict(_skipped(r, 'nothing to do'), event=ev)
     if what == 'command':
         notes = ''  # the command line is the event column already
     return dict(t=r.get('received') or 0, at=r.get('received_at') or '', status='failed' if r.get('error') else '',
@@ -227,6 +265,8 @@ def line(e, now=None, color=True):
         return f"{text} {SIG_BAD} SIGNATURE FAILED {RESET}"
     if e.get('status') == 'failed':
         return f"{RED}{text}{('  ERROR: ' + err) if err else ''}{RESET}"
+    if e.get('status') == 'skipped':  # shown with the skips toggle: always in the background
+        return f"\033[38;5;{GRAY_END}m{text}{RESET}"
     g = shade(now - float(e.get('t') or 0))
     return f"{BOLD}{text}{RESET}" if g is None else f"\033[38;5;{g}m{text}{RESET}"
 
@@ -267,23 +307,43 @@ def rows_after(db, last_id, since='', sources=()):
     return [dict(r) for r in db.execute(q + ' ORDER BY id', args)]
 
 
-def blocks(rows, now=None, color=True, verbose=False):
+def blocks(rows, now=None, color=True, verbose=False, skips=False):
     """[(event key, stable text, text)] in order: the event's line, and its rows as JSON with
     -v. The stable text has no color, so the age shading alone is never a change."""
     out = []
-    for e in events(rows):
+    for e in events(rows, skips):
         rows_json = ('\n' + '\n'.join(full(r) for r in e['rows'])) if verbose else ''
         out.append((e['key'], line(e, now, False) + rows_json, line(e, now, color) + rows_json))
     return out
 
 
-def render(rows, now=None, color=True, verbose=False, height=None, width=None):
+def render(rows, now=None, color=True, verbose=False, height=None, width=None, skips=False):
     """The lines of one screen: the newest events that fit in height (all when None), each cut
     to width so that none wraps (Codex on PR #48)."""
-    out = [l for _, _, text in blocks(rows, now, color, verbose) for l in text.split('\n')]
+    out = [l for _, _, text in blocks(rows, now, color, verbose, skips) for l in text.split('\n')]
     if width:
         out = [agents_view.clip(l, width) for l in out]
     return out[-height:] if height else out
+
+
+def footer(rows, skips=False):
+    """The key line under the events screen (#34 Step 2): how many events, the skipped
+    ones shown or hidden, and the keys."""
+    evs = events(rows, True)
+    n_skip = sum(1 for e in evs if e['status'] == 'skipped')
+    shown = len(evs) if skips else len(evs) - n_skip
+    state = f"{n_skip} skipped shown" if skips else f"{n_skip} skipped hidden"
+    return f"{shown} events, {state}    keys: s {'hide' if skips else 'show'} skips  a agents  e events  q quit"
+
+
+def events_screen(rows, now, color=True, verbose=False, height=None, width=None, skips=False):
+    """The lines of the events screen in a terminal: the newest events over a blank line and
+    the footer, all in height lines."""
+    foot = footer(rows, skips)
+    if width:
+        foot = agents_view.clip(foot, width)
+    body = render(rows, now, color, verbose, max(1, height - 2) if height else None, width, skips)
+    return body + ['', foot]
 
 
 class TermKeys:
@@ -340,10 +400,11 @@ def key_list(pressed):
 
 def run(path, since='today', verbose=False, once=False, color=None, out=sys.stdout, sleep=time.sleep,
         polls=None, redraw=10.0, clock=time.time, tty=None, screen='events', keys=None, sample=None,
-        sources=()):
+        sources=(), skips=False):
     """--once or a pipe: print the events, then append new ones. A terminal: redraw the screen
     on a new event and every `redraw` s, so the age shading stays true. screen='agents' shows
-    the Agents screen (once on a pipe); in a terminal, keys(timeout) switches the screen."""
+    the Agents screen (once on a pipe); in a terminal, keys(timeout) switches the screen and
+    s shows or hides the skipped events (#34 Step 2; skips=True starts with them shown)."""
     tty = out.isatty() if tty is None else tty
     color = tty if color is None else color
     lower = since_iso(since)
@@ -357,7 +418,10 @@ def run(path, since='today', verbose=False, once=False, color=None, out=sys.stdo
         sample = lambda: livestate.collect(watch, now=clock())  # noqa: E731
     if tty and keys is None:
         with TermKeys(sleep=sleep) as k:
-            return run(path, since, verbose, once, color, out, sleep, polls, redraw, clock, tty, screen, k, sample)
+            # by keyword, so that no option is lost (sources and skips were dropped by position)
+            return run(path, since=since, verbose=verbose, once=once, color=color, out=out, sleep=sleep,
+                       polls=polls, redraw=redraw, clock=clock, tty=tty, screen=screen, keys=k, sample=sample,
+                       sources=sources, skips=skips)
     # the server makes the DB on its first request; a terminal waits for it in the main loop
     # (Codex on PR #48: the keys must work before it exists)
     while not os.path.exists(path) and not keys:
@@ -376,6 +440,9 @@ def run(path, since='today', verbose=False, once=False, color=None, out=sys.stdo
             want = {'a': 'agents', 'e': 'events'}.get(ch.lower())
             if want and want != screen:
                 screen, switched = want, True
+            elif ch in ('s', 'S'):
+                skips = not skips
+                switched = switched or screen == 'events'
             elif screen == 'agents' and (ch in SCROLL or ch in PAGE):
                 # Codex on PR #48: every pane row must be reachable in a short terminal
                 top = max(0, top + SCROLL.get(ch, 0) + PAGE.get(ch, 0) * agents_view.page(height))
@@ -395,7 +462,7 @@ def run(path, since='today', verbose=False, once=False, color=None, out=sys.stdo
             # a queued event becomes handled later: print an event again only when it changed,
             # tracked by its identity (Codex on PR #36: by position, one change reprinted the rest)
             shown = shown or {}
-            for key, stable, text in blocks(rows, now, color, verbose):
+            for key, stable, text in blocks(rows, now, color, verbose, skips):
                 if shown.get(key) != stable:  # Codex on PR #36: a new shade is not a change
                     print(text, file=out)
                     shown[key] = stable
@@ -406,7 +473,7 @@ def run(path, since='today', verbose=False, once=False, color=None, out=sys.stdo
                 drawn = now
         elif got or switched or drawn is None or now - drawn >= redraw:
             width = shutil.get_terminal_size((120, 40)).columns
-            out.write(CLEAR + '\n'.join(render(rows, now, color, verbose, height, width)) + '\n')
+            out.write(CLEAR + '\n'.join(events_screen(rows, now, color, verbose, height, width, skips)) + '\n')
             drawn = now
         out.flush()
         n += 1
@@ -431,6 +498,8 @@ def main(argv=None):
     ap.add_argument('--color', dest='color', action='store_true', default=None)
     ap.add_argument('--no-color', dest='color', action='store_false')
     ap.add_argument('--agents', action='store_true', help='start on the Agents screen (a pipe or --once: print it once)')
+    ap.add_argument('--skips', action='store_true',
+                    help='show the skipped events too (in a terminal, the s key shows or hides them)')
     a = ap.parse_args(argv)
     try:
         since_iso(a.since)
@@ -439,7 +508,7 @@ def main(argv=None):
     try:
         sources = tuple(s.strip() for x in a.source for s in x.split(',') if s.strip())
         return run(a.db, a.since, a.verbose, a.once, a.color, redraw=a.redraw,
-                   screen='agents' if a.agents else 'events', sources=sources)
+                   screen='agents' if a.agents else 'events', sources=sources, skips=a.skips)
     except KeyboardInterrupt:
         return 0
 
