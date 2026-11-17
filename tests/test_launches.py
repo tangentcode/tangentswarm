@@ -197,3 +197,10 @@ def test_the_migration_reads_the_old_swarm_held_path(tmp_path, monkeypatch):
     assert slots.load()['unstarted']['9']['branch'] == 'b9'
     monkeypatch.delenv('SWARM_HELD')
     assert L.old_held() == L.HOME / 'var' / 'swarm-held.json'
+
+
+def test_brief_line_carries_the_scratch_root_rule():
+    """#64: the one line every worker gets names the throwaway user / scratch root rule."""
+    from tangentswarm.gatechecks import SCRATCH_RULE
+    line = L.brief_line('/b/486.txt')
+    assert SCRATCH_RULE in line and line.isascii() and '\n' not in line

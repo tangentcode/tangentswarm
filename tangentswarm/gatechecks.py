@@ -40,6 +40,11 @@ SHOTS_RULE = ("Screenshots in the PR body must be absolute https URLs that rende
               f"or push it to the {SHOTS_BRANCH} branch and use https://github.com/<owner>/<repo>/blob/"
               f"{SHOTS_BRANCH}/<path>?raw=true. Never a relative file name such as ![x](shot.png); "
               "hr-gate fails it.")
+# Methodology #88 / tangentswarm #64: a verification worker wrote into the human's real staging
+# tree (methodology #87). Every brief that sends a worker to staging carries this rule.
+SCRATCH_RULE = ("A worker that does verification or takes screenshots must use a throwaway user or a "
+                "scratch root. Do not sign in as the human, and never write, change, or delete files in "
+                "the real staging tree of the human.")
 SERVED_RE = re.compile(r'^(web|api|app)/')
 
 _MD = re.compile(r'!\[[^\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)')

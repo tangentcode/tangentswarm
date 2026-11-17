@@ -69,7 +69,7 @@ REPORT_RULE = (
 
 
 def brief_text(n, title, branch, pr):
-    from .gatechecks import SHOTS_RULE
+    from .gatechecks import SCRATCH_RULE, SHOTS_RULE
     return (
         f"Task #{n}: {title}\n\n"
         f"Read the issue first, with its comments: gh issue view {n} --comments --repo {REPO}. "
@@ -84,7 +84,7 @@ def brief_text(n, title, branch, pr):
         "force-push. Keep comments sparse; every new code file starts with a 1-2 line file-purpose "
         "header. Run only the exact test files you add or change, through ~/bin/test-slot, never the "
         "whole suite. Fix the root cause and cover the neighbor cases. A UI change needs screenshots "
-        f"from staging or a local run of the real app, never an isolated component page. {SHOTS_RULE} "
+        f"from staging or a local run of the real app, never an isolated component page. {SCRATCH_RULE} {SHOTS_RULE} "
         "Before your final push, stop every dev server, watcher and background test run you started "
         "(kill the pids you started): the handoff does not run while one is left in your worktree. "
         "When you are done, commit and push, reply with: what changed, the tests you ran and their "

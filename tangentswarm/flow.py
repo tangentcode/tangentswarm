@@ -172,10 +172,10 @@ RELAY_DIR = Path(os.environ.get('SWARM_RELAY_DIR', '/tmp'))  # relay-<N>-<kind>.
 
 
 def shots_text(n):
-    from .gatechecks import SHOTS_RULE
+    from .gatechecks import SCRATCH_RULE, SHOTS_RULE
     return (f"Coordinator: #{n} needs screenshots before Human Review. Take them from staging (it serves "
             f"work with your head) or from a local run of the real app, never an isolated component page. "
-            f"{SHOTS_RULE} Do not change code; push only the PR body edit.")
+            f"{SCRATCH_RULE} {SHOTS_RULE} Do not change code; push only the PR body edit.")
 
 
 def held():

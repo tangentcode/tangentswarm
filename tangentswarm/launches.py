@@ -185,9 +185,9 @@ def start_scoped(branch, window=None, refuse=None):
 
 
 def brief_line(path):
-    from .gatechecks import SHOTS_RULE
+    from .gatechecks import SCRATCH_RULE, SHOTS_RULE
     return (f"Your brief is in {path}. Read the whole file first, then follow it. "
-            "It names your branch, the issue, the tests and how to report. " + SHOTS_RULE)
+            "It names your branch, the issue, the tests and how to report. " + SCRATCH_RULE + " " + SHOTS_RULE)
 
 
 def send_brief(pane, unit, path):

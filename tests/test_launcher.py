@@ -286,3 +286,13 @@ def test_an_unfinished_setup_with_no_issue_fails_with_a_clear_reason(tmp_path):
     lz = L.Launcher(g=gate(), run=Run(), git_dir=tmp_path, launch=lambda *a, **k: ('launched', {}))
     with pytest.raises(RuntimeError, match='setup is not done and the record names no issue'):
         lz.start_existing(7, {'branch': 'b', 'setup': 'pending'})
+
+
+def test_the_brief_tells_verification_workers_to_use_a_throwaway_user_or_scratch_root():
+    """#64 (methodology #88): a verification worker wrote into the human's staging tree."""
+    from tangentswarm.gatechecks import SCRATCH_RULE
+    text = L.brief_text(64, 'T', 'b', 93)
+    assert SCRATCH_RULE in text
+    assert 'throwaway user or a scratch root' in SCRATCH_RULE
+    assert 'never write, change, or delete files in the real staging tree of the human' in SCRATCH_RULE
+    assert SCRATCH_RULE.isascii() and text.isascii()
