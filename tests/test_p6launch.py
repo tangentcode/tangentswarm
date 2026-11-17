@@ -30,6 +30,7 @@ class World:
         self.tips = dict(tips or {})         # branch -> its tip commit subject
         self.local = dict(local or {})       # local branch -> its tip ('tip:<b>' is origin's tip)
         self.wts = dict(wts or {})           # worktree path -> the branch it has
+        self.body = 'Build a Project 6 launcher with no AI.'
         self.linked = list(linked)           # [(PR, branch, state, repo)] PRs that close #98
         self.prs = dict(prs or {})           # branch -> (number, body)
         self.gh, self.gits, self.worktrees, self.starts = [], [], [], []
@@ -44,6 +45,7 @@ class World:
             refs = {'nodes': [{'number': p, 'headRefName': b, 'state': st, 'repository': {'nameWithOwner': rp}}
                               for p, b, st, rp in self.linked]}
             return {'repository': {'issueOrPullRequest': {'state': self.issue_state, 'projectItems': {'nodes': items},
+                                                          'body': self.body,
                                                           'closedByPullRequestsReferences': refs}}}
         items = [{'id': 'OTHER', 'project': {'id': 'P4'}, 'fieldValueByName': None}]
         if self.pr_col:
@@ -479,3 +481,17 @@ def test_a_local_branch_behind_its_pr_is_a_conflict_with_real_git(tmp_path, monk
     assert lau.owner('worker') == 'conflict' and 'not at origin' in lau.why
     g('branch', '-f', 'worker', impl, cwd=repo)  # synced by hand: the same tip is reused
     assert lau.owner('worker') == 'ours'
+
+
+def test_the_brief_has_the_issue_text(tmp_path):
+    # Codex on PR #108 (50112ca): the worker has the spec without a GitHub read
+    w = World(tmp_path)
+    w.launcher().run()
+    text = (tmp_path / 'briefs' / f'swarm-108-{SLUG}.md').read_text()
+    assert text.endswith('## The issue text at launch\n\nBuild a Project 6 launcher with no AI.\n')
+
+
+def test_a_long_issue_text_is_cut_and_an_empty_one_is_left_out():
+    assert L.spec_section('') == ''
+    out = L.spec_section('q' * (L.SPEC_MAX + 50))
+    assert out.count('q') == L.SPEC_MAX and out.endswith('[cut: read the rest on GitHub]\n')

@@ -36,7 +36,7 @@ CHECKS = {'tangentcode/tangentswarm': 'the full suite: ~/.venvs/swarm-tmux/bin/p
 
 ITEM_Q = """query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){
   issueOrPullRequest(number:$n){
-   ...on Issue{state closedByPullRequestsReferences(first:20, includeClosedPrs:false){
+   ...on Issue{state body closedByPullRequestsReferences(first:20, includeClosedPrs:false){
      nodes{number state headRefName repository{nameWithOwner}}}
     projectItems(first:20){nodes{id project{id}
     fieldValueByName(name:"Status"){...on ProjectV2ItemFieldSingleSelectValue{name optionId}}}}}
@@ -53,7 +53,10 @@ def brief_dir():
     return brief.BRIEF_DIR
 
 
-def brief_text(repo, n, title, branch, pr, wt):
+SPEC_MAX = 20000  # characters of the issue text kept in the brief
+
+
+def brief_text(repo, n, title, branch, pr, wt, spec=''):
     name = repo.split('/')[1]
     return (
         f"# {name} PR #{pr} / {name} issue #{n}: {title}\n\n"
@@ -78,7 +81,19 @@ def brief_text(repo, n, title, branch, pr, wt):
         "through the swarm MCP needs_input tool and stop.\n\n"
         "Rules: no deploys or restarts, and never kill a process you did not start. Do not edit the live "
         "services or ~/bin. Card moves are done from outside. Do not ask questions in the pane. Ask "
-        "questions only through the swarm MCP needs_input tool. Write plain, short sentences.\n")
+        "questions only through the swarm MCP needs_input tool. Write plain, short sentences.\n"
+        + spec_section(spec))
+
+
+def spec_section(spec):
+    """The issue text as read at launch (Codex on PR #108: the worker has the spec even when
+    a GitHub read fails). Comments are not in it: step 1 still reads them."""
+    spec = (spec or '').strip()
+    if not spec:
+        return ''
+    if len(spec) > SPEC_MAX:
+        spec = spec[:SPEC_MAX] + '\n\n[cut: read the rest on GitHub]'
+    return f"\n## The issue text at launch\n\n{spec}\n"
 
 
 def start_claude(window, wt, brief_path):
@@ -132,6 +147,7 @@ class P6Launcher:
         self.agent_root = agent_root
         self._wt_branch = wt_branch
         self.why = ''  # why owner() found a conflict
+        self.spec = ''  # the issue body, read at launch
         self.notes = []
 
     # -- tools ------------------------------------------------------------------------------
@@ -343,7 +359,8 @@ class P6Launcher:
             self.note(f"brief {path} exists")
             return path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(brief_text(self.repo, self.n, self.title, branch, pr, self.worktree_path(branch)))
+        path.write_text(brief_text(self.repo, self.n, self.title, branch, pr, self.worktree_path(branch),
+                                   spec=self.spec))
         self.note(f"wrote brief {path}")
         return path
 
@@ -375,6 +392,7 @@ class P6Launcher:
         from . import alerts
         with alerts.once_lock(f"p6launch:{self.repo}#{self.n}"):  # never two launches of one issue at once
             node = self.node(self.n)
+            self.spec = node.get('body') or ''
             state, _, _ = self.issue_item(self.n, node)
             if state and state != 'OPEN':
                 self.note(f"{self.repo}#{self.n} is {state.lower()}: no launch")
