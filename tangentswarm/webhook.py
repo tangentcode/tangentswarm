@@ -33,6 +33,9 @@ SQLite event log (eventdb: a 'received' row before the reply, a 'handled' row af
            then the cascade, card Done, close each linked issue and its card Done, park the
            worker, active-gate sweeps
   closed   card Canceled
+  p6merge  a worker's `MERGE-READY <sha>` comment on a Project 6 PR: verify, merge and clean
+           up at that sha with no AI (p6merge, tangentswarm #89)
+  p6cleanup  a Project 6 merge event, after 'merged': p6merge at the merged head, never a merge
   card     a new PR or issue: Project 4 card with the right Status
   wake     an exception (EXCEPTIONS): one deduped, rate-limited POST to swarmbot's wake URL
 
@@ -186,6 +189,19 @@ def no_relay_skip(repo, user, body, n):
     return [Action('log-only', n, why)]
 
 
+def p6_merge_ready(repo, user, body, n):
+    """tangentswarm #89: the worker's `MERGE-READY <full sha>` comment on a Project 6 PR (the
+    fallback of its done report): verify and merge at that sha, with no AI (p6merge). None for
+    any other comment, repo or author."""
+    from . import p6merge
+    if repo not in p6merge.REPOS or login(user) != MICHAL:
+        return None
+    sha = p6merge.merge_ready_sha(body)
+    if not sha:
+        return None
+    return [Action('p6merge', n, f"MERGE-READY {sha[:8]} on {repo}#{n}", dict(head=sha))]
+
+
 CODE_REVIEW_STATUS_RE = re.compile(r'"code_review"\s*:\s*\{[^{}]*?"status"\s*:\s*"(\w+)"', re.I)
 STATUS_RE = re.compile(r'"status"\s*:\s*"running"', re.I)
 
@@ -241,6 +257,9 @@ def _classify(event, p):
             if codex_running(body):
                 return [Action('skip', pr=n, why='Codex review is running')]
             return [Action('codex', n, 'Codex comment (summary or receipt)')]
+        merge = p6_merge_ready(repo, c.get('user'), body, n) if is_pr else None
+        if merge:
+            return merge
         if is_bot_self(c.get('user')) or ours(body):
             return [Action('skip', pr=n, why='the swarm\'s own comment')]
         if login(c.get('user')).endswith('[bot]'):
@@ -293,8 +312,12 @@ def _classify(event, p):
                 head = pr.get('head') or {}
                 # a fork's branch name says nothing about this repo's branches (Codex on PR #42)
                 own = ((head.get('repo') or {}).get('full_name') or REPO) == REPO
-                return [Action('merged', n, f"#{n} merged into main", dict(head=head.get('sha'),
+                acts = [Action('merged', n, f"#{n} merged into main", dict(head=head.get('sha'),
                                                                            branch=head.get('ref') if own else None))]
+                from . import p6merge  # Codex on PR #90: its own action, so a failed board step cannot stop it
+                if repo in p6merge.REPOS and p6merge.SHA_RE.match(head.get('sha') or ''):
+                    acts.append(Action('p6cleanup', n, f"#{n} merged: the Project 6 cleanup", dict(head=head.get('sha'))))
+                return acts
             if pr.get('merged'):
                 return [Action('wake', n, f"#{n} merged into {base}, not main", dict(key=f'merge-base:{n}'))]
             return [Action('closed', n, f"#{n} closed without a merge")]
@@ -368,8 +391,9 @@ class Executor:
     """Runs actions with the swarm's tools. Every tool is injectable for tests."""
 
     def __init__(self, g=None, dry=False, sh=None, enqueue=None, cascade=None, give=None, wake_post=None,
-                 signal_promoted=None):
+                 signal_promoted=None, p6merge=None):
         self._g, self.dry = g, dry
+        self.p6merge = p6merge
         self.sh = sh
         self.signal_promoted = signal_promoted
         self.enqueue = enqueue
@@ -793,6 +817,22 @@ class Executor:
                 self.note(f"#{a.pr}: -vN cleanup failed: {type(e).__name__}: {str(e)[:160]}")
         self.note(f"#{a.pr} merged: cascade, Done, linked issues closed")
 
+    def do_p6cleanup(self, a):
+        """tangentswarm #89 (Codex on PR #90): a Project 6 merge event runs p6merge at the merged
+        head, as its own action after 'merged' (Executor.run catches each action alone, so a
+        failed card read, card move, issue close or cascade queue in do_merged cannot stop it). It is idempotent: after the swarm's own merge it only sends the MethBot POSTs
+        still pending; after a merge it could not confirm (a merge queue) or a merge by hand,
+        it does the cleanup (windows, worktree, branch, deploy note, Backlog pull), never a merge."""
+        from . import p6merge
+        head = a.args.get('head') or ''
+        if self.repo not in p6merge.REPOS or not p6merge.SHA_RE.match(head):
+            return
+        if self.dry:
+            return self.note(f"would run the Project 6 cleanup of {self.repo}#{a.pr} at {head[:8]}")
+        res = (self.p6merge or p6merge.run)(self.repo, a.pr, head, 'merged', gql=self.g['gql'], sh=self._sh)
+        self.note(f"{self.repo}#{a.pr} Project 6 cleanup at {head[:8]}: "
+                  + ('; '.join(res.get('notes') or []) or res.get('why') or 'done'))
+
     def drop_premerge_labels(self, n):
         """Remove merge-ready and pre-merging from a PR merged to main (tangentswarm #65), and
         its pre-merge record. A label the PR does not carry is not an error."""
@@ -876,6 +916,17 @@ class Executor:
             return self.note(f"would queue hr-gate --apply {a.pr} (Staging PR edited)")
         (self.enqueue or gatelock.enqueue)([str(BIN / 'hr-gate'), '--apply', str(a.pr)], by='swarm-webhook')
         self.note(f"queued hr-gate --apply {a.pr}: the Staging PR was edited")
+
+    def do_p6merge(self, a):
+        """tangentswarm #89: verify, merge and clean up a Project 6 PR at the MERGE-READY sha."""
+        if self.dry:
+            return self.note(f"would verify and merge {self.repo}#{a.pr} at {a.args['head'][:8]}")
+        from . import p6merge
+        res = (self.p6merge or p6merge.run)(self.repo, a.pr, a.args['head'], 'comment', gql=self.g['gql'], sh=self._sh)
+        if res.get('merged'):
+            return self.note(f"{self.repo}#{a.pr} merged at {a.args['head'][:8]}"
+                             + ''.join(f"; {x}" for x in res.get('notes') or []) + (f": {res['why']}" if res.get('why') else ''))
+        self.note(f"{self.repo}#{a.pr} not merged at {a.args['head'][:8]}: {res.get('why')}")
 
     def do_wake(self, a):
         self.wake(a.pr, a.why, key=a.args.get('key'))

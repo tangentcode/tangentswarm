@@ -222,3 +222,23 @@ def test_a_stale_state_does_not_repeat_an_alert_or_an_incident():
     assert alerts.incident('z', 't', 'w', st=c, sh=sh).endswith('/issues/91')
     assert alerts.incident('z', 't', 'w', st=d, sh=sh) == 'dup'
     assert len(calls) == 2  # one issue create and one item-add
+
+
+def test_methbot_exception_and_pull_post_the_reason_once_per_pr_head_and_key():
+    """tangentswarm #89: a done report the swarm could not merge, and the Backlog pull."""
+    sent = []
+    repo = 'tangentcode/tangentswarm'
+    assert alerts.tell_methbot('exception', repo, 90, head=HEAD, reason=' draft ', post=sent.append,
+                               now=lambda: 1_763_400_000.0) is True
+    assert alerts.tell_methbot('exception', repo, 90, head=HEAD, reason='other', post=sent.append) == 'already sent'
+    assert sent == [{'source': 'swarm', 'kind': 'exception', 'repo': repo, 'pr': 90, 'head': HEAD,
+                     'reason': 'draft', 'at': '2025-11-17T12:20:00-05:00'}]
+    assert alerts.tell_methbot('exception', repo, 90, head=HEAD, reason='dirty', key='cleanup', post=sent.append) is True
+    assert alerts.tell_methbot('exception', repo, 90, head='b' * 40, reason='draft', post=sent.append) is True
+    assert alerts.tell_methbot('pull', repo, 90, head=HEAD, reason='start #95', post=sent.append) is True
+    assert [p['kind'] for p in sent] == ['exception'] * 3 + ['pull']
+    assert 'full head sha' in alerts.tell_methbot('exception', repo, 90, head='abc', reason='x', post=sent.append)
+    assert 'needs the reason' in alerts.tell_methbot('pull', repo, 90, head=HEAD, reason=' ', post=sent.append)
+    assert 'not a Project 6 repo' in alerts.tell_methbot('exception', 'tangentcode/platform', 1, head=HEAD,
+                                                         reason='x', post=sent.append)
+    assert len(sent) == 4

@@ -1060,14 +1060,25 @@ or is reviewing, and a head with a pending ask younger than `SWARM_CODEX_ASK_WAI
 It asks again only after a Codex "Something went wrong" reply or that timeout. A re-ask is
 a `codex-retry` row in the events DB, not a new round.
 
-MethBot gets exactly two events (tangentswarm #19, Michal 2026-11-16), and only for the
-Project 6 repos (`tangentcode/tangentswarm`, `tangentcode/methodology`): one POST to the URL
-in `~/.config/tangentswarm/methbot-alert-url` with the bearer key in `methbot-alert-key`.
-A worker in `~/ver/tangentswarm.<slug>` or `~/ver/methodology.<slug>` that calls the worker
-MCP `handoff` (done, clean and pushed, the head shown on its open PR) sends
-`{"source":"swarm","kind":"done","repo":...,"pr":N,"head":sha,"at":ET time}` once per PR and
-head; `needs_input` sends `{"source":"swarm","kind":"needs-input","repo":...,"pr":N,"question":...,"at":ET time}`.
-Each is also a `methbot-done` or `methbot-needs-input` row in the events DB.
+MethBot gets POSTs only for the Project 6 repos (`tangentcode/tangentswarm`,
+`tangentcode/methodology`; tangentswarm #19, #89): one POST to the URL in
+`~/.config/tangentswarm/methbot-alert-url` with the bearer key in `methbot-alert-key`.
+`needs_input` from a worker in `~/ver/tangentswarm.<slug>` or `~/ver/methodology.<slug>` sends
+`{"source":"swarm","kind":"needs-input","repo":...,"pr":N,"question":...,"at":ET time}`.
+
+That worker's `handoff` (done, clean and pushed, the head shown on its open PR) has no AI
+on the success path (`tangentswarm.p6merge`, tangentswarm #89). The worker's
+`MERGE-READY <full sha>` PR comment does the same, through swarm-webhook. The swarm checks
+the exact head: the PR is open, not a draft and on main; Codex is clean on the head (a
+completed review-state summary with both findings flags false); no unresolved review
+thread (an outdated one counts unless the worker replied); required CI is green; GitHub
+says MERGEABLE. Then it runs `gh pr merge --merge --match-head-commit <sha>`, moves the PR
+card and the closed issue cards to Done, closes the `swarm-<PR>-*` (or `meth-<PR>-*`)
+windows, removes a clean worktree and its local branch, writes a `p6-merge` events row,
+tells swarmbot that a tangentswarm deploy is needed (only a note), and sends MethBot one
+`pull` POST with the next Project 6 Backlog issues for about 4 live workers, in pick order.
+A check that fails sends one `exception` POST with the reasons, once per PR and head, and
+there is no merge. Each POST is also a `methbot-<kind>` row in the events DB.
 
 ```sh
 swarm-watch --panes              # the latest capture class of every pane
