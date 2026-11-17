@@ -188,9 +188,14 @@ def held():
 
 
 def hold(n, head, why, relay=None, tried=None):
+    """at: when this head was first held (a retry keeps it; tangentswarm #101: a gate pass
+    after it releases the hold)."""
     d = held()
+    old = d.get(n) or {}
+    now = time.time()
     d[n] = {'head': head, 'why': why[:200], 'relay': str(relay) if relay else None,
-            'tried': time.time() if tried is None else tried}
+            'tried': now if tried is None else tried,
+            'at': old.get('at', old.get('tried', now)) if old.get('head') == head else now}
     _save_held(d)
 
 
@@ -198,6 +203,38 @@ def unhold(n):
     d = held()
     if d.pop(n, None) is not None:
         _save_held(d)
+
+
+def conflict_hold(h):
+    """True for a hold of a conflict (a merge-main relay): only a new head can fix it."""
+    return 'conflict' in str(h.get('why') or '').lower() or 'merge-main' in str(h.get('relay') or '')
+
+
+def release_on_edit(n):
+    """tangentswarm #101: a body edit (pull_request edited) releases the hold of PR n, so the
+    next cascade can pull it at the same head (platform #516 was held for a 7b body line from
+    8:03 PM to 12:41 AM ET after its body was fixed). A conflict hold stays: a body edit
+    cannot fix a conflict. Returns the released hold, or None."""
+    h = held().get(n)
+    if not h or conflict_hold(h):
+        return None
+    unhold(n)
+    return h
+
+
+def gate_passed_holds(log_text, hd=None):
+    """tangentswarm #101: {n: hold} for each hold whose held head got an hr-gate apply pass
+    (PASS, or PENDING with no failed row: promoted.gate_times) after it was held."""
+    from .promoted import gate_times
+    times = gate_times(log_text or '')
+    out = {}
+    for n, h in (held() if hd is None else hd).items():
+        head = str(h.get('head') or '')
+        t = times.get((f'#{n}', head[:8])) if head else None
+        at = float(h.get('at', h.get('tried')) or 0)
+        if t is not None and t.timestamp() >= at:
+            out[n] = h
+    return out
 
 
 def _save_held(d):
@@ -574,7 +611,8 @@ class Flow:
         order, no queue-jumping. The PRs go in the shared pick order; each one must be
         merge-ready (premerge_one: pre-merged onto future main as a <branch>-vN tip) and
         merge cleanly with the batch so far. The first one that is not stops the batch:
-        nothing behind it is pulled. work gets the tree of future main + the batch
+        nothing behind it is pulled. tangentswarm #101: a PR held at its head (its last pull
+        found no worker) is skipped, not a stop; the other PRs keep the pick order. work gets the tree of future main + the batch
         (work_commit). Returns the pulled PRs."""
         try:
             return self._pull_batch(prs, cols, scratch, room)
@@ -585,7 +623,7 @@ class Flow:
         ready = [p for p in cols.get(board.READY, []) if not p['draft']]
         if not ready or room < 1:
             return []
-        hd = held()
+        hd = self.release_gate_passes()
         fm = self.future_main(scratch, cols)
         work = self.fetch_work(scratch)
         target, batch, tips = None, [], {}  # target: future main + the batch so far
@@ -593,10 +631,11 @@ class Flow:
             if len(batch) >= room:
                 break
             n, head = p['number'], p['head']
-            if (hd.get(n) or {}).get('head') == head:
-                self.note(f"#{n} is next in the pick order and held: its last pull failed with no worker "
-                          f"({hd[n]['why'][:100]}); a new head releases it; nothing behind it is pulled")
-                break
+            if (hd.get(n) or {}).get('head') == head:  # tangentswarm #101: skip it, keep the order
+                self.note(f"#{n} is held: its last pull failed with no worker ({hd[n]['why'][:100]}); a new "
+                          "head, a body edit or a gate pass on this head releases it; the next PR in the pick "
+                          "order is pulled")
+                continue
             t = self.premerge_one(p, scratch, fm)
             if not t:
                 self.note(f"#{n} is next in the pick order and is not merge-ready: nothing behind it is pulled")
@@ -640,6 +679,24 @@ class Flow:
         self.change(f"{names} pulled: {len(batch)} pre-merged tip(s) in {WORK} ({tip[:8]} = future main + the batch) "
                     "in one push; staging redeploys once")
         return batch
+
+    def release_gate_passes(self):
+        """tangentswarm #101: end each hold whose held head passed hr-gate after it was held
+        (hr-gate's LOG). Returns the holds that are left (a dry run releases nothing on disk,
+        but the pass treats the released ones as free)."""
+        hd = held()
+        path = self.g.get('LOG') if hd else None
+        try:
+            text = Path(path).read_text() if path else ''
+        except OSError:
+            text = ''
+        gone = gate_passed_holds(text, hd) if text else {}
+        for n, h in gone.items():
+            if not self.dry:
+                unhold(n)
+            self.change(f"#{n} hold released: hr-gate passed on its held head {str(h.get('head'))[:8]} "
+                        f"(held for: {str(h.get('why') or '')[:100]})")
+        return {n: h for n, h in hd.items() if n not in gone}
 
     # -- pre-merge onto future main (tangentswarm #65, Michal 2026-11-16 3:22 and 3:24 PM ET) --
     def onto(self, scratch, base, tip, msg):

@@ -579,3 +579,148 @@ def test_a_worker_tip_with_conflict_markers_is_never_merge_ready_or_pushed_to_wo
     assert f2.premerge(cols, s) == {7: good} and good != bad  # the bad cached tip is skipped
     assert f2.work_commit(s, h['hr1'], bad, [bad], 'm') is None
     assert any('work NOT pushed' in n and 'conflict marker' in n for n in f2.notes)
+
+
+# --- tangentswarm #101: held PRs are skipped, and a body edit or a gate pass releases a hold ---
+
+def gate_log(tmp_path, *lines):
+    """hr-gate's LOG: tab lines time, apply, #n, head8, verdict, fail=..."""
+    path = tmp_path / 'hr-gate.log'
+    path.write_text(''.join('\t'.join(map(str, l)) + '\tcaller=t\n' for l in lines))
+    return path
+
+
+def iso(dt):
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) + timedelta(seconds=dt)).isoformat(timespec='seconds')
+
+
+def test_a_held_pr_first_in_the_pick_order_does_not_stop_the_next_one(world):
+    """#7 is first in the pick order and held at its head: the pull skips it and takes #9."""
+    w, s, h, origin = world
+    f, sent = make(world)
+    p7, p9 = card(7, RD, h['z']), card(9, RD, h['st2'])
+    flow.hold(7, h['z'], 'conflicts with origin/main: z.txt', relay='/r/relay-7-merge-main.md')
+    batch = f.pull_batch({}, {HR: [card(1, HR, h['hr1'])], RD: [p7, p9]}, s, room=1)
+    assert [p['number'] for p in batch] == [9]
+    assert [d['pr'] for d in flow.load_pulls()] == [9] and 7 in flow.held()
+    assert any(n.startswith('#7 is held') and 'the next PR in the pick order is pulled' in n for n in f.notes)
+
+
+def test_a_held_pr_does_not_take_room_and_the_rest_keep_the_pick_order(world):
+    """The skip keeps the order for every PR that is not held: #3 (held) is skipped, #7 and
+    #9 follow in number order, and room counts only the pulled PRs."""
+    w, s, h, origin = world
+    f, sent = make(world)
+    p3, p7, p9 = card(3, RD, h['c']), card(7, RD, h['z']), card(9, RD, h['st2'])
+    flow.hold(3, h['c'], '7b where-to-see line: missing', relay='/r/relay-3-gate.md')
+    batch = f.pull_batch({}, {HR: [card(1, HR, h['hr1'])], RD: [p9, p3, p7]}, s, room=2)
+    assert [p['number'] for p in batch] == [7, 9]
+
+
+def test_a_body_edit_releases_a_7b_hold_and_the_next_cascade_pulls_the_same_head(world, monkeypatch):
+    """Done-when of #101 (platform #516): a pull held for a 7b failure; the worker fixes the
+    body (no new commit); the pull_request edited event releases the hold and queues a
+    cascade; the next pull takes the PR at the SAME head."""
+    from tangentswarm import advance
+    from tangentswarm import events as E
+    w, s, h, origin = world
+    f, sent = make(world)
+    p7 = card(7, RD, h['z'])
+    cols = {HR: [card(1, HR, h['hr1'])], RD: [p7]}
+    flow.hold(7, h['z'], '7b where-to-see line: missing', relay='/r/relay-7-gate.md')
+    assert f.pull_batch({}, cols, s, room=1) == []
+    monkeypatch.setattr(advance, 'flag_rerun', lambda by='': None)
+    E.new_records()
+    append({'event': 'pull_request', 'action': 'edited', 'repo': E.REPO, 'pr': 7})
+    cascades = []
+    lines = E.Events(run=lambda *a, **k: type('R', (), dict(returncode=0, stdout='', stderr=''))(),
+                     enqueue=lambda *a, **k: None, cascade=lambda: cascades.append(1) or 'queued').poll()
+    assert cascades == [1] and 7 not in flow.held()
+    assert any('hold released; cascade queued' in l for l in lines)
+    batch = f.pull_batch({}, cols, s, room=1)
+    assert [p['number'] for p in batch] == [7] and batch[0]['head'] == h['z']
+
+
+def append(*recs):
+    import json
+    from tangentswarm import events as E
+    with open(E.EVENTS, 'a') as fh:
+        for r in recs:
+            fh.write(json.dumps(r) + '\n')
+
+
+def test_a_body_edit_does_not_release_a_conflict_hold(monkeypatch):
+    """A body edit cannot fix a conflict: the hold stays (a new head releases it); the
+    cascade is still queued."""
+    from tangentswarm import advance
+    from tangentswarm import events as E
+    monkeypatch.setattr(advance, 'flag_rerun', lambda by='': None)
+    flow.hold(7, 'a' * 40, 'conflicts with origin/main: x.ts', relay='/r/relay-7-merge-main.md')
+    flow.hold(8, 'b' * 40, '2 mergeable onto main: CONFLICTING', relay='/r/relay-8-gate.md')
+    ev = E.Events(enqueue=lambda *a, **k: None, cascade=lambda: 'queued')
+    assert ev.queue_gate(7, 'edited') == 'edited: cascade queued'
+    assert ev.queue_gate(8, 'edited') == 'edited: cascade queued'
+    assert set(flow.held()) == {7, 8}
+    assert flow.release_on_edit(9) is None  # not held: nothing
+
+
+def test_a_dry_body_edit_releases_nothing():
+    from tangentswarm import events as E
+    flow.hold(7, 'a' * 40, '7b where-to-see line: missing', relay='/r/relay-7-gate.md')
+    assert E.Events(dry=True).queue_gate(7, 'edited') == 'edited: would release the hold and queue a cascade pass'
+    assert 7 in flow.held()
+
+
+def test_a_gate_pass_on_the_held_head_releases_the_hold_and_the_pull_takes_it(world, tmp_path):
+    """#101 rule 1, second half: hr-gate passed every condition on the held head after the
+    hold (an apply PASS, or PENDING with fail=-): the hold ends and the pull takes it."""
+    w, s, h, origin = world
+    f, sent = make(world)
+    p7 = card(7, RD, h['z'])
+    cols = {HR: [card(1, HR, h['hr1'])], RD: [p7]}
+    flow.hold(7, h['z'], '7b where-to-see line: missing', relay='/r/relay-7-gate.md')
+    f.g['LOG'] = str(gate_log(tmp_path, (iso(60), 'apply', '#7', h['z'][:8], 'PENDING', 'fail=-')))
+    batch = f.pull_batch({}, cols, s, room=1)
+    assert [p['number'] for p in batch] == [7] and 7 not in flow.held()
+    assert any(d.startswith('did: #7 hold released: hr-gate passed on its held head') for d in f.did)
+
+
+@pytest.mark.parametrize('lines', [
+    [(-3600, 'apply', '#7', 'PASS', 'fail=-')],                # the pass is older than the hold
+    [(60, 'apply', '#7', 'PENDING', 'fail=7b')],               # not every condition passed
+    [(60, 'apply', '#7', 'PASS', 'fail=-'), (61, 'apply', '#7', 'BLOCKED', 'fail=7b')],  # a later block
+    [(60, 'apply', '#8', 'PASS', 'fail=-')],                   # another PR
+    [(60, 'demote', '#7', 'PASS', 'fail=-')],                  # not an apply line
+])
+def test_a_gate_line_that_is_no_pass_after_the_hold_keeps_it(world, tmp_path, lines):
+    w, s, h, origin = world
+    f, sent = make(world)
+    flow.hold(7, h['z'], '7b where-to-see line: missing', relay='/r/relay-7-gate.md')
+    f.g['LOG'] = str(gate_log(tmp_path, *[(iso(t), m, n, h['z'][:8], v, fl) for t, m, n, v, fl in lines]))
+    assert f.pull_batch({}, {RD: [card(7, RD, h['z'])]}, s, room=1) == [] and 7 in flow.held()
+
+
+def test_a_gate_pass_on_an_older_head_does_not_release_the_hold(tmp_path):
+    flow.hold(7, 'a' * 40, 'why')
+    log = '\t'.join([iso(60), 'apply', '#7', 'b' * 8, 'PASS', 'fail=-']) + '\n'
+    assert flow.gate_passed_holds(log) == {}
+
+
+def test_a_dry_run_gate_pass_frees_the_pr_for_the_pass_but_keeps_the_hold_on_disk(world, tmp_path):
+    w, s, h, origin = world
+    f, sent = make(world, dry=True)
+    flow.hold(7, h['z'], '7b where-to-see line: missing', relay='/r/relay-7-gate.md')
+    f.g['LOG'] = str(gate_log(tmp_path, (iso(60), 'apply', '#7', h['z'][:8], 'PASS', 'fail=-')))
+    assert [p['number'] for p in f.pull_batch({}, {RD: [card(7, RD, h['z'])]}, s, room=1)] == [7]
+    assert 7 in flow.held() and any(d.startswith('would: #7 hold released') for d in f.did)
+
+
+def test_a_retry_keeps_the_first_hold_time_and_a_new_head_resets_it(monkeypatch):
+    t = iter([100.0, 200.0, 300.0])
+    monkeypatch.setattr(flow.time, 'time', lambda: next(t))
+    flow.hold(7, 'a' * 40, 'why')
+    flow.hold(7, 'a' * 40, 'why', tried=150)  # a retry of the held handoff (retry_held)
+    assert flow.held()[7]['at'] == 100.0 and flow.held()[7]['tried'] == 150
+    flow.hold(7, 'b' * 40, 'why')
+    assert flow.held()[7]['at'] == 300.0

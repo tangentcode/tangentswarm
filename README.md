@@ -973,7 +973,10 @@ then pulls in flight). A new `<branch>-vN` = future main + the PR head is pushed
 one gets the label `merge-ready`. A real conflict gets `pre-merging`, and the PR's worker
 resolves it on that `-vN` only; nothing is ever merged into the PR's own branch. A new head
 or a new future main builds the next `-vN`. The pull takes the `-vN` tips in strict order
-and stops at the first PR that is not merge-ready. Staging and Human Review PRs carry
+and stops at the first PR that is not merge-ready. A PR held at its head (its last pull
+found no worker) is skipped, not a stop; the other PRs keep the pick order. A new head, a
+body edit (not for a conflict hold), or an hr-gate pass on the held head after the hold
+releases it (tangentswarm #101). Staging and Human Review PRs carry
 `merge-ready`; a merge to main removes both labels.
 3. **Advance the pull.** Evaluate hr-gate on the pulled head. All pass: `hr-gate --apply`
    puts it into Staging. CI running or screenshots missing: wait (90 minutes at most). A
