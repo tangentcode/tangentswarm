@@ -239,7 +239,32 @@ def make_draft(n, repo, sh=None):
     Staging to In Progress and left it ready for review; the sanity check flagged it).
     gh does nothing for a PR that is a draft already. Never raises: the card has moved,
     and a failed conversion is a logged event that the sanity check reports. Returns
-    True if the gh call ran without an error."""
+    True if the gh call and the label removal ran without an error.
+
+    tangentswarm #134: a draft is work in progress, never merge-ready. The same step
+    removes merge-ready and pre-merging (platform #528 was rejected into In Progress,
+    became a draft and kept merge-ready). It is done here so no caller can forget it,
+    and also when the gh call fails: the card is in In Progress either way."""
+    ok = _draft(n, repo, sh)
+    if repo:
+        ok = _drop_premerge_labels(n, repo) and ok
+    return ok
+
+
+def _drop_premerge_labels(n, repo):
+    from . import eventdb, flow
+    try:
+        errs = flow.drop_premerge_labels(n, repo)
+    except Exception as e:
+        errs = [f'{type(e).__name__}: {str(e)[:300]}']
+    if errs:
+        eventdb.log_event('draft', source='board', action='drop-labels', pr=n, actor=eventdb.SOURCE or None,
+                          repo=repo, error='; '.join(errs)[:300])
+        return False
+    return True
+
+
+def _draft(n, repo, sh=None):
     from . import eventdb
     if not repo:
         eventdb.log_event('draft', source='board', action='undo-ready', pr=n, actor=eventdb.SOURCE or None,
