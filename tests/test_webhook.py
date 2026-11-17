@@ -858,3 +858,87 @@ def test_the_wake_at_is_eastern_time_whatever_the_host_clock():
     sent = []
     W.wake_exception(103, 'x', now=lambda: 1794903060.0, post=sent.append)  # 08:11 UTC
     assert sent[0]['at'] == '2026-11-17T03:11:00-05:00'
+
+
+# -- tangentswarm #122: a closed issue leaves Triage and Discuss -------------------------------
+
+TS = {'full_name': 'tangentcode/tangentswarm'}
+
+
+def issue_closed(n=122, reason='completed', repo=TS):
+    return {'action': 'closed', 'repository': repo, 'issue': {'number': n, 'state_reason': reason}}
+
+
+def closed_ex(col, b, monkeypatch):
+    """An Executor whose card read finds issue n in col on board b; gh calls go to calls."""
+    from tangentswarm import boardcache
+    monkeypatch.setattr(boardcache, 'snapshot', lambda gql, max_age=0: {})
+    monkeypatch.setattr(boardcache, 'open_prs', lambda snap: [])
+    monkeypatch.setattr(boardcache, 'open_issues', lambda snap: [])
+    monkeypatch.setattr(board, 'BOARDS', [board.DEFAULT, b])
+    node = {'projectItems': {'nodes': [{'id': 'IT1', 'project': {'id': b.id},
+                                        'fieldValueByName': {'name': col, 'optionId': b.option.get(col)}}]}}
+    calls = []
+    ex = W.Executor(g={'project_id': lambda: b.id, 'STATUS_FIELD': b.status_field,
+                       'gql': lambda q, **v: {'repository': {'issueOrPullRequest': node}}},
+                    sh=lambda argv: calls.append(argv) or '')
+    return ex, calls
+
+
+def p6(missing=()):
+    opts = {c: f'opt-{c}' for c in board.COLUMNS if c not in missing}
+    return board.Board(6, 'PVT_six', 'F6', opts, ['tangentcode/tangentswarm'], False)
+
+
+def test_an_issue_close_is_an_issue_closed_action_with_its_reason():
+    acts = W.classify('issues', issue_closed(reason='not_planned', repo=REPO))
+    assert [(a.kind, a.pr, a.args['reason']) for a in acts] == [('issue_closed', 122, 'not_planned')]
+    no_reason = issue_closed(repo=REPO)
+    no_reason['issue'].pop('state_reason')
+    assert W.classify('issues', no_reason)[0].args['reason'] == 'completed'
+
+
+@pytest.mark.parametrize('col', [board.TRIAGE, board.DISCUSS])
+@pytest.mark.parametrize('reason, to', [('completed', board.DONE), ('not_planned', board.CANCELED),
+                                        ('duplicate', board.CANCELED)])
+def test_a_closed_issue_in_triage_or_discuss_goes_to_done_or_canceled(col, reason, to, monkeypatch):
+    b = p6()
+    ex, calls = closed_ex(col, b, monkeypatch)
+    for a in W.classify('issues', issue_closed(reason=reason)):
+        ex.run(a)
+    assert ex.errors == []
+    assert len(calls) == 1 and calls[0][:2] == ['gh', 'project'] and calls[0][2] == 'item-edit'
+    assert calls[0][calls[0].index('--id') + 1] == 'IT1' and calls[0][-1] == b.option[to]
+
+
+@pytest.mark.parametrize('col', [board.BACKLOG, board.ACTIVE, board.DONE, board.CANCELED, board.PARKED])
+def test_a_closed_issue_in_another_column_is_left_alone(col, monkeypatch):
+    ex, calls = closed_ex(col, p6(), monkeypatch)
+    for a in W.classify('issues', issue_closed()):
+        ex.run(a)
+    assert calls == [] and ex.errors == []
+
+
+@pytest.mark.parametrize('reason, to', [('completed', board.DONE), ('not_planned', board.CANCELED)])
+def test_a_board_without_the_column_takes_the_card_off(reason, to, monkeypatch):
+    ex, calls = closed_ex(board.TRIAGE, p6(missing=(to,)), monkeypatch)
+    for a in W.classify('issues', issue_closed(reason=reason)):
+        ex.run(a)
+    assert ex.errors == []
+    assert calls == [['gh', 'project', 'item-delete', '6', '--owner', 'tangentcode', '--id', 'IT1']]
+
+
+def test_a_closed_issue_in_triage_on_project_4_goes_to_done(monkeypatch):
+    """Same on every board: the platform board moves by the default option ids."""
+    ex, calls = closed_ex(board.TRIAGE, board.DEFAULT, monkeypatch)
+    monkeypatch.setattr(board, 'BOARDS', [board.DEFAULT])
+    for a in W.classify('issues', issue_closed(repo=REPO)):
+        ex.run(a)
+    assert ex.errors == [] and calls and calls[0][-1] == board.OPTION[board.DONE]
+
+
+def test_the_dry_run_moves_nothing(monkeypatch):
+    ex, calls = closed_ex(board.TRIAGE, p6(missing=(board.CANCELED,)), monkeypatch)
+    ex.dry = True
+    ex.run(W.classify('issues', issue_closed(reason='not_planned'))[0])
+    assert calls == [] and any('would take issue #122 off' in d for d in ex.done)

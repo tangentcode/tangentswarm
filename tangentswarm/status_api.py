@@ -336,6 +336,10 @@ def transitions(b):
     hr = flow.HR_TARGET if b.staging else boardflow.HR_TARGET
     ts = [
         _t('new issue', ['(none)'], board.TRIAGE, 'swarm-webhook', 'a new issue gets its card in Triage'),
+        _t('issue closed: completed', [board.TRIAGE, board.DISCUSS], board.DONE, 'swarm-webhook',
+           'an issue closed as completed leaves Triage and Discuss (off the board if it has no Done)'),
+        _t('issue closed: not planned', [board.TRIAGE, board.DISCUSS], board.CANCELED, 'swarm-webhook',
+           'an issue closed as not planned leaves Triage and Discuss (off the board if it has no Canceled)'),
         _t('new PR', ['(none)'], board.IN_PROGRESS, 'swarm-webhook',
            'a new draft PR gets its card in In Progress (a ready PR: Auto Review)'),
     ]
