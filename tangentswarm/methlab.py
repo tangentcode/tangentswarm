@@ -64,7 +64,7 @@ class FakeGitHub:
         self.cards = {}               # (repo, n) -> {'id', 'col'}
         self.ci_runs = {}             # head sha -> [check run]
         self.calls = []               # every gh argv and GraphQL query, in order
-        self.relays, self.queued, self.wakes, self.merges = [], [], [], []
+        self.relays, self.queued, self.wakes, self.merges, self.deploys = [], [], [], [], []
         self.cascades = 0
         self.history = []             # one row per delivery: event, action, kinds, notes, errors
         self._sha = 0
@@ -103,6 +103,7 @@ class FakeGitHub:
                 'state': 'closed' if p['state'] != 'OPEN' else 'open', 'node_id': p['id'],
                 'base': {'ref': p['baseRefName']},
                 'head': {'sha': p['headRefOid'], 'ref': p['headRefName'], 'repo': {'full_name': repo}},
+                'merge_commit_sha': p.get('mergeCommit'),
                 'html_url': f'https://github.com/{repo}/pull/{p["number"]}'}
 
     def _comment(self, p, body, user):
@@ -209,6 +210,7 @@ class FakeGitHub:
         repo = repo or self.repo
         p = self.pr(n, repo)
         p['state'] = 'MERGED'
+        p['mergeCommit'] = self._new_sha()
         return 'pull_request', {'action': 'closed', 'repository': self._repo_payload(repo),
                                 'sender': {'login': SWARM_USER}, 'pull_request': self._pr_payload(p, repo)}
 
@@ -222,7 +224,7 @@ class FakeGitHub:
     def executor(self):
         return W.Executor(g=self.g, sh=self.sh, enqueue=self.enqueue, cascade=self.cascade, give=self.give,
                           wake_post=self.wake_post, signal_promoted=lambda: 'woken (meth lab)',
-                          p6merge=self.p6merge, check_runs=self.check_runs)
+                          p6merge=self.p6merge, check_runs=self.check_runs, deploy_start=self.deploy_start)
 
     def deliver(self, step):
         """Run one (event, payload) through classify() and the Executor. Returns the actions."""
@@ -259,6 +261,10 @@ class FakeGitHub:
     def wake_post(self, payload):
         self.wakes.append(payload)
 
+    def deploy_start(self, sha, pr=None):
+        self.deploys.append((sha, pr))
+        return f'deploy of {sha[:8]} recorded (meth lab)'
+
     def check_runs(self, head, repo=None):
         return list(self.ci_runs.get(head, []))
 
@@ -277,7 +283,7 @@ class FakeGitHub:
         p = self.prs.get((repo, n))
         if p is None:
             return {}
-        out = {k: v for k, v in p.items() if k not in ('closes', 'id')}
+        out = {k: v for k, v in p.items() if k not in ('closes', 'id', 'mergeCommit')}
         out['comments'] = {'nodes': [{k: v for k, v in c.items() if k != 'head'} for c in p['comments']['nodes']]}
         out['closingIssuesReferences'] = {'nodes': [
             {'number': i, 'repository': {'nameWithOwner': repo},
@@ -520,6 +526,7 @@ SANDBOX_FILES = {
     'SWARM_FASTTRACK_STATE': 'fasttrack.json', 'SWARM_MAINMERGE_CACHE': 'mainmerge-cache.json',
     'SWARM_MERGE_CLOCK': 'merge-clock.json', 'SWARM_FLOW_STATUS_CACHE': 'flow-status.json',
     'SWARM_HOOK_CACHE': 'hook-cache.json',
+    'SWARM_DEPLOY_STATE': 'deploy-state', 'SWARM_FLOW_LIVE': 'no-flow-live',  # never deploys the live tree
 }
 
 

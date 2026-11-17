@@ -52,7 +52,8 @@ def test_a_project_6_pr_walks_the_whole_flow_from_open_to_done():
     assert any(q[:2] == ['swarm-advance', '--promote-board'] for q in f.queued)
     assert step(f, f.comment(125, f'MERGE-READY {head2}')) == ['p6merge']
     assert f.pr(125)['state'] == 'MERGED' and f.merges[-1] == (P6, 125, head2, 'comment')
-    assert step(f, f.merge(125)) == ['merged', 'p6cleanup']
+    assert step(f, f.merge(125)) == ['merged', 'p6cleanup', 'deploy']
+    assert f.deploys == [(f.pr(125)['mergeCommit'], 125)]
     assert f.col(125) == board.DONE and f.col(115) == board.DONE
     assert f.issues[(P6, 115)]['state'] == 'CLOSED'
     assert f.errors() == [] and f.wakes == []
@@ -145,13 +146,15 @@ def test_the_fake_never_runs_a_real_command(monkeypatch):
     monkeypatch.setattr(subprocess, 'run', boom)
     monkeypatch.setattr(subprocess, 'Popen', boom)
     monkeypatch.setattr(urllib.request, 'urlopen', boom)
+    from tangentswarm import deploy
+    monkeypatch.setattr(deploy, 'start', boom)  # the merge's deploy goes to the fake
     f = lab()
     f.deliver(f.open_issue(1))
     f.deliver(f.open_pr(8, closes=[1]))
     f.deliver(f.ready(8))
     f.deliver(f.codex_review(8))
     f.deliver(f.merge(8))
-    assert f.errors() == [] and f.col(8) == board.DONE and f.col(1) == board.DONE
+    assert f.errors() == [] and f.col(8) == board.DONE and f.col(1) == board.DONE and len(f.deploys) == 1
 
 
 def test_the_executor_reads_ci_through_the_injected_reader(monkeypatch):
@@ -329,6 +332,8 @@ def test_safe_live_settings_have_no_problem_and_give_their_own_paths(tmp_path_fa
     assert '/.local/state/swarm-flow' not in ''.join(env.values())  # never the live state dir
     assert env['HOME'].endswith('methlab-state/home') and env['GH_CONFIG_DIR'].endswith('methlab-state/gh')
     assert env['SWARM_WATCH_STATE'].endswith('methlab-state/watch.json')
+    assert env['SWARM_DEPLOY_STATE'].endswith('methlab-state/deploy-state')
+    assert env['SWARM_FLOW_LIVE'].endswith('methlab-state/no-flow-live')
     assert env['SWARM_WAKE_URL_FILE'].endswith('no-wake-url')
 
 
