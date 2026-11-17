@@ -168,9 +168,15 @@ def _text(path):
 GH_RE = re.compile(r'github\.com[:/]+([^/\s]+/[^/\s]+?)(?:\.git)?/?$')
 
 
+def _branch(ref):
+    """The branch of a 'ref: refs/heads/x' (HEAD) or 'refs/heads/x' (head-name) line, or None."""
+    ref = ref.removeprefix('ref:').strip()
+    return ref[len('refs/heads/'):] or None if ref.startswith('refs/heads/') else None
+
+
 def git_info(root):
     """(repo 'owner/name' of origin or None, branch or None) of a worktree, from its files
-    (no git process)."""
+    (no git process). During a rebase the branch is the one that is rebased (#94)."""
     dot = Path(root) / '.git'
     gitdir = dot
     if dot.is_file():
@@ -182,8 +188,10 @@ def git_info(root):
     cd = _text(gitdir / 'commondir')
     if cd:
         common = (gitdir / cd).resolve()
-    head = _text(gitdir / 'HEAD')
-    branch = head[len('ref: refs/heads/'):] if head.startswith('ref: refs/heads/') else None
+    branch = _branch(_text(gitdir / 'HEAD'))
+    if branch is None:  # #94: HEAD is detached during a rebase; head-name names the branch
+        branch = _branch(_text(gitdir / 'rebase-merge' / 'head-name')) or \
+            _branch(_text(gitdir / 'rebase-apply' / 'head-name'))
     repo, in_origin = None, False
     for line in _text(common / 'config').splitlines():
         s = line.strip()
@@ -272,6 +280,11 @@ def check(cards, claudes, hold_issues=(), hold_prs=()):
     return sorted(out, key=lambda f: f['key'])
 
 
+def _repo_name(repo):
+    """The name part of 'owner/name', lower case (GitHub names are not case sensitive), or None."""
+    return repo.rsplit('/', 1)[-1].lower() if repo else None
+
+
 def _claude_rules(cards, claudes, hold_prs):
     out = []
     by_root = {}
@@ -283,11 +296,13 @@ def _claude_rules(cards, claudes, hold_prs):
             pids = ', '.join(str(c['pid']) for c in cs)
             out.append(finding('duplicate-claudes', f"{len(cs)} live Claudes in the worktree {root}: pids {pids}",
                                scope=root))
-    live = {(c.get('repo'), c.get('branch')) for c in claudes if c.get('branch')}
+    # #94: compare by repo name, not owner/name: a moved repo or a stale origin (tangentstorm/x
+    # for tangentcode/x) must not hide a live Claude
+    live = {(_repo_name(c.get('repo')), c.get('branch')) for c in claudes if c.get('branch')}
     for c in cards:
         if c['kind'] != 'pr' or c['col'] != board.IN_PROGRESS or (c['repo'], c['n']) in hold_prs:
             continue
-        if (c['repo'], c['branch']) not in live and (None, c['branch']) not in live:
+        if (_repo_name(c['repo']), c['branch']) not in live and (None, c['branch']) not in live:
             out.append(finding('no-live-claude', f"PR {c['repo']}#{c['n']} is in In Progress but no live Claude "
                                                  f"runs in a worktree on its branch {c['branch']}",
                                c['repo'], c['n'], board_no=c['board']))

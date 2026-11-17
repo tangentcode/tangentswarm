@@ -148,9 +148,20 @@ def _git(cwd, *args):
     return r.stdout.strip() if r.returncode == 0 else ''
 
 
+def _branch_of(cwd):
+    """The branch of the worktree that holds cwd, or ''. During a rebase HEAD is detached, so
+    then it is the branch that is rebased (#94: a worker mid-rebase still owns its PR)."""
+    b = _git(cwd, 'symbolic-ref', '--short', '-q', 'HEAD')
+    if b:
+        return b
+    from . import sanity
+    root = sanity.worktree_root(str(cwd))
+    return (sanity.git_info(root)[1] or '') if root else ''
+
+
 def running(sessions=None, alive=_alive, branch_of=None):
     """[{pid, session, cwd, pane, status, branch}] for live Claudes in platform worktrees."""
-    branch_of = branch_of or (lambda cwd: _git(cwd, 'symbolic-ref', '--short', '-q', 'HEAD'))
+    branch_of = branch_of or _branch_of
     out = []
     for f in sorted((sessions or SESSIONS).glob('*.json')):
         try:

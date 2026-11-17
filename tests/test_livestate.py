@@ -152,6 +152,11 @@ def test_sessions_board_cards_and_branch(tmp_path):
     (gd / 'HEAD').write_text('ref: refs/heads/agents-screen\n')
     assert LS.branch_of(wt) == 'agents-screen'
     assert LS.branch_of(tmp_path / 'nothing') == ''
+    (gd / 'HEAD').write_text('0123456789abcdef0123456789abcdef01234567\n')  # #94: a rebase in progress
+    assert LS.branch_of(wt) == ''
+    (gd / 'rebase-merge').mkdir()
+    (gd / 'rebase-merge' / 'head-name').write_text('refs/heads/agents-screen\n')
+    assert LS.branch_of(wt) == 'agents-screen'
 
 
 def test_tmux_panes_parses_list_panes():

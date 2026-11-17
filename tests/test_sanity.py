@@ -121,6 +121,15 @@ def test_in_progress_needs_a_draft_and_a_live_claude_on_its_branch():
     assert rules(sanity.check(cards, [], hold_prs={(TS, 10)})) == [('no-live-claude', 10)]  # another repo's #10
 
 
+def test_a_stale_origin_or_a_moved_repo_does_not_hide_a_live_claude():
+    """#94: origin tangentstorm/tangentswarm still matches the card's tangentcode/tangentswarm."""
+    cards = [issue(1, board.ACTIVE, repo=TS), pr(10, board.IN_PROGRESS, repo=TS, closes=[(1, ())])]
+    assert sanity.check(cards, [claude(1, '/w/x', 'b10', repo='tangentstorm/tangentswarm')]) == []
+    assert sanity.check(cards, [claude(1, '/w/x', 'b10', repo='TangentCode/TangentSwarm')]) == []
+    assert rules(sanity.check(cards, [claude(1, '/w/x', 'b10', repo='tangentstorm/platform')])) == \
+        [('no-live-claude', 10)]  # another repo name on the same branch name
+
+
 def test_human_review_never_holds_more_than_two_per_board():
     cards = [pr(n, board.HUMAN_REVIEW, closes=None) for n in (1, 2)] + \
             [pr(n, board.HUMAN_REVIEW, closes=None, repo=TS, b=6) for n in (3, 4, 5)]
@@ -237,6 +246,39 @@ def test_git_info_reads_the_origin_and_branch_of_a_checkout_and_a_worktree(tmp_p
     assert sanity.git_info(str(wt)) == (P, 'feat/x')
     (wt / 'sub').mkdir()
     assert sanity.worktree_root(str(wt / 'sub')) == str(wt) and sanity.worktree_root('/') is None
+
+
+def test_git_info_names_the_branch_of_a_rebase_in_progress(tmp_path):
+    """#94: during a rebase HEAD is detached; rebase-merge or rebase-apply/head-name names the branch."""
+    main = git_repo(tmp_path / 'platform', 'main')
+    for kind in ('rebase-merge', 'rebase-apply'):
+        wt = git_worktree(main, tmp_path / f'platform.{kind}', 'feat/x')
+        gd = main / '.git' / 'worktrees' / wt.name
+        (gd / 'HEAD').write_text('0123456789abcdef0123456789abcdef01234567\n')
+        assert sanity.git_info(str(wt)) == (P, None)  # detached, no rebase
+        (gd / kind).mkdir()
+        (gd / kind / 'head-name').write_text('refs/heads/feat/x\n')
+        assert sanity.git_info(str(wt)) == (P, 'feat/x'), kind
+    (main / '.git' / 'HEAD').write_text('0123456789abcdef0123456789abcdef01234567\n')
+    (main / '.git' / 'rebase-merge').mkdir()
+    (main / '.git' / 'rebase-merge' / 'head-name').write_text('refs/heads/main\n')
+    assert sanity.git_info(str(main)) == (P, 'main')  # a main checkout too
+    (main / '.git' / 'rebase-merge' / 'head-name').write_text('detached HEAD\n')
+    assert sanity.git_info(str(main)) == (P, None)  # a rebase of a detached HEAD: no branch
+
+
+def test_a_live_claude_mid_rebase_counts_on_its_branch(tmp_path):
+    """#94: a worker mid-rebase in a worktree with a stale origin is still the live Claude of its PR."""
+    main = git_repo(tmp_path / 'tangentswarm', 'main', url='https://github.com/tangentstorm/tangentswarm.git')
+    wt = git_worktree(main, tmp_path / 'tangentswarm.b10', 'b10')
+    gd = main / '.git' / 'worktrees' / wt.name
+    (gd / 'HEAD').write_text('0123456789abcdef0123456789abcdef01234567\n')
+    (gd / 'rebase-merge').mkdir()
+    (gd / 'rebase-merge' / 'head-name').write_text('refs/heads/b10\n')
+    got = sanity.live_claudes(proc=fake_proc(tmp_path, {10: ('claude', 'claude', wt, 1)}), uid=os.getuid())
+    assert [(c['repo'], c['branch']) for c in got] == [('tangentstorm/tangentswarm', 'b10')]
+    cards = [issue(1, board.ACTIVE, repo=TS), pr(10, board.IN_PROGRESS, repo=TS, closes=[(1, ())])]
+    assert sanity.check(cards, got) == []
 
 
 def test_live_claudes_finds_each_top_claude_with_its_worktree(tmp_path):

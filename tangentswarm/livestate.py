@@ -147,13 +147,9 @@ def capture(pane, run=subprocess.run):
 
 
 def branch_of(cwd):
-    head = _read(Path(cwd) / '.git')
-    if head.startswith('gitdir:'):  # a worktree
-        head = _read(Path(head.split(':', 1)[1].strip()) / 'HEAD')
-    else:
-        head = _read(Path(cwd) / '.git' / 'HEAD')
-    head = head.strip()
-    return head[len('ref: refs/heads/'):] if head.startswith('ref: refs/heads/') else ''
+    """The branch of the worktree at cwd, or ''. During a rebase: the branch it rebases (#94)."""
+    from . import sanity
+    return sanity.git_info(cwd)[1] or ''
 
 
 # -- the 1-minute pane capture and CPU samples --------------------------------------------------
