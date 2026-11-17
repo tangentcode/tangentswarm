@@ -44,6 +44,7 @@ swarm-events = "tangentswarm.events_view:main"
 swarm-tmux-status = "tangentswarm.tmux_status:main"
 swarm-watch = "tangentswarm.watchdog:main"
 swarm-sanity = "tangentswarm.sanity:main"
+swarm-unit-check = "tangentswarm.unitcheck:main"
 swarm-codex-rounds = "tangentswarm.codexrounds:main"
 
 [tool.setuptools]

@@ -372,7 +372,7 @@ def test_a_failed_board_read_still_runs_the_other_checks_and_keeps_its_findings(
     monkeypatch.setattr(sanity, 'cards_from_board', broken)
     snap = boardcache.snapshot(gql([node(8, board.PARKED, draft=False, closes=[(1, ())])]), max_age=0)
     failed = {}
-    found = sanity.gather({'gql': None}, snap, T0 + 700, claudes=[], failed=failed)
+    found = sanity.gather({'gql': None}, snap, T0 + 700, claudes=[], failed=failed, units=[])
     assert [f['key'] for f in found] == [F1['key']] and 'rate limited' in failed[6]
     lines, due = sanity.report(found, T0 + 700, apply=True, alert=s.alert, incident=s.incident, grace=600,
                                unread={6})
@@ -390,6 +390,6 @@ def test_gather_holds_only_the_platform_numbers_of_the_launch_records(monkeypatc
     monkeypatch.setattr(sanity, 'cards_from_board', lambda gql_, b: [pr(79, board.IN_PROGRESS, repo=TS, b=6, closes=None)])
     snap = {'prs': [node(79, board.IN_PROGRESS, draft=True, closes=[(43, ())])],
             'issues': [node(43, board.ACTIVE, kind='Issue')], 'at': T0}
-    got = rules(sanity.gather({'gql': None}, snap, T0, claudes=[]))
+    got = rules(sanity.gather({'gql': None}, snap, T0, claudes=[], units=[]))
     assert got == [('no-live-claude', 79)]
-    assert next(f for f in sanity.gather({'gql': None}, snap, T0, claudes=[]))['repo'] == TS
+    assert next(f for f in sanity.gather({'gql': None}, snap, T0, claudes=[], units=[]))['repo'] == TS

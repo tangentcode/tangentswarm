@@ -22,10 +22,13 @@ The checks (each one has a rule id; docs/sanity-check.md is the full list):
   active-pr-count        an Active issue without exactly one open PR in a flow column
   flow-pr-active-count   a flow-column PR that does not belong to exactly one Active issue
   duplicate-claudes      two or more live Claudes in one git worktree
+  unit-source            a swarm user unit (or its process) that does not import tangentswarm
+                         from flow-live (methodology #84; tangentswarm.unitcheck)
 
 Project 4 is read from the shared board snapshot (boardcache), with issues and PRs, so every
 rule runs there. The other boards (Project 6) are read with boards.open_prs: open PRs only,
-so the issue rules do not run there.
+so the issue rules do not run there. The units are read with systemctl --user; when that read
+fails, it goes in failed as 'units', like a board that is not read.
 
 A finding is reported only when it is still there SANITY_GRACE s after it was first seen
 (a card move and its draft flip, or a Claude start, are not one atomic step). Then, once per
@@ -80,7 +83,10 @@ RULES = {
     'active-pr-count': 'An Active issue has exactly one open linked pull request in a flow column.',
     'flow-pr-active-count': 'A pull request in a flow column belongs to exactly one Active issue.',
     'duplicate-claudes': 'One Claude per worktree.',
+    'unit-source': 'Every swarm service imports tangentswarm from the flow-live checkout '
+                   '(methodology #84; swarm-unit-check).',
 }
+UNITS = 'units'  # the failed/unread key of the unit read (the boards use their project number)
 
 
 def finding(rule, text, repo=None, n=None, scope=None, board_no=None):
@@ -349,6 +355,11 @@ def incident_what(f, first):
             f"finding key `{f['key']}`.")
 
 
+def where(b):
+    """How a failed/unread key reads in a line: 'project 6', or 'units'."""
+    return f"project {b}" if isinstance(b, int) else str(b)
+
+
 def report(findings, now, apply=False, alert=None, incident=None, path=None, grace=None, unread=()):
     """Act on the findings of one pass. Returns (lines, next_due): next_due is when a pass
     must run again (a finding inside its grace, or a capped ticket), else None. A dry run
@@ -367,9 +378,9 @@ def report(findings, now, apply=False, alert=None, incident=None, path=None, gra
         kept = {k: r for k, r in seen.items() if k not in now_keys and r.get('board') in unread}
         for k in sorted(set(seen) - now_keys - set(kept)):
             lines.append(f"resolved: {seen[k].get('text', k)}")
-        for b in sorted(unread):
+        for b in sorted(unread, key=str):
             due.append(now + RETRY)
-            lines.append(f"project {b} not read; its findings are kept and the check runs again")
+            lines.append(f"{where(b)} not read; its findings are kept and the check runs again")
         recs = {f['key']: dict(seen.get(f['key']) or {'first': now, 'told': False, 'filed': None}, text=f['text'],
                                board=f.get('board'))
                 for f in findings}
@@ -449,10 +460,18 @@ def fingerprint(snap):
     return hashlib.sha1(json.dumps(rows).encode()).hexdigest()
 
 
-def gather(g, snap, now, claudes=None, failed=None):
+def unit_findings(results):
+    """unit-source findings from unitcheck.check results."""
+    return [finding('unit-source', f"{r['unit']} does not run from flow-live: " + '; '.join(r['problems']),
+                    scope=r['unit'], board_no=UNITS)
+            for r in results if not r['ok']]
+
+
+def gather(g, snap, now, claudes=None, failed=None, units=None):
     """Every card (Project 4 from the snapshot, the other boards read now), the live Claudes,
     and the holds; then the findings. A board whose read fails is skipped, and its number and
-    error go in failed ({board: error}), so the other checks still run (Codex on PR #79)."""
+    error go in failed ({board: error}), so the other checks still run (Codex on PR #79).
+    units: unitcheck.check results; None reads them now (a failed read goes in failed[UNITS])."""
     from . import boardcache, slots, watchdog
     cards = cards_from_snap(snap)
     for b in board.BOARDS[1:]:
@@ -466,7 +485,17 @@ def gather(g, snap, now, claudes=None, failed=None):
     # the launch records hold platform numbers only (slots, webhook.Executor.do_closed)
     hold_issues = {(boardcache.REPO, n) for n in watchdog.launching_issues(st, now)}
     hold_prs = {(boardcache.REPO, int(k)) for k in (st.get('unstarted') or {}) if str(k).isdigit()}
-    return check(cards, live_claudes() if claudes is None else claudes, hold_issues, hold_prs)
+    if units is None:
+        from . import unitcheck
+        try:
+            units = unitcheck.check()
+        except Exception as e:
+            if failed is None:
+                raise
+            failed[UNITS] = f"{type(e).__name__}: {str(e)[:200]}"
+            units = []
+    found = check(cards, live_claudes() if claudes is None else claudes, hold_issues, hold_prs)
+    return found + unit_findings(units)
 
 
 def main(argv=None):
@@ -480,8 +509,8 @@ def main(argv=None):
     now = time.time()
     failed = {}
     found = gather(g, boardcache.snapshot(g['gql']), now, failed=failed)
-    for b, err in sorted(failed.items()):
-        print(f"project {b} not read: {err}", file=sys.stderr)
+    for b, err in sorted(failed.items(), key=str):
+        print(f"{where(b)} not read: {err}", file=sys.stderr)
     if a.json:
         print(json.dumps(found, indent=1))
         return 0
