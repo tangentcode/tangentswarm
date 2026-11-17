@@ -110,6 +110,19 @@ def session(tmp_path, pid, cwd, sid, tmux='agents:@1.%9', status='idle'):
     (d / f'{pid}.json').write_text(json.dumps(dict(pid=pid, sessionId=sid, cwd=str(cwd), tmux=tmux, status=status)))
 
 
+def test_branch_of_names_the_branch_of_a_rebase_in_progress(tmp_path):
+    """#94: HEAD is detached during a rebase; the worker still owns its branch and its PR."""
+    wt, gd = tmp_path / 'platform.x', tmp_path / 'gd'
+    (wt / 'web').mkdir(parents=True)
+    gd.mkdir()
+    (wt / '.git').write_text(f'gitdir: {gd}\n')
+    (gd / 'HEAD').write_text('0123456789abcdef0123456789abcdef01234567\n')
+    assert slots._branch_of(wt / 'web') == ''
+    (gd / 'rebase-apply').mkdir()
+    (gd / 'rebase-apply' / 'head-name').write_text('refs/heads/feat/x\n')
+    assert slots._branch_of(wt / 'web') == 'feat/x'
+
+
 def test_running_lists_only_live_claudes_in_platform_worktrees(tmp_path, monkeypatch):
     monkeypatch.setattr(slots, 'WORKTREE_PARENT', tmp_path / 'ver')
     ver = tmp_path / 'ver'

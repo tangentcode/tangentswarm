@@ -38,7 +38,7 @@ Active rules do not run there.
 | `open-pr-in-canceled` | An open pull request is in Canceled | Canceled holds closed pull requests |
 | `not-draft` | A pull request in In Progress, Needs Input, or Parked is not a draft | These columns hold draft pull requests |
 | `draft` | A pull request in Auto Review, Ready, Staging, or Human Review is a draft | Auto Review holds pull requests that are marked ready |
-| `no-live-claude` | A pull request in In Progress has no live Claude in a worktree on its head branch (same repo) | In Progress: a worker works on each one now |
+| `no-live-claude` | A pull request in In Progress has no live Claude in a worktree on its head branch (same repo name; the owner is not compared, so a moved repo or a stale origin still counts; a worktree in a rebase counts on the branch it rebases) | In Progress: a worker works on each one now |
 | `human-review-over-two` | Human Review of one board holds more than two pull requests | Never more than two |
 | `active-work2` | An Active issue has the `work2` label | Active holds issues without `work2` |
 | `active-pr-count` | An Active issue does not have exactly one open pull request in a flow column or in Deferred that closes it | Exactly one open linked pull request in a flow column |
