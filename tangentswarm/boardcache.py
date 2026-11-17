@@ -232,14 +232,30 @@ def _apply(d, op):
         return True
     if kind == 'pr':
         ok = True
+        put = dict(op.get('set') or {})
+        at = put.pop('updatedAt', None)
         for _, c in _content(d, 'PullRequest', op['number']):
-            at = (op.get('set') or {}).get('updatedAt')
-            if at and c.get('updatedAt') and str(c['updatedAt']) > str(at):
-                continue  # Codex on PR #117: an older event than the cache: it knows this or later
-            if 'before' in op and c.get('headRefOid') not in (op['before'], (op.get('set') or {}).get('headRefOid')):
+            # Codex on PR #117: freshness is kept PER FIELD. A patch changes only some fields
+            # (a comment only updatedAt), so one shared updatedAt would make an older event for
+            # another field (labels, draft, head) look stale. A field is skipped only when the
+            # cache holds a newer value for that same field: its own patch stamp, else the
+            # updatedAt of the board read it came from (_base).
+            base = c.setdefault('_base', c.get('updatedAt'))
+            stamps = c.setdefault('_at', {})
+
+            def newer(field):
+                mine = stamps.get(field) or base
+                return bool(at and mine and str(mine) > str(at))
+            fields = {k: v for k, v in put.items() if not newer(k)}
+            if 'before' in op and 'headRefOid' in fields and \
+                    c.get('headRefOid') not in (op['before'], fields['headRefOid']):
                 ok = False  # a push the cache did not see the step before: read the board
-                continue
-            c.update(op.get('set') or {})
+                fields.pop('headRefOid')
+            c.update(fields)
+            if at:
+                stamps.update({k: at for k in fields})
+                if not c.get('updatedAt') or str(at) > str(c['updatedAt']):
+                    c['updatedAt'] = at
         return ok  # a PR that is not in the cache: its own card event brings it
     return False  # 'dirty'
 

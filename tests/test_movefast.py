@@ -432,7 +432,7 @@ def test_an_in_order_status_event_and_one_with_no_status_before_apply():
 def test_an_out_of_order_push_or_older_pr_event_never_rolls_the_cache_back():
     """Neighbors of the stale status event: synchronize carries "before" (applied only onto
     that head; else the board is read), and every PR event carries updated_at (an event older
-    than the cached updatedAt is skipped: the cache knows that state or a later one)."""
+    than the cached value of the SAME field is skipped: the cache knows that state or a later one)."""
     gql, calls = counting([node(5, ST, H5)])
     B.snapshot(gql)
     B.apply_event('pull_request', pr_event('synchronize', 5, head={'sha': H8}, updated_at='2026-11-17T16:00:02Z')
@@ -442,11 +442,52 @@ def test_an_out_of_order_push_or_older_pr_event_never_rolls_the_cache_back():
     # the older push (H6 -> H5... delivered late): its updated_at is older: skipped, no read
     B.apply_event('pull_request', pr_event('synchronize', 5, head={'sha': H5}, updated_at='2026-11-17T16:00:01Z')
                   | {'before': H6})
-    B.apply_event('pull_request', pr_event('converted_to_draft', 5, updated_at='2026-11-17T16:00:00Z'))
     c = next(c for _, c in B.open_prs(B.snapshot(gql)))
-    assert c['headRefOid'] == H8 and not c['isDraft'] and len(calls) == 1
+    assert c['headRefOid'] == H8 and len(calls) == 1
     # a push whose "before" the cache never saw (a lost event): read the board
     B.apply_event('pull_request', pr_event('synchronize', 5, head={'sha': '7' * 40}, updated_at='2026-11-17T16:00:09Z')
                   | {'before': '9' * 40})
     B.snapshot(gql)
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize('late', [
+    ('labeled', {'labels': [{'name': 'fast-track'}]}, lambda c: B._names(c) == ['fast-track']),
+    ('converted_to_draft', {}, lambda c: c['isDraft'] is True),
+    ('synchronize', {'head': {'sha': H8}}, lambda c: c['headRefOid'] == H8),
+    ('edited', {'title': 't1'}, lambda c: c['title'] == 't1'),
+])
+def test_a_newer_patch_of_another_field_never_hides_an_older_event(late):
+    """Codex on PR #117 (P2): a comment at T2 moves only updatedAt; a delayed labeled (or
+    draft, push, title) event at T1 must still apply: freshness is per field."""
+    nd = node(5, ST, H5)
+    nd['content']['updatedAt'] = '2026-11-17T16:00:00Z'  # the board read
+    gql, calls = counting([nd])
+    B.snapshot(gql)
+    B.apply_event('issue_comment', {'action': 'created', 'repository': {'full_name': B.REPO},
+                                    'issue': {'number': 5, 'state': 'open', 'pull_request': {},
+                                              'updated_at': '2026-11-17T16:00:02Z'}})
+    action, extra, check = late
+    e = pr_event(action, 5, updated_at='2026-11-17T16:00:01Z', **extra)
+    if action == 'synchronize':
+        e['before'] = H5
+    if action == 'edited':
+        e['changes'] = {'title': {'from': 't0'}}
+    B.apply_event('pull_request', e)
+    c = next(c for _, c in B.open_prs(B.snapshot(gql)))
+    assert check(c) and c['updatedAt'] == '2026-11-17T16:00:02Z' and len(calls) == 1
+
+
+def test_an_event_older_than_the_board_read_or_than_its_own_field_is_skipped():
+    nd = node(5, ST, H5)
+    nd['content']['updatedAt'] = '2026-11-17T16:00:05Z'
+    gql, calls = counting([nd])
+    B.snapshot(gql)
+    B.apply_event('pull_request', pr_event('labeled', 5, updated_at='2026-11-17T16:00:01Z',
+                                           labels=[{'name': 'old'}]))           # older than the read
+    B.apply_event('pull_request', pr_event('labeled', 5, updated_at='2026-11-17T16:00:09Z',
+                                           labels=[{'name': 'new'}]))
+    B.apply_event('pull_request', pr_event('unlabeled', 5, updated_at='2026-11-17T16:00:07Z',
+                                           labels=[]))                          # older than "new"
+    c = next(c for _, c in B.open_prs(B.snapshot(gql)))
+    assert B._names(c) == ['new'] and len(calls) == 1
