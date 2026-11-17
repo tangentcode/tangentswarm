@@ -33,6 +33,9 @@ SQLite event log (eventdb: a 'received' row before the reply, a 'handled' row af
            then the cascade, card Done, close each linked issue and its card Done, park the
            worker, active-gate sweeps
   closed   card Canceled
+  issue_closed  an issue closed while its card is in Triage or Discuss (tangentswarm #122): card
+           Done (completed) or Canceled (not planned, duplicate); off the board if the board has
+           no such column
   p6merge  a worker's `MERGE-READY <sha>` comment on a Project 6 PR: verify, merge and clean
            up at that sha with no AI (p6merge, tangentswarm #89)
   p6cleanup  a Project 6 merge event, after 'merged': p6merge at the merged head, never a merge
@@ -352,6 +355,10 @@ def _classify(event, p):
         i = p.get('issue') or {}
         if action == 'opened':
             return [Action('card', i.get('number'), f"issue #{i.get('number')} opened", dict(what='issue'))]
+        if action == 'closed':
+            reason = i.get('state_reason') or 'completed'
+            return [Action('issue_closed', i.get('number'), f"issue #{i.get('number')} closed ({reason})",
+                           dict(reason=reason))]
         return [Action('skip', pr=i.get('number'), why=f'issues {action}')]
 
     return [Action('skip', why=f'{event} {action}: no rule for this action')]
@@ -383,6 +390,10 @@ def project_move(p):
     if frm == board.HUMAN_REVIEW or to == board.DONE:
         return [Action('cascade', 0, f"card moved {frm} -> {to}", dict(board=b.number))]
     return [Action('skip', why=f"card moved {frm} -> {to}: his decision")]
+
+
+# tangentswarm #122: the columns a closed issue's card leaves (for Done or Canceled)
+ISSUE_CLOSE_FROM = (board.TRIAGE, board.DISCUSS)
 
 
 CARD_QUERY = """query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){
@@ -902,6 +913,24 @@ class Executor:
             from . import slots
             if self.platform():  # Codex on PR #47: launch records are platform PR numbers
                 slots.unstarted_done(a.pr)
+
+    def do_issue_closed(self, a):
+        """tangentswarm #122 (Michal 2026-11-17 11:52 AM ET): a closed issue must not stay in
+        Triage or Discuss. Closed as completed: card Done; as not planned (or duplicate): card
+        Canceled. A board with no such column: the card goes off the board. A card in any
+        other column is left alone (a merge already moved it, or Michal put it there)."""
+        item, col = self.card(a.pr)
+        if not item or col not in ISSUE_CLOSE_FROM:
+            return self.note(f"issue #{a.pr} closed: card in {col or 'no column'}, left alone")
+        to = board.DONE if a.args.get('reason', 'completed') == 'completed' else board.CANCELED
+        if self.board_.option.get(to):
+            return self.move(a.pr, item, to)
+        if self.dry:
+            return self.note(f"would take issue #{a.pr} off Project {self.board_.number} (no {to} column)")
+        self._sh(['gh', 'project', 'item-delete', str(self.board_.number), '--owner', 'tangentcode', '--id', item])
+        from . import boardcache
+        boardcache.patch({'op': 'item-gone', 'item': item})
+        self.note(f"issue #{a.pr} closed: off Project {self.board_.number} (no {to} column)")
 
     def do_card(self, a):
         """A new PR (draft -> In Progress, ready -> Auto Review) or issue (Triage) gets its card.
