@@ -22,11 +22,14 @@ class World:
     """GitHub (gql, gh), git, the worktree maker, the Claude start and admission, all fake."""
 
     def __init__(self, tmp_path, repo=TS, issue_state='OPEN', issue_col=board.BACKLOG, remote=(), prs=None,
-                 pr_col=None, admit=(True, 'room'), refuse=None, start=None, tips=None):
+                 pr_col=None, admit=(True, 'room'), refuse=None, start=None, tips=None,
+                 local=None, wts=None):
         self.tmp, self.repo = tmp_path, repo
         self.issue_state, self.issue_col, self.pr_col = issue_state, issue_col, pr_col
         self.remote = set(remote)            # branches on origin
         self.tips = dict(tips or {})         # branch -> its tip commit subject
+        self.local = dict(local or {})       # local branch -> its tip ('tip:<b>' is origin's tip)
+        self.wts = dict(wts or {})           # worktree path -> the branch it has
         self.prs = dict(prs or {})           # branch -> (number, body)
         self.gh, self.gits, self.worktrees, self.starts = [], [], [], []
         self._admit, self._refuse, self._start = admit, refuse, start
@@ -64,6 +67,12 @@ class World:
         if args[0] == 'ls-remote':
             b = args[2].removeprefix('refs/heads/')
             return f'tip:{b}\trefs/heads/{b}' if b in self.remote else ''
+        if args[0] == 'rev-parse':
+            return self.local.get(args[-1].removeprefix('refs/heads/'), '')
+        if args[0] == 'merge-base':  # only a local tip equal to origin's is its ancestor here
+            if args[2] != args[3] and check:
+                raise RuntimeError('not an ancestor')
+            return ''
         if args[0] == 'log':
             return self.tips.get(args[-1].removeprefix('tip:'), 'Some other work')
         if args[0] == 'commit-tree':
@@ -85,7 +94,7 @@ class World:
     def launcher(self, n=98, title=TITLE):
         return L.P6Launcher(self.repo, n, title, gql=self.gql, sh=self.sh, git=self.git, worktree=self.worktree,
                             start=self.start, admit=lambda: self._admit, refuse=lambda wt: self._refuse,
-                            briefs=self.tmp / 'briefs', agent_root='/ver')
+                            briefs=self.tmp / 'briefs', agent_root='/ver', wt_branch=lambda p: self.wts.get(str(p)))
 
     def moves(self):
         return [(a[a.index('--id') + 1], a[-1]) for a in self.gh if a[:3] == ['gh', 'project', 'item-edit']]
@@ -343,3 +352,66 @@ def test_the_daemon_retries_kept_exceptions_every_retry_every_seconds(monkeypatc
     p.retry_p6launch(now=1000.0 + L.RETRY_EVERY, retry=retry)
     assert len(calls) == 2
     p.retry_p6launch(now=5000.0, retry=lambda: (_ for _ in ()).throw(OSError('x')))  # never raises
+
+
+# -- Codex on PR #108 (adfa44e): local branches and worktrees count too ------------------------
+
+def test_a_local_branch_or_worktree_of_other_work_is_never_used(tmp_path):
+    # a local branch left after an old cleanup, not on origin: the name is not free
+    w = World(tmp_path, local={SLUG: 'old'})
+    w.launcher().run()
+    assert w.worktrees == [('tangentswarm', f'{SLUG}-98')]
+    # a worktree dir at the path with no origin branch
+    w = World(tmp_path / 'b', wts={f'/ver/tangentswarm.{SLUG}': SLUG})
+    w.launcher().run()
+    assert w.worktrees == [('tangentswarm', f'{SLUG}-98')]
+
+
+def test_local_state_of_our_own_branch_is_reused(tmp_path):
+    # origin's branch is ours (open PR closes #98), the local branch has origin's tip, and the
+    # worktree is on that branch: a run again of a launch
+    w = World(tmp_path, remote={SLUG}, prs={SLUG: (108, 'Fixes #98')}, local={SLUG: f'tip:{SLUG}'},
+              wts={f'/ver/tangentswarm.{SLUG}': SLUG})
+    w.launcher().run()
+    assert w.worktrees == [('tangentswarm', SLUG)] and not [a for a in w.gits if a[0] == 'push']
+
+
+def test_local_work_that_origin_does_not_have_or_a_worktree_on_another_branch_is_other(tmp_path):
+    w = World(tmp_path, remote={SLUG}, prs={SLUG: (108, 'Fixes #98')}, local={SLUG: 'unrelated'})
+    w.launcher().run()
+    assert w.worktrees == [('tangentswarm', f'{SLUG}-98')]
+    w = World(tmp_path / 'b', remote={SLUG}, prs={SLUG: (108, 'Fixes #98')},
+              wts={f'/ver/tangentswarm.{SLUG}': 'something-else'})
+    w.launcher().run()
+    assert w.worktrees == [('tangentswarm', f'{SLUG}-98')]
+
+
+def test_owner_with_real_git_repos(tmp_path, monkeypatch):
+    """Codex's repro: a local branch of unrelated work that origin does not have is not free."""
+    import subprocess
+
+    def g(*a, cwd=tmp_path):
+        return subprocess.run(['git', *a], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+    root = tmp_path / 'ver'
+    root.mkdir()
+    g('init', '-q', '--bare', '-b', 'main', str(tmp_path / 'origin.git'))
+    g('clone', '-q', str(tmp_path / 'origin.git'), str(root / 'tangentswarm'))
+    repo = root / 'tangentswarm'
+    for k, v in (('user.name', 't'), ('user.email', 't@example.invalid')):
+        g('config', k, v, cwd=repo)
+    g('commit', '-q', '--allow-empty', '-m', 'base', cwd=repo)
+    g('push', '-q', 'origin', 'HEAD:main', cwd=repo)
+    g('branch', 'mine', cwd=repo)
+    g('commit', '-q', '--allow-empty', '-m', 'Unrelated local work', cwd=repo)
+    g('branch', 'unrelated', cwd=repo)
+    monkeypatch.setenv('TANGENTSWARM_AGENT_ROOT', str(root))
+    lau = L.P6Launcher(TS, 98, TITLE, sh=lambda argv, check=True: '', agent_root=str(root))
+    assert lau.owner('unrelated') == 'other'  # local only: never free
+    assert lau.owner('nothing-here') == 'free'
+    g('push', '-q', 'origin', 'mine', cwd=repo)  # origin has 'mine' with no PR and no start commit
+    assert lau.owner('mine') == 'other'
+    sha = g('commit-tree', 'origin/main^{tree}', '-p', 'origin/main', '-m', 'Start work on tangentswarm #98', cwd=repo)
+    g('push', '-q', 'origin', f'{sha}:refs/heads/started', cwd=repo)
+    assert lau.owner('started') == 'ours'  # a launch that stopped before its PR
+    g('branch', 'started', 'unrelated', cwd=repo)  # but a local 'started' of other work
+    assert lau.owner('started') == 'other'

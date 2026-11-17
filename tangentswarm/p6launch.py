@@ -118,7 +118,7 @@ class P6Launcher:
     callable, so the tests run with no network, no tmux and no real git."""
 
     def __init__(self, repo, n, title, gql=None, sh=None, git=None, worktree=None, start=None,
-                 admit=None, refuse=None, briefs=None, agent_root=None):
+                 admit=None, refuse=None, briefs=None, agent_root=None, wt_branch=None):
         if repo not in REPOS:
             raise ValueError(f"{repo} is not a Project 6 repo")
         self.repo, self.n, self.title = repo, int(n), (title or '').strip() or f"Issue #{n}"
@@ -128,6 +128,7 @@ class P6Launcher:
         self._worktree, self._start, self._admit, self._refuse = worktree, start, admit, refuse
         self.briefs = Path(briefs) if briefs else None
         self.agent_root = agent_root
+        self._wt_branch = wt_branch
         self.notes = []
 
     # -- tools ------------------------------------------------------------------------------
@@ -184,19 +185,50 @@ class P6Launcher:
     def start_message(self):
         return f'Start work on {self.name} #{self.n}'
 
+    def wt_branch(self, path):
+        """The branch checked out in path, '' for a detached or unreadable one, None with no dir."""
+        if self._wt_branch:
+            return self._wt_branch(path)
+        if not Path(path).is_dir():
+            return None
+        r = subprocess.run(['git', '-C', str(path), 'branch', '--show-current'], capture_output=True, text=True,
+                           timeout=60)
+        return r.stdout.strip() if r.returncode == 0 else ''
+
     def owner(self, branch):
-        """'free' (no such branch on origin), 'ours' (its open PR closes this issue, or it has
-        no open PR and its tip is this issue's start commit: a launch that stopped before the
-        PR) or 'other' (any other work: never reused). Codex on PR #108."""
+        """'free', 'ours' or 'other' (never reused) for a candidate name (Codex on PR #108).
+        On origin: 'ours' when its open PR closes this issue, or it has no open PR and its tip
+        is this issue's start commit (a launch that stopped before the PR); else 'other'; no
+        such branch is 'free'. Local state must agree, because ensure_worktree reuses a local
+        branch and worktree first: a local branch counts only when origin's branch is ours and
+        has its tip; the worktree <root>/<name>.<slug> counts only when origin's branch is ours
+        and the worktree is on that branch. Any other local branch or worktree is 'other'."""
         tip = self.git('ls-remote', 'origin', f'refs/heads/{branch}', check=False).split('\t')[0].strip()
-        if not tip:
-            return 'free'
-        pr, body = self.open_pr(branch)
-        if pr:
-            return 'ours' if self.closes(body) else 'other'
-        self.git('fetch', '-q', 'origin', f'refs/heads/{branch}', check=False)
-        subject = self.git('log', '-1', '--format=%s', tip, check=False)
-        return 'ours' if subject == self.start_message() else 'other'
+        if tip:
+            pr, body = self.open_pr(branch)
+            self.git('fetch', '-q', 'origin', f'refs/heads/{branch}', check=False)
+            if pr:
+                remote = 'ours' if self.closes(body) else 'other'
+            else:
+                remote = 'ours' if self.git('log', '-1', '--format=%s', tip, check=False) == self.start_message() \
+                    else 'other'
+            if remote == 'other':
+                return 'other'
+        local = self.git('rev-parse', '--verify', '--quiet', f'refs/heads/{branch}', check=False).strip()
+        if local and (not tip or not self.git_ok('merge-base', '--is-ancestor', local, tip)):
+            return 'other'  # local work that origin's branch of this issue does not have
+        on = self.wt_branch(self.worktree_path(branch))
+        if on is not None and (not tip or on != branch):
+            return 'other'  # a worktree of other work (or of a branch origin does not have) at this path
+        return 'ours' if tip else 'free'
+
+    def git_ok(self, *args):
+        """True when the git command exits 0 (raises nothing)."""
+        try:
+            self.git(*args, check=True)
+            return True
+        except Exception:
+            return False
 
     def pick_branch(self):
         """The first of <slug>, <slug>-<N>, <slug>-<N>-2 ... that is free or this issue's own.
