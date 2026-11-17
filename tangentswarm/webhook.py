@@ -33,6 +33,8 @@ SQLite event log (eventdb: a 'received' row before the reply, a 'handled' row af
            then the cascade, card Done, close each linked issue and its card Done, park the
            worker, active-gate sweeps
   closed   card Canceled
+  p6merge  a worker's `MERGE-READY <sha>` comment on a Project 6 PR: verify, merge and clean
+           up at that sha with no AI (p6merge, tangentswarm #89)
   card     a new PR or issue: Project 4 card with the right Status
   wake     an exception (EXCEPTIONS): one deduped, rate-limited POST to swarmbot's wake URL
 
@@ -186,6 +188,19 @@ def no_relay_skip(repo, user, body, n):
     return [Action('log-only', n, why)]
 
 
+def p6_merge_ready(repo, user, body, n):
+    """tangentswarm #89: the worker's `MERGE-READY <full sha>` comment on a Project 6 PR (the
+    fallback of its done report): verify and merge at that sha, with no AI (p6merge). None for
+    any other comment, repo or author."""
+    from . import p6merge
+    if repo not in p6merge.REPOS or login(user) != MICHAL:
+        return None
+    sha = p6merge.merge_ready_sha(body)
+    if not sha:
+        return None
+    return [Action('p6merge', n, f"MERGE-READY {sha[:8]} on {repo}#{n}", dict(head=sha))]
+
+
 CODE_REVIEW_STATUS_RE = re.compile(r'"code_review"\s*:\s*\{[^{}]*?"status"\s*:\s*"(\w+)"', re.I)
 STATUS_RE = re.compile(r'"status"\s*:\s*"running"', re.I)
 
@@ -241,6 +256,9 @@ def _classify(event, p):
             if codex_running(body):
                 return [Action('skip', pr=n, why='Codex review is running')]
             return [Action('codex', n, 'Codex comment (summary or receipt)')]
+        merge = p6_merge_ready(repo, c.get('user'), body, n) if is_pr else None
+        if merge:
+            return merge
         if is_bot_self(c.get('user')) or ours(body):
             return [Action('skip', pr=n, why='the swarm\'s own comment')]
         if login(c.get('user')).endswith('[bot]'):
@@ -368,8 +386,9 @@ class Executor:
     """Runs actions with the swarm's tools. Every tool is injectable for tests."""
 
     def __init__(self, g=None, dry=False, sh=None, enqueue=None, cascade=None, give=None, wake_post=None,
-                 signal_promoted=None):
+                 signal_promoted=None, p6merge=None):
         self._g, self.dry = g, dry
+        self.p6merge = p6merge
         self.sh = sh
         self.signal_promoted = signal_promoted
         self.enqueue = enqueue
@@ -876,6 +895,17 @@ class Executor:
             return self.note(f"would queue hr-gate --apply {a.pr} (Staging PR edited)")
         (self.enqueue or gatelock.enqueue)([str(BIN / 'hr-gate'), '--apply', str(a.pr)], by='swarm-webhook')
         self.note(f"queued hr-gate --apply {a.pr}: the Staging PR was edited")
+
+    def do_p6merge(self, a):
+        """tangentswarm #89: verify, merge and clean up a Project 6 PR at the MERGE-READY sha."""
+        if self.dry:
+            return self.note(f"would verify and merge {self.repo}#{a.pr} at {a.args['head'][:8]}")
+        from . import p6merge
+        res = (self.p6merge or p6merge.run)(self.repo, a.pr, a.args['head'], 'comment', gql=self.g['gql'], sh=self._sh)
+        if res.get('merged'):
+            return self.note(f"{self.repo}#{a.pr} merged at {a.args['head'][:8]}"
+                             + ''.join(f"; {x}" for x in res.get('notes') or []) + (f": {res['why']}" if res.get('why') else ''))
+        self.note(f"{self.repo}#{a.pr} not merged at {a.args['head'][:8]}: {res.get('why')}")
 
     def do_wake(self, a):
         self.wake(a.pr, a.why, key=a.args.get('key'))

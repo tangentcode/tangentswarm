@@ -4,9 +4,13 @@ of Project 6 (tangentswarm #19).
 
 MethBot (Michal 2026-11-16: "The webhook should only receive those two specific things")
 gets one POST to the URL in ALERT_URL_FILE (with an optional bearer key in ALERT_KEY_FILE)
-for exactly two events, and only for the Project 6 repos (METHBOT_REPOS):
-  done         a worker reports done through the worker MCP (once per PR and head sha)
+for these events, and only for the Project 6 repos (METHBOT_REPOS):
   needs-input  a worker asks a question through the worker MCP needs_input tool
+  exception    a done report or MERGE-READY comment that the swarm could not merge, with the
+               reasons (tangentswarm #89: the merge itself has no AI; once per PR and head,
+               and once more per PR and head for a cleanup step that failed after the merge)
+  pull         after such a merge, the next Project 6 Backlog issues to start (once per merge)
+  done         kept for callers of #19; the worker MCP no longer sends it (p6merge merges)
 Everything else the watchdog finds (a Codex outage, a stalled promote, a new Needs Input
 card on any board) is an alert(): it wakes swarmbot and never POSTs to the MethBot URL.
 Every alert, wake, MethBot POST and incident is also a row in the events DB (source 'watch').
@@ -28,7 +32,7 @@ INCIDENT_REPO = 'tangentcode/methodology'
 INCIDENT_PROJECT = '6'
 INCIDENTS_PER_HOUR = int(os.environ.get('SWARM_INCIDENTS_PER_HOUR', '6'))
 METHBOT_REPOS = ('tangentcode/tangentswarm', 'tangentcode/methodology')  # Project 6
-METHBOT_KINDS = ('done', 'needs-input')
+METHBOT_KINDS = ('done', 'needs-input', 'exception', 'pull')
 
 
 def state():
@@ -99,10 +103,13 @@ def methbot_post(payload):
     return webhook.post_wake(payload, url_file=ALERT_URL_FILE, key_file=ALERT_KEY_FILE, background=False)
 
 
-def tell_methbot(kind, repo, pr, head=None, question=None, st=None, post=None, now=time.time):
-    """Wake MethBot for one of its two events (tangentswarm #19), only for a Project 6 repo.
+def tell_methbot(kind, repo, pr, head=None, question=None, st=None, post=None, now=time.time, reason=None,
+                 key=''):
+    """Wake MethBot for one of its events (tangentswarm #19, #89), only for a Project 6 repo.
     kind 'done' needs the full head sha and is sent once per repo, PR and head; kind
-    'needs-input' needs the question and is sent once per repo, PR and question. Returns
+    'needs-input' needs the question and is sent once per repo, PR and question; kinds
+    'exception' and 'pull' need the full head sha and the reason text, and are sent once per
+    repo, PR, head and key (key '' for the merge exception and the pull). Returns
     True when MethBot took it, else the reason it was not sent. The once-key is marked only
     after a delivered POST, so a report repeated after a failed POST tries again (Codex on
     PR #71). post answers False for a failed POST (anything else is delivered)."""
@@ -118,6 +125,15 @@ def tell_methbot(kind, repo, pr, head=None, question=None, st=None, post=None, n
         once = f"methbot:done:{repo}#{pr}@{head}"
         payload['head'] = head
         text = f"{repo}#{pr} done at {head[:8]}"
+    elif kind in ('exception', 'pull'):
+        if len(head or '') != 40:
+            return f"{kind} needs the full head sha (got {head!r})"
+        reason = (reason or '').strip()
+        if not reason:
+            return f"{kind} needs the reason"
+        once = f"methbot:{kind}:{repo}#{pr}@{head}" + (f":{key}" if key else '')
+        payload.update(head=head, reason=reason[:4000])
+        text = f"{repo}#{pr} {kind} at {head[:8]}: {reason}"[:2000]
     else:
         question = (question or '').strip()
         if not question:

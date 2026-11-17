@@ -26,9 +26,9 @@ Tools:
 
 Project 6 worktrees (tangentswarm #19): a worker in ~/ver/tangentswarm.<slug> or
 ~/ver/methodology.<slug> works on a tangentcode/tangentswarm or tangentcode/methodology PR.
-For it, handoff ("done") and needs_input wake MethBot (alerts.tell_methbot: done once per
-PR and head sha, needs-input once per question) and log an events DB row; nothing else
-(no card move, no /exit). worker_status and request_review serve platform worktrees only.
+For it, handoff ("done") verifies, merges and cleans up on the server with no AI (p6merge,
+tangentswarm #89; a failed check is one MethBot exception per PR and head), and needs_input
+wakes MethBot (alerts.tell_methbot, once per question) and logs an events DB row. worker_status and request_review serve platform worktrees only.
 
 Install (user scope, every Claude on the host):
     claude mcp add --scope user tangentswarm -- ~/bin/swarm-worker-mcp
@@ -52,8 +52,8 @@ INSTRUCTIONS = """Tools about your own swarm worktree and its pull request. Call
 to see your PR, card, Codex and CI state. When your work is committed and pushed, call
 handoff: it marks the PR ready, asks Codex for a review and moves the card to Auto Review
 (the same as the Stop hook). request_review only posts "@codex review" for your head.
-In a tangentswarm or methodology worktree (Project 6), handoff reports done and needs_input
-sends the question to MethBot; worker_status and request_review are platform-only there.
+In a tangentswarm or methodology worktree (Project 6), handoff reports done (the swarm
+verifies and merges the PR) and needs_input sends the question to MethBot; worker_status and request_review are platform-only there.
 Never ask Michal a question in your pane: call needs_input(pr, question), then end your turn."""
 
 REPO = 'tangentcode/platform'
@@ -100,11 +100,12 @@ def p6_only(wt, tool):
         raise ToolError(f"{tool} serves platform worktrees only; {repo} PRs use handoff (done) and needs_input")
 
 
-def p6_done(wt, repo, sh=None, tell=None):
+def p6_done(wt, repo, sh=None, merge=None):
     """handoff in a Project 6 worktree: the worker is done. The worktree must be clean and
-    pushed and GitHub must show that head on the open PR; then MethBot is woken once per PR
-    and head (tangentswarm #19)."""
-    from . import alerts, stophook
+    pushed and GitHub must show that head on the open PR; then the swarm verifies, merges and
+    cleans up with no AI (p6merge, tangentswarm #89). A check that fails is one exception to
+    MethBot (once per PR and head), and the answer says why."""
+    from . import p6merge, stophook
     branch, head = stophook.pushed_head(wt)
     if not branch or len(head or '') != 40:
         return {'done': False, 'why': f"not finished: {head}"}
@@ -114,11 +115,12 @@ def p6_done(wt, repo, sh=None, tell=None):
     n, pr_head = found
     if pr_head != head:
         return {'done': False, 'pr': n, 'why': f"GitHub does not show head {head[:8]} on #{n} yet; try again in a minute"}
-    sent = (tell or alerts.tell_methbot)('done', repo, n, head=head)
-    if sent is True:
-        return {'done': True, 'pr': n, 'repo': repo, 'head': head, 'log': f"{repo}#{n} done at {head[:8]}: MethBot woken"}
-    return {'done': sent == 'already sent', 'pr': n, 'repo': repo, 'head': head,
-            'why': f"{repo}#{n} done at {head[:8]}: MethBot not woken: {sent}"}
+    res = (merge or p6merge.run)(repo, n, head, 'done', wt=wt)
+    out = {'done': bool(res.get('merged')), 'pr': n, 'repo': repo, 'head': head}
+    if res.get('merged'):
+        return dict(out, log=f"{repo}#{n} merged at {head[:8]}" + ''.join(f"; {x}" for x in res.get('notes') or []))
+    return dict(out, why=f"{repo}#{n} not merged at {head[:8]}: {res.get('why')}"
+                + ('; MethBot has the exception' if res.get('methbot') else ''))
 
 
 def p6_needs_input(wt, repo, pr, question, sh=None, tell=None):
@@ -274,8 +276,8 @@ async def handoff() -> dict:
     """Call this when your work is committed and pushed: mark the PR ready, ask Codex for a
     review (once per head) and move the card to Auto Review. A head that is already
     Codex-clean gets the MinBot check instead. Nothing happens for a dirty or unpushed
-    worktree. In a tangentswarm or methodology worktree (Project 6) it reports done: MethBot
-    is woken once for the pushed head. On a problem: {'ok': false, 'error': '...'}."""
+    worktree. In a tangentswarm or methodology worktree (Project 6) it reports done: the swarm
+    verifies the pushed head and merges it (or says why not). On a problem: {'ok': false, 'error': '...'}."""
     return await anyio.to_thread.run_sync(via_daemon, 'handoff')
 
 
