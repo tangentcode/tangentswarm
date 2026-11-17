@@ -395,3 +395,58 @@ def test_a_body_edit_makes_the_next_read_take_the_board(changes, reads):
     assert len(calls) == reads
     if reads == 1:
         assert next(c for _, c in B.open_prs(snap))['title'] == 't2'
+
+
+def moved_event(item, frm, to):
+    e = item_event(item, to)
+    e['changes']['field_value']['from'] = {'id': board.OPTION[frm], 'name': frm} if frm else None
+    return e
+
+
+def test_a_status_event_older_than_a_local_move_never_overwrites_it():
+    """Codex on PR #117 (P2): a queued Ready -> Staging event handled after the swarm moved
+    #5 Staging -> Human Review must not put #5 back in Staging. Its "from" is not the cached
+    column, so the cache is marked dirty and the next read takes the board."""
+    board_nodes = [node(5, ST, H5)]
+    gql, calls = counting(board_nodes)
+    B.snapshot(gql)
+    B.moved('I5', HR)                                         # the swarm's own move
+    B.apply_event('projects_v2_item', moved_event('I5', ST, HR))  # its echo: no change, no read
+    assert cols_of(B.snapshot(gql)) == {5: HR} and len(calls) == 1
+    B.apply_event('projects_v2_item', moved_event('I5', RD, ST))  # a stale, delayed delivery
+    board_nodes[0]['fieldValueByName'] = {'name': HR, 'optionId': board.OPTION[HR]}
+    assert cols_of(B.snapshot(gql)) == {5: HR} and len(calls) == 2  # read again, never Staging
+
+
+def test_an_in_order_status_event_and_one_with_no_status_before_apply():
+    gql, calls = counting([node(5, RD, H5), node(6, RD, H6)])
+    B.snapshot(gql)
+    B.apply_event('projects_v2_item', moved_event('I5', RD, ST))
+    snap = B.snapshot(gql)
+    assert cols_of(snap)[5] == ST and len(calls) == 1
+    B._write(B.PATH, dict(snap, prs=[dict(it, fieldValueByName=None) if it['id'] == 'I6' else it for it in snap['prs']]))
+    B.apply_event('projects_v2_item', moved_event('I6', None, ST))  # a card's first status
+    assert cols_of(B.snapshot(gql))[6] == ST and len(calls) == 1
+
+
+def test_an_out_of_order_push_or_older_pr_event_never_rolls_the_cache_back():
+    """Neighbors of the stale status event: synchronize carries "before" (applied only onto
+    that head; else the board is read), and every PR event carries updated_at (an event older
+    than the cached updatedAt is skipped: the cache knows that state or a later one)."""
+    gql, calls = counting([node(5, ST, H5)])
+    B.snapshot(gql)
+    B.apply_event('pull_request', pr_event('synchronize', 5, head={'sha': H8}, updated_at='2026-11-17T16:00:02Z')
+                  | {'before': H5})
+    c = next(c for _, c in B.open_prs(B.snapshot(gql)))
+    assert c['headRefOid'] == H8 and len(calls) == 1
+    # the older push (H6 -> H5... delivered late): its updated_at is older: skipped, no read
+    B.apply_event('pull_request', pr_event('synchronize', 5, head={'sha': H5}, updated_at='2026-11-17T16:00:01Z')
+                  | {'before': H6})
+    B.apply_event('pull_request', pr_event('converted_to_draft', 5, updated_at='2026-11-17T16:00:00Z'))
+    c = next(c for _, c in B.open_prs(B.snapshot(gql)))
+    assert c['headRefOid'] == H8 and not c['isDraft'] and len(calls) == 1
+    # a push whose "before" the cache never saw (a lost event): read the board
+    B.apply_event('pull_request', pr_event('synchronize', 5, head={'sha': '7' * 40}, updated_at='2026-11-17T16:00:09Z')
+                  | {'before': '9' * 40})
+    B.snapshot(gql)
+    assert len(calls) == 2

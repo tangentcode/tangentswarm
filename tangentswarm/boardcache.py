@@ -207,10 +207,17 @@ def _apply(d, op):
     if kind == 'col':
         hit = False
         for it in (d.get('prs') or []) + (d.get('issues') or []):
-            if it.get('id') == op['item']:
-                it['fieldValueByName'] = ({'name': op.get('name'), 'optionId': op.get('optionId')}
-                                          if op.get('name') or op.get('optionId') else None)
-                hit = True
+            if it.get('id') != op['item']:
+                continue
+            if 'frm' in op:  # Codex on PR #117: a webhook event says where the card came from
+                cur, to = col(it), board.column({'optionId': op.get('optionId'), 'name': op.get('name')})
+                if cur == to:
+                    return True  # the echo of a move the cache has (our own, or a repeat)
+                if cur != board.column(op['frm']):
+                    return False  # out of order: the cache is newer or lost a step; read the board
+            it['fieldValueByName'] = ({'name': op.get('name'), 'optionId': op.get('optionId')}
+                                      if op.get('name') or op.get('optionId') else None)
+            hit = True
         return hit or op['item'] in (d.get('gone') or [])  # a move of a card that just closed
     if kind == 'gone':
         key = 'prs' if op.get('kind', 'PullRequest') == 'PullRequest' else 'issues'
@@ -224,9 +231,16 @@ def _apply(d, op):
         _forget(d, [op['item']])
         return True
     if kind == 'pr':
+        ok = True
         for _, c in _content(d, 'PullRequest', op['number']):
+            at = (op.get('set') or {}).get('updatedAt')
+            if at and c.get('updatedAt') and str(c['updatedAt']) > str(at):
+                continue  # Codex on PR #117: an older event than the cache: it knows this or later
+            if 'before' in op and c.get('headRefOid') not in (op['before'], (op.get('set') or {}).get('headRefOid')):
+                ok = False  # a push the cache did not see the step before: read the board
+                continue
             c.update(op.get('set') or {})
-        return True  # a PR that is not in the cache: its own card event brings it
+        return ok  # a PR that is not in the cache: its own card event brings it
     return False  # 'dirty'
 
 
@@ -271,8 +285,12 @@ def ops_for(event, p):
             if not ch or (ch.get('field_node_id') and ch.get('field_node_id') != board.DEFAULT.status_field):
                 return []
             to = ch.get('to') or {}
-            return [{'op': 'col', 'item': item.get('node_id'), 'name': board.column(
-                {'optionId': to.get('id'), 'name': to.get('name')}), 'optionId': to.get('id')}]
+            op = {'op': 'col', 'item': item.get('node_id'), 'name': board.column(
+                {'optionId': to.get('id'), 'name': to.get('name')}), 'optionId': to.get('id')}
+            if 'from' in ch:  # Codex on PR #117: applied only onto the column it left
+                frm = ch.get('from') or {}
+                op['frm'] = {'optionId': frm.get('id'), 'name': frm.get('name')}
+            return [op]
         if action in ('deleted', 'archived'):
             return [{'op': 'item-gone', 'item': item.get('node_id')}]
         if action in ('created', 'restored', 'converted'):
@@ -292,6 +310,8 @@ def ops_for(event, p):
         put = {'updatedAt': upd} if upd else {}
         if action == 'synchronize':
             put['headRefOid'] = (pr.get('head') or {}).get('sha')
+            if p.get('before'):  # applied only onto the head it replaced
+                return [{'op': 'pr', 'number': n, 'set': put, 'before': p['before']}]
         elif action in ('converted_to_draft', 'ready_for_review'):
             put['isDraft'] = action == 'converted_to_draft'
         elif action in ('labeled', 'unlabeled'):
