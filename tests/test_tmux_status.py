@@ -1,5 +1,6 @@
 """Tests for swarm-tmux-status (tangentswarm #49): classification, views and zoom."""
 import io
+import json
 
 from tangentswarm import tmux, tmux_status as ts
 
@@ -118,6 +119,56 @@ def test_read_windows_uses_tmux(monkeypatch):
     assert row.cls == 'working'
 
 
+def test_add_idle_info_reads_session_record_and_board():
+    rows = [ts.Window(index=1, name='mn-1-a', pane='%1', command='claude', cls='idle', activity='done',
+                      path='/w/a', pid=100),
+            ts.Window(index=2, name='mn-2-b', pane='%2', command='claude', cls='idle', activity='done',
+                      path='/w/b', pid=200),
+            ts.Window(index=3, name='mn-3-c', pane='%3', command='claude', cls='working', activity='x',
+                      path='/w/c', pid=300)]
+    table = {100: dict(ppid=1, comm='bash', cmd='bash'), 101: dict(ppid=100, comm='claude', cmd='claude'),
+             200: dict(ppid=1, comm='claude', cmd='claude'),
+             300: dict(ppid=1, comm='claude', cmd='claude')}
+    sess = {101: dict(status='idle', statusUpdatedAt=1000 * 1000, cwd='/w/a2'),
+            200: dict(status='busy', statusUpdatedAt=1000 * 1000)}
+    cards = {'br-a2': (55, False, 'Auto Review')}
+    branches = {'/w/a2': 'br-a2', '/w/b': 'br-b'}
+    seen = []
+
+    def branch(path):
+        seen.append(path)
+        return branches.get(path, '')
+    ts.add_idle_info(rows, table=table, sess=sess, cards=cards, branch=branch, now=1000 + 125)
+    a, b, c = rows
+    assert (a.idle_s, a.branch, a.pr, a.draft, a.card) == (125, 'br-a2', 55, False, 'Auto Review')
+    assert (b.idle_s, b.branch, b.pr) == (None, 'br-b', None)   # not idle in its record: age unknown
+    assert (c.idle_s, c.branch) == (None, '') and '/w/c' not in seen   # working rows are left alone
+
+
+def test_add_idle_info_reads_nothing_without_idle_rows(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError('read')
+    monkeypatch.setattr(ts.livestate, 'procs', boom)
+    monkeypatch.setattr(ts.livestate, 'sessions', boom)
+    monkeypatch.setattr(ts, 'board_prs', boom)
+    rows = [W(1, 'working'), W(2, 'shell')]
+    assert ts.add_idle_info(rows) == rows
+
+
+def test_board_prs_reads_the_snapshot_file(tmp_path):
+    def item(n, branch, status, draft=False, repo='tangentcode/platform', state='OPEN'):
+        return {'fieldValueByName': {'name': status},
+                'content': {'__typename': 'PullRequest', 'number': n, 'headRefName': branch, 'isDraft': draft,
+                            'state': state, 'repository': {'nameWithOwner': repo}}}
+    f = tmp_path / 'snap.json'
+    f.write_text(json.dumps({'prs': [item(1, 'a', 'Auto Review'), item(2, 'b', 'In Progress', draft=True),
+                                     item(3, 'c', 'Done', state='MERGED')], 'issues': []}))
+    prs = ts.board_prs(f)
+    assert prs['a'][:2] == (1, False) and prs['b'][:2] == (2, True) and 'c' not in prs
+    assert prs['a'][2] == ts.boardcache.col({'fieldValueByName': {'name': 'Auto Review'}})
+    assert ts.board_prs(tmp_path / 'missing.json') == {}
+
+
 # -- views --------------------------------------------------------------------------------------
 
 def W(index, cls, name=None, activity='doing x', command='claude'):
@@ -135,12 +186,36 @@ def view(**kw):
     return v
 
 
-def test_default_view_shows_only_working():
+def test_default_view_shows_every_claude_window_working_or_idle():
+    """#119: idle Claudes are listed by default; shell-only and program windows are not."""
     v = view()
-    assert [w.index for w in v.visible()] == [2, 4]
-    text = '\n'.join(line for line, _ in v.render(120, 40))
-    assert 'mn-2-t' in text and 'mn-4-t' in text and 'mn-1-t' not in text and 'mn-3-t' not in text
-    assert '2 working, 1 idle, 1 shell, 1 program - working only' in text
+    assert [w.index for w in v.visible()] == [2, 3, 4]
+    text = '\n'.join(line for line, _ in v.render(160, 40))
+    assert 'mn-2-t' in text and 'mn-3-t' in text and 'mn-4-t' in text
+    assert 'mn-1-t' not in text and 'events' not in text
+    assert '2 working, 1 idle, 1 shell, 1 program - Claude windows' in text
+
+
+def test_idle_row_says_why_it_is_idle():
+    w = W(21, 'idle', name='mn-539-fix', activity='Done. PR is ready.')
+    w.idle_s, w.branch, w.pr, w.card = 750, 'mn-539-fix', 1234, 'Auto Review'
+    v = ts.View()
+    v.set_windows([w, W(22, 'working', activity='Bash(pytest)')])
+    idle, working = v.table(200)
+    assert idle.startswith('IDLE') and 'mn-539-fix' in idle
+    assert 'idle 12m, PR #1234 Auto Review - said: Done. PR is ready.' in idle
+    assert working.startswith('WORKING') and working.endswith('Bash(pytest)') and 'said:' not in working
+
+
+def test_why_idle_texts():
+    w = W(1, 'idle')
+    assert ts.why_idle(w) == 'idle ?, no branch'
+    w.branch = 'mn-1-t'
+    assert ts.why_idle(w) == 'idle ?, no open PR on the board for mn-1-t'
+    w.pr, w.draft, w.card, w.idle_s = 7, True, 'Pending', 3 * 3600 + 5
+    assert ts.why_idle(w) == 'idle 3h, PR #7 draft Staging'
+    w.card = ''
+    assert ts.why_idle(w) == 'idle 3h, PR #7 draft no column'
 
 
 def test_toggle_shows_all_windows_and_back():
@@ -148,20 +223,21 @@ def test_toggle_shows_all_windows_and_back():
     v.key('a')
     assert [w.index for w in v.visible()] == [1, 2, 3, 4, 5]
     text = '\n'.join(line for line, _ in v.render(120, 40))
-    assert 'all windows' in text and 'idle' in text and 'python' in text
+    assert 'all windows' in text and 'IDLE' in text and 'python' in text
     v.key('a')
-    assert [w.index for w in v.visible()] == [2, 4]
+    assert [w.index for w in v.visible()] == [2, 3, 4]
 
 
 def test_toggle_keeps_selection_when_it_stays_visible():
     v = view()
     v.key('down')
-    assert v.selected == 4
-    v.key('a')
-    assert v.selected == 4
-    v.key('up')
     assert v.selected == 3
-    v.key('a')   # idle window 3 is hidden: the selection moves to a visible row
+    v.key('a')
+    assert v.selected == 3
+    v.key('up')
+    v.key('up')
+    assert v.selected == 1
+    v.key('a')   # shell window 1 is hidden: the selection moves to a visible row
     assert v.selected == 2
 
 
@@ -177,7 +253,7 @@ def test_selected_row_is_marked():
     v = view()
     v.key('j')
     sel = [line for line, s in v.render(120, 40) if s]
-    assert len(sel) == 1 and 'mn-4-t' in sel[0]
+    assert len(sel) == 1 and 'mn-3-t' in sel[0]
 
 
 def test_lines_fit_the_width():
@@ -236,6 +312,7 @@ def test_quit():
 def test_zoom_into_selected_window_and_back():
     v = view()
     v.key('down')
+    v.key('down')
     assert v.key('enter') == 'zoom'
     assert v.zoomed.index == 4
     v.zoom_lines = [f'line {i}' for i in range(100)]
@@ -274,11 +351,12 @@ def test_read_zoom_asks_for_history(monkeypatch):
 
 # -- command line -------------------------------------------------------------------------------
 
-def test_main_once_prints_working_only_by_default():
+def test_main_once_prints_claude_windows_by_default():
     out = io.StringIO()
     assert ts.main(['--once'], reader=lambda s: list(WINDOWS), out=out) == 0
     text = out.getvalue()
-    assert 'mn-2-t' in text and 'mn-1-t' not in text and 'enter zoom' not in text
+    assert 'mn-2-t' in text and 'mn-3-t' in text and 'mn-1-t' not in text and 'events' not in text
+    assert 'enter zoom' not in text
 
 
 def test_main_once_all():

@@ -8,12 +8,16 @@ Each window in the swarm session (default `agents`) gets one class, from tmux st
   program   no Claude, another program runs in the foreground (shown with its name)
 
 A row shows the class, the window, the ticket/PR from the window name and the last activity
-line. The default view lists only the working windows; `a` toggles all windows. Up/down (or
+line. The default view lists every window with a Claude, working or idle (#119); `a` toggles
+all windows, shells and programs included. An idle row says why it is idle: how long it has
+been idle (the Claude session record), its PR, draft state and board column (the board
+snapshot file, never fetched here) and what it last said. There should be no idle Claudes. Up/down (or
 j/k) select a row, Enter (or z) zooms into its window's recent output, Esc (or q) goes back.
 
   swarm-tmux-status [--session NAME] [--all] [--once] [--zoom WINDOW] [--interval S]
 """
 import argparse
+import json
 import os
 import re
 import sys
@@ -21,7 +25,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 
-from . import tmux
+from . import boardcache, livestate, sanity, tmux
 
 SESSION = os.environ.get('SWARM_TMUX_SESSION', 'agents')
 SHELLS = {'bash', 'sh', 'zsh', 'fish', 'dash', 'ksh', 'tcsh', 'csh'}
@@ -118,6 +122,12 @@ class Window:
     activity: str
     path: str = ''
     panes: int = 1
+    pid: int = 0        # the pane's process id
+    idle_s: object = None   # seconds idle (idle Claude only), None when unknown
+    branch: str = ''
+    pr: object = None   # the open PR of the branch on the board, or None
+    draft: bool = False
+    card: str = ''      # its board column
 
     @property
     def ticket(self):
@@ -149,12 +159,57 @@ def window_rows(panes, screens):
         rows.append(Window(index=index, name=p['window_name'], pane=p['pane_id'],
                            command=p['current_command'], cls=cls,
                            activity=last_activity(screen, cls), path=p.get('current_path', ''),
-                           panes=len(group)))
+                           panes=len(group), pid=p.get('pid') or 0))
     return rows
 
 
 def strip_escapes(text):
     return ESC_RE.sub('', text)
+
+
+def board_prs(path=None):
+    """{branch: (PR number, draft?, board column)} of the open PRs in the board snapshot file
+    ({} when there is none). It is never fetched here."""
+    try:
+        snap = json.loads((path or boardcache.PATH).read_text())
+        return {c.get('headRefName'): (c['number'], bool(c.get('isDraft')), boardcache.col(it) or '')
+                for it, c in boardcache.open_prs(snap)}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {}
+
+
+def branch_of(path):
+    """The branch of the worktree at path, from its files (no git process), or ''."""
+    try:
+        return sanity.git_info(path)[1] or '' if path else ''
+    except OSError:
+        return ''
+
+
+def add_idle_info(windows, table=None, sess=None, cards=None, branch=branch_of, now=None):
+    """Fill in why each idle Claude is idle: idle_s from its Claude session record
+    (statusUpdatedAt of the claude process in the pane's process tree), and the branch of its
+    directory with the branch's open PR, draft state and board column. Other rows are left as
+    they are. The sources are read only when a window is idle."""
+    idle = [w for w in windows if w.cls == 'idle']
+    if not idle:
+        return windows
+    now = time.time() if now is None else now
+    table = livestate.procs() if table is None else table
+    sess = livestate.sessions() if sess is None else sess
+    cards = board_prs() if cards is None else cards
+    for w in idle:
+        claude = next((pid for pid in livestate.tree(table, w.pid) if livestate.is_claude(table[pid])), None)
+        s = sess.get(claude) or {} if claude else {}
+        if s.get('status') == 'idle' and s.get('statusUpdatedAt'):
+            try:
+                w.idle_s = max(0, int(now - float(s['statusUpdatedAt']) / 1000))
+            except (TypeError, ValueError):
+                w.idle_s = None
+        w.branch = branch(s.get('cwd') or w.path)
+        if w.branch in cards:
+            w.pr, w.draft, w.card = cards[w.branch]
+    return windows
 
 
 def read_windows(session):
@@ -168,7 +223,7 @@ def read_windows(session):
             screens[p['pane_id']] = strip_escapes(tmux.capture_pane(p['pane_id']))
         except tmux.TmuxError:
             screens[p['pane_id']] = ''
-    return window_rows(panes, screens)
+    return add_idle_info(window_rows(panes, screens))
 
 
 def read_zoom(pane, history=ZOOM_HISTORY):
@@ -182,7 +237,32 @@ def read_zoom(pane, history=ZOOM_HISTORY):
 
 # -- view state (no curses) -------------------------------------------------------------------
 
-LABEL = {'working': 'WORKING', 'idle': 'idle', 'shell': 'shell', 'program': 'program'}
+LABEL = {'working': 'WORKING', 'idle': 'IDLE', 'shell': 'shell', 'program': 'program'}
+CLAUDE_CLASSES = ('working', 'idle')
+CARD_NAMES = {'Pending': 'Staging'}   # board.STAGING keeps the internal key "Pending"
+
+
+def ago(s):
+    """A short age: 45s, 12m, 3h, 2d ('?' for None)."""
+    if s is None:
+        return '?'
+    s = int(s)
+    for unit, n in (('d', 86400), ('h', 3600), ('m', 60)):
+        if s >= n:
+            return f"{s // n}{unit}"
+    return f"{s}s"
+
+
+def why_idle(w):
+    """Why an idle Claude is idle, before what it last said: 'idle 12m, PR #123 Auto Review'."""
+    if w.pr:
+        card = CARD_NAMES.get(w.card, w.card) or 'no column'
+        pr = f"PR #{w.pr}{' draft' if w.draft else ''} {card}"
+    elif w.branch:
+        pr = f"no open PR on the board for {w.branch}"
+    else:
+        pr = 'no branch'
+    return f"idle {ago(w.idle_s)}, {pr}"
 
 
 def _cells(ch):
@@ -229,8 +309,9 @@ class View:
     error: str = ''
 
     def visible(self):
-        """The rows of the current view: working windows only, or all with show_all."""
-        return [w for w in self.windows if self.show_all or w.cls == 'working']
+        """The rows of the current view: the windows with a Claude (working or idle), or all
+        windows with show_all. A window with only a shell or a program is not an agent."""
+        return [w for w in self.windows if self.show_all or w.cls in CLAUDE_CLASSES]
 
     def _cursor(self):
         rows = self.visible()
@@ -281,7 +362,7 @@ class View:
 
     def header(self):
         n = self.counts()
-        mode = 'all windows' if self.show_all else 'working only'
+        mode = 'all windows' if self.show_all else 'Claude windows'
         return (f"swarm tmux: {self.session} - {n['working']} working, {n['idle']} idle, "
                 f"{n['shell']} shell, {n['program']} program - {mode}")
 
@@ -289,14 +370,17 @@ class View:
         """The table lines of the current view (no header or key help)."""
         rows = self.visible()
         if not rows:
-            return ['(no working windows; press a to show all)' if not self.show_all
+            return ['(no Claude windows; press a to show all)' if not self.show_all
                     else '(no windows)']
         name_w = min(36, max(width_of(w.name) for w in rows))
         out = []
         for w in rows:
             label = LABEL[w.cls] if w.cls != 'program' else w.command
-            head = f"{_pad(label, 8)} {w.index:>3} {_pad(w.ticket, 9)} {_pad(w.name, name_w)}  "
-            out.append(_fit(head + w.activity, width))
+            head = f"{_pad(label, 8)} {w.index:>3} {_pad(w.ticket, 10)} {_pad(w.name, name_w)}  "
+            text = w.activity
+            if w.cls == 'idle':
+                text = f"{why_idle(w)} - said: {w.activity}"
+            out.append(_fit(head + text, width))
         return out
 
     def render(self, width, height, keys=True):
@@ -323,7 +407,7 @@ class View:
         self.top = max(0, min(self.top, len(table) - room))
         for i in range(self.top, min(len(table), self.top + room)):
             lines.append((table[i], i == cursor))
-        help_line = 'a all/working  up/down select  enter zoom  q quit'
+        help_line = 'a all/claude  up/down select  enter zoom  q quit'
         if len(table) > room:
             help_line += f'  [{self.top + 1}-{min(len(table), self.top + room)} of {len(table)}]'
         lines = lines[:max(0, height - 1)]
@@ -392,7 +476,7 @@ def main(argv=None, reader=read_windows, zoom_reader=read_zoom, out=None):
     out = out or sys.stdout
     ap = argparse.ArgumentParser(prog='swarm-tmux-status', description=__doc__.split('\n', 1)[0])
     ap.add_argument('--session', default=SESSION, help='tmux session of the swarm (default %(default)s)')
-    ap.add_argument('--all', action='store_true', help='start with all windows shown')
+    ap.add_argument('--all', action='store_true', help='start with all windows shown, shells and programs too')
     ap.add_argument('--once', action='store_true', help='print the table once and exit')
     ap.add_argument('--zoom', metavar='WINDOW', type=int,
                     help='print the recent output of one window (by index) and exit')
