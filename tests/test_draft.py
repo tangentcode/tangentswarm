@@ -85,29 +85,20 @@ def test_the_pull_sends_a_conflicting_staging_pr_back_as_a_draft(monkeypatch):
     """The #95 case: platform #447 went Staging -> In Progress and stayed ready for review."""
     moved = _no_gh_move(monkeypatch)
     f = F.Flow(dry_run=False, out=lambda l: None, g=_gate())
-    f.give_worker = lambda n, text, priority=False: (0, 'sent')
+    f.give_worker = lambda n, text, priority=False, queue=False: (0, 'sent')
     p = dict(number=447, head='h' * 40, item='I447', col=board.STAGING)
     assert f.fail(p, 'conflicts with main') is True
     assert moved == [('I447', board.IN_PROGRESS)] and board.DRAFTED == [(447, PLATFORM)]
 
 
-def test_the_pull_with_no_worker_neither_moves_nor_drafts(monkeypatch):
+def test_the_pull_with_no_worker_still_moves_and_drafts(monkeypatch):
+    """tangentswarm #101 (drop parking): with no worker the card goes to In Progress anyway,
+    as a draft, and waits there for a Claude."""
     moved = _no_gh_move(monkeypatch)
     f = F.Flow(dry_run=False, out=lambda l: None, g=_gate())
-    f.give_worker = lambda n, text, priority=False: (3, 'no slot')
-    assert f.fail(dict(number=447, head='h' * 40, item='I447', col=board.STAGING), 'conflicts') is False
-    assert moved == [] and board.DRAFTED == []
-
-
-def test_a_held_handoff_retry_drafts_the_pr(monkeypatch, tmp_path):
-    moved = _no_gh_move(monkeypatch)
-    rel = tmp_path / 'relay-8-gate.md'
-    rel.write_text('Coordinator: #8 fix it\n')
-    F.hold(8, 'h' * 40, 'a conflict', relay=rel, tried=0)
-    f = F.Flow(dry_run=False, out=lambda l: None, g=_gate())
-    f.give_worker = lambda n, text, priority=False: (0, 'sent')
-    f.retry_held({board.READY: [dict(number=8, head='h' * 40, item='I8')]}, now=10 ** 9)
-    assert moved == [('I8', board.IN_PROGRESS)] and board.DRAFTED == [(8, PLATFORM)]
+    f.give_worker = lambda n, text, priority=False, queue=False: (3, 'no slot')
+    assert f.fail(dict(number=447, head='h' * 40, item='I447', col=board.STAGING), 'conflicts') is True
+    assert moved == [('I447', board.IN_PROGRESS)] and board.DRAFTED == [(447, PLATFORM)]
 
 
 def test_the_main_merge_recheck_gives_the_mover_the_pr_number(tmp_path, monkeypatch):
@@ -116,7 +107,7 @@ def test_the_main_merge_recheck_gives_the_mover_the_pr_number(tmp_path, monkeypa
     staging = [dict(number=12, head='a' * 40, item='I12')]
     out = M.recheck(staging, 'm' * 40, lambda m, h: False,
                     lambda item, col, n=None: board.move_card(_gate(), item, col, n=n), lambda s: None,
-                    cache_path=tmp_path / 'c', give=lambda n, text: (True, 'sent'))
+                    cache_path=tmp_path / 'c', give=lambda p, text, path: (True, 'sent'))
     assert out == [12] and moved == [('I12', board.IN_PROGRESS)] and board.DRAFTED == [(12, PLATFORM)]
 
 

@@ -585,7 +585,7 @@ def _report():
 
 
 def test_a_held_revive_without_queue_is_not_queued(wt, monkeypatch):
-    """flow.give_worker has its own hold and retry (flow.retry_held): no second retry path."""
+    """flow.give_worker does not retry by itself (tangentswarm #101: a held revive waits in the queue)."""
     assert slots.revive(7, 'go', out=lambda s: None, sp=FakeSP(wt, room=100), host=FakeHost(), claudes=[]) == 3
     assert slots.load()['queued'] == {}
 
@@ -620,3 +620,27 @@ def test_a_dry_queue_run_changes_nothing():
     out = []
     assert slots.run_queued(out=out.append, dry=True, revive_fn=lambda *a, **k: pytest.fail('dry')) == []
     assert out == ['revive queue: would revive #7 ()'] and '7' in slots.load()['queued']
+
+
+def test_waiting_claudes_start_in_pick_order_not_queue_age(monkeypatch):
+    """tangentswarm #101: when capacity frees, the waiting In Progress PRs get their Claudes in
+    the shared pick order (fast-track, milestone due date, number), not by queue age."""
+    from tangentswarm import board
+    slots.queue_revive(30, 'a', now=1)
+    slots.queue_revive(20, 'b', now=2)
+    slots.queue_revive(10, 'c', now=3)
+    slots.queue_revive(99, 'd', now=0)  # not on the board: after the board PRs
+    prs = {n: dict(number=n, state='OPEN', labels=[], closes=[]) for n in (10, 20, 30, 99)}
+    prs[30].update(due='2026-11-20', milestone='m')
+    order = []
+    slots.run_queued(out=lambda l: None, prs={k: v for k, v in prs.items() if k != 99} | {99: {'state': 'OPEN'}},
+                     revive_fn=lambda n, text, out=print, **k: order.append(n) or 0)
+    assert order == [30, 10, 20, 99]
+    assert [k for k, _ in slots.wait_order({'5': {'at': 2}, '6': {'at': 1}})] == ['6', '5']
+
+
+def test_waiting_counts_queued_and_unstarted():
+    slots.queue_revive(7, 'x')
+    slots.unstarted_add(8, branch='b8')
+    assert slots.waiting() == {7, 8}
+    assert slots.waiting(st={'queued': {'3': {}}, 'unstarted': {}}) == {3}

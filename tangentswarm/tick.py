@@ -700,6 +700,9 @@ class Tick:
     def no_claude(self, n, pr, mine):
         if pr['col'] != 'In Progress':
             return
+        from . import slots
+        if n in slots.waiting():  # tangentswarm #101: it waits for a Claude, with its feedback saved
+            return
         shells = [p for p in mine if p['cls'] == 'shell']
         if not shells:
             parked = [w for w, num in parked_windows().items() if num == str(n)]

@@ -71,7 +71,6 @@ BACKSTOP = int(os.environ.get('SWARM_PROMOTE_BACKSTOP', '900'))  # retry a lefto
 BOARD_EVERY = int(os.environ.get('SWARM_BOARD_EVERY', '300'))  # s between passes of a board without staging (#45)
 DEPLOY_LAG = int(os.environ.get('SWARM_DEPLOY_LAG', '600'))  # s before a staging deploy lag wakes swarmbot (#37)
 LAG_EVERY = 60  # s between deploy-lag checks
-MAIN_RETRY = int(os.environ.get('SWARM_MAIN_RETRY', '300'))  # s between retries of a held merge-main handoff
 HR_TARGET = int(os.environ.get('SWARM_PROMOTE_HR_TARGET', os.environ.get('SWARM_HR_TARGET', '2')))  # only raise it for a dry-run proof
 WATCH = os.environ.get('SWARM_WATCH', '1') != '0'  # the watchdog thread (tangentswarm.watchdog)
 
@@ -251,7 +250,6 @@ class Promoter:
         self.left = []    # [(n, head, why)] Staging PRs the last fast path did not move
         self.tried = {}   # {(n, head): time} the slow path last ran for this leftover head
         self.last_main = None  # main SHA the last main-merge recheck ran for
-        self.main_retry_at = 0.0  # next retry of a merge-main handoff that found no worker
         self.last_hr = None    # Human Review count at the last check
         self.cascade_at = 0.0  # when this daemon last queued a cascade for an empty Human Review
         self.last_deploy = None  # the staging .deploy-sha values at the last check
@@ -397,7 +395,7 @@ class Promoter:
             def clean(m, head):
                 scratch.ensure(m, head)
                 return flow.merge_commit(scratch, m, head, 'probe main') is not None
-            give = flow.Flow(dry_run=self.dry, out=lambda l: None, g=self.g).hand_off  # (ok, note)
+            give = flow.Flow(dry_run=self.dry, out=lambda l: None, g=self.g).hand_off  # (ok, note); now or waiting
             return mainmerge.recheck(staging, main, clean, lambda item, col, n=None: board.move_card(self.g, item, col, n=n), say,
                                      details=details, dry=self.dry, give=give)
 
@@ -679,19 +677,6 @@ class Promoter:
         for line in f.did + f.notes:
             say('flow: ' + line)
 
-    def main_retry_due(self, cols, now=None):
-        """Staging PRs whose merge-main handoff found no worker (mainmerge.recheck held them).
-        Codex on PR #26: the recheck ran only when main moved, so a held handoff waited for
-        the next merge. They are retried every MAIN_RETRY s, with or without a new main."""
-        from . import flow
-        now = time.time() if now is None else now
-        if now < self.main_retry_at:
-            return []
-        held = flow.held()
-        return [p['number'] for p in cols.get(board.STAGING, [])
-                if str((held.get(p['number']) or {}).get('why', '')).startswith('conflicts with main')
-                and held[p['number']].get('head') == p.get('head')]
-
     def board_passes(self, now=None):
         """Every BOARD_EVERY s, queue the pass of each board without staging (#45: Project 6):
         its MinBot checks and promote, for what no event finished (Codex on PR #47: a promote
@@ -725,10 +710,7 @@ class Promoter:
                 waiting = gatelock.queued()
             from . import flow
             pull_due = needs_pull(cols, flow.load_pull())
-            main_retry = self.main_retry_due(cols)
-            if main_retry:
-                say(f"merge-main handoff retry: {', '.join('#' + str(n) for n in main_retry)} (no worker took it)")
-            if not needs_promotion(cols) and not main_moved and not waiting and not pull_due and not main_retry:
+            if not needs_promotion(cols) and not main_moved and not waiting and not pull_due:
                 return 'idle'
             if waiting:
                 say(f"{len(waiting)} queued gate request(s): draining")
@@ -750,10 +732,9 @@ class Promoter:
                     cols, moved, hr = self.fill(cols)
                     if moved:
                         self.queue_cascade(f"promoted {', '.join('#' + str(n) for n in moved)}: restock Staging")
-                if main and (main_moved or self.main_retry_due(cols)):
+                if main and main_moved:
                     self.main_pass(cols, moved, main)
                     self.last_main = main
-                    self.main_retry_at = time.time() + MAIN_RETRY
                 if hr < HR_TARGET and any(a[0].endswith('pending-promote') for a, _ in drained):
                     self.mark_tried()  # a queued pending-promote just ran: that was the slow path
                 elif hr < HR_TARGET and self.slow_due():
@@ -849,6 +830,11 @@ def main(argv=None):
         moved = launches.migrate_held(warn=say)
         if moved:
             say('held-launch list retired: unstarted records for ' + ', '.join(f'#{n}' for n in moved))
+        from . import flow
+        cleared = flow.clear_held()  # tangentswarm #101: no parking; the first passes find each conflict again
+        if cleared:
+            say('parking retired: cleared held.json (' + ', '.join(f'#{n}' for n in cleared)
+                + '); each conflict goes to In Progress on the next pass')
     p = Promoter(dry_run=a.dry_run)
     if a.once:
         say('result: ' + p.once())

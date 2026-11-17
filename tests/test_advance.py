@@ -466,7 +466,7 @@ def rework_case(monkeypatch, tmp_path, rc):
     moved, revived = [], []
     g = CascadeGate()
     g['move'] = lambda item, col: moved.append((item, col))
-    monkeypatch.setattr(slots, 'revive', lambda n, msg, out=print: revived.append((n, msg)) or rc)
+    monkeypatch.setattr(slots, 'revive', lambda n, msg, out=print, **k: revived.append((n, msg)) or rc)
     out = []
     c = A.Cascade(g=g, dry_run=False, out=out.append, sleep=lambda s: None)
     cols = {board.READY: [pr(481, board.READY)]}
@@ -486,20 +486,17 @@ def test_a_live_rework_moves_the_card_once_its_claude_has_the_relay(monkeypatch,
     assert 'rework: #481 already has a relay for 00000000: not sent again' in out
 
 
-def test_a_rework_with_no_worker_never_demotes_the_card(monkeypatch, tmp_path):
-    """Michal 2026-11-15 2:23 AM ET: never demote into a column with no worker."""
-    from tangentswarm import flow as F
+def test_a_rework_with_no_worker_goes_to_in_progress_and_waits(monkeypatch, tmp_path):
+    """tangentswarm #101 (Michal 2026-11-17 8:49 AM ET: drop parking; replaces the Nov 15 rule
+    never to demote into a column with no worker): the card goes to In Progress at once and
+    waits there for a Claude. Nothing is held, and one relay per head."""
+    from tangentswarm import flow as F, slots
     c, cols, out, moved, revived = rework_case(monkeypatch, tmp_path, rc=3)  # rework slots full
-    assert moved == [] and len(revived) == 1
-    assert any(l.startswith('note: NEEDS_WORKER #481: conflicts with origin/main') and 'stays in Ready' in l
-               for l in out)
-    assert f'RELAY: swarm-resume 481 {tmp_path}/relay-481-merge-main.md' in out
-    assert F.held()[481]['head'] == f'{481:040d}'  # not pulled again at this head
-    from tangentswarm import slots
-    assert '481' not in slots.load()['relayed']  # Codex on PR #26: no worker took it, so the next pass tries again
-    c.main_check(cols)
-    assert len(revived) == 2
-
+    assert moved == [('I481', board.IN_PROGRESS)] and len(revived) == 1
+    assert not F.HELD.exists() and not any(l.startswith('RELAY:') for l in out)
+    assert slots.load()['relayed']['481'] == f'{481:040d}'
+    c.main_check(cols)  # same head: no second relay, no second move
+    assert len(revived) == 1 and len(moved) == 1
 
 def test_empty_ready_stops_the_fill_and_starts_coders_on_active_issues(monkeypatch, tmp_path):
     cols = {board.STAGING: [pr(1, board.STAGING)]}
@@ -955,7 +952,8 @@ def test_a_held_revive_is_queued_and_the_card_still_moves(ar7, revives):
     g = Gate(ar7, details={7: dict(codex_pr(), mergeable='CONFLICTING')})
     out, _ = run(g)
     assert g.moves == [('I7', board.IN_PROGRESS)]
-    assert any('its Claude is queued for a rework slot' in line for line in out)
+    assert any('WAITING_FOR_CLAUDE: waiting for a Claude: the revive is queued' in line for line in out)
+    assert revives[0][2] == {'queue': True}
 
 
 def test_one_revive_per_head_and_reason(ar7, revives):
@@ -966,14 +964,22 @@ def test_one_revive_per_head_and_reason(ar7, revives):
     assert len(revives) == 1 and g.moves == [('I7', board.IN_PROGRESS)] * 2
 
 
-def test_no_worker_keeps_the_card_in_auto_review_and_retries(ar7, revives):
-    revives.rcs.extend([1, 0])
+def test_no_worker_still_sends_the_card_to_in_progress_to_wait(ar7, revives, tmp_path):
+    """tangentswarm #101 (drop parking): a conflicting Auto Review PR whose worktree is gone
+    goes to In Progress anyway. Its relay is saved as the brief of a worker start, which the
+    cascade's start retry runs when capacity frees."""
+    from tangentswarm import slots
+    revives.rcs.append(1)  # 'refused: worktree is gone'
     g = Gate(ar7, details={7: dict(codex_pr(), mergeable='CONFLICTING')})
     out, _ = run(g)
-    assert g.moves == [] and out[0].startswith('NEEDS_WORKER #7: conflicts with main')
-    run(g)
-    assert len(revives) == 2 and g.moves == [('I7', board.IN_PROGRESS)]
-
+    assert g.moves == [('I7', board.IN_PROGRESS)] and board.DRAFTED == [(7, A.REPO)]
+    assert any('WAITING_FOR_CLAUDE' in line and 'a worker start with the relay relay-7-conflict.md' in line
+               for line in out)
+    rec = slots.load()['unstarted']['7']
+    assert rec['brief'] == str(tmp_path / 'relay-7-conflict.md') and rec['setup'] == 'done'
+    assert 'merge origin/main' in (tmp_path / 'relay-7-conflict.md').read_text().lower()
+    run(g)  # one revive per head and reason
+    assert len(revives) == 1
 
 def test_an_outdated_or_older_head_thread_is_no_rework(ar7, revives):
     """Only an open, not outdated thread on the head counts; an older-head thread with Codex
@@ -1020,14 +1026,13 @@ def test_the_cascade_runs_the_revive_queue_after_park(monkeypatch):
     c = A.Cascade.__new__(A.Cascade)
     c.out, c.dry, c.prs, c.why, c.g = (lambda line: None), False, {7: {'state': 'OPEN'}}, [], {'gql': None}
     c.clock = lambda: 0
-    c.f = type('F', (), {'retry_held': lambda self, cols: order.append('retry_held')})()
     monkeypatch.setattr(promoted, 'read_columns', lambda gql, max_age=None: {})
     for name in ('promote', 'unblock', 'auto_review', 'park', 'flush', 'signal'):
         monkeypatch.setattr(A.Cascade, name, lambda self, *a, _n=name: order.append(_n) or True)
     monkeypatch.setattr(A.Cascade, 'fill', lambda self: order.append('fill') or {})
     assert c._run(0) == 0
     assert order == ['promote', 'fill', 'unblock', 'auto_review', 'park', ('queue', {7: {'state': 'OPEN'}}),
-                     'retry_held', 'flush', 'signal']
+                     'flush', 'signal']
 
 
 def test_the_thread_feedback_fits_one_revive_line():
@@ -1035,3 +1040,16 @@ def test_the_thread_feedback_fits_one_revive_line():
     threads = [head_thread(body='x' * 5000, tid=f'T{i}') for i in range(10)]
     text = A.thread_rework_text(7, H, threads)
     assert slots.one_line(text) and len(text) <= slots.FEEDBACK_MAX
+
+
+def test_the_start_retry_starts_waiting_workers_in_pick_order():
+    """tangentswarm #101: a conflicting PR with no worktree waits as an unstarted record; when
+    capacity frees, the starts go in the shared pick order, not by record age."""
+    a = A.Cascade.__new__(A.Cascade)
+    out = []
+    a.out, a.dry = out.append, True
+    a.prs = {n: dict(number=n, state='OPEN', labels=[], closes=[]) for n in (5, 6)}
+    a.prs[6].update(due='2026-11-20', milestone='m')
+    unstarted = {'5': dict(branch='b5', at=1), '6': dict(branch='b6', at=2)}
+    assert a.retry_starts(unstarted, 1) == 0
+    assert out == ['start: would queue the worker start of #6 (b6)']

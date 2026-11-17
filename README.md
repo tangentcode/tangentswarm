@@ -983,6 +983,16 @@ and stops at the first PR that is not merge-ready. Staging and Human Review PRs 
    Ready at its place in the pick order (tangentswarm #83). Its worker gets the reason once
    per head; a moved head gets no relay (the webhook moves it to Auto Review).
 
+There is no parking (tangentswarm #101, Michal 2026-11-17: this replaces the Nov 15 rule
+never to move a card into a column with no worker). A conflicting PR (the main check, the
+pull, the Staging main recheck, or an Auto Review rework) always goes to In Progress. Its
+Claude gets the relay now, or the relay waits for a Claude: a queued revive (`queued` in
+slots.json) or, with no worktree, a worker start with the relay as its brief (`unstarted`).
+The cascade runs both in the shared pick order when a worker slot or memory frees. Nothing
+is held in Ready, so the PRs behind it are pulled as usual. swarm-tick and the sanity check
+accept such an In Progress card with no live Claude. At start, swarm-promoted deletes the
+old `held.json`; the next passes find each conflict again.
+
 Only the pulled PR is merged, deployed or gated. swarm-tick runs one step per pass; the
 GitHub hook runs `swarm-flow event` on `projects_v2_item` and merge events.
 

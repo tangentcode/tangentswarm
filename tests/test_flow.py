@@ -301,7 +301,7 @@ def test_advance_hard_failure_with_no_conflict_stays_in_ready(monkeypatch, tick_
     sent = told(monkeypatch)
     monkeypatch.setattr(f, 'pull', lambda *a: None)
     f.step()
-    assert g.moves == [] and flow.load_pull() is None and 7 not in flow.held()
+    assert g.moves == [] and flow.load_pull() is None
     assert '8 no later human request' in f.did[0] and 'stays in Ready' in f.did[0]
     assert [n for n, _ in sent] == [7] and 'no conflict' in sent[0][1] and 'merge origin/main' not in sent[0][1]
     pull_state()  # the same head fails again: no second relay
@@ -318,7 +318,7 @@ def test_advance_no_conflict_with_no_worker_still_stays_in_ready(monkeypatch, ti
     monkeypatch.setattr(slots, 'revive', lambda n, text, out=print, **k: out('no slot') or 3)
     monkeypatch.setattr(f, 'pull', lambda *a: None)
     f.step()
-    assert g.moves == [] and flow.load_pull() is None and 7 not in flow.held()
+    assert g.moves == [] and flow.load_pull() is None
     assert any('no worker took the reason' in n for n in f.notes)
 
 
@@ -560,27 +560,81 @@ def test_needs_screenshots_exempts_api_docs_and_tooling():
     assert ns(['web/src/a.tsx'], body='This is code-only.')  # web/ files still need shots
 
 
-def test_a_held_ready_head_is_handed_off_again_when_a_worker_can_take_it(tmp_path, monkeypatch):
-    """Codex on PR #26: a gate failure that found no worker held the head for good."""
-    from tangentswarm import board, flow as F
-    rel = tmp_path / 'relay-7-gate.md'
-    rel.write_text('Coordinator: #7 fix the gate\n')
-    F.hold(7, 'h' * 40, 'a human comment after the head', relay=rel, tried=0)
-    moves, rcs = [], [3, 0]
-    f = F.Flow(dry_run=False, out=lambda l: None, g={'OPT': {}, 'project_id': lambda: 'P', 'STATUS_FIELD': 'S'})
-    f.give_worker = lambda n, text: (rcs.pop(0), 'x')
-    monkeypatch.setattr(board, 'move_card', lambda g, item, col, sh=None, n=None, **k: moves.append((item, col)))
-    cols = {board.READY: [dict(number=7, head='h' * 40, item='I7')]}
-    f.retry_held(cols, now=10_000)
-    assert moves == [] and F.held()[7]['tried'] == 10_000
-    f.retry_held(cols, now=10_100)  # inside HELD_RETRY: not tried
-    assert rcs == [0]
-    f.retry_held(cols, now=10_000 + F.HELD_RETRY)
-    assert moves == [('I7', board.IN_PROGRESS)] and 7 not in F.held()
-
-
 def test_shots_relay_tells_the_worker_to_use_a_throwaway_user_or_scratch_root():
     """#64: the screenshot relay sends a worker to staging, so it carries the scratch rule."""
     from tangentswarm.gatechecks import SCRATCH_RULE
     text = flow.shots_text(7)
     assert SCRATCH_RULE in text and 'staging' in text and text.isascii()
+
+
+# --- tangentswarm #101: drop parking ---------------------------------------------
+
+def test_a_conflicting_pr_with_no_worker_goes_to_in_progress_and_nothing_behind_it_waits(monkeypatch):
+    """tangentswarm #101 (Michal 2026-11-17 8:49 AM ET): #7 conflicts with main and no Claude
+    can run (rework slots full). It goes to In Progress, not Ready; #9 behind it is pulled at
+    once; and when a slot frees, its Claude starts with the saved feedback."""
+    from tangentswarm import moves, slots
+    calls = []
+
+    def revive(n, text, out=print, queue=False, **k):
+        calls.append((n, text, queue))
+        if not slots_free:
+            out('held: the 3 rework slots are in use')
+            if queue:
+                slots.queue_revive(n, text, why='held')
+            return 3
+        out(f'#{n}: Claude resumed; feedback sent')
+        return 0
+    slots_free = False
+    monkeypatch.setattr(slots, 'revive', revive)
+    prs = {1: card(1, HR), 2: card(2, HR), 7: card(7, RD, rank=0), 9: card(9, RD)}
+    f, g = make_flow(prs, dry=False, clean=lambda a, b: not (a == 'main' and b == prs[7]['head']))
+    premerged(monkeypatch, f, {9: 'v9'})
+    started = []
+    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False, fm=None: started.append(p['number']))
+    f.step()
+    assert g.moves == [('I7', IP)] and started == [9]
+    assert any(d.startswith('did: #7 -> In Progress, WAITING_FOR_CLAUDE') for d in f.did)
+    assert not flow.HELD.exists()
+    assert 'waiting for a Claude' in moves.LOG.read_text()
+    saved = slots.load()['queued']['7']['text']
+    assert 'merge origin/main' in saved and calls == [(7, saved, True)]
+    assert 7 in slots.waiting()
+    slots_free = True  # a rework slot frees: the cascade runs the queue
+    assert slots.run_queued(out=lambda l: None, prs=prs) == [7]
+    assert calls[-1][:2] == (7, saved) and '7' not in slots.load()['queued']
+
+
+def test_a_conflicting_pr_with_no_worktree_waits_for_a_worker_start_with_its_relay(monkeypatch):
+    """No worktree to resume: the relay file is the brief of an unstarted record; the start
+    retry starts its worker when capacity frees (no capacity check here: it only waits)."""
+    from tangentswarm import slots
+    monkeypatch.setattr(slots, 'revive', lambda n, text, out=print, **k: out('refused: worktree /x is gone') or 1)
+    monkeypatch.setattr(slots, 'conflict_capacity', lambda: pytest.fail('no capacity check: it waits'))
+    f, g = make_flow({7: card(7, RD)}, dry=False)
+    assert f.fail(card(7, RD), 'conflicts with main', relay='merge-main', text='Coordinator: #7 merge main') is True
+    assert g.moves == [('I7', IP)]
+    rec = slots.load()['unstarted']['7']
+    assert rec['brief'] == str(flow.RELAY_DIR / 'relay-7-merge-main.md') and rec['branch'] == 'b7'
+    assert (flow.RELAY_DIR / 'relay-7-merge-main.md').read_text() == 'Coordinator: #7 merge main\n'
+    assert '7' not in slots.load()['queued'] and 7 in slots.waiting()
+
+
+def test_any_other_refusal_still_moves_and_queues_the_feedback(monkeypatch):
+    from tangentswarm import slots
+    monkeypatch.setattr(slots, 'revive', lambda n, text, out=print, **k: out('refused: another resume runs') or 1)
+    f, g = make_flow({7: card(7, RD)}, dry=False)
+    assert f.fail(card(7, RD), 'conflicts with main', text='Coordinator: #7 merge main') is True
+    assert g.moves == [('I7', IP)] and slots.load()['queued']['7']['text'] == 'Coordinator: #7 merge main'
+
+
+def test_the_pull_batch_has_no_hold_any_more(monkeypatch):
+    """A stale held.json entry never stops the batch (the file is retired)."""
+    import json
+    flow.HELD.write_text(json.dumps({'7': {'head': f'{7:040d}', 'why': 'old'}}))
+    f, _ = make_flow({7: card(7, RD)})
+    asked = premerged(monkeypatch, f, {})
+    monkeypatch.setattr(f, 'fetch_work', lambda scratch: 'w')
+    f.pull_batch({}, {RD: [card(7, RD)]}, None, room=1)
+    assert asked == [7]
+    assert not hasattr(flow, 'held') and not hasattr(flow.Flow, 'retry_held')

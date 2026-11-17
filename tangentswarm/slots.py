@@ -26,8 +26,9 @@ State: ~/.local/state/swarm-flow/slots.json
   parked  {PR: {session, window, pane, worktree, branch, head, parked_at}}
   rework  {PR: {session, window, pane, worktree, branch, head, started, feedback}}
   relayed {PR: head} the head a rework relay was sent for (the cascade sends one per head)
-  queued  {PR: {text, why, at}} a revive held for a rework slot (tangentswarm #102); the
-          cascade runs it after its park step, when a slot is free (run_queued)
+  queued  {PR: {text, why, at}} a revive held for a rework slot (tangentswarm #102), or a
+          conflicting In Progress PR that waits for a Claude (tangentswarm #101); the cascade
+          runs it after its park step, in pick order, when a slot is free (run_queued)
 
     swarm-slots              the running Claudes by slot, and the parked sessions
     swarm-slots --park [--dry-run]   park the Claude of each PR in Ready now
@@ -781,6 +782,14 @@ def queue_revive(n, text, why='', path=None, now=None):
                                     at=old.get('at') or (time.time() if now is None else now))
 
 
+def waiting(path=None, st=None):
+    """{PR number} of the PRs that wait for a Claude: a queued revive or an unstarted worker
+    (tangentswarm #101). An In Progress card of such a PR is valid with no live Claude.
+    st: the slots state when the caller has it."""
+    st = load(path) if st is None else st
+    return {int(k) for k in list(st.get('queued') or {}) + list(st.get('unstarted') or {}) if str(k).isdigit()}
+
+
 def unqueue(n, path=None):
     if str(n) not in load(path)['queued']:
         return
@@ -788,15 +797,30 @@ def unqueue(n, path=None):
         st['queued'].pop(str(n), None)
 
 
+def wait_order(recs, prs=None):
+    """[(PR text, record)] of {PR: record} in the shared pick order (board.pick_key; tangentswarm
+    #101: Claudes start for waiting In Progress PRs in pick order). A PR that is not in prs
+    (the open board PRs, or None) goes after them, oldest record first."""
+    prs, ft = prs or {}, board.active_fast_track()
+
+    def key(kv):
+        p = prs.get(int(kv[0])) if str(kv[0]).isdigit() else None
+        if p is not None and 'number' in p:
+            return (0, board.pick_key(p, ft), 0.0)
+        return (1, (), float(kv[1].get('at') or 0))
+    return sorted(recs.items(), key=key)
+
+
 def run_queued(out=print, prs=None, dry=False, path=None, revive_fn=None):
-    """Run the held revives, oldest first (tangentswarm #102: #539 stayed held after swarm-revive
-    exited 3, and nothing retried it). The cascade calls this after its park step, so a slot that
-    a park freed is used in the same pass. prs: the open board PRs; a queued PR that is not open
-    any more is dropped. The first revive that is still held ends the run: the slots are full.
-    Returns the PR numbers that were revived."""
+    """Run the held revives in pick order (wait_order; tangentswarm #102: #539 stayed held
+    after swarm-revive exited 3, and nothing retried it; tangentswarm #101: a conflicting PR
+    waits for its Claude here in In Progress). The cascade calls this after its park step, so
+    a slot that a park freed is used in the same pass. prs: the open board PRs; a queued PR
+    that is not open any more is dropped. The first revive that is still held ends the run:
+    the slots are full. Returns the PR numbers that were revived."""
     q = load(path)['queued']
     done = []
-    for k, rec in sorted(q.items(), key=lambda kv: float(kv[1].get('at') or 0)):
+    for k, rec in wait_order(q, prs):
         n = int(k)
         if prs is not None and (prs.get(n) or {}).get('state', 'GONE') != 'OPEN':
             out(f"revive queue: #{n} is not an open board PR: dropped")

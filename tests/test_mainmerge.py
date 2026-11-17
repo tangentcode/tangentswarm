@@ -31,18 +31,23 @@ def test_recheck_moves_and_relays_only_the_conflicting_pr(tmp_path, monkeypatch)
     assert 'merge-main relay' in said[-1] and said[-1].endswith('sent')
 
 
-def test_a_conflict_moves_the_card_only_once_a_worker_has_the_relay(tmp_path, monkeypatch):
-    """Codex on PR #26: a parked Staging worker was demoted while no live pane took the relay."""
+def test_a_conflict_moves_the_card_now_or_waiting_and_holds_nothing(tmp_path, monkeypatch):
+    """tangentswarm #101 (drop parking): the daemon's give (Flow.hand_off) says ok when its
+    Claude has the relay or the relay waits for a Claude; the card moves either way. A
+    send-only failure (no give) leaves it in Staging, and nothing is held."""
     from tangentswarm import flow
     monkeypatch.setattr(M, 'RELAY_DIR', tmp_path)
     moves, said, given = [], [], []
     out = M.recheck(ST, MAIN, lambda m, h: h == A, lambda i, c, n=None: moves.append((i, c)), said.append,
-                    cache_path=tmp_path / 'c.json', give=lambda n, t: given.append(n) or (False, 'no worker'))
-    assert out == [6] and given == [6] and moves == []
-    assert said[-1].startswith('NEEDS_WORKER #6') and flow.held()[6]['head'] == B
-    out = M.recheck(ST, MAIN, lambda m, h: h == A, lambda i, c, n=None: moves.append((i, c)), said.append,
-                    cache_path=tmp_path / 'c.json', give=lambda n, t: (True, 'revived'))
-    assert moves == [('I6', board.IN_PROGRESS)] and said[-1].endswith('revived')
+                    cache_path=tmp_path / 'c.json', details={6: {'headRefName': 'ptw/x'}},
+                    give=lambda p, t, path: given.append((p['number'], p['branch'], path.name))
+                    or (True, 'waiting for a Claude: the revive is queued'))
+    assert out == [6] and given[0][:2] == (6, 'ptw/x') and given[0][2].startswith('relay-6-mergemain-')
+    assert moves == [('I6', board.IN_PROGRESS)] and said[-1].endswith('waiting for a Claude: the revive is queued')
+    moves.clear()
+    M.recheck(ST, MAIN, lambda m, h: h == A, lambda i, c, n=None: moves.append((i, c)), said.append,
+              cache_path=tmp_path / 'c.json', send=lambda pr, text: 'held: no live Claude pane')
+    assert moves == [] and said[-1].startswith('NEEDS_WORKER #6') and not flow.HELD.exists()
 
 
 def test_recheck_all_clean_moves_nothing(tmp_path):
@@ -79,15 +84,18 @@ def test_find_pane_matches_window_or_worktree_and_needs_claude(monkeypatch):
     assert M.find_pane(dict(number=7, branch='ptw/z'), list_panes=lambda: rows) is None
 
 
-def test_the_daemon_gives_recheck_a_success_boolean_not_give_workers_rc():
+def test_the_daemon_gives_recheck_a_success_boolean_not_give_workers_rc(tmp_path):
     """Codex on PR #26: give_worker returns (rc, note) with rc 0 = success; mainmerge reads
-    (ok, note). Flow.hand_off converts at the boundary."""
-    from tangentswarm import flow
+    (ok, note). Flow.hand_off converts at the boundary. tangentswarm #101: a held revive
+    (rc 3) is ok too: the relay waits for a Claude."""
+    from tangentswarm import flow, slots
     f = flow.Flow(dry_run=True, out=lambda l: None, g={})
-    f.give_worker = lambda n, t: (0, 'revived')
-    assert f.hand_off(6, 't') == (True, 'revived')
-    f.give_worker = lambda n, t: (3, 'rework slots full')
-    assert f.hand_off(6, 't') == (False, 'rework slots full')
+    p = dict(number=6, branch='ptw/x')
+    f.give_worker = lambda n, t, queue=False: (0, 'revived')
+    assert f.hand_off(p, 't', tmp_path / 'relay-6.md') == (True, 'revived')
+    f.give_worker = lambda n, t, queue=False: (3, 'rework slots full')
+    ok, note = f.hand_off(p, 't', tmp_path / 'relay-6.md')
+    assert ok and note.startswith('waiting for a Claude') and 6 not in slots.load()['unstarted']
     import inspect
     from tangentswarm import promoted
     src = inspect.getsource(promoted.Promoter.main_pass)
