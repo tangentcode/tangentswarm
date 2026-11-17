@@ -19,10 +19,16 @@ JSON = {'Content-Type': 'application/json'}
 
 
 def node(n, col, kind='PullRequest', repo='tangentcode/platform', title='', labels=(), draft=False, item=None,
-         board_opts=None):
+         board_opts=None, due=None, closes=()):
     opts = board_opts or board.DEFAULT.option
     c = {'__typename': kind, 'number': n, 'title': title or f't{n}', 'state': 'OPEN',
          'repository': {'nameWithOwner': repo}, 'labels': {'nodes': [{'name': l} for l in labels]}}
+    if due:
+        c['milestone'] = {'title': f'M {due}', 'dueOn': f'{due}T00:00:00Z'}
+    if closes:   # [(number, repo, labels, due)]
+        c['closingIssuesReferences'] = {'nodes': [
+            {'number': i, 'repository': {'nameWithOwner': r}, 'labels': {'nodes': [{'name': l} for l in ls]},
+             'milestone': {'title': 'm', 'dueOn': f'{d}T00:00:00Z'} if d else None} for i, r, ls, d in closes]}
     if kind == 'PullRequest':
         c.update(isDraft=draft, headRefOid='a' * 40, headRefName=f'b{n}', updatedAt='2026-11-17T00:00:00Z')
     return {'id': item or f'item-{n}', 'fieldValueByName': {'name': col, 'optionId': opts[col]}, 'content': c}
@@ -452,3 +458,30 @@ def test_serves_on_loopback_only_and_over_http(tmp_path):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_places_order_and_fast_track_match_the_pickers(tmp_path):
+    """Codex on PR #74: a PR is fast-track by an issue it closes, and milestone due dates
+    order the rest, exactly as board.pick_key sees them in promoted.read_board."""
+    o6 = board.BOARDS[1].option
+    e = Env(tmp_path, nodes4=[node(2, board.READY), node(3, board.READY, due='2026-12-01'),
+                              node(4, board.READY, closes=[(40, 'tangentcode/platform', [], '2026-11-20')]),
+                              node(5, board.READY, closes=[(50, 'tangentcode/platform', ['fast-track'], None)]),
+                              node(6, board.READY, closes=[(60, 'tangentcode/other', ['fast-track'], '2026-01-01')]),
+                              node(9, board.READY)],
+            nodes6=[node(11, board.READY, repo='tangentcode/tangentswarm', board_opts=o6),
+                    node(12, board.READY, repo='tangentcode/tangentswarm', board_opts=o6,
+                         closes=[(13, 'tangentcode/tangentswarm', ['high priority'], None)])])
+    ready = {p['key']: p for p in e.get('/api/swarms/4/places')[1]['places']}[board.READY]['cards']
+    assert [c['number'] for c in ready] == [5, 4, 3, 2, 6, 9]
+    c5 = ready[0]
+    assert c5['ft'] and c5['closes'] == [50] and c5['own_labels'] == [] and c5['labels'] == ['fast-track']
+    assert ready[1]['due'] == '2026-11-20' and ready[4]['closes'] == []   # another repo's #60 is not its issue
+    # the active fast-track ticket (Project 4) goes first too
+    board.FT_STATE.write_text(json.dumps({'active': 9}))
+    st, obj = e.get('/api/swarms/4/places')
+    assert obj['active_fast_track'] == 9
+    ready = {p['key']: p for p in obj['places']}[board.READY]['cards']
+    assert [c['number'] for c in ready][:2] == [5, 9]
+    ready6 = {p['key']: p for p in e.get('/api/swarms/6/places')[1]['places']}[board.READY]['cards']
+    assert [c['number'] for c in ready6] == [12, 11] and ready6[0]['ft']

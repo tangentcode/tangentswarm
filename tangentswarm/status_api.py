@@ -185,7 +185,10 @@ ITEMS_Q = """query($org:String!,$n:Int!,$c:String){organization(login:$org){proj
  items(first:100, after:$c){pageInfo{hasNextPage endCursor} nodes{id
   fieldValueByName(name:"Status"){...on ProjectV2ItemFieldSingleSelectValue{name optionId}}
   content{__typename ...on PullRequest{number title state isDraft headRefOid repository{nameWithOwner}
-   labels(first:15){nodes{name}}} ...on Issue{number title state repository{nameWithOwner}
+   milestone{title dueOn} labels(first:15){nodes{name}}
+   closingIssuesReferences(first:5){nodes{number repository{nameWithOwner} milestone{title dueOn}
+    labels(first:10){nodes{name}}}}}
+   ...on Issue{number title state repository{nameWithOwner} milestone{title dueOn}
    labels(first:10){nodes{name}}}}}}}}}"""
 
 
@@ -194,12 +197,20 @@ def _labels(c):
 
 
 def _card(it, c):
+    """One card, with the same priority inputs the pickers give board.pick_key (Codex on PR
+    #74; promoted.read_board, boards.open_prs): the labels of the card and of the issues a PR
+    closes in its own repo, and the soonest milestone due date among them."""
     kind = 'pr' if c.get('__typename') == 'PullRequest' else 'issue'
     repo = (c.get('repository') or {}).get('nameWithOwner') or ''
-    labels = _labels(c)
+    closes = [i for i in ((c.get('closingIssuesReferences') or {}).get('nodes') or [])
+              if (i.get('repository') or {}).get('nameWithOwner', repo) == repo]   # never another repo's #N
+    own = _labels(c)
+    labels = own + [l for i in closes for l in _labels(i)]
+    due, ms = board.soonest_due([c.get('milestone') or {}] + [i.get('milestone') or {} for i in closes])
     return {'number': c['number'], 'repo': repo, 'kind': kind, 'title': c.get('title') or '',
             'item': it['id'], 'col': board.column(it.get('fieldValueByName')),
-            'draft': bool(c.get('isDraft')), 'head': c.get('headRefOid'), 'labels': labels,
+            'draft': bool(c.get('isDraft')), 'head': c.get('headRefOid'), 'labels': labels, 'own_labels': own,
+            'closes': [i['number'] for i in closes], 'due': due, 'milestone': ms,
             'ft': board.is_fast_track(labels),
             'url': f"https://github.com/{repo}/{'pull' if kind == 'pr' else 'issues'}/{c['number']}"}
 
@@ -297,7 +308,7 @@ def swarms():
              'path': f'/api/swarms/{b.number}'} for b in board.BOARDS]
 
 
-def places(b, cards):
+def places(b, cards, active=None):
     """[{key, name, count, cards}] in board order; a card in an unknown column gets its own place."""
     by = {}
     for c in cards:
@@ -306,7 +317,7 @@ def places(b, cards):
     keys += sorted(k for k in by if k not in keys)
     out = []
     for k in keys:
-        cs = sorted(by.get(k, []), key=lambda c: board.pick_key(c))
+        cs = sorted(by.get(k, []), key=lambda c: board.pick_key(c, active))
         out.append({'key': k, 'name': DISPLAY.get(k, k), 'count': len(cs), 'cards': cs})
     return out
 
@@ -603,7 +614,10 @@ def _swarms(ctx, who, qs, body):
 @route('GET', r'/api/swarms/(?P<b>\d+)/places')
 def _places(ctx, who, qs, body, b):
     bd = swarm(int(b))
-    return {'board': bd.number, 'at': time.time(), 'places': places(bd, ctx.src.cards(bd))}
+    # the active fast-track ticket is a Project 4 number (boardflow.promote passes None elsewhere)
+    active = board.active_fast_track() if bd is board.DEFAULT else None
+    return {'board': bd.number, 'at': time.time(), 'active_fast_track': active,
+            'places': places(bd, ctx.src.cards(bd), active)}
 
 
 @route('GET', r'/api/swarms/(?P<b>\d+)/transitions')
