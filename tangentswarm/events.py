@@ -6,12 +6,16 @@ that already had an event: mn-workflow.timer (a pass 5 minutes after the last on
 Codex finding into a draft and relays it) and the Codex-result poll before the MinBot check.
 
 The swarm-promoted daemon reads the new lines every second (only the file size, until it
-grows) and, for the platform repo:
+grows) and:
 
-  pull_request_review (any reviewer), or a Codex comment on a PR
+  a submitted pull_request_review (any reviewer), or a Codex comment on a PR, in a repo that
+  mn-workflow runs for (the "repos" of MN_CONFIG; the platform repo if it cannot be read)
       -> start mn-workflow.service now (no-block). A pass already running: start it again
-         once that pass ends, so the event is never lost. mn-workflow's own flock prevents
-         overlap; its 5-minute timer stays as a slow backstop.
+         once that pass ends, so the event is never lost. That wanted pass is kept in
+         MN_PENDING, so a daemon restart does not lose it either. mn-workflow's own flock
+         prevents overlap; its 5-minute timer stays as a slow backstop.
+
+For the platform repo only (swarm-webhook queues the other repos' MinBot checks itself):
   pull_request edited (a body edit, such as added screenshots) on a PR whose pull waits or
   is held -> a cascade pass now (re-runs its gate), and the MinBot check.
   a Codex review, or a Codex comment on a PR (a review summary, a receipt)
@@ -34,6 +38,9 @@ OFFSET = Path(os.environ.get('SWARM_EVENTS_OFFSET', str(STATE_DIR / 'events.offs
 REPO = 'tangentcode/platform'
 CODEX = 'chatgpt-codex-connector'
 MN_UNIT = os.environ.get('SWARM_MN_UNIT', 'mn-workflow.service')
+MN_CONFIG = Path(os.environ.get('SWARM_MN_CONFIG', str(HOME / 'ver' / 'mn-workflow' / 'config.json')))
+MN_PENDING = Path(os.environ.get('SWARM_MN_PENDING', str(STATE_DIR / 'mn-pending')))
+REVIEW_ACTIONS = ('submitted', None, '')  # an old record without "action" is a submit
 
 
 def _size(path):
@@ -109,35 +116,89 @@ def is_codex(login):
     return (login or '').startswith(CODEX)
 
 
-def actions(rec):
-    """[(kind, PR number, why)] for one event record: kind 'mn' or 'minbot'."""
-    if rec.get('repo') != REPO:
-        return []
+def mn_repos(path=None):
+    """The repos mn-workflow runs for, lower case: the keys of "repos" in its config. The
+    platform repo alone when the config cannot be read."""
+    try:
+        repos = json.loads((path or MN_CONFIG).read_text()).get('repos') or {}
+        out = {str(r).lower() for r in repos}
+    except (OSError, ValueError, AttributeError):
+        out = set()
+    return out or {REPO}
+
+
+def _short(repo):
+    return 'platform' if repo == REPO else repo
+
+
+def actions(rec, repos=None):
+    """[(kind, PR number, why)] for one event record: kind 'mn', 'minbot' or 'gate'.
+    repos: the repos mn-workflow runs for (mn_repos())."""
+    repo = rec.get('repo') or ''
     ev = rec.get('event')
+    mn_ok = repo.lower() in (repos if repos is not None else mn_repos())
+    if repo != REPO and not mn_ok:
+        return []
+    platform = repo == REPO
     if ev == 'pull_request_review' and rec.get('pr'):
+        if rec.get('action') not in REVIEW_ACTIONS:  # edited or dismissed: no new finding
+            return []
         n = rec['pr']
-        why = f"pull_request_review on platform#{n} by {rec.get('reviewer')}"
-        return [('mn', n, why)] + ([('minbot', n, why)] if is_codex(rec.get('reviewer')) else [])
+        why = f"pull_request_review on {_short(repo)}#{n} by {rec.get('reviewer')}"
+        return ([('mn', n, why)] if mn_ok else []) + \
+            ([('minbot', n, why)] if platform and is_codex(rec.get('reviewer')) else [])
+    if not platform:
+        if ev == 'issue_comment' and rec.get('is_pr') and is_codex(rec.get('commenter')) and rec.get('issue') \
+                and rec.get('action') in ('created', None, ''):
+            return [('mn', rec['issue'], f"Codex comment on {repo}#{rec['issue']}")]
+        return []
     if ev == 'pull_request' and rec.get('action') == 'edited' and rec.get('pr'):
         n = rec['pr']
         why = f"pull_request edited on platform#{n} (a body edit: screenshots?)"
         return [('gate', n, why), ('minbot', n, why)]
-    if ev == 'issue_comment' and rec.get('is_pr') and is_codex(rec.get('commenter')) and rec.get('issue'):
+    if ev == 'issue_comment' and rec.get('is_pr') and is_codex(rec.get('commenter')) and rec.get('issue') \
+            and rec.get('action') in ('created', None, ''):  # an edited comment is no new result
         n = rec['issue']
         why = f"Codex comment on platform#{n}"
-        return [('mn', n, why), ('minbot', n, why)]
+        return ([('mn', n, why)] if mn_ok else []) + [('minbot', n, why)]
     return []
 
 
 class Events:
     """The daemon's event reader. poll() returns the lines to log."""
 
-    def __init__(self, dry=False, run=subprocess.run, enqueue=None, events=None, offset=None, cascade=None):
+    def __init__(self, dry=False, run=subprocess.run, enqueue=None, events=None, offset=None, cascade=None,
+                 pending_file=None, mn_config=None):
         self.dry, self.run = dry, run
         self.cascade = cascade
         self.enqueue = enqueue
         self.events, self.offset = events, offset
-        self.mn_pending = None  # why: an mn-workflow pass is wanted once the running one ends
+        self.pending_file = pending_file or MN_PENDING
+        self.mn_config = mn_config
+        try:  # a pass wanted before a daemon restart is still wanted
+            self._mn_pending = self.pending_file.read_text().strip() or None
+        except OSError:
+            self._mn_pending = None
+
+    @property
+    def mn_pending(self):
+        """why: an mn-workflow pass is wanted once the running one ends (kept in pending_file)."""
+        return self._mn_pending
+
+    @mn_pending.setter
+    def mn_pending(self, why):
+        if why == self._mn_pending:
+            return
+        self._mn_pending = why
+        if self.dry:
+            return
+        try:
+            if why:
+                _save(self.pending_file, why)
+            else:
+                self.pending_file.unlink(missing_ok=True)
+        except OSError:
+            pass  # the in-memory flag still works; the timer is the backstop
 
     def mn_active(self):
         r = self.run(['systemctl', '--user', 'is-active', MN_UNIT], capture_output=True, text=True, timeout=30)
@@ -169,8 +230,10 @@ class Events:
     def poll(self):
         lines = []
         mn, minbot, gate = None, {}, {}
-        for rec in new_records(self.events, self.offset, save=not self.dry):
-            for kind, n, why in actions(rec):
+        recs = new_records(self.events, self.offset, save=not self.dry)
+        repos = mn_repos(self.mn_config) if recs else set()
+        for rec in recs:
+            for kind, n, why in actions(rec, repos):
                 if kind == 'mn':
                     mn = mn or why
                 elif kind == 'gate':
