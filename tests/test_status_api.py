@@ -485,3 +485,16 @@ def test_places_order_and_fast_track_match_the_pickers(tmp_path):
     assert [c['number'] for c in ready][:2] == [5, 9]
     ready6 = {p['key']: p for p in e.get('/api/swarms/6/places')[1]['places']}[board.READY]['cards']
     assert [c['number'] for c in ready6] == [12, 11] and ready6[0]['ft']
+
+
+def test_answer_makes_the_pr_a_draft_but_not_an_issue(tmp_path):
+    """tangentswarm #95: In Progress PRs are drafts."""
+    o6 = board.BOARDS[1].option
+    e = Env(tmp_path, nodes4=[node(12, board.NEEDS_INPUT), node(14, board.NEEDS_INPUT, 'Issue')],
+            nodes6=[node(3, board.NEEDS_INPUT, repo='tangentcode/methodology', item='b', board_opts=o6)])
+    assert e.post('/api/swarms/4/cards/12/answer', {'body': 'Yes.'})[0] == 200
+    assert board.DRAFTED == [(12, 'tangentcode/platform')]
+    assert e.post('/api/swarms/4/cards/14/answer', {'body': 'Yes.'})[0] == 200
+    assert board.DRAFTED == [(12, 'tangentcode/platform')]
+    assert e.post('/api/swarms/6/cards/3/answer', {'body': 'Yes.'})[0] == 200
+    assert board.DRAFTED[-1] == (3, 'tangentcode/methodology')

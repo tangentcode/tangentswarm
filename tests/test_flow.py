@@ -569,7 +569,7 @@ def test_a_held_ready_head_is_handed_off_again_when_a_worker_can_take_it(tmp_pat
     moves, rcs = [], [3, 0]
     f = F.Flow(dry_run=False, out=lambda l: None, g={'OPT': {}, 'project_id': lambda: 'P', 'STATUS_FIELD': 'S'})
     f.give_worker = lambda n, text: (rcs.pop(0), 'x')
-    monkeypatch.setattr(board, 'move_card', lambda g, item, col, sh=None, n=None: moves.append((item, col)))
+    monkeypatch.setattr(board, 'move_card', lambda g, item, col, sh=None, n=None, **k: moves.append((item, col)))
     cols = {board.READY: [dict(number=7, head='h' * 40, item='I7')]}
     f.retry_held(cols, now=10_000)
     assert moves == [] and F.held()[7]['tried'] == 10_000

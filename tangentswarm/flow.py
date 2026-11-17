@@ -1088,7 +1088,7 @@ class Flow:
                 self.note(f"NEEDS_WORKER #{n}: retried the held handoff; still no worker ({said})")
                 continue
             unhold(n)
-            board.move_card(self.g, p['item'], board.IN_PROGRESS, n=n)
+            board.move_card(self.g, p['item'], board.IN_PROGRESS, n=n, repo=REPO)
             from . import moves
             moves.log_move(n, board.READY, 'In Progress', p.get('head', ''), note=('held: ' + h.get('why', ''))[:120])
             self.change(f"#{n} -> In Progress: the held handoff reached its worker ({said})")
@@ -1160,7 +1160,7 @@ class Flow:
             self.note(f"NEEDS_WORKER #{n}: {reason[:160]}; the card stays in {p.get('col') or '?'} because no "
                       f"worker could be started ({said}); its head is held from new pulls")
             return False
-        board.move_card(self.g, p['item'], board.IN_PROGRESS, n=n)
+        board.move_card(self.g, p['item'], board.IN_PROGRESS, n=n, repo=REPO)
         from . import moves
         moves.log_move(n, p.get('col') or '?', 'In Progress', p.get('head', ''), note=reason[:120])
         self.change(f"#{n} -> In Progress: {reason[:200]} (its worker has the relay: {said})")

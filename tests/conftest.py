@@ -28,6 +28,10 @@ def isolated_state(tmp_path, monkeypatch):
             monkeypatch.delenv(var, raising=False)
     from tangentswarm import board
     monkeypatch.setattr(board, 'FT_STATE', tmp_path / 'swarm-fasttrack.json')
+    drafted = []  # tangentswarm #95: never a real gh pr ready --undo in a test
+    monkeypatch.setattr(board, 'REAL_MAKE_DRAFT', board.make_draft, raising=False)
+    monkeypatch.setattr(board, 'make_draft', lambda n, repo, sh=None: drafted.append((n, repo)) or True)
+    monkeypatch.setattr(board, 'DRAFTED', drafted, raising=False)
     from tangentswarm import moves
     monkeypatch.setattr(moves, 'LOG', tmp_path / 'moves.log')
     monkeypatch.setattr(moves, 'SEEN', tmp_path / 'ready-seen.json')

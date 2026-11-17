@@ -70,7 +70,7 @@ class Rig:
                              alert=lambda text, key, pr=None, st=None: self.alerts.append((text, key)) or True,
                              wake=lambda why, key, pr=None, detail=None: self.wakes.append((why, detail)),
                              incident=lambda key, title, what, **kw: self.incidents.append(title),
-                             move=lambda item, col: self.moves.append((item, col)),
+                             move=lambda item, col, n=None: self.moves.append((item, col)),
                              kill=lambda pid: self.killed.append(pid) or [pid], hung_sample=lambda: {},
                              on_main=lambda head, n: False, out=lambda line: None)
 
