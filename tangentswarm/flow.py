@@ -1091,7 +1091,8 @@ class Flow:
             return
         full = self.g['fetch'](n, refresh=True)
         if d.get('pre_merged') and p['col'] == board.READY and not p.get('draft'):
-            why = self.identity_problem(d, full) or self.evidence_problem(full) or self.work_health(full)
+            why = (self.identity_problem(d, full) or self.evidence_problem(full) or self.work_health(full)
+                   or self.main_problem(scratch, d))
             if not why:
                 return self.stage(d, p, served, full)  # tangentswarm #136: no gate re-run for a Ready PR
             # Codex on PR #138: Ready does not prove 7a/7b (a UI PR may reach Ready while its
@@ -1164,7 +1165,8 @@ class Flow:
         that renders, when the PR needs them), 7b the where-to-see line, and 8 no later human
         request; and the tangentswarm #130 hold (a body that states where the PR stands). Why
         one fails, or None. The other rows: 1 is identity_problem; 2 and 9 the
-        pre-merge onto future main; 3, 4 and 5 the MinBot pass at this head (Ready); 6 the
+        pre-merge onto future main, and 2 again against the current main (main_problem);
+        3, 4 and 5 the MinBot pass at this head (Ready); 6 the
         work health (work_health) and the served check in stage(). No hr-gate run; hr-gate's
         own 7a check when it is loaded."""
         from . import gatechecks
@@ -1188,6 +1190,24 @@ class Flow:
         if later:
             return f"8: {len(later)} later {gatechecks.HUMAN} {later[0][0]}(s) after the head"
         return None
+
+    def main_problem(self, scratch, d):
+        """Codex on PR #138: row 2 again at the move. Main can move while the pull waits for its
+        deploy, and the pre-merge was built on the main of the pull time. A local merge-tree of
+        the head onto CURRENT origin/main (hr-gate row 2; the conflict map keeps the answer per
+        SHA pair). Why it fails or cannot be checked, or None. A conflict takes the full gate
+        path, which sends the PR to rework with a merge-main relay (gate_conflicts)."""
+        if scratch is None:
+            return '2: no scratch repo for the merge check'
+        try:
+            scratch.ensure_main()
+            main = self.sha_of(scratch, scratch.main)
+            scratch.ensure(d['head'])
+            clean = self.clean(scratch, main, d['head'])
+            self.cmap.save()
+        except Exception as e:
+            return f"2: merge check failed: {type(e).__name__}: {str(e)[:120]}"
+        return None if clean else f"2: head {d['head'][:8]} conflicts with origin/main {str(main)[:8]}"
 
     def work_health(self, full):
         """Codex on PR #138: condition 6's entry safeguard (gatechecks.work_problem: conflict
