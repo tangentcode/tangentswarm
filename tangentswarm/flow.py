@@ -182,9 +182,13 @@ def held():
     """{PR number: {head, why}}: PRs whose failed pull found no worker (not pulled again at
     that head)."""
     try:
-        return {int(k): v for k, v in json.loads(HELD.read_text()).items()}
+        d = {int(k): v for k, v in json.loads(HELD.read_text()).items()}
     except (OSError, ValueError):
         return {}
+    for h in d.values():  # Codex on PR #103: a hold from before 'at' starts at its first 'tried'
+        if isinstance(h, dict) and 'at' not in h:
+            h['at'] = h.get('tried')
+    return d
 
 
 @contextlib.contextmanager
@@ -209,7 +213,7 @@ def hold(n, head, why, relay=None, tried=None):
         now = time.time()
         d[n] = {'head': head, 'why': why[:200], 'relay': str(relay) if relay else None,
                 'tried': now if tried is None else tried,
-                'at': old.get('at', old.get('tried', now)) if old.get('head') == head else now}
+                'at': old['at'] if old.get('head') == head and old.get('at') is not None else now}
 
 
 def unhold(n, only_if=None):
@@ -262,7 +266,7 @@ def gate_passed_holds(log_text, hd=None):
     for n, h in (held() if hd is None else hd).items():
         head = str(h.get('head') or '')
         t = times.get((f'#{n}', head[:8])) if head else None
-        at = float(h.get('at', h.get('tried')) or 0)
+        at = float(h.get('at') or 0)
         if t is not None and t.timestamp() >= at:
             out[n] = h
     return out

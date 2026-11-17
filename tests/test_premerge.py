@@ -834,3 +834,43 @@ def test_a_failed_handoff_retry_marks_only_the_hold_it_retried(tmp_path):
     f.give_worker = newer
     f.retry_held({RD: [dict(number=7, head='a' * 40, item='I7')]}, now=2 * 10 ** 9)
     assert flow.held()[7]['head'] == 'b' * 40 and flow.held()[7]['tried'] == 5
+
+
+def legacy_hold(n, head, tried, relay=None):
+    """A held.json entry written before 'at' existed."""
+    import json
+    flow.HELD.parent.mkdir(parents=True, exist_ok=True)
+    flow.HELD.write_text(json.dumps({str(n): {'head': head, 'why': '7b where-to-see line: missing',
+                                              'relay': str(relay) if relay else None, 'tried': tried}}))
+
+
+def test_a_legacy_hold_starts_at_its_tried_time():
+    """Codex on PR #103 (d1184f0): held() gives a hold from before 'at' its 'tried' as 'at'."""
+    legacy_hold(7, 'a' * 40, 100.0)
+    assert flow.held()[7]['at'] == 100.0
+
+
+def test_a_failed_retry_of_a_legacy_hold_keeps_its_start_so_an_earlier_gate_pass_still_releases_it(tmp_path):
+    """Codex on PR #103 (d1184f0): legacy hold tried=T, a gate pass at T+60, then a failed
+    retry (Staging full: no pull_batch, so no gate-pass release in that pass). The retry
+    used to move the start to its own time, and the pass no longer counted."""
+    import time as _t
+    relay = tmp_path / 'relay-7-gate.md'
+    relay.write_text('fix it\n')
+    start = _t.time() - 3600
+    legacy_hold(7, 'a' * 40, start, relay=relay)
+    f = flow.Flow(out=lambda line: None, g={}, now=lambda: 10_000)
+    f.give_worker = lambda n, text, priority=False: (3, 'no worker')
+    f.retry_held({RD: [dict(number=7, head='a' * 40, item='I7')]}, now=_t.time())
+    h = flow.held()[7]
+    assert h['at'] == start and h['tried'] > start
+    log = '\t'.join([iso(-3600 + 60), 'apply', '#7', 'a' * 8, 'PASS', 'fail=-']) + '\n'
+    assert set(flow.gate_passed_holds(log)) == {7}
+
+
+def test_a_new_hold_on_a_legacy_hold_at_the_same_head_keeps_its_start():
+    legacy_hold(7, 'a' * 40, 100.0)
+    flow.hold(7, 'a' * 40, 'why', tried=500.0)
+    assert flow.held()[7]['at'] == 100.0
+    flow.hold(7, 'b' * 40, 'why', tried=600.0)
+    assert flow.held()[7]['at'] != 100.0
