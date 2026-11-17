@@ -39,7 +39,9 @@ def test_another_repo_queues_its_own_minbot_check_and_board_promote_and_wakes_fo
     ex = Fake6(col=board.AUTO_REVIEW, full=codex_pr(findings=True))
     ex.give = None
     ex.run(W.Action('codex', 47, args={'repo': TS}))
-    assert ex.relays == [] and ex.calls == [] and 'no worker relay for tangentcode/tangentswarm' in ex.wakes[0]['why']
+    # tangentswarm #99: no live worker: one log line, no wake
+    assert ex.relays == [] and ex.calls == [] and ex.wakes == []
+    assert any(d.startswith(f'{TS}#47: Codex findings') and 'logged only' in d for d in ex.done)
 
 
 def test_a_project_6_card_move_carries_its_board():
@@ -137,16 +139,31 @@ def test_a_project_6_pr_is_fast_track_by_its_own_labels(monkeypatch, clean_now):
     assert boardflow.promote(adv, B6) == [40, 30]
 
 
-def test_same_number_findings_in_two_repos_both_wake():
+def test_same_number_ci_failures_in_two_repos_both_wake(monkeypatch):
     """Codex on PR #47: the wake key had no repo, so the second repo's handoff was lost."""
+    from tangentswarm import advance as A
+    monkeypatch.setattr(A, 'check_runs', lambda h, repo=None: [{'name': 't', 'status': 'completed',
+                                                               'conclusion': 'failure'}])
     wakes = []
     for repo in (TS, 'tangentcode/methodology'):
-        ex = Fake6(col=board.AUTO_REVIEW, full=codex_pr(findings=True))
+        ex = Fake6(col=board.AUTO_REVIEW, full=codex_pr('c' * 40))
         ex.give, ex.wake_post = None, wakes.append
-        ex.run(W.Action('codex', 47, args={'repo': repo}))
+        ex.run(W.Action('ci', 47, args={'repo': repo, 'sha': 'c' * 40}))
     keys = [k for k in W._seen()['wake'] if k.startswith('tangentcode/')]
     assert sorted(k.split(':')[0] for k in keys) == ['tangentcode/methodology', TS]  # both kept, none deduped
     assert wakes[0]['why'].startswith(TS + ':')
+
+
+def test_same_number_codex_findings_in_two_repos_are_both_logged():
+    """tangentswarm #99: the no-wake log key names the repo too, so neither is deduped."""
+    done = []
+    for repo in (TS, 'tangentcode/methodology'):
+        ex = Fake6(col=board.AUTO_REVIEW, full=codex_pr(findings=True))
+        ex.give = None
+        ex.run(W.Action('codex', 47, args={'repo': repo}))
+        done += [d for d in ex.done if 'logged only' in d]
+        assert ex.wakes == []
+    assert [d.split('#')[0] for d in done] == [TS, 'tangentcode/methodology']
 
 
 def test_a_ready_pr_that_conflicts_now_is_not_promoted(monkeypatch, clean_now):

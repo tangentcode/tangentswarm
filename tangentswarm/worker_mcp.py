@@ -72,17 +72,12 @@ def worktree():
     return top
 
 
-P6_PREFIX = {'tangentswarm.': 'tangentcode/tangentswarm', 'methodology.': 'tangentcode/methodology'}
-
-
 def project6_repo(wt):
     """The Project 6 repo of a worker worktree ~/ver/tangentswarm.<slug> or
-    ~/ver/methodology.<slug> (tangentswarm #19), else None."""
+    ~/ver/methodology.<slug> (tangentswarm #19), else None (slots.project6_repo: the webhook
+    relay finds the same worktrees, tangentswarm #99)."""
     from . import slots
-    p = Path(wt or '')
-    if p.parent != slots.WORKTREE_PARENT:
-        return None
-    return next((repo for pre, repo in P6_PREFIX.items() if p.name.startswith(pre) and len(p.name) > len(pre)), None)
+    return slots.project6_repo(wt)
 
 
 def p6_pr(repo, branch, sh=None):

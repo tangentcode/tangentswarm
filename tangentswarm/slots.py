@@ -159,9 +159,25 @@ def _branch_of(cwd):
     return (sanity.git_info(root)[1] or '') if root else ''
 
 
-def running(sessions=None, alive=_alive, branch_of=None):
-    """[{pid, session, cwd, pane, status, branch}] for live Claudes in platform worktrees."""
+# Project 6 worker worktrees (tangentswarm #19): ~/ver/tangentswarm.<slug>, ~/ver/methodology.<slug>.
+P6_PREFIX = {'tangentswarm.': 'tangentcode/tangentswarm', 'methodology.': 'tangentcode/methodology'}
+
+
+def project6_repo(cwd):
+    """The Project 6 repo of a worker worktree ~/ver/tangentswarm.<slug> or
+    ~/ver/methodology.<slug> (tangentswarm #19), else None. The main checkouts are not ones."""
+    p = Path(cwd or '')
+    if p.parent != WORKTREE_PARENT:
+        return None
+    return next((repo for pre, repo in P6_PREFIX.items() if p.name.startswith(pre) and len(p.name) > len(pre)), None)
+
+
+def running(sessions=None, alive=None, branch_of=None, where=None):
+    """[{pid, session, cwd, pane, status, branch}] for live Claudes in platform worktrees.
+    where: another test of the session's cwd (tangentswarm #99: a Project 6 repo's worktrees)."""
     branch_of = branch_of or _branch_of
+    alive = alive or _alive
+    where = where or is_platform_worktree
     out = []
     for f in sorted((sessions or SESSIONS).glob('*.json')):
         try:
@@ -169,7 +185,7 @@ def running(sessions=None, alive=_alive, branch_of=None):
             pid = int(d.get('pid') or f.stem)
         except (OSError, ValueError, TypeError):
             continue
-        if not is_platform_worktree(d.get('cwd')) or not alive(pid):
+        if not where(d.get('cwd')) or not alive(pid):
             continue
         tm = d.get('tmux') or ''  # "agents:@<window>.%<pane>"
         pane = tm.rsplit('.', 1)[-1] if tm.startswith(TMUX_SESSION + ':') else ''
@@ -640,6 +656,48 @@ def tell_worker(n, text, sp=None, host=None, out=print):
     host.tell(existing['pane'], one_line(text))
     _event('tell', pr=n, actor=window, notes=[one_line(text)[:600]])
     return True
+
+
+def p6_worker(repo, branch, claudes=None, sessions=None, alive=None, branch_of=None):
+    """The live Claude of a Project 6 PR (tangentswarm #99): the one in a worktree of repo
+    whose branch is the PR's head branch and that runs in a pane of the agents session.
+    (claude, None), or (None, why not)."""
+    if not branch:
+        return None, 'the PR head branch is unknown'
+    if claudes is None:
+        claudes = running(sessions, alive, branch_of, where=lambda cwd: project6_repo(cwd) == repo)
+    mine = [c for c in claudes if c.get('branch') == branch]
+    if not mine:
+        return None, f"no live Claude in a {repo} worktree on branch {branch}"
+    with_pane = [c for c in mine if c.get('pane')]
+    if not with_pane:
+        return None, f"the Claude of branch {branch} ({mine[0]['cwd']}) has no {TMUX_SESSION} pane"
+    if len(with_pane) > 1:
+        return None, f"{len(with_pane)} live Claudes on branch {branch}: " + ', '.join(c['cwd'] for c in with_pane)
+    return with_pane[0], None
+
+
+def tell_p6(repo, n, branch, text, claudes=None, tell=None):
+    """(ok, note): send one line to the live Claude of Project 6 PR repo#n (tangentswarm #99).
+    No resume and no rework slot: a Project 6 worker that is not running is not started.
+    tell(pane, text): the send (tests); else swarm_parking's Host.tell (an empty prompt first)."""
+    try:
+        text = one_line(text)
+    except ValueError as e:
+        return False, f"refused: {e}"
+    c, why = p6_worker(repo, branch, claudes)
+    if c is None:
+        return False, why
+    try:
+        if tell:
+            tell(c['pane'], text)
+        else:
+            sp = parking()
+            make_host(sp).tell(c['pane'], text)
+    except Exception as e:
+        return False, f"{c['pane']}: not sent: {type(e).__name__}: {str(e)[:160]}"
+    _event('tell', pr=int(n), actor=f"{repo} {c['pane']}", notes=[text[:600]])
+    return True, f"sent to the live Claude of {repo}#{n} in {c['pane']} ({c['cwd']})"
 
 
 def relay_leftovers(n, cwd, out=print, path=None, find=None, tell=None):

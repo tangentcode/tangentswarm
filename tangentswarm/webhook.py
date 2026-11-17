@@ -18,7 +18,10 @@ SQLite event log (eventdb: a 'received' row before the reply, a 'handled' row af
            no open question; a pass moves the card to Ready and resolves addressed threads)
   cascade  set the rerun flag and queue `swarm-advance --cascade` for swarm-promoted
   codex    read the PR: findings on the head -> relay them to the worker (root-cause rule),
-           card In Progress; clean -> minbot + cascade; no result yet -> nothing
+           card In Progress; clean -> minbot + cascade; no result yet -> nothing. On Project 6
+           (tangentswarm #99) the worker is the live Claude in a tangentswarm.<slug> or
+           methodology.<slug> worktree on the PR's head branch; with none, the findings are
+           one deduped log line and swarmbot is not woken
   ci       a completed check suite on the PR head: red -> relay to the worker, card In
            Progress (only with a worker); green -> minbot (Auto Review) or cascade (Staging)
   handoff  a new head on a non-draft PR in In Progress or past it (or ready_for_review): mark
@@ -93,6 +96,11 @@ WORKER_STATUS = ('MERGE-READY', 'NEEDS-INPUT', 'BLOCKED', 'STEP-DONE')
 
 ROOT_CAUSE = ("ROOT-CAUSE RULE: fix the root cause, list the neighbor cases, add tests, and say which "
               "ones they cover. Fix and push; do not touch the Codex threads and do not post on GitHub.")
+# tangentswarm #99: a Project 6 worker replies on and resolves its Codex threads and asks for
+# the next review itself (its brief says so), so its relay keeps those steps.
+ROOT_CAUSE_P6 = ("ROOT-CAUSE RULE: fix the root cause, list the neighbor cases, add tests, and say which "
+                 "ones they cover. Fix and push, then follow your brief for the Codex threads and the next review.")
+P6_NO_WAKE = ('Codex findings',)  # tangentswarm #99: on Project 6, no live worker is logged only
 
 
 @dataclass
@@ -464,15 +472,28 @@ class Executor:
             return True, 'would relay to the worker'
         if self.give:
             return self.give(n, text)
-        if not self.platform():  # #45 phase 2: worker windows are named by platform PR number only
-            return False, f"no worker relay for {self.repo} yet"
+        if not self.platform():  # #99: the live Claude in a worktree on the PR's head branch
+            from . import slots
+            return slots.tell_p6(self.repo, n, self.head_branch(n), text)
         from . import flow
         return flow.Flow(dry_run=False, out=lambda l: None, g=self.g).hand_off(n, text)
+
+    def head_branch(self, n):
+        """The head branch name of PR n of this repo, or ''."""
+        owner, name = self.repo.split('/')
+        d = self.g['gql'](f'query{{repository(owner:"{owner}",name:"{name}"){{pullRequest(number:{int(n)})'
+                          '{headRefName}}}')
+        return (((d or {}).get('repository') or {}).get('pullRequest') or {}).get('headRefName') or ''
+
+    def root_cause(self):
+        return ROOT_CAUSE if self.platform() else ROOT_CAUSE_P6
 
     def back_to_work(self, n, text, why):
         """Relay, then In Progress, only when a worker has it (never demote into a column with
         no worker); else wake swarmbot. A merged or closed PR, or a card in Done, Canceled or
-        Parked, is left alone (Codex on PR #26: a late Codex or CI delivery restarted done work)."""
+        Parked, is left alone (Codex on PR #26: a late Codex or CI delivery restarted done work).
+        tangentswarm #99: Codex findings on a Project 6 PR with no live worker never wake
+        swarmbot; they are one deduped log line (the worker polls its own review)."""
         from . import advance
         state = (advance.codex_details(self.g['gql'], n, self.repo).get('state') or 'OPEN')
         item, col = self.card(n)
@@ -480,10 +501,30 @@ class Executor:
             return self.note(f"#{n}: {why}, but the PR is {state.lower()} and its card is in {col}: no rework")
         ok, said = self.to_worker(n, text)
         if not ok:
+            if not self.platform() and why in P6_NO_WAKE:
+                return self.log_once(n, f"{self.repo}#{n}: {why}; no live worker took the relay ({said}): logged only, "
+                                        "no swarmbot wake", key=f"{self.repo}:noworker:{n}:{why[:40]}")
             return self.wake(n, f"#{n}: {why}; no worker could take the relay ({said})", key=f'noworker:{n}:{why[:40]}')
         if item and col not in (board.IN_PROGRESS, board.NEEDS_INPUT):
             self.move(n, item, board.IN_PROGRESS)
         self.note(f"#{n} relayed to its worker ({said})")
+
+    def log_once(self, n, why, key, now=time.time):
+        """One note and one log line per key for WAKE_DEDUPE s, and no wake (tangentswarm #99)."""
+        if self.dry:
+            return self.note(f"would log: {why}")
+        t = now()
+        with _lock:
+            st = _seen()
+            last = st.setdefault('logged', {})
+            if t - float(last.get(key, 0)) < WAKE_DEDUPE:
+                return self.note(f"already logged: {why[:120]}")
+            last[key] = t
+            for k in [k for k, v in last.items() if t - float(v) >= WAKE_DEDUPE]:
+                del last[k]
+            _save_seen(st)
+        log(decision='logged-no-wake', pr=n or None, why=why)
+        self.note(why)
 
     def wake(self, n, why, key=None, now=time.time):
         """An exception for swarmbot: deduped by key for WAKE_DEDUPE s, and at most one POST
@@ -536,7 +577,7 @@ class Executor:
             codexrounds.result(a.pr, full.get('headRefOid'), status, detail)
         if status == 'findings':
             text = (f"Coordinator: #{a.pr}: Codex found issues on your head {full['headRefOid'][:8]} ({detail}). "
-                    f"Read them with: gh pr view {a.pr} --comments (and the review threads). {ROOT_CAUSE}")
+                    f"Read them with: gh pr view {a.pr} --comments (and the review threads). {self.root_cause()}")
             return self.back_to_work(a.pr, text, 'Codex findings')
         if status == 'clean':
             self.minbot(a.pr)
@@ -554,7 +595,7 @@ class Executor:
         item, col = self.card(a.pr)
         if problem:
             text = (f"Coordinator: #{a.pr}: {problem} (head {a.args['sha'][:8]}). Read the failed job log "
-                    f"(gh pr checks {a.pr}), fix the root cause, push. {ROOT_CAUSE}")
+                    f"(gh pr checks {a.pr}), fix the root cause, push. {self.root_cause()}")
             return self.back_to_work(a.pr, text, 'CI failed')
         if col == board.AUTO_REVIEW:
             return self.minbot(a.pr)
@@ -600,7 +641,7 @@ class Executor:
         if col not in (board.IN_PROGRESS, board.AUTO_REVIEW, board.READY, board.STAGING):
             return self.note(f"#{a.pr}: comment while in {col}: no relay")
         text = (f"Coordinator: #{a.pr}: {a.args.get('author')} commented ({a.args.get('url')}): "
-                f"{' '.join((a.args.get('body') or '').split())[:600]} {ROOT_CAUSE}")
+                f"{' '.join((a.args.get('body') or '').split())[:600]} {self.root_cause()}")
         self.back_to_work(a.pr, text, f"comment by {a.args.get('author')}")
 
     def do_issue_comment(self, a):
