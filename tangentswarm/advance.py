@@ -14,7 +14,10 @@ the first useful step, nearest Human Review first:
                no open Codex threads), not a draft, merges onto main and has green Linux
                CI (hr-gate conditions 1, 2, 3, 5): post the MinBot pass comment that
                names the head (hr-gate condition 4 reads it; the MinBot-passed label
-               is retired), and move the card to Ready.
+               is retired), and move the card to Ready. An Auto Review PR that stays only
+               because of an open Codex thread on its head or a conflict with main goes back
+               to rework (tangentswarm #102): draft, In Progress, and its Claude revived with
+               the finding (or queued until a rework slot frees).
 
 Nothing to do: exit 0 with one summary line.
 
@@ -65,7 +68,7 @@ CODEX_FIELDS = """number state isDraft headRefOid baseRefName mergeable body
  comments(last:40){nodes{author{login} body createdAt}}
  commits(last:1){nodes{commit{committedDate}}}
  reviews(last:30){nodes{author{login} commit{oid} comments{totalCount}}}
- reviewThreads(last:60){nodes{id isResolved isOutdated comments(first:1){nodes{author{login} originalCommit{oid}}}}}"""
+ reviewThreads(last:60){nodes{id isResolved isOutdated comments(first:1){nodes{author{login} originalCommit{oid} path body}}}}"""
 
 
 def _codex(node):
@@ -81,6 +84,12 @@ def _open_codex_threads(pr):
     return [t for t in (pr.get('reviewThreads') or {}).get('nodes') or []
             if not t.get('isResolved') and not t.get('isOutdated')
             and _codex(((t.get('comments') or {}).get('nodes') or [{}])[0])]
+
+
+def head_threads(pr):
+    """The open, not outdated Codex threads on the head (or of unknown commit)."""
+    head = pr.get('headRefOid') or ''
+    return [t for t in _open_codex_threads(pr) if _thread_commit(t) in (head, None)]
 
 
 def _review_comments(r):
@@ -106,7 +115,7 @@ def codex_decision(pr):
     head = pr.get('headRefOid') or ''
     if not head:
         return 'pending', 'no head'
-    on_head = [t for t in _open_codex_threads(pr) if _thread_commit(t) in (head, None)]
+    on_head = head_threads(pr)
     if on_head:
         return 'findings', f'{len(on_head)} open Codex thread(s) on {head[:8]}'
     reviews = [r for r in (pr.get('reviews') or {}).get('nodes') or []
@@ -192,6 +201,34 @@ def ci_problem(runs):
     if running:
         return 'CI is still running: ' + ', '.join(f'"{n}"' for n in running)
     return None
+
+
+THREAD_TEXT_MAX = 600  # chars of one Codex thread in the rework feedback (slots.FEEDBACK_MAX is 4000)
+
+
+def thread_rework_text(n, head, threads):
+    """tangentswarm #102: the feedback for an Auto Review PR held by open Codex threads on its
+    head: the finding text of each thread, then the root-cause rule."""
+    from .webhook import ROOT_CAUSE
+    parts = []
+    for t in threads:
+        first = ((t.get('comments') or {}).get('nodes') or [{}])[0]
+        body = ' '.join((first.get('body') or '(no text)').split())
+        parts.append(f"[{first.get('path') or 'PR'}] {body[:THREAD_TEXT_MAX]}")
+    head_txt = (f"Coordinator: #{n} cannot leave Auto Review: {len(threads)} open Codex thread(s) on your head "
+                f"{head[:8]}. ")
+    tail = f" Read them with: gh pr view {n} --comments (and the review threads). {ROOT_CAUSE}"
+    room = 3800 - len(head_txt) - len(tail)
+    found = ' '.join(f"({i}) {x}" for i, x in enumerate(parts, 1))
+    return head_txt + (found if len(found) <= room else found[:room - 3] + '...') + tail
+
+
+def conflict_rework_text(n, head):
+    """tangentswarm #102: the feedback for an Auto Review PR that conflicts with main."""
+    return (f"Coordinator: #{n} cannot leave Auto Review: your head {head[:8]} conflicts with main "
+            "(GitHub mergeable is CONFLICTING). Merge origin/main and resolve the conflicts "
+            "(git fetch origin; git merge origin/main). Do not rebase and do not force-push. Run the tests, "
+            "push, and report the new head and the test counts.")
 
 
 def check_text(head, why):
@@ -283,8 +320,9 @@ class Advance:
             if q:
                 skipped.append(f"#{n} {q}")
                 continue
-            if d.get('mergeable') == 'CONFLICTING':  # cheap: no full hr-gate read for it
-                skipped.append(f"#{n} conflicts with main (GitHub mergeable)")
+            back = self.back_to_rework(p, d)  # cheap: no full hr-gate read for it
+            if back:
+                skipped.append(f"#{n} {back}")
                 continue
             if not codex_clean(d):
                 skipped.append(f"#{n} not Codex-clean on {p['head'][:8]}")
@@ -325,6 +363,51 @@ class Advance:
             flag_rerun(by=f'MinBot pass #{n}')
             self.out(f"#{n} reached Ready: cascade {queue_cascade()}")
         return 0
+
+    def back_to_rework(self, p, d):
+        """tangentswarm #102 (methodology #106: platform #528 and #546 sat in Auto Review for
+        hours with an open Codex thread on the head, #539 with a conflict with main): an Auto
+        Review PR that stays only because of an open, not outdated Codex thread on its head,
+        or because GitHub says it conflicts with main, goes back to rework. Its Claude is
+        revived with the finding text, or with "merge origin/main and resolve the conflicts";
+        the card moves to In Progress, and the PR becomes a draft (board.move_card). A revive
+        held for a rework slot is queued (slots.run_queued runs it when a slot frees), and the
+        card moves too. A refused revive (no worker can run) leaves the card in Auto Review
+        with a NEEDS_WORKER line, so the next check tries again. One revive per head and
+        reason. Returns the skip note, or None when neither reason holds."""
+        n, head = p['number'], p.get('head') or ''
+        if d.get('mergeable') == 'CONFLICTING':
+            kind, why, text = 'conflict', 'conflicts with main (GitHub mergeable)', conflict_rework_text(n, head)
+        else:
+            threads = head_threads(d)
+            if not threads:
+                return None
+            kind, why, text = 'codex', f"has {len(threads)} open Codex thread(s) on {head[:8]}", \
+                thread_rework_text(n, head, threads)
+        if self.dry:
+            self.out(f"would send #{n} back to rework ({why}): draft, Auto Review -> In Progress, revive")
+            return f"{why}: would go back to rework"
+        from . import moves, slots, tick
+        state = tick.State(tick.STATE_DIR / 'state.json')
+        key = f"ar-rework:{n}@{head}:{kind}"
+        if not state.done(key):
+            lines = []
+            try:
+                rc = slots.revive(n, text, out=lines.append, queue=True)
+            except Exception as e:
+                rc, lines = 1, [f"{type(e).__name__}: {str(e)[:160]}"]
+            said = lines[-1] if lines else f'rc={rc}'
+            if rc not in (0, 3):
+                self.out(f"NEEDS_WORKER #{n}: {why}; no worker could take the rework ({said}); "
+                         "the card stays in Auto Review")
+                return f"{why}: no worker for the rework"
+            state.mark(key)
+            self.out(f"#{n} {why}: its Claude " + ('has the feedback' if rc == 0 else 'is queued for a rework slot')
+                     + f" ({said})")
+        board.move_card(self.g, p['item'], board.IN_PROGRESS, n=n, repo=REPO)
+        moves.log_move(n, 'Auto Review', 'In Progress', head, note=f"swarm-advance: {why}"[:120])
+        self.out(f"NEEDS_REWORK #{n} {why}: Auto Review -> In Progress, draft")
+        return f"{why}: sent back to rework"
 
     def full_check(self, n):
         """None if hr-gate conditions 1, 2, 3 and 5 pass on the head, else the failed rows."""
@@ -436,9 +519,12 @@ class Cascade(Advance):
                    fast-track. The promote ran first in the pass, so a promote frees a slot
                    and the next pull starts in the same pass (Michal
                    2026-11-14 8:43 PM). Each move goes to the move log (tangentswarm.moves).
+      auto review  (tangentswarm #102) an Auto Review PR held by an open Codex thread on its
+                   head or a conflict with main goes back to rework (back_to_rework).
       park         (tangentswarm.slots) the Claude of each PR in Ready exits; its tmux
                    window, branch and worktree stay, and its session id is kept so that
-                   swarm-revive PR FEEDBACK can resume it in a rework slot.
+                   swarm-revive PR FEEDBACK can resume it in a rework slot. Then the queued
+                   revives run while a rework slot is free (slots.run_queued).
       3. signal    (tangentswarm.slots) fewer than NEW_SLOTS new-work Claudes run and Active
                    issues without a PR exist: print one START_CLAUDE line for swarmbot that
                    names the issues to start, in Ready order.
@@ -681,6 +767,36 @@ class Cascade(Advance):
         self.prs, cols = self.f.columns()
         return self.prs, cols
 
+    # -- Auto Review: back to rework (tangentswarm #102) -----------------------------
+    def auto_review(self, cols):
+        """Each Auto Review PR that stays only because of an open Codex thread on its head or
+        a conflict with main goes back to rework (Advance.back_to_rework). One GraphQL read
+        for all of them. A failure here never stops the cascade."""
+        ar = cols.get(board.AUTO_REVIEW, [])
+        if not ar:
+            return
+        try:
+            owner, name = REPO.split('/')
+            parts = ' '.join(f'p{p["number"]}: pullRequest(number:{int(p["number"])}){{{CODEX_FIELDS}}}' for p in ar)
+            data = self.g['gql'](f'query{{repository(owner:"{owner}",name:"{name}"){{{parts}}}}}')['repository']
+            details = {int(k[1:]): v for k, v in data.items() if v}
+            for p in ar:
+                d = details.get(p['number']) or {}
+                if d.get('state', 'OPEN') != 'OPEN' or d.get('headRefOid') != p.get('head') \
+                        or d.get('isDraft') or open_question(d):
+                    continue
+                self.back_to_rework(p, d)
+        except Exception as e:
+            self.out(f"auto review: skipped: {type(e).__name__}: {str(e)[:200]}")
+
+    def revive_queue(self):
+        """tangentswarm #102: the revives held for a rework slot run once a slot is free."""
+        from . import slots
+        try:
+            slots.run_queued(out=self.out, prs=getattr(self, 'prs', None), dry=self.dry)
+        except Exception as e:
+            self.out(f"revive queue: skipped: {type(e).__name__}: {str(e)[:200]}")
+
     # -- park --------------------------------------------------------------------
     def park(self, cols):
         """(a) Michal 2026-11-14 8:43 PM ET: the Claude of a PR in Ready exits (its window,
@@ -826,8 +942,10 @@ class Cascade(Advance):
         self.pulled = []
         cols = self.fill()
         self.unblock(cols, self.pulled)
+        self.auto_review(cols)
         self.park(cols)
-        self.f.retry_held(cols)  # after park: a parked worker may have freed a rework slot
+        self.revive_queue()  # after park: a parked worker may have freed a rework slot
+        self.f.retry_held(cols)
         self.flush()
         self.signal(cols)
         self.out(f"cascade: done in {int(self.clock() - t0)}s")

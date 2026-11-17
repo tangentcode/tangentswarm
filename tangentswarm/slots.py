@@ -26,6 +26,8 @@ State: ~/.local/state/swarm-flow/slots.json
   parked  {PR: {session, window, pane, worktree, branch, head, parked_at}}
   rework  {PR: {session, window, pane, worktree, branch, head, started, feedback}}
   relayed {PR: head} the head a rework relay was sent for (the cascade sends one per head)
+  queued  {PR: {text, why, at}} a revive held for a rework slot (tangentswarm #102); the
+          cascade runs it after its park step, when a slot is free (run_queued)
 
     swarm-slots              the running Claudes by slot, and the parked sessions
     swarm-slots --park [--dry-run]   park the Claude of each PR in Ready now
@@ -81,7 +83,7 @@ def load(path=None):
     return {'parked': dict(d.get('parked') or {}), 'rework': dict(d.get('rework') or {}),
             'relayed': dict(d.get('relayed') or {}), 'named': dict(d.get('named') or {}),
             'launching': dict(d.get('launching') or {}), 'unstarted': dict(d.get('unstarted') or {}),
-            'told': dict(d.get('told') or {})}
+            'told': dict(d.get('told') or {}), 'queued': dict(d.get('queued') or {})}
 
 
 def save(d, path=None):
@@ -735,9 +737,11 @@ def _event(event, **kw):
 
 
 def revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, path=None, refuse=None,
-           priority=False, capacity=None):
+           priority=False, capacity=None, queue=False):
     """(b) Resume PR n's Claude (claude --resume SESSION) in its window, in a rework slot,
     and send the feedback. 0 done, 1 refused or failed, 3 held (no rework slot or memory).
+    queue (tangentswarm #102): a held revive is kept in the queue, and the cascade runs it
+    when a rework slot frees (run_queued). A held swarm-revive ran nowhere before.
     Every non-dry call is one events DB row: 'resume' (a new Claude), 'feedback' (to a
     running one), or the hold or refusal (tangentswarm #32). priority (a conflict fix for fill,
     tangentswarm #65): no rework-slot wait; a new Claude starts only within conflict_capacity
@@ -750,6 +754,11 @@ def revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, path
     rc, error = None, None
     try:
         rc = _revive(n, text, dry, said, sp, host, claudes, path, refuse, priority, capacity)
+        if rc == 3 and queue and not dry:
+            queue_revive(n, text, lines[-1] if lines else 'held', path=path)
+            said(f"queued: #{n} is revived when a rework slot frees (the cascade runs the queue)")
+        elif rc == 0 and not dry and str(n).lstrip('#').isdigit():
+            unqueue(int(str(n).lstrip('#')), path=path)  # its Claude has feedback now: no stale retry
         return rc
     except Exception as e:
         error = f'{type(e).__name__}: {str(e)[:300]}'
@@ -760,6 +769,56 @@ def revive(n, text, dry=False, out=print, sp=None, host=None, claudes=None, path
             _event(ev, action={0: 'done', 1: 'refused', 3: 'held'}.get(rc, 'failed'),
                    pr=int(str(n).lstrip('#')) if str(n).lstrip('#').isdigit() else None,
                    notes=lines[-3:] + [one_line_safe(text)[:600]], error=error)
+
+
+def queue_revive(n, text, why='', path=None, now=None):
+    """Keep a held revive of PR n (tangentswarm #102). One entry per PR: a newer feedback
+    replaces the older one, and the entry keeps its place in the queue."""
+    n = int(str(n).lstrip('#'))
+    with update(path) as st:
+        old = st['queued'].get(str(n)) or {}
+        st['queued'][str(n)] = dict(text=text, why=str(why)[:200],
+                                    at=old.get('at') or (time.time() if now is None else now))
+
+
+def unqueue(n, path=None):
+    if str(n) not in load(path)['queued']:
+        return
+    with update(path) as st:
+        st['queued'].pop(str(n), None)
+
+
+def run_queued(out=print, prs=None, dry=False, path=None, revive_fn=None):
+    """Run the held revives, oldest first (tangentswarm #102: #539 stayed held after swarm-revive
+    exited 3, and nothing retried it). The cascade calls this after its park step, so a slot that
+    a park freed is used in the same pass. prs: the open board PRs; a queued PR that is not open
+    any more is dropped. The first revive that is still held ends the run: the slots are full.
+    Returns the PR numbers that were revived."""
+    q = load(path)['queued']
+    done = []
+    for k, rec in sorted(q.items(), key=lambda kv: float(kv[1].get('at') or 0)):
+        n = int(k)
+        if prs is not None and (prs.get(n) or {}).get('state', 'GONE') != 'OPEN':
+            out(f"revive queue: #{n} is not an open board PR: dropped")
+            if not dry:
+                unqueue(n, path)
+            continue
+        if dry:
+            out(f"revive queue: would revive #{n} ({(rec.get('why') or '')[:80]})")
+            continue
+        lines = []
+        rc = (revive_fn or revive)(n, rec.get('text') or '', out=lines.append, path=path)
+        last = lines[-1] if lines else f'rc={rc}'
+        if rc == 3:
+            out(f"revive queue: #{n} still held ({last}); {len(q) - len(done)} wait")
+            break
+        unqueue(n, path)
+        if rc == 0:
+            done.append(n)
+            out(f"revive queue: #{n} revived ({last})")
+        else:
+            out(f"NEEDS_WORKER #{n}: the queued revive was refused ({last}); dropped from the queue")
+    return done
 
 
 def one_line_safe(text):
@@ -893,6 +952,8 @@ def report(out=print, path=None):
     for k, r in sorted(st['parked'].items(), key=lambda kv: (not kv[0].isdigit(), int(kv[0]) if kv[0].isdigit() else kv[0])):
         label = f"#{k}" if k.isdigit() else k
         out(f"parked {label} {r.get('window') or r.get('pane')} session {r.get('session')} since {r.get('parked_at')}")
+    for k, r in sorted(st['queued'].items(), key=lambda kv: float(kv[1].get('at') or 0)):
+        out(f"queued revive #{k}: {(r.get('why') or 'held')[:100]}")
     return 0
 
 
@@ -919,6 +980,7 @@ def main(argv=None):
     if a.park:
         prs, cols = board_now()
         park_ready(prs, cols, dry=a.dry_run)
+        run_queued(prs=prs, dry=a.dry_run)  # tangentswarm #102: a park frees a rework slot
     return report()
 
 
@@ -930,7 +992,7 @@ def revive_main(argv=None):
     ap.add_argument('--dry-run', action='store_true', help='check and print the launch line; change nothing')
     a = ap.parse_args(argv)
     text = sys.stdin.read() if a.feedback == ['-'] else ' '.join(a.feedback)
-    return revive(a.pr, text, dry=a.dry_run)
+    return revive(a.pr, text, dry=a.dry_run, queue=True)  # tangentswarm #102: exit 3 = held and queued
 
 
 if __name__ == '__main__':
