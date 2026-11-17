@@ -16,6 +16,11 @@ each in its own process, outside swarm-workers.slice, and runs these steps:
      agents session: a bash shell in the worktree, then Claude in its own scope in
      swarm-workers.slice, then the brief line when its prompt is ready
 
+An issue and the PR that fixes it are always in the same repo (tangentswarm #114: a closing
+link works only within one repo, so tangentswarm #107 stayed open in Active after its PR,
+methodology #111, merged). The launch is refused, and says why, when it is asked for a PR in
+another repo (pr_repo) or when an open PR of another repo already closes the issue.
+
 Each step is safe to run again: an existing branch, open PR, card, brief, worktree or window
 is reused. A window that already runs an agent, or a worktree with a live Claude, starts
 nothing. Memory admission (launches.admits) is checked first: when it holds, nothing is
@@ -46,6 +51,19 @@ ITEM_Q = """query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,
 
 class Deferred(Exception):
     """Memory admission holds the start: nothing was made, and the issue stays in Backlog."""
+
+
+class CrossRepo(RuntimeError):
+    """The issue's PR would be in another repo: the launch is refused and nothing is made."""
+
+
+def cross_repo_why(repo, n, pr_repo, pr=None):
+    """Why a launch of repo#n with its PR in pr_repo is refused (tangentswarm #114)."""
+    what = f"its open PR {pr_repo}#{pr} is" if pr else "its PR would be"
+    return (f"{repo}#{n} was not launched: {what} in {pr_repo}, not in {repo}. An issue and the PR that fixes "
+            "it must be in the same repo: a closing link works only within one repo, so the issue would stay "
+            f"open and its card in Active after the merge. Close {repo}#{n} with a link and open a new issue "
+            f"in {pr_repo}, then launch that issue (or transfer the issue to {pr_repo}).")
 
 
 def brief_dir():
@@ -135,9 +153,10 @@ class P6Launcher:
     callable, so the tests run with no network, no tmux and no real git."""
 
     def __init__(self, repo, n, title, gql=None, sh=None, git=None, worktree=None, start=None,
-                 admit=None, refuse=None, briefs=None, agent_root=None, wt_branch=None):
+                 admit=None, refuse=None, briefs=None, agent_root=None, wt_branch=None, pr_repo=None):
         if repo not in REPOS:
             raise ValueError(f"{repo} is not a Project 6 repo")
+        self.pr_repo = pr_repo or repo  # where the PR is asked for; run() refuses another repo
         self.repo, self.n, self.title = repo, int(n), (title or '').strip() or f"Issue #{n}"
         self.name = repo.split('/')[1]
         self.board = board.for_repo(repo)
@@ -186,6 +205,18 @@ class P6Launcher:
         return [(p['number'], p.get('headRefName') or '')
                 for p in ((node.get('closedByPullRequestsReferences') or {}).get('nodes') or [])
                 if p.get('state') == 'OPEN' and (p.get('repository') or {}).get('nameWithOwner') == self.repo]
+
+    def other_repo_prs(self, node):
+        """[(repo, PR number)] of the open PRs of another repo that close the issue."""
+        return [((p.get('repository') or {}).get('nameWithOwner') or 'another repo', p['number'])
+                for p in ((node.get('closedByPullRequestsReferences') or {}).get('nodes') or [])
+                if p.get('state') == 'OPEN' and (p.get('repository') or {}).get('nameWithOwner') != self.repo]
+
+    def same_repo(self, node):
+        """Raise CrossRepo when an open PR of another repo already closes the issue
+        (tangentswarm #114): a second PR here would leave two PRs for one issue."""
+        for repo, pr in self.other_repo_prs(node)[:1]:
+            raise CrossRepo(cross_repo_why(self.repo, self.n, repo, pr=pr))
 
     def issue_item(self, n, node=None):
         """(state, item id, column) of issue or PR n on this board; item is None with no card."""
@@ -390,6 +421,8 @@ class P6Launcher:
         """Launch the issue. Returns the notes; raises Deferred (nothing made) or the failed
         step's error (the steps before it stay, and a run again goes on from there)."""
         from . import alerts
+        if self.pr_repo != self.repo:  # no read needed: refused before anything is made
+            raise CrossRepo(cross_repo_why(self.repo, self.n, self.pr_repo))
         with alerts.once_lock(f"p6launch:{self.repo}#{self.n}"):  # never two launches of one issue at once
             node = self.node(self.n)
             self.spec = node.get('body') or ''
@@ -397,6 +430,7 @@ class P6Launcher:
             if state and state != 'OPEN':
                 self.note(f"{self.repo}#{self.n} is {state.lower()}: no launch")
                 return self.notes
+            self.same_repo(node)
             ok, why = (self._admit or admit)()
             if not ok:
                 raise Deferred(f"memory or CPU admission holds the start ({why}); "
@@ -412,12 +446,14 @@ class P6Launcher:
         return self.notes
 
 
-def queue(repo, n, title, after=None, submit=None):
+def queue(repo, n, title, after=None, submit=None, pr_repo=None):
     """Queue one launch for the swarm-promoted daemon (spool op 'p6launch'). after: the
-    {repo, pr, head} of the merge whose pull asked for it. Returns the request id."""
+    {repo, pr, head} of the merge whose pull asked for it. pr_repo: the repo the PR is asked
+    for (default: the issue's; another one is refused). Returns the request id."""
     from . import spool
+    extra = {'pr_repo': pr_repo} if pr_repo else {}
     res = (submit or spool.submit)('p6launch', str(Path.home()), repo=repo, issue=int(n), title=title or '',
-                                   after=after or {})
+                                   after=after or {}, **extra)
     return res.get('queued')
 
 
@@ -482,14 +518,15 @@ RETRY_EVERY = 300  # s between retries of the kept MethBot exceptions
 
 
 def execute(req, launcher=None, tell=None):
-    """The spool op 'p6launch' (daemon side): {repo, issue, title, after}. A failed or deferred
-    launch asked for by a pull is one MethBot exception on the merged PR and head (key
-    launch:<repo>#<issue>)."""
+    """The spool op 'p6launch' (daemon side): {repo, issue, title, after, pr_repo?}. A failed,
+    refused (CrossRepo) or deferred launch asked for by a pull is one MethBot exception on the
+    merged PR and head (key launch:<repo>#<issue>)."""
     from . import eventdb
     repo, n, title = req.get('repo'), int(req['issue']), req.get('title') or ''
     after = req.get('after') or {}
     try:
-        notes = (launcher or P6Launcher)(repo, n, title).run()
+        kw = {'pr_repo': req['pr_repo']} if req.get('pr_repo') else {}
+        notes = (launcher or P6Launcher)(repo, n, title, **kw).run()
     except Exception as e:
         deferred = isinstance(e, Deferred)
         text = str(e) if deferred else f"{type(e).__name__}: {str(e)[:300]}"
@@ -515,11 +552,12 @@ def main(argv=None):
     ap.add_argument('repo', choices=REPOS)
     ap.add_argument('issue', type=int)
     ap.add_argument('title', nargs='?', default='')
+    ap.add_argument('--pr-repo', help="the repo of the PR (default: the issue's; another repo is refused)")
     a = ap.parse_args(argv)
     title = a.title or subprocess.run(['gh', 'issue', 'view', str(a.issue), '-R', a.repo, '--json', 'title',
                                        '--jq', '.title'], capture_output=True, text=True, timeout=60).stdout.strip()
     try:
-        for line in P6Launcher(a.repo, a.issue, title).run():
+        for line in P6Launcher(a.repo, a.issue, title, pr_repo=a.pr_repo).run():
             print(line)
     except Deferred as e:
         print(f"deferred: {e}", file=sys.stderr)

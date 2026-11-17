@@ -25,7 +25,8 @@ merged into another base is a reason.
 All pass: `gh pr merge --merge --match-head-commit <sha>`. Only when a new read shows the PR
 MERGED at the head (a merge queue may only queue it), then (each step on its own; a failed
 step is reported and the rest go on):
-  - the PR card and the closed issue cards go to Done on Project 6
+  - the PR card and the closed issue cards go to Done on Project 6 (an issue of the other
+    Project 6 repo too, closed in its own repo: tangentswarm #114)
   - the PR's tmux windows (<code>-<PR>-*: swarm for tangentswarm, meth for methodology) close
   - `git worktree remove` when the worktree is clean (worktrees.remove_worktree), and the
     local branch is deleted; a dirty or busy worktree is reported and left. Only for a head
@@ -373,10 +374,11 @@ class P6Merge:
         return left
 
     # -- after the merge ----------------------------------------------------------------------
-    def card(self, n):
-        """The item id of PR or issue n on its board, or None."""
-        b = board.for_repo(self.repo)
-        owner, name = self.repo.split('/')
+    def card(self, n, repo=None):
+        """The item id of PR or issue n of repo (default: this PR's repo) on its board, or None."""
+        repo = repo or self.repo
+        b = board.for_repo(repo)
+        owner, name = repo.split('/')
         d = self.gql(CARD_Q, owner=owner, name=name, n=int(n))
         node = (((d or {}).get('repository') or {}).get('issueOrPullRequest') or {})
         for it in (node.get('projectItems') or {}).get('nodes') or []:
@@ -384,25 +386,36 @@ class P6Merge:
                 return it['id']
         return None
 
-    def to_done(self, n, what):
-        item = self.card(n)
+    def to_done(self, n, what, repo=None):
+        repo = repo or self.repo
+        name = f"{what} #{n}" if repo == self.repo else f"{what} {repo}#{n}"
+        item = self.card(n, repo)
         if not item:
-            return self.note(f"{what} #{n} has no Project 6 card")
-        board.move_card({}, item, board.DONE, self.sh, n=n, b=board.for_repo(self.repo))
-        self.note(f"{what} #{n} card -> Done")
+            return self.note(f"{name} has no Project 6 card")
+        board.move_card({}, item, board.DONE, self.sh, n=n, b=board.for_repo(repo), repo=repo)
+        self.note(f"{name} card -> Done")
 
     def cards(self, pr):
+        """The PR card and the cards of the issues it closes go to Done. An issue of the other
+        Project 6 repo is handled the same way, in its own repo (tangentswarm #114: a closing
+        link across repos left tangentswarm #107 open in Active after methodology #111 merged).
+        An issue of a repo not on this board is never closed or moved."""
         self.to_done(self.n, 'PR')
+        mine = board.for_repo(self.repo)
         for i in (pr.get('closingIssuesReferences') or {}).get('nodes') or []:
             num = i.get('number')
-            if (i.get('repository') or {}).get('nameWithOwner') != self.repo or not num:
-                continue  # never a same-number issue of another repo
+            repo = (i.get('repository') or {}).get('nameWithOwner')
+            if not num:
+                continue
+            if repo != self.repo and (mine is None or repo not in mine.repos):
+                self.note(f"#{self.n} closes {repo}#{num}: not a Project 6 issue, left to GitHub")
+                continue
             if i.get('state') == 'OPEN':  # GitHub closes it on the merge; this makes sure
                 try:
-                    self.sh(['gh', 'issue', 'close', str(num), '-R', self.repo, '--reason', 'completed'])
+                    self.sh(['gh', 'issue', 'close', str(num), '-R', repo, '--reason', 'completed'])
                 except Exception as e:
-                    self.note(f"issue #{num} close: {str(e)[:120]}")
-            self.to_done(num, 'issue')
+                    self.note(f"issue {repo}#{num} close: {str(e)[:120]}")
+            self.to_done(num, 'issue', repo)
 
     def windows(self):
         """[(window id, name)] of the PR's worker windows: <code>-<PR> or <code>-<PR>-*."""

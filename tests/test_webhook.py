@@ -250,6 +250,33 @@ def test_a_merge_runs_the_cascade_and_closes_the_issues():
     assert any('tangentcode/other#17' in d for d in ex.done)
 
 
+def test_a_project_6_merge_closes_and_moves_a_cross_repo_issue_of_its_board():
+    """tangentswarm #114: a methodology PR that fixes tangentswarm #107 takes #107 out of Active,
+    in its own repo; an issue of a repo off the board is still left to GitHub."""
+    meth, ts = 'tangentcode/methodology', 'tangentcode/tangentswarm'
+    b6 = board.for_repo(ts)
+    reads = []
+    ex = Fake(col=board.HUMAN_REVIEW, full={'closingIssuesReferences': {'nodes': [
+        {'number': 107, 'repository': {'nameWithOwner': ts}},
+        {'number': 17, 'repository': {'nameWithOwner': W.REPO}}]}})
+
+    def gql(q, **v):
+        if 'issueOrPullRequest' in q:
+            reads.append((f"{v['owner']}/{v['name']}", v['n']))
+            return {'repository': {'issueOrPullRequest': {'projectItems': {'nodes': [
+                {'id': 'ISSUE107', 'project': {'id': b6.id}, 'fieldValueByName': {'name': board.ACTIVE}}]}}}}
+        return {'repository': {'p': ex.full, 'pullRequest': ex.full}}
+    ex._g['gql'] = gql
+    ex.run(W.Action('merged', 111, args={'repo': meth}))
+    assert ['gh', 'issue', 'close', '107', '-R', ts, '--reason', 'completed'] in ex.calls
+    assert reads == [(ts, 107)]
+    edits = [c for c in ex.calls if c[:3] == ['gh', 'project', 'item-edit']]
+    assert [(c[c.index('--id') + 1], c[-1]) for c in edits][-1] == ('ISSUE107', b6.option[board.DONE])
+    assert not any(c[:4] == ['gh', 'issue', 'close', '17'] for c in ex.calls)
+    assert any(f'{W.REPO}#17: not an issue of this board' in d for d in ex.done)
+    assert f'{ts}#107 -> {board.DONE}' in ex.done
+
+
 def merged_payload(base='main', merged=True, n=540):
     return {'action': 'closed', 'repository': REPO, 'pull_request': pr(n, base=base, merged=merged)}
 

@@ -440,9 +440,10 @@ class Executor:
                 return it['id'], boardcache.col(it)
         return self.card_direct(n)
 
-    def card_direct(self, n):
-        """(item id, column) from the PR or issue's own projectItems, open or closed."""
-        owner, name = self.repo.split('/')
+    def card_direct(self, n, repo=None):
+        """(item id, column) from the PR or issue's own projectItems, open or closed. repo:
+        the item's repo (default: the action's repo)."""
+        owner, name = (repo or self.repo).split('/')
         d = self.g['gql'](CARD_QUERY, owner=owner, name=name, n=n)
         node = (((d or {}).get('repository') or {}).get('issueOrPullRequest') or {})
         for it in (node.get('projectItems') or {}).get('nodes') or []:
@@ -450,11 +451,12 @@ class Executor:
                 return it['id'], board.column(it.get('fieldValueByName'))
         return None, None
 
-    def move(self, n, item, col):
+    def move(self, n, item, col, repo=None):
+        name = f"#{n}" if not repo or repo == self.repo else f"{repo}#{n}"
         if self.dry:
-            return self.note(f"would move #{n} to {col}")
-        board.move_card(self.g, item, col, self._sh, n=n, b=self.board_, repo=self.repo)
-        self.note(f"#{n} -> {col}")
+            return self.note(f"would move {name} to {col}")
+        board.move_card(self.g, item, col, self._sh, n=n, b=self.board_, repo=repo or self.repo)
+        self.note(f"{name} -> {col}")
 
     def draft(self, n):
         """tangentswarm #95: Michal moved the card into In Progress (reject, answer); In
@@ -786,15 +788,20 @@ class Executor:
         for i in self.closing_issues(a.pr):
             num = i.get('number')
             repo = (i.get('repository') or {}).get('nameWithOwner')
-            if repo != self.repo:  # Codex on PR #26: never close a same-number issue of another repo
-                self.note(f"#{a.pr} closes {repo}#{num}: not a {self.repo} issue, left to GitHub")
+            # Codex on PR #26: never close a same-number issue of another repo by this repo's
+            # number. tangentswarm #114: an issue of another repo on this same board is closed
+            # and moved in its own repo, the same as a same-repo closing link (a closing link
+            # across repos left tangentswarm #107 open in Active after methodology #111 merged)
+            if repo != self.repo and repo not in self.board_.repos:
+                self.note(f"#{a.pr} closes {repo}#{num}: not an issue of this board, left to GitHub")
                 continue
             if not num or self.dry:
                 continue
-            it, _ = self.card(num)  # before the close: the issue is still in the open snapshot
-            self._sh(['gh', 'issue', 'close', str(num), '-R', self.repo, '--reason', 'completed'])
+            # before the close: a same-repo issue is still in the open snapshot
+            it, _ = self.card(num) if repo == self.repo else self.card_direct(num, repo)
+            self._sh(['gh', 'issue', 'close', str(num), '-R', repo, '--reason', 'completed'])
             if it:
-                self.move(num, it, board.DONE)
+                self.move(num, it, board.DONE, repo=repo)
         if not self.dry and self.platform():  # active-gate knows only Project 4
             from .promoted import BIN
             for argv in ([BIN / 'active-gate', '--sweep', '--demote'], [BIN / 'active-gate', '--promote-missing']):

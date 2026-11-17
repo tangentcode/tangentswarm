@@ -93,10 +93,11 @@ class World:
             return self._start(window, wt, path)
         return {'window': window, 'pane': '%9', 'unit': f'swarm-{window}-abc'}
 
-    def launcher(self, n=98, title=TITLE):
+    def launcher(self, n=98, title=TITLE, **kw):
         return L.P6Launcher(self.repo, n, title, gql=self.gql, sh=self.sh, git=self.git, worktree=self.worktree,
                             start=self.start, admit=lambda: self._admit, refuse=lambda wt: self._refuse,
-                            briefs=self.tmp / 'briefs', agent_root='/ver', wt_branch=lambda p: self.wts.get(str(p)))
+                            briefs=self.tmp / 'briefs', agent_root='/ver', wt_branch=lambda p: self.wts.get(str(p)),
+                            **kw)
 
     def moves(self):
         return [(a[a.index('--id') + 1], a[-1]) for a in self.gh if a[:3] == ['gh', 'project', 'item-edit']]
@@ -419,10 +420,57 @@ def test_an_open_pr_of_the_issue_on_a_branch_of_other_work_is_refused(tmp_path):
     assert w.writes() == [] and w.starts == []
 
 
-def test_closed_prs_and_other_repos_prs_do_not_count(tmp_path):
-    w = World(tmp_path, linked=[(70, 'old', 'CLOSED', TS), (71, 'm', 'OPEN', METH)])
+def test_closed_prs_do_not_count(tmp_path):
+    w = World(tmp_path, linked=[(70, 'old', 'CLOSED', TS), (71, 'm', 'CLOSED', METH)])
     w.launcher().run()
     assert w.worktrees == [('tangentswarm', SLUG)]
+
+
+# -- tangentswarm #114: an issue and its PR are in the same repo -------------------------------
+
+def test_a_pr_asked_for_in_another_repo_is_refused_and_says_why(tmp_path):
+    w = World(tmp_path)
+    with pytest.raises(L.CrossRepo) as e:
+        w.launcher(pr_repo=METH).run()
+    why = str(e.value)
+    assert f'{TS}#98 was not launched: its PR would be in {METH}, not in {TS}' in why
+    assert 'must be in the same repo' in why and f'open a new issue in {METH}' in why
+    assert w.writes() == [] and w.worktrees == [] and w.starts == [] and w.gits == []
+    assert not (tmp_path / 'briefs').exists()
+
+
+def test_a_pr_asked_for_in_the_issues_own_repo_launches(tmp_path):
+    w = World(tmp_path)
+    w.launcher(pr_repo=TS).run()
+    assert w.worktrees == [('tangentswarm', SLUG)] and len(w.starts) == 1
+
+
+def test_an_open_pr_of_another_repo_that_closes_the_issue_refuses_the_launch(tmp_path):
+    w = World(tmp_path, linked=[(111, 'one-flow-every-board', 'OPEN', METH)])
+    with pytest.raises(L.CrossRepo, match=f'its open PR {METH}#111 is in {METH}, not in {TS}'):
+        w.launcher().run()
+    assert w.writes() == [] and w.worktrees == [] and w.starts == []
+
+
+def test_a_refused_cross_repo_launch_from_a_pull_tells_methbot(tmp_path):
+    posts = []
+    tell = lambda *a, **k: alerts.tell_methbot(*a, post=posts.append, **k)  # noqa: E731
+    w = World(tmp_path)
+    made = lambda repo, n, title, **kw: w.launcher(n, title, **kw)  # noqa: E731
+    out = L.execute({'repo': TS, 'issue': 98, 'title': TITLE, 'after': AFTER, 'pr_repo': METH},
+                    launcher=made, tell=tell)
+    assert out['ok'] is False and 'CrossRepo' in out['error'] and 'same repo' in out['error']
+    assert len(posts) == 1 and f'{TS}#98 was not started' in posts[0]['reason']
+    assert w.writes() == []
+
+
+def test_queue_and_the_cli_carry_pr_repo(capsys):
+    rid = L.queue(TS, 98, TITLE, pr_repo=METH)
+    assert json.loads((spool.SPOOL / f'{rid}.req.json').read_text())['pr_repo'] == METH
+    rid = L.queue(TS, 99, TITLE)
+    assert 'pr_repo' not in json.loads((spool.SPOOL / f'{rid}.req.json').read_text())
+    assert L.main([TS, '98', 't', '--pr-repo', METH]) == 1  # refused before any read
+    assert 'must be in the same repo' in capsys.readouterr().err
 
 
 def test_owner_with_real_git_repos(tmp_path, monkeypatch):
