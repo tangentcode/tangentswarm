@@ -9,7 +9,8 @@ for these events, and only for the Project 6 repos (METHBOT_REPOS):
   exception    a done report or MERGE-READY comment that the swarm could not merge, with the
                reasons (tangentswarm #89: the merge itself has no AI; once per PR and head,
                and once more per PR and head for a cleanup step that failed after the merge)
-  pull         after such a merge, the next Project 6 Backlog issues to start (once per merge)
+  pull         kept for pending POSTs of older runs; the pull now queues the launches itself
+               (p6launch, tangentswarm #98), and a launch that fails is an exception
   done         kept for callers of #19; the worker MCP no longer sends it (p6merge merges)
 Everything else the watchdog finds (a Codex outage, a stalled promote, a new Needs Input
 card on any board) is an alert(): it wakes swarmbot and never POSTs to the MethBot URL.

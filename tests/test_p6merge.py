@@ -48,13 +48,15 @@ class World:
     """The fakes of one run: GitHub (gql, gh), tmux, the worktree remover and MethBot."""
 
     def __init__(self, prs, windows=('@1\tswarm-90-done-automerge', '@2\tswarm-9-other', '@3\tswarm-900-x',
-                                     '@4\tmeth-90-doc'), remove=None, live=1, backlog=None):
+                                     '@4\tmeth-90-doc'), remove=None, live=1, backlog=None, inflight=(),
+                 launch=None):
         self.prs = list(prs)  # one read each; the last one repeats
         self.gh, self.tmuxed, self.posts, self.wakes, self.slept, self.removed = [], [], [], [], [], []
         self.windows = windows
         self.merges_on_command = True
         self._remove = remove
         self.live = live
+        self.inflight, self.launched, self._launch = set(inflight), [], launch
         self.backlog = backlog if backlog is not None else [
             {'repo': TS, 'number': 95}, {'repo': METH, 'number': 120}, {'repo': TS, 'number': 99}]
 
@@ -84,7 +86,12 @@ class World:
     def kw(self, **extra):
         return {**dict(gql=self.gql, sh=self.sh, tmux=self.tmux, remove=self.remove, procs=lambda p: [],
                        live=lambda: self.live, backlog=lambda: self.backlog, sleep=self.slept.append,
-                       tipcheck=lambda branch: None), **extra}
+                       tipcheck=lambda branch: None, launch=self.launch, inflight=lambda: self.inflight), **extra}
+
+    def launch(self, i):
+        self.launched.append(f"{i['repo']}#{i['number']}")
+        if self._launch:
+            self._launch(i)
 
     def run(self, repo=TS, n=90, head=HEAD, trigger='done', **extra):
         kw = self.kw(**extra)
@@ -183,9 +190,9 @@ def test_a_clean_done_merges_at_the_head_and_cleans_up():
     assert [x['action'] for x in rows] == ['merged'] and rows[0]['repo'] == TS
     assert w.wakes == [(f'{TS}#90 merged at {HEAD[:8]}: a deploy is needed. Notify only: deploys need '
                         "Michal's OK.", f'p6-deploy:90@{HEAD}', 90)]
-    pulls = [p for p in w.posts if p['kind'] == 'pull']
-    assert len(pulls) == 1 and f'{TS}#95, {METH}#120, {TS}#99' in pulls[0]['reason']
-    assert [p['kind'] for p in w.posts] == ['pull']  # no exception: everything passed
+    assert w.launched == [f'{TS}#95', f'{METH}#120', f'{TS}#99']  # tangentswarm #98: launches, no MethBot pull
+    assert any(f'queued launches of {TS}#95, {METH}#120, {TS}#99' in x for x in r['notes'])
+    assert w.posts == []  # no exception: everything passed, and no 'pull' POST
 
 
 def test_the_same_head_is_merged_once():
@@ -193,7 +200,7 @@ def test_the_same_head_is_merged_once():
     assert w.run()['merged'] is True
     again = w.run(trigger='comment')
     assert again['merged'] is True and again['already'] is True
-    assert len(w.merges()) == 1 and len([p for p in w.posts if p['kind'] == 'pull']) == 1
+    assert len(w.merges()) == 1 and len(w.launched) == 3  # the pull runs once per merge
 
 
 def test_an_unknown_mergeable_is_read_again_before_it_fails():
@@ -273,11 +280,11 @@ def test_a_dirty_worktree_is_left_and_reported_and_the_rest_goes_on():
     r = w.run()
     assert r['merged'] is True and any('worktree' in x and 'left' in x for x in r['notes'])
     kinds = [p['kind'] for p in w.posts]
-    assert kinds == ['pull', 'exception'] and 'uncommitted' in w.posts[1]['reason']
+    assert kinds == ['exception'] and 'uncommitted' in w.posts[0]['reason']
     assert w.wakes  # the deploy note still went
     w.prs = [full()]
     w.run()  # the same head again: already merged, no second exception
-    assert len(w.posts) == 2
+    assert len(w.posts) == 1
 
 
 def test_no_worktree_deletes_only_the_branch():
@@ -287,19 +294,19 @@ def test_no_worktree_deletes_only_the_branch():
     w = World([full()], remove=gone)
     r = w.run(delbranch=lambda repo, branch: deleted.append((repo, branch)) or f'deleted local branch {branch}')
     assert r['merged'] is True and deleted == [('tangentswarm', 'p6-done-automerge')]
-    assert [p['kind'] for p in w.posts] == ['pull']
+    assert w.posts == [] and len(w.launched) == 3
 
 
 def test_a_kept_branch_is_reported():
     w = World([full()], remove=lambda repo, branch: {'path': 'p', 'branch_deleted': False, 'branch_kept': 'not merged'})
     w.run()
-    assert [p['kind'] for p in w.posts] == ['pull', 'exception'] and 'not merged' in w.posts[1]['reason']
+    assert [p['kind'] for p in w.posts] == ['exception'] and 'not merged' in w.posts[0]['reason']
 
 
 def test_no_window_is_a_note_not_a_problem():
     w = World([full()], windows=())
     r = w.run()
-    assert any('no swarm-90-* window' in x for x in r['notes']) and [p['kind'] for p in w.posts] == ['pull']
+    assert any('no swarm-90-* window' in x for x in r['notes']) and w.posts == []
 
 
 def test_the_cleanup_waits_for_the_closed_windows_processes(tmp_path):
@@ -314,17 +321,36 @@ def test_the_cleanup_waits_for_the_closed_windows_processes(tmp_path):
 def test_the_pull_takes_only_the_free_slots_in_order():
     w = World([full()], live=2)
     w.run()
-    pull = [p for p in w.posts if p['kind'] == 'pull'][0]
-    assert f'{TS}#95, {METH}#120' in pull['reason'] and '#99' not in pull['reason']
+    assert w.launched == [f'{TS}#95', f'{METH}#120'] and w.posts == []
+
+
+def test_queued_launches_count_and_are_not_queued_twice():
+    w = World([full()], live=1, inflight={(TS, 95)})  # one live worker, #95 still in the spool
+    r = w.run()
+    assert w.launched == [f'{METH}#120', f'{TS}#99'] and w.posts == []  # 4 - 1 - 1 = 2 free, #95 skipped
+    w = World([full()], live=2, inflight={(TS, 95), (METH, 120)})
+    r = w.run(n=91)
+    assert w.launched == [] and any('2 queued launches' in x and 'none pulled' in x for x in r['notes'])
+
+
+def test_a_pick_that_cannot_be_queued_is_an_exception_and_the_rest_still_go():
+    def launch(i):
+        if i['number'] == 120:
+            raise OSError('disk full')
+    w = World([full()], launch=launch)
+    r = w.run()
+    assert w.launched == [f'{TS}#95', f'{METH}#120', f'{TS}#99']
+    assert any(f'queued launches of {TS}#95, {TS}#99' in x for x in r['notes'])
+    assert [p['kind'] for p in w.posts] == ['exception'] and f'{METH}#120 (OSError: disk full)' in w.posts[0]['reason']
 
 
 def test_no_free_slot_or_an_empty_backlog_posts_no_pull():
     w = World([full()], live=4)
     r = w.run()
-    assert w.posts == [] and any('none pulled' in x for x in r['notes'])
+    assert w.posts == [] and w.launched == [] and any('none pulled' in x for x in r['notes'])
     w = World([full()], backlog=[])
     r = w.run(n=91)
-    assert w.posts == [] and any('Backlog is empty' in x for x in r['notes'])
+    assert w.posts == [] and w.launched == [] and any('no Project 6 Backlog issue' in x for x in r['notes'])
 
 
 def item(n, col, repo=TS, labels=(), due=None, state='OPEN', kind='Issue'):
@@ -421,12 +447,16 @@ def run_with(w, tell, **extra):
     return M.run(TS, 90, HEAD, 'done', tell=tell, wake=lambda why, key, pr: 'woke', **kw)
 
 
-@pytest.mark.parametrize('remove, kinds', [
-    (None, ['pull']),  # the Backlog pull
-    (lambda repo, branch: (_ for _ in ()).throw(worktrees.WorktreeError('REFUSING: dirty')), ['pull', 'exception']),
+def _no_spool(i):
+    raise OSError('spool is full')
+
+
+@pytest.mark.parametrize('remove, launch, kinds', [
+    (None, _no_spool, ['exception']),  # a pick that could not be queued
+    (lambda repo, branch: (_ for _ in ()).throw(worktrees.WorktreeError('REFUSING: dirty')), None, ['exception']),
 ])
-def test_a_failed_post_after_the_merge_is_sent_on_the_next_report_with_no_new_merge(remove, kinds):
-    w = World([full()], remove=remove)
+def test_a_failed_post_after_the_merge_is_sent_on_the_next_report_with_no_new_merge(remove, launch, kinds):
+    w = World([full()], remove=remove, launch=launch)
     fail = set(kinds)
     r = run_with(w, flaky(w, fail))
     assert r['merged'] is True and w.posts == [] and len(w.merges()) == 1
@@ -446,7 +476,7 @@ def test_a_delivered_post_leaves_no_pending_file():
     w = World([full()])
     w.run()
     p = M.P6Merge(TS, 90, HEAD, 'done').pending_path()
-    assert not p.exists() and [x['kind'] for x in w.posts] == ['pull']
+    assert not p.exists() and w.posts == []
 
 
 # -- Codex on PR #90 (cfd3e08): a part read or a merge into another base never counts ---------
@@ -577,14 +607,14 @@ def test_a_fork_head_touches_no_local_worktree_or_branch(hrepo):
     r = w.run()
     assert r['merged'] is True and w.removed == []
     assert any('no local worktree or branch is touched' in x for x in r['notes'])
-    assert [p['kind'] for p in w.posts] == ['pull']  # a note, not a problem
+    assert w.posts == []  # a note, not a problem
 
 
 def test_a_local_branch_with_more_commits_is_left_and_reported():
     w = World([full()])
     r = w.run(tipcheck=lambda branch: 'its tip cccccccc has commits that are not in the merged head')
     assert r['merged'] is True and w.removed == []
-    assert [p['kind'] for p in w.posts] == ['pull', 'exception'] and 'not in the merged head' in w.posts[1]['reason']
+    assert [p['kind'] for p in w.posts] == ['exception'] and 'not in the merged head' in w.posts[0]['reason']
 
 
 def test_tip_problem_reads_the_local_branch(tmp_path, monkeypatch):
