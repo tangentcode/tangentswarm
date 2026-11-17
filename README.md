@@ -930,8 +930,11 @@ where-to-see or "Check it on staging" section says only how to see the change. E
 worker gets this as `gatechecks.STATUS_RULE`. Before swarm-flow or swarm-tick runs
 `hr-gate --apply`, `gatechecks.scrub_status()` removes such sentences from the live body
 (not the brief section, not code fences) and opens one incident per head. If the body
-edit fails, `--apply` waits for the next pass. A sentence that starts with a condition
-("Once merged into work, open /x") tells how to see the change and is kept.
+edit fails, `--apply` waits for the next pass. A sentence with a condition or a describing
+clause before the state words ("Once merged into work, open /x", "This PR changes how code
+is deployed to staging") tells how something works and is kept. So is a bare mention of
+`.deploy-sha`; only a claim about which commit it holds is removed. Code fences close only
+on a matching run of the same character, as long or longer (CommonMark).
 
 ### swarm-launch: start a worker
 

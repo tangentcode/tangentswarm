@@ -139,10 +139,14 @@ def body_problem(paths, body):
 
 # tangentswarm #130: sentences that say where the PR stands. Two kinds:
 #   _STATE: deploy or merge state ("not on staging yet", "merged into work", "is live on
-#           staging"). A sentence that opens with a condition ("Once merged into work, open
-#           /x") tells how to see the change, not where it stands, so it is kept.
-#   _SERVES: a site and the commit it serves ("work.example.com serves a6024515", "the
-#           .deploy-sha"). That is always status.
+#           staging"). When a condition or a describing clause comes before the match
+#           ("Once merged into work, open /x", "This PR changes how code is deployed to
+#           staging", "A branch that is merged into work is skipped"), the sentence tells
+#           how something works, not where this PR stands, so it is kept (_DESCR).
+#   _SERVES: a site and the commit it serves ("work.example.com serves a6024515",
+#           ".deploy-sha is a6024515", "the .deploy-sha lacks the head"). A bare mention of
+#           the marker ("open /.deploy-sha", "how the deploy SHA is made") is not status
+#           (Codex on PR #133).
 _W = r'(?:origin/)?(?:work|staging)\b'
 _STATE = re.compile(
     r"\bnot\s+(?:yet\s+|currently\s+)?(?:(?:merged|deployed|live|served|pushed|landed)\s+)?(?:on|in|into|to|onto)\s+" + _W
@@ -157,30 +161,43 @@ _STATE = re.compile(
 _SERVES = re.compile(
     r"\bserv(?:es|ing|ed)\s+(?:commit\s+|sha\s+|head\s+)?`?[0-9a-f]{7,40}\b"
     r"|\b[0-9a-f]{7,40}`?\s+(?:is|was)\s+(?:now\s+)?(?:served|deployed|live)\b"
-    r"|\.deploy-sha\b|\bdeploy\s+sha\b",
+    r"|(?:\.deploy-sha|\bdeploy[- ]sha)`?\s*(?:(?:is|was|=|:|reads|says|shows)\s*)?(?:(?:now|still)\s+)?"
+    r"(?:(?:is|was|=|:|reads|says|shows)\s*)?`?[0-9a-f]{7,40}\b"
+    r"|(?:\.deploy-sha|\bdeploy[- ]sha)`?\s+(?:(?:now|still)\s+)?(?:has|lacks|contains|includes|"
+    r"does\s+not\s+(?:have|contain|include)|doesn't\s+(?:have|contain|include))\s+"
+    r"(?:the|this|my|our)\s+(?:head|branch|change|changes|pr|fix|commit)\b",
     re.I)
-_COND = re.compile(r'^\W*(?:once|after|when|whenever|if|until|as\s+soon\s+as|before)\b', re.I)
+_DESCR = re.compile(r'\b(?:once|after|when|whenever|if|unless|until|as\s+soon\s+as|before|how|whether|'
+                    r'that|which|who)\b', re.I)
 _BULLET = re.compile(r'^(\s*(?:[-*+]|\d+[.)])\s+|\s*)')
 _SENT = re.compile(r'(?<=[.!?])\s+(?=\S)')
-_FENCE = re.compile(r'^\s*(```|~~~)')
+_FENCE = re.compile(r'^\s*(?:(?:[-*+]|\d+[.)])\s+)?(`{3,}|~{3,})(.*)$')  # list items may indent it
 
 
 def is_status(sentence):
     """True when one sentence says where the PR stands (tangentswarm #130)."""
     if _SERVES.search(sentence):
         return True
-    return bool(_STATE.search(sentence)) and not _COND.match(sentence)
+    m = _STATE.search(sentence)
+    return bool(m) and not _DESCR.search(sentence[:m.start()])
 
 
 def _scrub_text(text):
     """(text without status sentences, [removed sentences]). Lines in code fences are kept."""
-    out, gone, fenced = [], [], False
+    out, gone, fence = [], [], None  # fence: the open fence run, such as '````' (CommonMark)
     for line in text.split('\n'):
-        if _FENCE.match(line):
-            fenced = not fenced
+        m = _FENCE.match(line)
+        if fence is not None:
+            # Only a run of the same character, as long or longer, with nothing after it closes.
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip():
+                fence = None
             out.append(line)
             continue
-        if fenced or not line.strip():
+        if m and not (m.group(1)[0] == '`' and '`' in m.group(2)):  # a backtick info string has no backtick
+            fence = m.group(1)
+            out.append(line)
+            continue
+        if not line.strip():
             out.append(line)
             continue
         lead = _BULLET.match(line).group(1)

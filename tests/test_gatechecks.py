@@ -188,7 +188,9 @@ PR528 = 'Not on staging yet: work.pawntakesworld.com serves a60245158, which doe
     'ptw.example.com serves `abcdef12`.',
     'Staging is serving commit 0123abcd.',
     'Commit 0123abcd is deployed.',
-    'The static .deploy-sha has it.',
+    'The static .deploy-sha is a6024515.',
+    'The deploy SHA is still `0123abcd`.',
+    'The .deploy-sha lacks the head.',
     'Work does not contain this branch.',
 ])
 def test_status_text_is_found(text):
@@ -203,6 +205,12 @@ def test_status_text_is_found(text):
     'After it is deployed to staging, click Save.',
     'This PR changes the work queue.',
     'A branch that is not merged is skipped.',
+    # Codex on PR #133: a mention of the marker, or a sentence that describes how things work
+    'Where-to-see: open https://work.example.com/.deploy-sha and verify it is plain text.',
+    'This PR changes how the deploy SHA is generated.',
+    'This PR changes how code is deployed to staging.',
+    'A branch that is merged into work is skipped.',
+    'The gate checks whether the PR is on staging.',
 ])
 def test_how_to_see_text_is_not_status(text):
     assert not G.is_status(text)
@@ -254,3 +262,24 @@ def test_every_worker_instruction_carries_the_status_rule():
     assert G.STATUS_RULE.isascii() and '\n' not in G.STATUS_RULE
     for text in (launches.brief_line('/b/1.txt'), launcher.brief_text(1, 't', 'b', 2), flow.shots_text(7)):
         assert G.STATUS_RULE in text
+
+
+FOUR = '`' * 4
+THREE = '`' * 3
+
+
+@pytest.mark.parametrize('body', [
+    # Codex on PR #133: an inner fence of another length or character does not close the outer one
+    f'{FOUR}markdown\n{THREE}python\nx = 1\n{THREE}\nMerged into work.\n{FOUR}\n',
+    f'~~~\n{THREE}\nMerged into work.\n~~~\n',
+    f'{THREE}\n~~~\nMerged into work.\n{THREE}\n',
+    f'{THREE}\n{THREE} not a close\nMerged into work.\n{THREE}\n',
+    f'- step one\n  {THREE}\n  Merged into work.\n  {THREE}\n',
+])
+def test_text_inside_a_fence_is_kept(body):
+    assert G.strip_status(body) == (body, [])
+
+
+def test_text_after_a_closed_fence_is_scrubbed():
+    body = f'{FOUR}\nx\n{FOUR}\nMerged into work.\n{THREE}js\ny\n{THREE}\nNot on staging yet.\n'
+    assert G.strip_status(body)[1] == ['Merged into work.', 'Not on staging yet.']
