@@ -47,6 +47,7 @@ swarm-sanity = "tangentswarm.sanity:main"
 swarm-unit-check = "tangentswarm.unitcheck:main"
 swarm-deploy = "tangentswarm.deploy:main"
 swarm-codex-rounds = "tangentswarm.codexrounds:main"
+swarm-methlab = "tangentswarm.methlab:main"
 
 [tool.setuptools]
 packages = ["tangentswarm", "tangentswarm.cloud", "tangentswarm.queue"]

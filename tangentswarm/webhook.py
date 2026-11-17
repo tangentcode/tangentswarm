@@ -219,10 +219,15 @@ def codex_running(body):
     return 'Code Review' in b and '**Running**' in b
 
 
-def classify(event, p):
+def classify(event, p, poke=True):
     """[Action] for one delivery (pure: no I/O). An empty list is "skip"; the first action's
     why says why when it is a skip. Every action carries the delivery's repository
-    (tangentswarm #45: platform on Project 4, tangentswarm and methodology on Project 6)."""
+    (tangentswarm #45: platform on Project 4, tangentswarm and methodology on Project 6).
+    The one side effect is the sanity poke of a board event; poke=False leaves it out (the
+    Meth Lab replay of recorded deliveries, tangentswarm #115)."""
+    if poke and event == 'projects_v2_item':
+        from . import sanity
+        sanity.poke()  # a board change: the watchdog runs the sanity check (tangentswarm #43)
     acts = _classify(event, p)
     repo = ((p.get('repository') or {}).get('full_name') or '')
     if repo:
@@ -238,8 +243,6 @@ def _classify(event, p):
     if event == 'ping':
         return [Action('skip', why='ping')]
     if event == 'projects_v2_item':
-        from . import sanity
-        sanity.poke()  # a board change: the watchdog runs the sanity check (tangentswarm #43)
         return project_move(p)
     if board.for_repo(repo) is None:
         return [Action('skip', why=f'not a swarm repo ({repo or "no repo"})')]
@@ -397,8 +400,9 @@ class Executor:
     """Runs actions with the swarm's tools. Every tool is injectable for tests."""
 
     def __init__(self, g=None, dry=False, sh=None, enqueue=None, cascade=None, give=None, wake_post=None,
-                 signal_promoted=None, p6merge=None, deploy_start=None):
+                 signal_promoted=None, p6merge=None, deploy_start=None, check_runs=None):
         self._g, self.dry = g, dry
+        self.check_runs = check_runs  # the CI read of a head (the Meth Lab fake, tangentswarm #115)
         self.p6merge = p6merge
         self.deploy_start = deploy_start
         self.sh = sh
@@ -641,7 +645,7 @@ class Executor:
         full = self.pr_full(a.pr)
         if a.args.get('sha') != full.get('headRefOid'):
             return self.note(f"#{a.pr}: CI on an older head: skip")
-        problem = advance.ci_problem(advance.check_runs(a.args['sha'], self.repo))
+        problem = advance.ci_problem((self.check_runs or advance.check_runs)(a.args['sha'], self.repo))
         if problem and problem.startswith('CI is still running'):
             return self.note(f"#{a.pr}: {problem}")
         item, col = self.card(a.pr)
@@ -1194,7 +1198,7 @@ def replay(n, ex=None):
     from . import advance
     ex = ex or Executor()
     full = advance.codex_details(ex.g['gql'], n)
-    ci = advance.ci_problem(advance.check_runs(full['headRefOid']))
+    ci = advance.ci_problem((ex.check_runs or advance.check_runs)(full['headRefOid']))
     acts = replay_plan(n, full, ci)
     for a in acts:
         ex.run(a)
