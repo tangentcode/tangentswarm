@@ -545,3 +545,78 @@ def test_tell_p6_sends_one_line_and_reports_a_failed_send():
     ok, note = slots.tell_p6('tangentcode/tangentswarm', 9, 'a', 'x', claudes=c, tell=boom)
     assert not ok and 'not sent: RuntimeError: busy' in note
     assert slots.tell_p6('r', 9, 'a', '  ', claudes=c, tell=boom) == (False, 'refused: the feedback is empty')
+
+
+# -- tangentswarm #102: a held revive is queued and runs when a rework slot frees ----------
+
+def test_a_held_revive_is_queued_and_runs_after_a_slot_frees(wt, monkeypatch):
+    monkeypatch.setattr(slots, 'REWORK_SLOTS', 2)
+    slots.save({'parked': {}, 'rework': {'1': dict(worktree='/w/1'), '2': dict(worktree='/w/2')}})
+    host, out = FakeHost(), []
+    cl = [claude(1, '/w/1', 'b1', 's1'), claude(2, '/w/2', 'b2', 's2')]
+
+    def again(n, text, **k):
+        return slots.revive(n, text, sp=FakeSP(wt), host=host, claudes=cl, **k)
+    assert again(7, 'merge origin/main', out=out.append, queue=True) == 3
+    assert out[-1].startswith('queued: #7 is revived when a rework slot frees')
+    assert slots.load()['queued']['7']['text'] == 'merge origin/main'
+    assert 'queued revive #7' in ' '.join(_report())
+
+    # the slots are still full: the queue keeps it and tells nothing
+    said = []
+    assert slots.run_queued(out=said.append, revive_fn=again) == []
+    assert '7' in slots.load()['queued'] and not host.told and 'still held' in said[-1]
+
+    # #1 is parked: its slot frees, and the next run revives #7 with the queued feedback
+    with slots.update() as st:
+        st['rework'].pop('1')
+    cl.pop(0)
+    assert slots.run_queued(out=said.append, revive_fn=again) == [7]
+    assert host.told == [('%50', 'merge origin/main')] and slots.load()['queued'] == {}
+    assert said[-1].startswith('revive queue: #7 revived')
+
+
+def _report():
+    lines = []
+    import unittest.mock as m
+    with m.patch.object(slots, 'running', lambda: []):
+        slots.report(out=lines.append)
+    return lines
+
+
+def test_a_held_revive_without_queue_is_not_queued(wt, monkeypatch):
+    """flow.give_worker has its own hold and retry (flow.retry_held): no second retry path."""
+    assert slots.revive(7, 'go', out=lambda s: None, sp=FakeSP(wt, room=100), host=FakeHost(), claudes=[]) == 3
+    assert slots.load()['queued'] == {}
+
+
+def test_the_queue_drops_a_closed_pr_and_a_refused_revive(tmp_path):
+    slots.queue_revive(7, 'a', 'held', now=1)
+    slots.queue_revive(8, 'b', 'held', now=2)
+    slots.queue_revive(9, 'c', 'held', now=3)
+    ran, out = [], []
+
+    def fake(n, text, out=print, **k):
+        ran.append(n)
+        out('refused: worktree is gone')
+        return 1
+    prs = {7: {'state': 'MERGED'}, 8: {'state': 'OPEN'}, 9: {'state': 'OPEN'}}
+    assert slots.run_queued(out=out.append, prs=prs, revive_fn=fake) == []
+    assert ran == [8, 9] and slots.load()['queued'] == {}  # oldest first; #7 is not open
+    assert out[0] == 'revive queue: #7 is not an open board PR: dropped'
+    assert out[1].startswith('NEEDS_WORKER #8: the queued revive was refused')
+
+
+def test_a_newer_feedback_replaces_the_queued_one_and_keeps_its_place():
+    slots.queue_revive(7, 'old', now=1)
+    slots.queue_revive(8, 'x', now=2)
+    slots.queue_revive(7, 'new', now=3)
+    q = slots.load()['queued']
+    assert q['7']['text'] == 'new' and q['7']['at'] == 1
+
+
+def test_a_dry_queue_run_changes_nothing():
+    slots.queue_revive(7, 'a', now=1)
+    out = []
+    assert slots.run_queued(out=out.append, dry=True, revive_fn=lambda *a, **k: pytest.fail('dry')) == []
+    assert out == ['revive queue: would revive #7 ()'] and '7' in slots.load()['queued']

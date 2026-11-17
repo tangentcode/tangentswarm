@@ -234,12 +234,13 @@ def test_nothing_to_do_is_one_line(board_read):
     board_read(cols)
     cols[board.AUTO_REVIEW].append(dict(number=9, head=H, item='I9'))
     g = Gate(cols, details={7: codex_pr(comments=[]), 8: codex_pr(draft=True, n=8),
-                            9: dict(codex_pr(n=9), mergeable='CONFLICTING')})
+                            9: dict(codex_pr(n=9), body='## Questions for Michal\n1. which one?')})
     g['fetch'] = lambda n, refresh=False: pytest.fail('a skipped PR must not get the full read')
     out, calls = run(g)
     assert len(out) == 1 and calls == []
     assert out[0] == (f"nothing to do: Human Review 2/2; Staging 3/{flow.STAGING_MIN}, Ready 0; "
-                      f"Auto Review: #7 not Codex-clean on {H[:8]}, #8 draft, #9 conflicts with main (GitHub mergeable)")
+                      f"Auto Review: #7 not Codex-clean on {H[:8]}, #8 draft, "
+                      "#9 the PR body has an open question for Michal")
 
 
 # --- --cascade: the drain loop -------------------------------------------------------
@@ -883,3 +884,154 @@ def test_a_minbot_pass_from_green_ci_queues_a_cascade(board_read, monkeypatch):
     adv = A.Advance(g=Gate(cols, details={7: codex_pr()}), out=out.append, minbot=lambda *a: calls.append(a))
     adv.minbot_one(7)
     assert queued == [1] and A.RERUN.exists() and 'reached Ready: cascade queued' in out[-1]
+
+
+# --- tangentswarm #102: Auto Review PRs held by a Codex thread or a conflict go back to rework ---
+
+CODEX = {'login': 'chatgpt-codex-connector[bot]'}
+
+
+def head_thread(commit=H, outdated=False, body='P1: the retry drops the last page', path='api/x.py', tid='T1'):
+    return {'id': tid, 'isResolved': False, 'isOutdated': outdated,
+            'comments': {'nodes': [{'author': CODEX, 'originalCommit': {'oid': commit}, 'path': path, 'body': body}]}}
+
+
+class Seen(list):
+    pass
+
+
+@pytest.fixture
+def revives(monkeypatch):
+    """slots.revive stand-in: records (n, text, kwargs) and returns the next rc (default 0)."""
+    from tangentswarm import slots
+    seen, rcs = Seen(), []
+
+    def fake(n, text, out=print, **k):
+        seen.append((n, text, k))
+        rc = rcs.pop(0) if rcs else 0
+        out({0: f'sent to #{n}', 3: 'held: the 3 rework slots are in use', 1: 'refused: worktree is gone'}[rc])
+        return rc
+    monkeypatch.setattr(slots, 'revive', fake)
+    seen.rcs = rcs
+    return seen
+
+
+@pytest.fixture
+def ar7(board_read):
+    cols = {board.HUMAN_REVIEW: [1, 2], board.STAGING: [3, 4, 5],
+            board.AUTO_REVIEW: [dict(number=7, head=H, item='I7')]}
+    board_read(cols)
+    return cols
+
+
+def test_an_open_codex_thread_on_the_head_sends_the_pr_back_to_rework(ar7, revives, monkeypatch):
+    """methodology #106: platform #528 had an open Codex P2 thread on its head and a later clean
+    receipt on the same head; it sat in Auto Review for hours."""
+    g = Gate(ar7, details={7: codex_pr(threads=[head_thread()])})  # the clean receipt is there too
+    g['fetch'] = lambda n, refresh=False: pytest.fail('no full read for a PR that goes back to rework')
+    out, calls = run(g)
+    assert calls == [] and g.moves == [('I7', board.IN_PROGRESS)] and board.DRAFTED == [(7, A.REPO)]
+    (n, text, kw), = revives
+    assert n == 7 and kw.get('queue') is True
+    assert 'open Codex thread(s) on your head' in text and '[api/x.py] P1: the retry drops the last page' in text
+    assert 'ROOT-CAUSE RULE' in text
+    assert f"NEEDS_REWORK #7 has 1 open Codex thread(s) on {H[:8]}: Auto Review -> In Progress, draft" in out
+    from tangentswarm import moves
+    assert 'Auto Review' in moves.LOG.read_text() and 'In Progress' in moves.LOG.read_text()
+
+
+def test_a_conflict_with_main_sends_the_pr_back_to_rework(ar7, revives):
+    """methodology #106: platform #539 was Codex-clean but CONFLICTING with main."""
+    g = Gate(ar7, details={7: dict(codex_pr(), mergeable='CONFLICTING')})
+    out, calls = run(g)
+    assert g.moves == [('I7', board.IN_PROGRESS)] and board.DRAFTED == [(7, A.REPO)]
+    (n, text, kw), = revives
+    assert 'Merge origin/main and resolve the conflicts' in text and 'Do not rebase' in text
+    assert out[-1].endswith('#7 conflicts with main (GitHub mergeable): sent back to rework')
+
+
+def test_a_held_revive_is_queued_and_the_card_still_moves(ar7, revives):
+    revives.rcs.append(3)
+    g = Gate(ar7, details={7: dict(codex_pr(), mergeable='CONFLICTING')})
+    out, _ = run(g)
+    assert g.moves == [('I7', board.IN_PROGRESS)]
+    assert any('its Claude is queued for a rework slot' in line for line in out)
+
+
+def test_one_revive_per_head_and_reason(ar7, revives):
+    """A failed card move is retried on the next check without a second feedback."""
+    g = Gate(ar7, details={7: codex_pr(threads=[head_thread()])})
+    run(g)
+    run(g)
+    assert len(revives) == 1 and g.moves == [('I7', board.IN_PROGRESS)] * 2
+
+
+def test_no_worker_keeps_the_card_in_auto_review_and_retries(ar7, revives):
+    revives.rcs.extend([1, 0])
+    g = Gate(ar7, details={7: dict(codex_pr(), mergeable='CONFLICTING')})
+    out, _ = run(g)
+    assert g.moves == [] and out[0].startswith('NEEDS_WORKER #7: conflicts with main')
+    run(g)
+    assert len(revives) == 2 and g.moves == [('I7', board.IN_PROGRESS)]
+
+
+def test_an_outdated_or_older_head_thread_is_no_rework(ar7, revives):
+    """Only an open, not outdated thread on the head counts; an older-head thread with Codex
+    clean on the head is resolved by the MinBot pass (addressed_threads)."""
+    for t in (head_thread(outdated=True), head_thread(commit='b' * 40)):
+        g = Gate(ar7, details={7: codex_pr(threads=[t])})
+        out, _ = run(g)
+        assert revives == [] and g.moves == [('I7', board.READY)], out
+
+
+def test_a_draft_or_an_open_question_is_no_rework(ar7, revives):
+    for d in (codex_pr(draft=True, threads=[head_thread()]),
+              dict(codex_pr(threads=[head_thread()]), body='Questions for Michal: which?')):
+        g = Gate(ar7, details={7: d})
+        run(g)
+        assert revives == [] and g.moves == []
+
+
+def test_a_dry_run_sends_nothing_back(ar7, revives):
+    g = Gate(ar7, details={7: dict(codex_pr(), mergeable='CONFLICTING')})
+    out, _ = run(g, dry=True)
+    assert revives == [] and g.moves == [] and board.DRAFTED == []
+    assert out[0].startswith('would send #7 back to rework (conflicts with main')
+
+
+def test_the_cascade_sends_auto_review_prs_back_to_rework(ar7, revives):
+    """The cascade checks every Auto Review PR, not only the one a Stop hook names."""
+    ar7[board.AUTO_REVIEW].append(dict(number=8, head=H, item='I8'))
+    ar7[board.AUTO_REVIEW].append(dict(number=9, head=H, item='I9'))
+    g = Gate(ar7, details={7: codex_pr(threads=[head_thread()]), 8: codex_pr(n=8),
+                           9: dict(codex_pr(n=9), mergeable='CONFLICTING')})
+    out = []
+    adv = A.Advance(g=g, out=out.append, minbot=lambda *a: pytest.fail('no MinBot pass in this step'))
+    A.Cascade.auto_review(adv, ar7)
+    assert [r[0] for r in revives] == [7, 9]
+    assert g.moves == [('I7', board.IN_PROGRESS), ('I9', board.IN_PROGRESS)]
+
+
+def test_the_cascade_runs_the_revive_queue_after_park(monkeypatch):
+    """A park frees a rework slot: the queued revives run right after it, in the same pass."""
+    from tangentswarm import slots
+    order = []
+    monkeypatch.setattr(slots, 'run_queued', lambda out=print, prs=None, dry=False: order.append(('queue', prs)))
+    c = A.Cascade.__new__(A.Cascade)
+    c.out, c.dry, c.prs, c.why, c.g = (lambda line: None), False, {7: {'state': 'OPEN'}}, [], {'gql': None}
+    c.clock = lambda: 0
+    c.f = type('F', (), {'retry_held': lambda self, cols: order.append('retry_held')})()
+    monkeypatch.setattr(promoted, 'read_columns', lambda gql, max_age=None: {})
+    for name in ('promote', 'unblock', 'auto_review', 'park', 'flush', 'signal'):
+        monkeypatch.setattr(A.Cascade, name, lambda self, *a, _n=name: order.append(_n) or True)
+    monkeypatch.setattr(A.Cascade, 'fill', lambda self: order.append('fill') or {})
+    assert c._run(0) == 0
+    assert order == ['promote', 'fill', 'unblock', 'auto_review', 'park', ('queue', {7: {'state': 'OPEN'}}),
+                     'retry_held', 'flush', 'signal']
+
+
+def test_the_thread_feedback_fits_one_revive_line():
+    from tangentswarm import slots
+    threads = [head_thread(body='x' * 5000, tid=f'T{i}') for i in range(10)]
+    text = A.thread_rework_text(7, H, threads)
+    assert slots.one_line(text) and len(text) <= slots.FEEDBACK_MAX
