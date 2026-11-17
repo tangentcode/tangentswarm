@@ -499,3 +499,50 @@ def test_a_merge_confirmed_on_a_later_read_goes_on():
             w.prs = [full(), full(state='MERGED')]  # one more read still OPEN, then MERGED
     w.sh = sh
     assert w.run()['merged'] is True and w.slept == [M.MERGEABLE_WAIT] and w.removed
+
+
+# -- Codex on PR #90 (2e61599): the merge event finishes a deferred Project 6 cleanup ---------
+
+def merged_event(repo, head=HEAD):
+    return {'action': 'closed', 'repository': {'full_name': repo},
+            'pull_request': {'number': 90, 'merged': True, 'base': {'ref': 'main'},
+                             'head': {'sha': head, 'ref': 'p6-done-automerge', 'repo': {'full_name': repo}}}}
+
+
+class MergedEx(W.Executor):
+    def card(self, n):
+        return None, None
+
+    def closing_issues(self, n):
+        return []
+
+
+@pytest.mark.parametrize('repo', [TS, METH])
+def test_a_project_6_merge_event_runs_the_cleanup(repo):
+    ran = []
+    ex = MergedEx(g={'gql': 'GQL'}, sh=lambda argv: '', enqueue=lambda argv, by='': None,
+                  p6merge=lambda *a, **k: ran.append(a) or {'merged': True, 'notes': ['closed window swarm-90-x']})
+    for a in W.classify('pull_request', merged_event(repo)):
+        ex.run(a)
+    assert ran == [(repo, 90, HEAD, 'merged')] and ex.errors == []
+    assert f'{repo}#90 Project 6 cleanup at {HEAD[:8]}: closed window swarm-90-x' in ex.done
+
+
+def test_a_platform_merge_event_never_runs_the_project_6_cleanup():
+    ex = MergedEx(g={'gql': 'GQL'}, sh=lambda argv: '', enqueue=lambda argv, by='': None,
+                  cascade=lambda: 'queued', signal_promoted=lambda: 'woken',
+                  p6merge=lambda *a, **k: pytest.fail('platform'))
+    ex.repo = 'tangentcode/platform'
+    ex.p6_cleanup(W.Action('merged', 90, '', {'head': HEAD}))
+    assert ex.errors == []
+
+
+def test_the_merge_event_after_a_queued_merge_cleans_up_with_no_second_merge():
+    w = World([full()])
+    w.merges_on_command = False
+    assert w.run()['merged'] is False  # queued: no cleanup
+    w.prs = [full(state='MERGED')]
+    r = w.run(trigger='merged')  # the merge event
+    assert r['merged'] is True and len(w.merges()) == 1 and w.removed and w.moves()
+    again = w.run(trigger='merged')
+    assert again['already'] is True and len(w.removed) == 1

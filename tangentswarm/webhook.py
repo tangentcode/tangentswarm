@@ -811,6 +811,22 @@ class Executor:
             except Exception as e:  # the rest of the merge handling is done; report this part
                 self.note(f"#{a.pr}: -vN cleanup failed: {type(e).__name__}: {str(e)[:160]}")
         self.note(f"#{a.pr} merged: cascade, Done, linked issues closed")
+        self.p6_cleanup(a)
+
+    def p6_cleanup(self, a):
+        """tangentswarm #89 (Codex on PR #90): a Project 6 merge event runs p6merge at the merged
+        head. It is idempotent: after the swarm's own merge it only sends the MethBot POSTs
+        still pending; after a merge it could not confirm (a merge queue) or a merge by hand,
+        it does the cleanup (windows, worktree, branch, deploy note, Backlog pull), never a merge."""
+        from . import p6merge
+        head = a.args.get('head') or ''
+        if self.repo not in p6merge.REPOS or not p6merge.SHA_RE.match(head):
+            return
+        if self.dry:
+            return self.note(f"would run the Project 6 cleanup of {self.repo}#{a.pr} at {head[:8]}")
+        res = (self.p6merge or p6merge.run)(self.repo, a.pr, head, 'merged', gql=self.g['gql'], sh=self._sh)
+        self.note(f"{self.repo}#{a.pr} Project 6 cleanup at {head[:8]}: "
+                  + ('; '.join(res.get('notes') or []) or res.get('why') or 'done'))
 
     def drop_premerge_labels(self, n):
         """Remove merge-ready and pre-merging from a PR merged to main (tangentswarm #65), and

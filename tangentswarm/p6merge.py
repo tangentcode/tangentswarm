@@ -5,6 +5,9 @@ LLM run did fixed steps. Now the swarm does them. Triggers:
   done          the worker MCP handoff in a Project 6 worktree (worker_mcp.p6_done)
   comment       a fallback: the worker's PR comment whose first line is `MERGE-READY <sha>`
                 (swarm-webhook, action p6merge)
+  merged        the PR's merge event (swarm-webhook do_merged): never a merge; the cleanup of a
+                merge the run could not confirm (a merge queue) or one done by hand, or only
+                the MethBot POSTs still pending
 
 Verify, all on the exact reported head (problems() lists every check that fails):
   - the PR is open, not a draft, and its base is main
