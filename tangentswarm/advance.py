@@ -282,10 +282,11 @@ class Advance:
 
     # 2 ---------------------------------------------------------------------
     def pull(self, cols):
-        from . import flow
+        from . import fill, flow, promoted
         st, ready = cols.get(board.STAGING, []), cols.get(board.READY, [])
         running = flow.load_pull()
-        if not running and (len(st) >= flow.STAGING_MIN or not ready):
+        need = fill.plan(cols, hr_target=promoted.HR_TARGET, staging_target=flow.STAGING_MIN).pull
+        if not running and (not need or not ready):  # tangentswarm #144: the one fill routine
             self.why.append(f"Staging {len(st)}/{flow.STAGING_MIN}, Ready {len(ready)}")
             return False
         f = flow.Flow(dry_run=self.dry, out=lambda line: None, g=self.g)
@@ -513,8 +514,10 @@ class Cascade(Advance):
                    pre-merged and checked against main; the rest of Ready is never re-checked.
                    A pre-merge whose queue ahead only lost PRs that merged into main as
                    their heads is kept as is (Flow.assumed: no probe, no write).
-                   (C) While Staging + pulls in flight is below FLOOR (the WIP target,
-                   default 2; --floor, SWARM_STAGING_FLOOR or SWARM_STAGING_TARGET), the
+                   (C) While fill.plan (tangentswarm #144, the one fill routine) says the
+                   board needs pulls (the Human Review slots Staging cannot fill, plus
+                   Staging short of FLOOR: default 2; --floor, SWARM_STAGING_FLOOR or
+                   SWARM_STAGING_TARGET; less the pulls in flight), the
                    Ready PRs are pulled in strict pick order, up to the target, as their
                    -vN tips in ONE work push (Flow.pull_batch), so one redeploy covers all
                    of them. The first PR that is not merge-ready stops the pull: nothing
@@ -605,10 +608,13 @@ class Cascade(Advance):
         return ended
 
     def _staged(self, cols, nums):
-        """Dry run: count the PRs a gate would move (from Ready) into Staging."""
+        """Dry run: count the PRs a gate would move (from Ready) into Staging, or into Human
+        Review where Flow.stage said so (fill.landing, tangentswarm #144)."""
         done = [q for q in cols.get(board.READY, []) if q['number'] in nums]
+        up = [q for q in done if self.f.landed.get(q['number']) == board.HUMAN_REVIEW]
         return dict(cols, **{board.READY: [q for q in cols.get(board.READY, []) if q not in done],
-                             board.STAGING: cols.get(board.STAGING, []) + done})
+                             board.HUMAN_REVIEW: cols.get(board.HUMAN_REVIEW, []) + up,
+                             board.STAGING: cols.get(board.STAGING, []) + [q for q in done if q not in up]})
 
     # -- 2. fill ------------------------------------------------------------------
     def fill(self):
@@ -631,7 +637,7 @@ class Cascade(Advance):
         with self.g['ScratchRepo']() as scratch:
             ended = self.gate_pulls(prs, scratch) if flow.load_pulls() else []
             if ended and self.dry:
-                gated = [n for n in ended if any(f"#{n} hr-gate --apply" in line or f"#{n} Ready -> Staging" in line
+                gated = [n for n in ended if any(f"#{n} hr-gate --apply" in line or f"#{n} Ready -> " in line
                                                  for line in self.f.did)]
                 cols = self._staged(cols, gated)
             elif ended:
@@ -641,8 +647,12 @@ class Cascade(Advance):
                       - {p['number'] for p in st})
             fl = f" + {len(flying)} in flight ({', '.join('#' + str(n) for n in sorted(flying))})" if flying else ''
             ready = [p for p in cols.get(board.READY, []) if not p.get('draft') and p['number'] not in flying]
-            have = len(st) + len(flying)
-            cols = self._fill_pull(prs, cols, scratch, st, fl, ready, have)
+            if getattr(self, 'waiting', None):  # tangentswarm #144: the top PR went to rework
+                self.out(f"fill: #{self.waiting} (the top Ready PR) went to rework: the fill waits; "
+                         "nothing behind it is pulled or pre-merged in this pass")
+                self.pulled = getattr(self, 'pulled', [])
+                return cols
+            cols = self._fill_pull(prs, cols, scratch, st, fl, ready, flying)
             # tangentswarm #65 (Michal 2026-11-16 3:22 PM ET): every pass keeps the top Ready
             # PRs pre-merged onto future main, so a freed Staging slot refills at once.
             # tangentswarm #69: AFTER the pull, so the pre-merge uses the queue with the pulled
@@ -653,16 +663,22 @@ class Cascade(Advance):
                 self.flush()
         return cols
 
-    def _fill_pull(self, prs, cols, scratch, st, fl, ready, have):
-        """(C) of fill: the pull. Fixed WIP: never past the target, also for a fast-track PR
-        (it goes first in the order). Returns the columns after it."""
-        if have >= FLOOR:
+    def _fill_pull(self, prs, cols, scratch, st, fl, ready, flying):
+        """(C) of fill: the pull. tangentswarm #144: the one fill routine (fill.plan) sets the
+        room: the Human Review slots that no Staging PR fills plus the Staging gap, less the
+        pulls in flight. A pulled PR lands where fill.landing says (Flow.stage): straight into
+        Human Review while it has such a slot, else Staging. Fixed WIP: never past the
+        targets, also for a fast-track PR (it goes first in the order). Returns the columns
+        after it."""
+        from . import fill, promoted
+        pl = fill.plan(cols, flying, hr_target=promoted.HR_TARGET, staging_target=FLOOR)
+        if not pl.pull:
             self.out(f"fill: Staging {len(st)}{fl}, target {FLOOR}: no pull needed")
             return cols
         if not ready:
             self.out(f"fill: Staging {len(st)}{fl}, Ready 0: Ready is empty")
             return cols
-        pick, room = dict(cols, **{board.READY: ready}), FLOOR - have
+        pick, room = dict(cols, **{board.READY: ready}), pl.pull
         batch = self.f.pull_batch(prs, pick, scratch, room)
         self.flush()
         if not batch:
@@ -673,7 +689,8 @@ class Cascade(Advance):
         getattr(self, 'pulled', []).extend(nums)
         ft = ' (fast-track)' if any(board.item_fast_track(p, board.active_fast_track()) for p in batch) else ''
         self.out(f"fill: {', '.join('#' + str(n) for n in nums)} pulled in one work merge{ft}: "
-                 f"Staging {len(st)}{fl} + {len(batch)}, target {FLOOR}")
+                 f"Staging {len(st)}{fl} + {len(batch)}, target {FLOOR}"
+                 + (f"; {min(pl.direct, len(batch))} go straight to Human Review" if pl.direct else ''))
         if self.dry:  # nothing was pushed: show the rest of the chain, then count them in Staging
             work = getattr(self.f, 'last_work', None)
             served = [p for p in batch if self.touches_served(p['number'])]
@@ -683,10 +700,13 @@ class Cascade(Advance):
                 self.out("would gate each one when its priority staging site serves the batch (no wait; the "
                          "daemon queues a cascade on a .deploy-sha change)"
                          + (f" (now lagging: {', '.join(h for _, h, _, _ in lag)})" if lag else ''))
-            for n in nums:
-                self.out(f"would run hr-gate --apply {n} (Ready -> Staging when it passes)")
+            direct = batch[:pl.direct]
+            for p in batch:
+                to = 'Human Review' if p in direct else 'Staging'
+                self.out(f"would run hr-gate --apply {p['number']} (Ready -> {to} when it passes)")
             return dict(cols, **{board.READY: [q for q in cols.get(board.READY, []) if q not in batch],
-                                 board.STAGING: st + batch})
+                                 board.HUMAN_REVIEW: cols.get(board.HUMAN_REVIEW, []) + direct,
+                                 board.STAGING: st + batch[len(direct):]})
         # one check now, no wait (a PR without served files is gated at once)
         if self.gate_pulls(prs, scratch, only=set(nums)):
             prs, cols = self.columns()
@@ -694,31 +714,33 @@ class Cascade(Advance):
 
     # -- rework: Ready PRs that cannot be pulled (Michal 2026-11-14 9:10 PM ET deadlock) ------
     def main_check(self, cols):
-        """(1) The TOP Ready PR (the shared pick order, not in a pull) against origin/main with
-        git merge-tree (local, kept per SHA pair: no GraphQL). A conflict: card to In Progress
-        and a rework relay that lists the files; then the next one is the top and is checked.
-        The check stops at the first clean PR. tangentswarm #111 (Michal 2026-11-17 10:45 AM
-        ET): nothing else in Ready is checked, so a merge never touches the other Ready PRs'
-        labels, branches or columns. Returns cols without the PRs sent to rework."""
-        from . import flow
-        flying = {d['pr'] for d in flow.load_pulls()}
-        ready = [p for p in cols.get(board.READY, []) if not p.get('draft') and p['number'] not in flying]
-        if not ready:
+        """(1) The TOP Ready PR only (fill.top: the shared pick order, not in a pull) against
+        origin/main with git merge-tree (local, kept per SHA pair: no GraphQL). A conflict: card
+        to In Progress and a rework relay that lists the files, and the fill WAITS in this pass
+        (self.waiting): no pull and no pre-merge, never a skip to the second Ready PR.
+        tangentswarm #144 (Michal 2026-11-18 2:09 PM ET: "we should just do the first ticket.
+        In ready."; nine Ready PRs went back together at 2:03 PM). tangentswarm #111: nothing
+        else in Ready is checked, so a merge never touches the other Ready PRs' labels,
+        branches or columns. Returns cols without the PR sent to rework."""
+        from . import fill, flow
+        self.waiting = None
+        p = fill.top(cols, {d['pr'] for d in flow.load_pulls()})
+        if p is None:
             return cols
-        bad = []
         with self.g['ScratchRepo']() as scratch:
             scratch.ensure_main()
             main = self.f.sha_of(scratch, scratch.main)
-            for p in flow.ready_order(ready):
-                scratch.ensure(p['head'])
-                if self.f.clean(scratch, main, p['head']):
-                    break
+            scratch.ensure(p['head'])
+            clean = self.f.clean(scratch, main, p['head'])
+            if not clean:
                 self.rework(p, [('origin/main', self.f.files(scratch, main, p['head']))])
-                bad.append(p['number'])
         self.f.cmap.save()
-        if bad:
-            self.out(f"main check: {', '.join('#' + str(n) for n in bad)} conflict with origin/main: sent to rework")
-        return dict(cols, **{board.READY: [p for p in cols.get(board.READY, []) if p['number'] not in bad]})
+        if clean:
+            return cols
+        self.waiting = p['number']
+        self.out(f"main check: #{p['number']} conflicts with origin/main: sent to rework; the fill waits "
+                 "(no PR further down Ready is checked or pulled in this pass)")
+        return dict(cols, **{board.READY: [q for q in cols.get(board.READY, []) if q['number'] != p['number']]})
 
     def unblock(self, cols, pulled):
         """(2) Human Review or Staging is empty and no Ready PR could be pulled: never end
@@ -726,10 +748,13 @@ class Cascade(Advance):
         names the NEXT Ready PR in the pick order and its pre-merge state; its conflict is
         resolved by its worker on a <branch>-vN (Flow.premerge), never on its own branch. A
         conflict with origin/main itself was sent to rework by main_check."""
-        from . import flow
+        from . import fill, flow, promoted
         hr, st = cols.get(board.HUMAN_REVIEW, []), cols.get(board.STAGING, [])
         ready = [p for p in cols.get(board.READY, []) if not p.get('draft')]
-        if pulled or flow.load_pulls() or (hr and st) or len(st) >= FLOOR:  # at the floor: no pull was wanted
+        need = fill.plan(cols, hr_target=promoted.HR_TARGET, staging_target=FLOOR).pull
+        if pulled or flow.load_pulls() or (hr and st) or not need:  # tangentswarm #144: no pull was wanted
+            return
+        if getattr(self, 'waiting', None):  # tangentswarm #144: the fill waits on the top PR's rework (said)
             return
         if not ready:
             self.out(f"STALLED: Human Review {len(hr)}, Staging {len(st)}, Ready empty: new work must reach Ready")

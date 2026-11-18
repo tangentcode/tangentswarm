@@ -127,13 +127,17 @@ def read_columns(gql, ft_state=None, max_age=None, stale_ok=True):
 def needs_pull(cols, running):
     """With SWARM_PROMOTE_PULL=1: a pull runs, or Staging is short and Ready has a PR."""
     from . import flow
+    from . import fill
     if not PULL:
         return False
-    return bool(running) or (len(cols.get(board.STAGING, [])) < flow.STAGING_MIN and bool(cols.get(board.READY)))
+    need = fill.plan(cols, hr_target=HR_TARGET, staging_target=flow.STAGING_MIN).pull
+    return bool(running) or (bool(need) and bool(cols.get(board.READY)))
 
 
 def needs_promotion(cols):
-    return len(cols.get(board.HUMAN_REVIEW, [])) < HR_TARGET and bool(cols.get(board.STAGING))
+    """tangentswarm #144: the one fill routine says a Staging PR moves to Human Review now."""
+    from . import fill
+    return bool(fill.plan(cols, hr_target=HR_TARGET).promote)
 
 
 def _when(text):
@@ -259,13 +263,18 @@ class Promoter:
         PR its pre-merge was built on keeps that pre-merge, and the rest of Ready is not
         re-checked). There is no rule that Human Review must be empty: a promote fills each
         free slot, and each promote queues the cascade that pulls the next Ready PR."""
+        from . import fill
         now = time.time() if now is None else now
         hr = len(cols.get(board.HUMAN_REVIEW, []))
         prev, self.last_hr = self.last_hr, hr
-        if hr == 0 and prev is not None and prev > 0:
-            return f"Human Review dropped to 0 (was {prev})"
-        if hr == 0 and now - self.cascade_at >= CASCADE_EMPTY_HR:
-            return "Human Review is empty"
+        # tangentswarm #144: the one fill routine. A Human Review slot that no Staging PR fills
+        # is filled straight from Ready, and only the cascade pulls: queue it (not only at 0).
+        gap = fill.plan(cols, hr_target=HR_TARGET).direct
+        if gap and prev is not None and hr < prev:
+            return (f"Human Review dropped to 0 (was {prev})" if hr == 0 else
+                    f"Human Review dropped to {hr} (was {prev}) and Staging cannot fill it")
+        if gap and now - self.cascade_at >= CASCADE_EMPTY_HR:
+            return "Human Review is empty" if hr == 0 else f"Human Review {hr}/{HR_TARGET} and Staging cannot fill it"
         if main_moved and self.last_main is not None:
             return "main moved"
         return None

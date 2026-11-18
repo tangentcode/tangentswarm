@@ -10,13 +10,15 @@ Columns (matched by option id, see tangentswarm.board):
   Human Review  exactly 2.
 
 One step, under the one global serial lock (a second caller exits 75 "busy"):
-  1. Promote: if Human Review has fewer than 2, run `pending-promote --apply`
+  tangentswarm #144: every count and target below comes from the one fill routine
+  (tangentswarm.fill): top down, Human Review first, then Staging, then Ready.
+  1. Promote: if fill.plan says a Staging PR moves up, run `pending-promote --apply`
      (Staging head -> Human Review through hr-gate). Never --fill.
-  2. Pull: if Staging has fewer than STAGING_MIN and no pull is running, pick the top
-     Ready PR that stacks cleanly on main + the Human Review heads + the Staging heads
-     (local merge-tree only). A PR that does not merge onto main goes back to In
-     Progress with a merge-main relay. Then merge its head into work (one merge commit,
-     pushed as a fast-forward; the push redeploys staging).
+  2. Pull: if fill.plan says the board needs a pull and no pull is running, take the top
+     Ready PR (only the top: if it does not merge onto main it goes back to In Progress
+     with a merge-main relay and the fill waits). Then merge its pre-merged tip into work
+     (pushed as a fast-forward; the push redeploys staging). It lands where fill.landing
+     says: straight in Human Review while Staging cannot fill it, else Staging.
   3. Advance a running pull: evaluate hr-gate on the pulled head. All conditions pass:
      `hr-gate --apply N` puts it into Staging. tangentswarm #83 (Michal 2026-11-10): only
      a real conflict at the final mergeability check (row 2: the head conflicts with
@@ -47,7 +49,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import board, gatelock, gqlmeter, proc
+from . import board, fill, gatelock, gqlmeter, proc
 
 HOME = Path.home()
 BIN = Path(os.environ.get('SWARM_TICK_BIN', str(HOME / 'bin')))
@@ -55,7 +57,8 @@ STATE = Path(os.environ.get('SWARM_FLOW_STATE', str(HOME / '.local' / 'state' / 
 LOG = STATE.with_name('flow.log')
 REPO = 'tangentcode/platform'
 # tangentswarm #65: fixed WIP targets (configurable; the number is not settled). Never past them.
-HR_TARGET = int(os.environ.get('SWARM_HR_TARGET', '2'))
+# tangentswarm #144: the targets and the fill rules are in tangentswarm.fill (one copy).
+HR_TARGET = fill.HR_TARGET
 STAGING_TARGET = int(os.environ.get('SWARM_STAGING_TARGET', '2'))
 STAGING_MIN = int(os.environ.get('SWARM_STAGING_MIN', str(STAGING_TARGET)))
 STAGING_MAX = int(os.environ.get('SWARM_STAGING_MAX', '5'))
@@ -466,6 +469,7 @@ class Flow:
         self.dry_pulls = []  # a dry run's pulls: not saved, but in future main like a real pull
         self.tool_timeout = 1800  # one hr-gate / pending-promote run; the cascade sets less
         self.stale_ok = False  # the cascade moves cards from a cache that is only stale (tangentswarm #136)
+        self.landed = {}  # {n: column} of the pulled PRs this Flow moved (tangentswarm #144: landing)
         from .conflictmap import ConflictMap
         self.cmap = ConflictMap()  # merge-tree answers per SHA pair
         self.g = g if g is not None else runpy.run_path(str(BIN / 'hr-gate'), run_name='swarm_flow')
@@ -501,9 +505,10 @@ class Flow:
     # -- 1. promote -----------------------------------------------------------
     def promote(self, cols):
         hr, staging = cols.get(board.HUMAN_REVIEW, []), cols.get(board.STAGING, [])
-        if len(hr) >= HR_TARGET or not staging:
+        if not fill.plan(cols, hr_target=HR_TARGET).promote:  # tangentswarm #144: the one fill routine
             if len(hr) < HR_TARGET:
-                self.note(f"Human Review {len(hr)}/{HR_TARGET} and Staging is empty: nothing to promote")
+                self.note(f"Human Review {len(hr)}/{HR_TARGET} and Staging is empty: nothing to promote; "
+                          "the next pulled Ready PR goes straight to Human Review")
             return False
         if self.dry:
             self.change(f"pending-promote --apply (Human Review {len(hr)}/{HR_TARGET}, Staging {len(staging)})")
@@ -535,19 +540,21 @@ class Flow:
             self.cmap.save()
 
     def _pull(self, prs, cols, scratch, limit=None, strict=False):
-        """Start one pull. Returns the pulled PR, or None. limit: pull only while Staging has
-        fewer PRs than this (default STAGING_MIN).
+        """Start one pull. Returns the pulled PR, or None. tangentswarm #144: pull only while
+        fill.plan says the board needs one (the Human Review gap that Staging cannot fill plus
+        the Staging gap; limit: the Staging target, default STAGING_MIN).
         tangentswarm #65: only the NEXT Ready PR in the pick order is pulled, as its
         pre-merged tip (premerge_one: <branch>-vN = future main + head); when it is not
         merge-ready, nothing behind it is pulled. Not strict (swarm-flow step): a PR that
         does not merge onto main first goes back to its worker with a merge-main relay.
         strict (the swarm-advance cascade): no such relay (main_check does it)."""
         staging = cols.get(board.STAGING, [])
-        if len(staging) >= (STAGING_MIN if limit is None else limit):
+        st_t = STAGING_MIN if limit is None else limit
+        if not fill.plan(cols, hr_target=HR_TARGET, staging_target=st_t).pull:
             return None
         ready = [p for p in cols.get(board.READY, []) if not p['draft']]
         if not ready:
-            self.note(f"Staging {len(staging)}/{STAGING_MIN} and Ready is empty: refill needed")
+            self.note(f"Staging {len(staging)}/{st_t} and Ready is empty: refill needed")
             return
         scratch.ensure_main()
         main = self.sha_of(scratch, scratch.main)  # a SHA, so the conflict map can key on it
@@ -565,7 +572,10 @@ class Flow:
             if not strict and not self.clean(scratch, main, p['head']):
                 self.fail(p, 'does not merge cleanly onto main: merge origin/main into the branch (no rebase)',
                           relay='merge-main')
-                continue  # it left Ready (In Progress with its worker)
+                # tangentswarm #144 (Michal 2026-11-18 2:09 PM ET): only the top Ready PR; the
+                # fill waits, it never skips ahead to (or checks) the next one
+                self.note(f"#{n} (the top Ready PR) went to rework: the fill waits; nothing behind it is checked")
+                return None
             # tangentswarm #65: strict order; the next PR must be pre-merged onto future main
             # (Codex on PR #66: also for swarm-flow step, so a queue conflict gets its -vN worker)
             tip = self.premerge_one(p, scratch, fm)
@@ -573,7 +583,6 @@ class Flow:
                 self.note(f"#{n} is next in the pick order and is not merge-ready: nothing behind it is pulled")
                 return None
             return p if self.start_pull(p, scratch, tip, pre_merged=True, fm=fm) else None
-        self.note('no Ready PR merges cleanly onto main: each one went back to its worker')
 
     def staging_order(self, staging):
         """Staging in the shared pick order (board.pick_key; tangentswarm #35)."""
@@ -1094,7 +1103,7 @@ class Flow:
             why = (self.identity_problem(d, full) or self.evidence_problem(full) or self.work_health(full)
                    or self.main_problem(scratch, d))
             if not why:
-                return self.stage(d, p, served, full)  # tangentswarm #136: no gate re-run for a Ready PR
+                return self.stage(d, p, served, full, prs)  # tangentswarm #136: no gate re-run for a Ready PR
             # Codex on PR #138: Ready does not prove 7a/7b (a UI PR may reach Ready while its
             # screenshot job runs): the full gate path below waits for it, as before.
             self.note(f"#{n}: {why}: the full gate runs")
@@ -1236,7 +1245,7 @@ class Flow:
         lag = advance.lagging(self.g, d, now=self.now)
         return '; '.join(f"{h} ({(x or '-')[:8]})" for _, h, x, _ in lag)
 
-    def stage(self, d, p, served=False, full=None):
+    def stage(self, d, p, served=False, full=None, prs=None):
         """tangentswarm #136 (Michal, #116: "This is what ready means"): a Ready PR passed every
         Human Review check before it entered Ready, so Ready -> Staging is only the pre-merged
         tip in work (the pull pushed it) and the card move. No hr-gate run, no board read, no
@@ -1245,20 +1254,31 @@ class Flow:
         7b; Codex on PR #138); the only check left is that the priority staging site serves it
         (served: the caller, such as
         Cascade.gate_pulls, already did; else unserved() does it here). The gate pass
-        line for the head is written here, so the promote fast path can move it on."""
+        line for the head is written here, so the promote fast path can move it on.
+        tangentswarm #144: the card goes where fill.landing says: straight into Human Review
+        when Human Review has a slot that no Staging PR fills, else into Staging. prs: the
+        board ({n: card}) for the count; this Flow's own moves count too (self.landed)."""
         from . import moves
         n, head = d['pr'], d['head']
         lag = '' if served else self.unserved(d, full)
         if lag:
             self.note(f"#{n} pull waiting: {head[:8]} is not served yet by {lag}")
             return
+        cols = fill.columns_of(prs if prs is not None else {n: p}, self.landed)
+        to = fill.landing({k: [q for q in v if q['number'] != n] for k, v in cols.items()}, hr_target=HR_TARGET)
+        name = 'Human Review' if to == board.HUMAN_REVIEW else 'Staging'
+        what = f"#{n} Ready -> {name} (pre-merged tip in {WORK}; no gate re-run)"
+        self.landed[n] = to
         if self.dry:
-            self.change(f"#{n} Ready -> Staging (pre-merged tip in {WORK}; no gate re-run)")
+            self.change(what)
             return
-        board.move_card(self.g, p['item'], board.STAGING, n=n)
+        board.move_card(self.g, p['item'], to, n=n)
         self.g['log']('apply', n, head[:8], 'PASS', [])  # the gate pass the promote fast path reads
-        moves.log_move(n, 'Ready', 'Staging', head, note='pre-merged Ready PR: no gate re-run (#136)')
-        self.change(f"#{n} Ready -> Staging (pre-merged tip in {WORK}; no gate re-run)")
+        if to == board.HUMAN_REVIEW:  # tangentswarm #116: event -> move time, as for a promote
+            for line in moves.merge_clock([n], frm='Ready'):
+                self.note(line.split('\t', 2)[2].replace('\t', ' '))
+        moves.log_move(n, 'Ready', name, head, note='pre-merged Ready PR: no gate re-run (#136); fill.landing (#144)')
+        self.change(what)
         drop_pull(n)
 
     def status_hold(self, n, full, head):

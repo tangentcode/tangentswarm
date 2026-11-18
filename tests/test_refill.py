@@ -355,6 +355,13 @@ def ready_card(n=7):
                 item=f'I{n}', rank=1, parked=False, body='')
 
 
+def full_hr(card):
+    """The board with card in Ready and a full Human Review (#1, #2): a pulled PR lands in
+    Staging (tangentswarm #144: fill.landing)."""
+    hr = {n: dict(ready_card(n), col=HR) for n in (1, 2)}
+    return {**hr, card['number']: card}
+
+
 def pull(n=7, **kw):
     d = dict(pr=n, head=f'{n:040d}', branch=f'b{n}', item=f'I{n}', tip='v' * 40, work='w' * 40, started=10_000,
              pre_merged=True)
@@ -378,7 +385,7 @@ def test_a_pre_merged_ready_pr_moves_to_staging_with_no_gate_run(monkeypatch):
     d = pull()
     g = G()
     f = make(g)
-    f.advance(d, {7: ready_card()}, scratch=Scratch())
+    f.advance(d, full_hr(ready_card()), scratch=Scratch())
     assert g.moves == [('I7', ST)] and flow.load_pulls() == []
     assert g.logged == [('apply', 7, d['head'][:8], 'PASS', [])]
     assert any('Ready -> Staging' in x and 'no gate re-run' in x for x in f.did)
@@ -390,17 +397,17 @@ def test_a_pre_merged_pull_waits_until_its_priority_site_serves_it():
     d = pull()
     g = G(served='o' * 40)
     f = make(g)
-    f.advance(d, {7: ready_card()}, scratch=Scratch())
+    f.advance(d, full_hr(ready_card()), scratch=Scratch())
     assert g.moves == [] and flow.load_pull()['pr'] == 7
     assert any('not served yet' in n for n in f.notes)
-    f.advance(d, {7: ready_card()}, scratch=Scratch(), served=True)  # the cascade checked it already
+    f.advance(d, full_hr(ready_card()), scratch=Scratch(), served=True)  # the cascade checked it already
     assert g.moves == [('I7', ST)]
 
 
 def test_a_pre_merged_pull_with_no_served_file_moves_at_once():
     d = pull()
     g = G(files=('docs/x.md',), served='o' * 40, body='Where to see: docs only')
-    make(g).advance(d, {7: ready_card()}, scratch=Scratch())
+    make(g).advance(d, full_hr(ready_card()), scratch=Scratch())
     assert g.moves == [('I7', ST)]
 
 
@@ -408,7 +415,7 @@ def test_a_dry_run_says_what_it_would_move():
     d = pull()
     g = G()
     f = make(g, dry=True)
-    f.advance(d, {7: ready_card()}, scratch=Scratch())
+    f.advance(d, full_hr(ready_card()), scratch=Scratch())
     assert g.moves == [] and g.logged == [] and f.did == ['would: #7 Ready -> Staging (pre-merged tip in work; no gate re-run)']
 
 
@@ -443,7 +450,7 @@ def test_ready_does_not_prove_the_body_evidence_so_a_gap_takes_the_full_gate(fil
     g['list_hr_prs'] = lambda refresh=False: []
     f = make(g)
     f.screenshot_job = lambda n, head, full=None: None
-    f.advance(d, {7: ready_card()}, scratch=Scratch())
+    f.advance(d, full_hr(ready_card()), scratch=Scratch())
     assert ran == [1] and g.moves == [] and g.logged == [] and flow.load_pull()['pr'] == 7
     assert any(why in n and 'the full gate runs' in n for n in f.notes)
 
@@ -464,7 +471,7 @@ def test_the_fast_move_needs_the_fresh_pr_at_the_pulled_head(fresh, why):
     g['list_hr_prs'] = lambda refresh=False: []
     f = make(g)
     f.leave = lambda p, why, tell=True: None
-    f.advance(d, {7: ready_card()}, scratch=Scratch())
+    f.advance(d, full_hr(ready_card()), scratch=Scratch())
     assert ran == [1] and g.moves == [] and g.logged == []
     assert any(why in n and 'the full gate runs' in n for n in f.notes)
 
@@ -499,7 +506,7 @@ def test_a_later_human_request_takes_the_full_gate(fresh, blocks):
     g['list_hr_prs'] = lambda refresh=False: []
     f = make(g)
     f.leave = lambda p, why, tell=True: None
-    f.advance(d, {7: ready_card()}, scratch=Scratch())
+    f.advance(d, full_hr(ready_card()), scratch=Scratch())
     if blocks:
         assert ran == [1] and g.moves == [] and any('8: ' in n and 'the full gate runs' in n for n in f.notes)
     else:
@@ -526,7 +533,7 @@ def test_a_broken_work_branch_takes_the_full_gate(broken, why):
     g['list_hr_prs'] = lambda refresh=False: []
     f = make(g)
     f.leave = lambda p, why, tell=True: None
-    f.advance(d, {7: ready_card()}, scratch=Scratch())
+    f.advance(d, full_hr(ready_card()), scratch=Scratch())
     assert ran == [1] and g.moves == [] and g.logged == []
     assert any(why in n and 'the full gate runs' in n for n in f.notes)
 
@@ -536,11 +543,11 @@ def test_the_work_health_uses_hr_gates_gatechecks_and_skips_a_pr_with_no_served_
     seen = []
     g = G(files=('docs/x.md',), body='Where to see: docs')
     g['work_broken'] = lambda gc: seen.append(gc) or 'broken'
-    make(g).advance(pull(), {7: ready_card()}, scratch=Scratch())
+    make(g).advance(pull(), full_hr(ready_card()), scratch=Scratch())
     assert seen == [] and g.moves == [('I7', ST)]
     g = G()
     g['work_broken'] = lambda gc: seen.append(gc) or None
-    make(g).advance(pull(), {7: ready_card()}, scratch=Scratch())
+    make(g).advance(pull(), full_hr(ready_card()), scratch=Scratch())
     assert seen == [gatechecks] and g.moves == [('I7', ST)]
 
 
@@ -555,7 +562,7 @@ def test_a_body_that_states_where_the_pr_stands_takes_the_full_gate():
     g['list_hr_prs'] = lambda refresh=False: []
     f = make(g)
     f.worker_jobs = lambda *a, **k: None
-    f.advance(d, {7: ready_card()}, scratch=Scratch())
+    f.advance(d, full_hr(ready_card()), scratch=Scratch())
     assert ran == [1] and g.moves == [] and g.logged == []
     assert any('tangentswarm #130' in n and 'the full gate runs' in n for n in f.notes)
 
@@ -578,7 +585,7 @@ def test_row_2_is_checked_again_against_the_current_main(scratch, clean, why):
     f = make(g)
     failed = []
     f.fail = lambda p, reason, relay=None, text=None: failed.append((p['number'], relay))
-    f.advance(d, {7: ready_card()}, scratch=scratch)
+    f.advance(d, full_hr(ready_card()), scratch=scratch)
     assert ran == [1] and g.moves == [] and g.logged == [] and failed == [(7, 'merge-main')]
     assert any(why in n and 'the full gate runs' in n for n in f.notes)
 
@@ -588,7 +595,7 @@ def test_the_row_2_check_merges_the_pulled_head_onto_the_current_main():
     g = G()
     g['merge_tree_clean'] = lambda dir_, a, b: seen.append((a, b)) or True
     sc = Scratch()
-    make(g).advance(pull(), {7: ready_card()}, scratch=sc)
+    make(g).advance(pull(), full_hr(ready_card()), scratch=sc)
     assert seen == [('a' * 40, f'{7:040d}')] and f'{7:040d}' in sc.ensured and g.moves == [('I7', ST)]
 
 
@@ -597,7 +604,7 @@ def test_the_fast_move_reads_the_pr_fresh_and_uses_hr_gates_image_check():
     g = G()
     seen = []
     g['shots_exists'] = lambda path: seen.append(path) or True
-    make(g).advance(d, {7: ready_card()}, scratch=Scratch())
+    make(g).advance(d, full_hr(ready_card()), scratch=Scratch())
     assert g.fetched[0] is True and g.moves == [('I7', ST)]
 
 

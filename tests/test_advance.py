@@ -345,8 +345,12 @@ def merge_fakes(monkeypatch, dirty=(), main_dirty=()):
 
 def cascade(monkeypatch, tmp_path, cols, g, dry=True, **kw):
     """kw dirty: Ready PRs that Flow.pull strict skips (they do not merge cleanly); main_dirty:
-    Ready PRs that conflict with origin/main (the main check sends them to rework)."""
+    Ready PRs that conflict with origin/main (the main check sends them to rework).
+    tangentswarm #144: a test that names no Human Review gets a full one (#901, #902), so it
+    tests the Staging target; an empty Human Review pulls for it too (fill.plan)."""
     from tangentswarm import flow as F
+    if board.HUMAN_REVIEW not in cols:
+        cols = dict(cols, **{board.HUMAN_REVIEW: [pr(n, board.HUMAN_REVIEW) for n in (901, 902)]})
     monkeypatch.setattr(F, 'STATE', tmp_path / 'pull.json')
     merge_fakes(monkeypatch, kw.get('dirty', ()), kw.get('main_dirty', ()))
     pulled = []
@@ -386,7 +390,7 @@ def test_strict_order_a_pr_that_is_not_merge_ready_stops_the_pull(monkeypatch, t
 
 
 def test_staging_empty_and_nothing_clean_pulls_nothing(monkeypatch, tmp_path):
-    cols = {board.READY: [pr(n, board.READY) for n in range(6, 12)]}
+    cols = {board.READY: [pr(n, board.READY) for n in range(6, 12)], board.HUMAN_REVIEW: []}
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(), dirty=set(range(6, 12)))
     assert pulled == [] and out[:2] == [
         'fill: Staging 0: the next Ready PR is not merge-ready; nothing is pulled past it (strict order)',
@@ -449,14 +453,17 @@ def test_the_pull_order_puts_the_fast_track_pr_first():
 
 
 def test_a_ready_pr_that_conflicts_with_main_goes_to_rework_with_its_files(monkeypatch, tmp_path):
-    """(1) Michal 9:10 PM ET: #481 and #484 conflicted with origin/main and the cascade ended quietly."""
+    """(1) Michal 9:10 PM ET: #481 and #484 conflicted with origin/main and the cascade ended
+    quietly. tangentswarm #144 (Michal 2026-11-18 2:09 PM ET): only the TOP Ready PR is checked;
+    it goes to rework and the fill waits: #484 and #486 are not checked, moved or pulled."""
     cols = {board.READY: [pr(481, board.READY), pr(484, board.READY), pr(486, board.READY)]}
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False), main_dirty={481, 484})
-    assert pulled == [486]
-    assert 'NEEDS_REWORK #481 f481.ts' in out and 'NEEDS_REWORK #484 f484.ts' in out
+    assert pulled == []
+    assert 'NEEDS_REWORK #481 f481.ts' in out and not any('#484' in l or '#486' in l for l in out)
     assert any(l.startswith('would move #481 Ready -> In Progress and send: Coordinator: #481 cannot enter '
                             'Staging: it conflicts with origin/main: f481.ts. Merge origin/main') for l in out)
-    assert 'main check: #481, #484 conflict with origin/main: sent to rework' in out
+    assert any(l.startswith('main check: #481 conflicts with origin/main: sent to rework; the fill waits') for l in out)
+    assert any(l.startswith('fill: #481 (the top Ready PR) went to rework: the fill waits') for l in out)
 
 
 def rework_case(monkeypatch, tmp_path, rc):
@@ -499,7 +506,7 @@ def test_a_rework_with_no_worker_goes_to_in_progress_and_waits(monkeypatch, tmp_
     assert len(revived) == 1 and len(moved) == 1
 
 def test_empty_ready_stops_the_fill_and_starts_coders_on_active_issues(monkeypatch, tmp_path):
-    cols = {board.STAGING: [pr(1, board.STAGING)]}
+    cols = {board.STAGING: [pr(1, board.STAGING)], board.HUMAN_REVIEW: []}
     g = CascadeGate(issues=[(n, board.BACKLOG) for n in (40, 41, 42, 43, 44)])
     out, pulled = cascade(monkeypatch, tmp_path, cols, g)
     assert pulled == [] and out == ['fill: Staging 1, Ready 0: Ready is empty',
@@ -532,7 +539,7 @@ def test_a_dry_run_shows_the_gate_after_every_site_serves_and_no_cornerbot_reque
     assert 'would run hr-gate --apply 9 (Ready -> Staging when it passes)' in out
 
 
-def live(monkeypatch, tmp_path, g, advance=None, ready=(9,), staging=(1,), hr=()):
+def live(monkeypatch, tmp_path, g, advance=None, ready=(9,), staging=(1,), hr=(901, 902)):
     """A live fill: Flow.pull_batch merges the clean Ready PRs into work ('w'*40) in one push.
     Returns (out, gated PRs, seconds slept, board)."""
     from tangentswarm import flow as F
@@ -1120,14 +1127,14 @@ def test_a_human_review_merge_moves_the_next_pr_up_and_checks_no_other_ready_pr(
         return fits
     monkeypatch.setattr(F.Flow, 'pull_batch', pull_batch)
     ready = [pr(n, board.READY, own_labels=['merge-ready']) for n in (546, 541, 539, 528)]
-    cols = {board.HUMAN_REVIEW: [], board.STAGING: [pr(447, board.STAGING), pr(518, board.STAGING)],
-            board.READY: ready}
+    cols = {board.HUMAN_REVIEW: [pr(600, board.HUMAN_REVIEW)],
+            board.STAGING: [pr(447, board.STAGING), pr(518, board.STAGING)], board.READY: ready}
     monkeypatch.setattr(F.Flow, 'columns', lambda self: ({}, {k: list(v) for k, v in cols.items()}))
     out = []
     c = A.Cascade(g=CascadeGate(served_files=False), dry_run=True, out=out.append, sleep=lambda s: None)
     c.moved, c.pulled = [447], []  # the promote step moved #447 up (dry run)
     after = c.fill()
-    assert [p['number'] for p in after[board.HUMAN_REVIEW]] == [447]
+    assert [p['number'] for p in after[board.HUMAN_REVIEW]] == [600, 447]
     assert pulled == [528] and [p['number'] for p in after[board.STAGING]] == [518, 528]
     assert checked == [528] and premerged == [539]
     assert 541 not in labelled and 546 not in labelled

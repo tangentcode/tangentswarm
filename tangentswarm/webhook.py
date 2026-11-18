@@ -390,7 +390,10 @@ def project_move(p):
                 Action('reject', 0, 'Michal sent the PR back from Human Review', dict(node=node, board=b.number))]
     if frm == board.NEEDS_INPUT and to == board.IN_PROGRESS:
         return [Action('answered', 0, 'Michal answered the question', dict(node=node, board=b.number))]
-    if frm == board.HUMAN_REVIEW or to == board.DONE:
+    # tangentswarm #144: a card that leaves Human Review, Staging or Ready (or reaches one of
+    # them by hand) changes what the one fill routine (tangentswarm.fill) needs: run it.
+    fill_cols = (board.HUMAN_REVIEW, board.STAGING, board.READY)
+    if frm in fill_cols or to in fill_cols or to == board.DONE:
         return [Action('cascade', 0, f"card moved {frm} -> {to}", dict(board=b.number, freed=frm == board.HUMAN_REVIEW))]
     return [Action('skip', why=f"card moved {frm} -> {to}: his decision")]
 

@@ -78,7 +78,11 @@ def test_michal_card_moves():
     assert [a.kind for a in W.classify('projects_v2_item', move(board.HUMAN_REVIEW, board.IN_PROGRESS))] == \
         ['cascade', 'reject']  # tangentswarm #135: the refill first
     assert [a.kind for a in W.classify('projects_v2_item', move(board.NEEDS_INPUT, board.IN_PROGRESS))] == ['answered']
-    assert [a.kind for a in W.classify('projects_v2_item', move(board.READY, board.BACKLOG))] == ['skip']
+    assert [a.kind for a in W.classify('projects_v2_item', move(board.INBOX, board.BACKLOG))] == ['skip']
+    # tangentswarm #144: a move into or out of Ready, Staging or Human Review runs the one fill routine
+    for frm, to in ((board.READY, board.BACKLOG), (board.STAGING, board.HUMAN_REVIEW),
+                    (board.STAGING, board.IN_PROGRESS), (board.IN_PROGRESS, board.READY)):
+        assert [a.kind for a in W.classify('projects_v2_item', move(frm, to))] == ['cascade'], (frm, to)
     assert [a.kind for a in W.classify('projects_v2_item', move(board.HUMAN_REVIEW, board.IN_PROGRESS,
                                                                  {'login': 'tangentcode-minbot[bot]'}))] == ['skip']
     # Codex on PR #26: another project, or another field, never acts
