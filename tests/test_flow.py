@@ -235,17 +235,34 @@ def test_pull_takes_only_the_next_ready_pr_in_the_pick_order(monkeypatch):
     assert started == [] and asked == [8]
     assert '#8 is next in the pick order and is not merge-ready: nothing behind it is pulled' in f.notes
 
-def test_pr_that_does_not_merge_onto_main_goes_back_with_a_relay(monkeypatch, tmp_path):
+def test_pr_that_does_not_merge_onto_main_is_fixed_in_place(monkeypatch, tmp_path):
+    """swarm-flow step. tangentswarm #144: only the top Ready PR; the fill waits and never skips
+    ahead to #9. tangentswarm #146: #7 stays in Ready (pre-merging), its worker fixes it there."""
     prs = {1: card(1, HR), 2: card(2, HR), 7: card(7, RD, rank=0), 9: card(9, RD)}
     f, g = make_flow(prs, dry=False, clean=lambda a, b: not (a == 'main' and b == prs[7]['head']))
     premerged(monkeypatch, f, {9: 'v9'})
     started = []
     monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False, fm=None: started.append((p['number'], tip, pre_merged)))
+    sent = told(monkeypatch)
     f.step()
-    # tangentswarm #144: only the top Ready PR; the fill waits and never skips ahead to #9
-    assert g.moves == [('I7', IP)] and started == []
-    assert any('#7 (the top Ready PR) went to rework: the fill waits' in n for n in f.notes)
-    assert 'merge origin/main' in (flow.RELAY_DIR / 'relay-7-merge-main.md').read_text()
+    assert g.moves == [] and started == [] and flow.fixing(7)
+    assert any('#7 (the top Ready PR) is fixed in place (pre-merging): the fill waits' in n for n in f.notes)
+    assert 'git merge origin/main' in (flow.RELAY_DIR / 'relay-7-fix.md').read_text()
+    assert [n for n, _ in sent] == [7]
+
+
+def test_the_step_pull_checks_no_ready_pr_but_the_top(monkeypatch):
+    """tangentswarm #146: the step pull never checks a Ready PR behind the top against main or
+    the queue (it used to merge-tree every Ready PR against every base)."""
+    prs = {1: card(1, HR), 2: card(2, HR), 3: card(3, ST), 7: card(7, RD, rank=0), 9: card(9, RD), 11: card(11, RD)}
+    seen = []
+    f, g = make_flow(prs, clean=lambda a, b: seen.append(b) or True)
+    premerged(monkeypatch, f, {7: 'v7'})
+    started = []
+    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False, fm=None: started.append(p['number']))
+    f.step()
+    assert started == [7] and set(seen) == {prs[7]['head']}
+
 
 def test_empty_ready_is_a_refill_note():
     f, _ = make_flow({1: card(1, HR), 2: card(2, HR)})
@@ -324,8 +341,10 @@ def test_advance_no_conflict_with_no_worker_still_stays_in_ready(monkeypatch, ti
     assert any('no worker took the reason' in n for n in f.notes)
 
 
-def test_advance_conflict_with_main_goes_to_in_progress_with_merge_main(monkeypatch, tick_state):
-    """tangentswarm #83: only a real conflict at the final mergeability check is rework."""
+def test_advance_conflict_with_main_is_fixed_in_place_in_ready(monkeypatch, tick_state):
+    """tangentswarm #83: only a real conflict at the final mergeability check is a fix.
+    tangentswarm #146 (Michal 2026-11-18 2:18 PM ET: "It should just be fixed in place."): the
+    pulled Ready PR stays in Ready with the label pre-merging, and its worker fixes it there."""
     pull_state()
     prs = {1: card(1, HR), 2: card(2, HR), 7: card(7, RD)}
     f, g = make_flow(prs, dry=False, rows=[('2 mergeable onto main', False,
@@ -333,19 +352,34 @@ def test_advance_conflict_with_main_goes_to_in_progress_with_merge_main(monkeypa
     sent = told(monkeypatch)
     monkeypatch.setattr(f, 'pull', lambda *a: None)
     f.step()
-    assert g.moves == [('I7', IP)] and flow.load_pull() is None
-    assert 'git merge origin/main' in sent[0][1]
-    assert 'git merge origin/main' in (flow.RELAY_DIR / 'relay-7-merge-main.md').read_text()
+    assert g.moves == [] and flow.load_pull() is None
+    assert (7, 'add', [flow.PRE_MERGING]) in flow.LABELS_WRITTEN
+    assert 'git merge origin/main' in sent[0][1] and 'stays in Ready' in sent[0][1]
+    assert 'git merge origin/main' in (flow.RELAY_DIR / 'relay-7-fix.md').read_text()
+    assert flow.fixing(7) and flow.load_fixes()['7']['kind'] == 'conflict'
 
 
 def test_advance_github_conflicting_is_a_conflict(monkeypatch, tick_state):
     pull_state()
     prs = {1: card(1, HR), 2: card(2, HR), 7: card(7, RD)}
     f, g = make_flow(prs, dry=False, rows=[('2 mergeable onto main', False, 'GitHub mergeable is CONFLICTING'),
-                                           ('8 no later human request', False, '1 later comment')])
+                                           ('8 no later', False, '1 later comment')])
+    told(monkeypatch)
     monkeypatch.setattr(f, 'pull', lambda *a: None)
     f.step()
-    assert g.moves == [('I7', IP)] and '8 no later' not in f.did[0]
+    assert g.moves == [] and flow.fixing(7) and '8 no later' not in flow.load_fixes()['7']['why']
+
+
+def test_advance_conflict_of_a_card_out_of_ready_still_goes_to_in_progress(monkeypatch, tick_state):
+    """tangentswarm #146 is about Ready only: any other column keeps the #83 rule."""
+    pull_state()
+    prs = {1: card(1, HR), 2: card(2, HR), 7: card(7, board.AUTO_REVIEW)}
+    f, g = make_flow(prs, dry=False, rows=[('2 mergeable onto main', False, 'CONFLICTS with origin/main')])
+    failed = []
+    monkeypatch.setattr(f, 'fail', lambda p, reason, relay=None, text=None: failed.append((p['number'], relay)))
+    monkeypatch.setattr(f, 'pull', lambda *a: None)
+    f.step()
+    assert failed == [(7, 'merge-main')] and not flow.fixing(7)
 
 
 def test_gate_conflicts_only_row_2_conflicts():
@@ -571,24 +605,21 @@ def test_shots_relay_tells_the_worker_to_use_a_throwaway_user_or_scratch_root():
 
 # --- tangentswarm #101: drop parking ---------------------------------------------
 
-def test_a_conflicting_pr_with_no_worker_goes_to_in_progress_and_nothing_behind_it_waits(monkeypatch):
-    """tangentswarm #101 (Michal 2026-11-17 8:49 AM ET): #7 conflicts with main and no Claude
-    can run (rework slots full). It goes to In Progress, not Ready; the fill waits (tangentswarm
-    #144: #9 behind it is not pulled in this pass); and when a slot frees, its Claude starts
-    with the saved feedback."""
-    from tangentswarm import moves, slots
+def test_a_conflicting_top_pr_gets_its_fix_with_priority_and_nothing_behind_it_moves(monkeypatch):
+    """tangentswarm #146: #7 conflicts with main while the rework slots are full. The fix is
+    priority work (no rework-slot wait), the card stays in Ready, and #9 behind it is not
+    pulled. A refused relay is tried again on the next pass (NEEDS_WORKER)."""
+    from tangentswarm import slots
     calls = []
 
-    def revive(n, text, out=print, queue=False, **k):
-        calls.append((n, text, queue))
-        if not slots_free:
+    def revive(n, text, out=print, priority=False, **k):
+        calls.append((n, priority))
+        if not priority:
             out('held: the 3 rework slots are in use')
-            if queue:
-                slots.queue_revive(n, text, why='held')
             return 3
         out(f'#{n}: Claude resumed; feedback sent')
-        return 0
-    slots_free = False
+        return 0 if ok else 1
+    ok = False
     monkeypatch.setattr(slots, 'revive', revive)
     prs = {1: card(1, HR), 2: card(2, HR), 7: card(7, RD, rank=0), 9: card(9, RD)}
     f, g = make_flow(prs, dry=False, clean=lambda a, b: not (a == 'main' and b == prs[7]['head']))
@@ -596,16 +627,13 @@ def test_a_conflicting_pr_with_no_worker_goes_to_in_progress_and_nothing_behind_
     started = []
     monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False, fm=None: started.append(p['number']))
     f.step()
-    assert g.moves == [('I7', IP)] and started == []
-    assert any(d.startswith('did: #7 -> In Progress, WAITING_FOR_CLAUDE') for d in f.did)
-    assert not flow.HELD.exists()
-    assert 'waiting for a Claude' in moves.LOG.read_text()
-    saved = slots.load()['queued']['7']['text']
-    assert 'merge origin/main' in saved and calls == [(7, saved, True)]
-    assert 7 in slots.waiting()
-    slots_free = True  # a rework slot frees: the cascade runs the queue
-    assert slots.run_queued(out=lambda l: None, prs=prs) == [7]
-    assert calls[-1][:2] == (7, saved) and '7' not in slots.load()['queued']
+    assert g.moves == [] and started == [] and calls == [(7, True)]
+    assert any(n.startswith('NEEDS_WORKER #7') for n in f.notes) and 'relayed' not in flow.load_fixes()['7']
+    ok = True
+    f.step()
+    assert calls == [(7, True), (7, True)] and flow.load_fixes()['7']['relayed'] == prs[7]['head']
+    f.step()
+    assert len(calls) == 2  # one relay per head
 
 
 def test_a_conflicting_pr_with_no_worktree_waits_for_a_worker_start_with_its_relay(monkeypatch):

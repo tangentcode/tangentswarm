@@ -16,10 +16,14 @@ From the top down:
      Human Review, Staging and the pulls in flight already hold (pull).
   5. Ready short of its target: the cascade's signal step starts new work (slots).
 Only the TOP Ready PR is looked at (Michal 2026-11-18 2:09 PM ET: "we should just do the first
-ticket. In ready."): it is the only one checked against main. When it merges cleanly it moves
-up. When it conflicts, only it goes to In Progress for rework and the fill WAITS in that pass:
-it never skips ahead to the second Ready PR (top()). No PR further down Ready is checked
-against main or sent to rework until it reaches the top.
+ticket. In ready."): it is the only one checked against main. After every merge into main it
+is updated onto the new main (its -vN) and its tests run again there; when it merges cleanly
+and they pass, it moves up. tangentswarm #146: when it conflicts or its tests fail, it stays in
+Ready (label pre-merging) and its worker fixes it in place; it never goes to In Progress. The
+fill WAITS on it: it never skips ahead to the second Ready PR (top()). No PR further down
+Ready is checked against main or reworked until it reaches the top. When Human Review cannot
+be kept at its target, the cascade sends a stall notice that names the blocked PR
+(tangentswarm.stall).
 The pick order is the shared one (board.pick_key): fast-track first, then milestone, then the
 lowest PR number.
 """

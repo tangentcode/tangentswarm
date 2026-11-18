@@ -575,7 +575,8 @@ def test_a_body_that_states_where_the_pr_stands_takes_the_full_gate():
 def test_row_2_is_checked_again_against_the_current_main(scratch, clean, why):
     """Codex on PR #138: main can move while the pull waits for its deploy. The fast move checks
     the head onto CURRENT origin/main (local merge-tree, hr-gate row 2). A conflict, or no way
-    to check, takes the full gate path: a row-2 conflict there goes to rework (merge-main)."""
+    to check, takes the full gate path: a row-2 conflict there is fixed in place (tangentswarm
+    #146: the card stays in Ready, label pre-merging; never In Progress)."""
     d = pull()
     g = G()
     g['merge_tree_clean'] = lambda dir_, a, b: clean
@@ -583,10 +584,11 @@ def test_row_2_is_checked_again_against_the_current_main(scratch, clean, why):
     g['evaluate'] = lambda pr, **k: ran.append(1) or ([('2 mergeable onto main', False, 'CONFLICTS with origin/main')], None)
     g['list_hr_prs'] = lambda refresh=False: []
     f = make(g)
-    failed = []
+    failed, fixed = [], []
     f.fail = lambda p, reason, relay=None, text=None: failed.append((p['number'], relay))
+    f.fix_in_place = lambda p, kind, why, files=(), token=None: fixed.append((p['number'], kind))
     f.advance(d, full_hr(ready_card()), scratch=scratch)
-    assert ran == [1] and g.moves == [] and g.logged == [] and failed == [(7, 'merge-main')]
+    assert ran == [1] and g.moves == [] and g.logged == [] and failed == [] and fixed == [(7, 'conflict')]
     assert any(why in n and 'the full gate runs' in n for n in f.notes)
 
 

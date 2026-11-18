@@ -25,7 +25,8 @@ SQLite event log (eventdb: a 'received' row before the reply, a 'handled' row af
   ci       a completed check suite on the PR head: red -> relay to the worker, card In
            Progress (only with a worker); green -> minbot (Auto Review) or cascade (Staging)
   handoff  a new head on a non-draft PR in In Progress or past it (or ready_for_review): mark
-           ready, "@codex review" once per head, card Auto Review, cascade
+           ready, "@codex review" once per head, card Auto Review, cascade. A new head of a
+           Ready PR fixed in place (tangentswarm #146) keeps the card in Ready
   relay    a human comment on a PR in work: relay it to the worker, card In Progress
   reject / answered   Michal's card moves (Human Review -> In Progress, Needs Input -> In
            Progress): relay his comments since the head to the worker. Any move out of
@@ -555,6 +556,7 @@ class Executor:
         """Relay, then In Progress, only when a worker has it (never demote into a column with
         no worker); else wake swarmbot. A merged or closed PR, or a card in Done, Canceled or
         Parked, is left alone (Codex on PR #26: a late Codex or CI delivery restarted done work).
+        tangentswarm #146: a Ready PR fixed in place (flow.fixing) gets the relay and stays in Ready.
         tangentswarm #99: Codex findings on a Project 6 PR with no live worker never wake
         swarmbot; they are one deduped log line (the worker polls its own review)."""
         from . import advance
@@ -568,6 +570,10 @@ class Executor:
                 return self.log_once(n, f"{self.repo}#{n}: {why}; no live worker took the relay ({said}): logged only, "
                                         "no swarmbot wake", key=f"{self.repo}:noworker:{n}:{why[:40]}")
             return self.wake(n, f"#{n}: {why}; no worker could take the relay ({said})", key=f'noworker:{n}:{why[:40]}')
+        if col == board.READY and self.platform():
+            from . import flow
+            if flow.fixing(n):  # tangentswarm #146: a Ready PR fixed in place is never moved back
+                return self.note(f"#{n} relayed to its worker ({said}); it is fixed in place: the card stays in Ready")
         if item and col not in (board.IN_PROGRESS, board.NEEDS_INPUT):
             self.move(n, item, board.IN_PROGRESS)
         self.note(f"#{n} relayed to its worker ({said})")
@@ -704,6 +710,13 @@ class Executor:
             return self.note(f"#{a.pr}: a push to a draft PR in In Progress: left to the Stop hook")
         if full.get('isDraft') and not self.dry:
             self._sh(['gh', 'pr', 'ready', str(a.pr), '-R', self.repo])
+        if col == board.READY and a.args.get('push') and self.platform():
+            from . import flow
+            if flow.fixing(a.pr):  # tangentswarm #146: a fix in place keeps the card in Ready
+                self.ask_codex(a.pr, head, full, col=col)
+                self.cascade(f'#{a.pr} fixed in place in Ready: new head {(head or "")[:8]}')
+                return self.note(f"#{a.pr}: new head {(head or '')[:8]} of a fix in place: the card stays in Ready "
+                                 "(pre-merging); Codex reviews it")
         if col != board.AUTO_REVIEW:
             self.move(a.pr, item, board.AUTO_REVIEW)
         self.ask_codex(a.pr, head, full, col=col)

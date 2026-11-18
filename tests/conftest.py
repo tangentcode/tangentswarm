@@ -62,6 +62,19 @@ def isolated_state(tmp_path, monkeypatch):
     labels_written = []  # tangentswarm #65: never a real minbot label write in a test
     monkeypatch.setattr(flow, 'label_write', lambda n, op, names, repo=flow.REPO: labels_written.append((n, op, list(names))))
     flow.LABELS_WRITTEN = labels_written
+    # tangentswarm #146: never a real workflow run, check-run read or fix state in a test; the
+    # tip tests are off unless a test turns them on (with fakes in its g)
+    monkeypatch.setattr(flow, 'FIX_STATE', tmp_path / 'fix-in-place.json')
+    monkeypatch.setattr(flow, 'PREMERGE_TESTS', ())
+
+    def no_gh(*a, **k):
+        raise AssertionError('a test called the real gh workflow run or check-run read')
+    monkeypatch.setattr(flow, 'REAL_TIP_RUNS', flow.tip_runs, raising=False)
+    monkeypatch.setattr(flow, 'dispatch_tests', no_gh)
+    monkeypatch.setattr(flow, 'tip_runs', no_gh)
+    from tangentswarm import stall
+    monkeypatch.setattr(stall, 'STALL_URL_FILE', tmp_path / 'stall-url')
+    monkeypatch.setattr(stall, 'STALL_KEY_FILE', tmp_path / 'stall-key')
     from tangentswarm import stophook
     from tangentswarm import spool
     from tangentswarm import webhook as _wh

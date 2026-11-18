@@ -647,9 +647,9 @@ class Cascade(Advance):
                       - {p['number'] for p in st})
             fl = f" + {len(flying)} in flight ({', '.join('#' + str(n) for n in sorted(flying))})" if flying else ''
             ready = [p for p in cols.get(board.READY, []) if not p.get('draft') and p['number'] not in flying]
-            if getattr(self, 'waiting', None):  # tangentswarm #144: the top PR went to rework
-                self.out(f"fill: #{self.waiting} (the top Ready PR) went to rework: the fill waits; "
-                         "nothing behind it is pulled or pre-merged in this pass")
+            if getattr(self, 'waiting', None):  # tangentswarm #144, #146: the top PR is fixed in place
+                self.out(f"fill: #{self.waiting} (the top Ready PR) is fixed in place (pre-merging): the fill "
+                         "waits; nothing behind it is pulled or pre-merged in this pass")
                 self.pulled = getattr(self, 'pulled', [])
                 return cols
             cols = self._fill_pull(prs, cols, scratch, st, fl, ready, flying)
@@ -712,49 +712,63 @@ class Cascade(Advance):
             prs, cols = self.columns()
         return cols
 
-    # -- rework: Ready PRs that cannot be pulled (Michal 2026-11-14 9:10 PM ET deadlock) ------
+    # -- the top Ready PR: checked against main, fixed in place (tangentswarm #144, #146) ---------
     def main_check(self, cols):
         """(1) The TOP Ready PR only (fill.top: the shared pick order, not in a pull) against
-        origin/main with git merge-tree (local, kept per SHA pair: no GraphQL). A conflict: card
-        to In Progress and a rework relay that lists the files, and the fill WAITS in this pass
-        (self.waiting): no pull and no pre-merge, never a skip to the second Ready PR.
-        tangentswarm #144 (Michal 2026-11-18 2:09 PM ET: "we should just do the first ticket.
-        In ready."; nine Ready PRs went back together at 2:03 PM). tangentswarm #111: nothing
-        else in Ready is checked, so a merge never touches the other Ready PRs' labels,
-        branches or columns. Returns cols without the PR sent to rework."""
+        origin/main with git merge-tree (local, kept per SHA pair: no GraphQL). tangentswarm #146
+        (Michal 2026-11-18 2:18 PM ET: "it shouldn't be fixed in by moving it back to in
+        progress. It should just be fixed in place."): a conflict keeps the card in Ready with
+        the label pre-merging, and its worker gets the fix relay (Flow.fix_in_place). The fill
+        WAITS on it (self.waiting): no pull and no pre-merge, never a skip to the second Ready
+        PR (Michal 2026-11-18 2:09 PM ET: "we should just do the first ticket. In ready.").
+        A new head pushed for the fix stays in Ready (swarm-webhook handoff) and must be Codex
+        clean before it moves on (Flow.fixed_head). Nothing else in Ready is checked (tangentswarm
+        #111). Returns cols (the top PR stays in Ready)."""
         from . import fill, flow
         self.waiting = None
+        fixes = flow.load_fixes()
+        elsewhere = {q['number'] for c, qs in cols.items() if c != board.READY for q in qs}
+        for k in [k for k in fixes if k.isdigit() and int(k) in elsewhere and not self.dry]:
+            flow.drop_fix(int(k))  # it left Ready (a Codex finding, a merge): no fix in place now
         p = fill.top(cols, {d['pr'] for d in flow.load_pulls()})
         if p is None:
+            return cols
+        n = p['number']
+        why = self.f.fixed_head(p)  # tangentswarm #146: a fix head waits for Codex
+        if why:
+            self.waiting = n
+            self.out(f"main check: #{n} {why}: the fill waits")
             return cols
         with self.g['ScratchRepo']() as scratch:
             scratch.ensure_main()
             main = self.f.sha_of(scratch, scratch.main)
             scratch.ensure(p['head'])
             clean = self.f.clean(scratch, main, p['head'])
-            if not clean:
-                self.rework(p, [('origin/main', self.f.files(scratch, main, p['head']))])
+            files = [] if clean else self.f.files(scratch, main, p['head'])
         self.f.cmap.save()
         if clean:
             return cols
-        self.waiting = p['number']
-        self.out(f"main check: #{p['number']} conflicts with origin/main: sent to rework; the fill waits "
-                 "(no PR further down Ready is checked or pulled in this pass)")
-        return dict(cols, **{board.READY: [q for q in cols.get(board.READY, []) if q['number'] != p['number']]})
+        self.out(f"NEEDS_FIX #{n} {' '.join(files) or '(files unknown)'}")
+        self.f.fix_in_place(p, 'conflict', f"it conflicts with main in {', '.join(files) or 'files unknown'}", files)
+        self.flush()
+        self.waiting = n
+        self.out(f"main check: #{n} conflicts with origin/main: it stays in Ready (pre-merging) and its worker "
+                 "fixes it in place; the fill waits (no PR further down Ready is checked or pulled)")
+        return cols
 
     def unblock(self, cols, pulled):
         """(2) Human Review or Staging is empty and no Ready PR could be pulled: never end
         quietly. tangentswarm #65 (Michal 2026-11-16 3:22 PM ET): strict order, so the line
         names the NEXT Ready PR in the pick order and its pre-merge state; its conflict is
         resolved by its worker on a <branch>-vN (Flow.premerge), never on its own branch. A
-        conflict with origin/main itself was sent to rework by main_check."""
+        conflict with origin/main itself is fixed in place (main_check)."""
         from . import fill, flow, promoted
         hr, st = cols.get(board.HUMAN_REVIEW, []), cols.get(board.STAGING, [])
         ready = [p for p in cols.get(board.READY, []) if not p.get('draft')]
         need = fill.plan(cols, hr_target=promoted.HR_TARGET, staging_target=FLOOR).pull
         if pulled or flow.load_pulls() or (hr and st) or not need:  # tangentswarm #144: no pull was wanted
             return
-        if getattr(self, 'waiting', None):  # tangentswarm #144: the fill waits on the top PR's rework (said)
+        if getattr(self, 'waiting', None):  # tangentswarm #146: the fill waits on the top PR's fix (said)
             return
         if not ready:
             self.out(f"STALLED: Human Review {len(hr)}, Staging {len(st)}, Ready empty: new work must reach Ready")
@@ -771,35 +785,41 @@ class Cascade(Advance):
         self.out(f"STALLED: Human Review {len(hr)}, Staging {len(st)}, no Ready PR was pulled; "
                  f"next in order #{p['number']}: {how}")
 
-    def rework(self, p, conflicts):
-        """Card to In Progress, NEEDS_REWORK line, and the relay: its Claude gets it now, or it
-        waits for a Claude in In Progress (Flow.fail; tangentswarm #101). One relay per head."""
-        from . import slots
-        n, head = p['number'], p.get('head') or ''
-        files = sorted({f for _, fs in conflicts for f in fs})
-        self.out(f"NEEDS_REWORK #{n} {' '.join(files) or '(files unknown)'}")
-        where = '; '.join(f"{name}: {', '.join(fs) or 'files unknown'}" for name, fs in conflicts)
-        others = [name for name, _ in conflicts if name != 'origin/main']
-        msg = (f"Coordinator: #{n} cannot enter Staging: it conflicts with {where}. Merge origin/main into "
-               f"your branch (git fetch origin; git merge origin/main). Do not rebase and do not force-push. "
-               + (f"Then make sure it also merges cleanly with {', '.join(others)} (resolve the same files). "
-                  if others else '')
-               + "Resolve the conflicts, run the tests, push, and report the new head and the test counts.")
-        st = slots.load()
-        if st['relayed'].get(str(n)) == head and head:
-            self.out(f"rework: #{n} already has a relay for {head[:8]}: not sent again")
-            return
+    def stall(self, cols):
+        """tangentswarm #146 (Michal 2026-11-18 2:17 PM ET: "you need to tell me right away,
+        explain what's happening that is preventing the flow"): Human Review is short of its
+        target and no pull in flight fills it. One plain-English notice through the stall
+        webhook (tangentswarm.stall) names the blocked PR and why, once per stall; a log line
+        alone is not enough. Returns the notice text, or None."""
+        from . import fill, flow, promoted, stall
+        hr, st = cols.get(board.HUMAN_REVIEW, []), cols.get(board.STAGING, [])
+        on_board = {q['number'] for q in hr + st}
+        flying = {d['pr'] for d in flow.load_pulls()} - on_board
         if self.dry:
-            self.out(f"would move #{n} Ready -> In Progress and send: {msg[:160]}")
-            return
-        moved = self.f.fail(p, f"conflicts with {where}"[:200], relay='merge-main', text=msg)
-        self.flush()
-        if not moved:
-            return
-        # tangentswarm #101: the card is in In Progress and its Claude has the relay or waits
-        # for one with it saved (Flow.to_worker): one relay per head
-        with slots.update() as st:
-            st['relayed'][str(n)] = head
+            flying |= set(getattr(self, 'pulled', []) or []) - on_board
+        target = promoted.HR_TARGET
+        if len(hr) + len(flying) >= target:
+            if not self.dry:
+                stall.clear()
+            return None
+        top = fill.top(cols, flying)
+        if st:
+            n, why = None, (f"Staging has {len(st)} PR(s) but the promote did not move them up "
+                            "(see the cascade log)")
+        elif top is None:
+            n, why = None, 'Ready is empty'
+        else:
+            n = top['number']
+            why = self.f.blocked.get(n) or 'it is not merge-ready yet (see the cascade log)'
+        text = (f"The flow into Human Review is stalled: Human Review has {len(hr)} of {target}"
+                + (f", {len(flying)} on the way" if flying else '') + '. '
+                + (f"#{n} (the top Ready PR) blocks it: {why}." if n else f"{why}."))
+        key = stall.key(n, top and top.get('head'), why)
+        if self.dry:
+            self.out(f"STALL_NOTICE (would send): {text}")
+            return text
+        self.out(f"STALL_NOTICE: {text} ({stall.notify(text, key, pr=n)})")
+        return text
 
     def columns(self):
         """Flow.columns, and keep the PRs for the park and signal steps."""
@@ -983,6 +1003,7 @@ class Cascade(Advance):
         self.pulled = []
         cols = self.fill()
         self.unblock(cols, self.pulled)
+        self.stall(cols)
         self.auto_review(cols)
         self.park(cols)
         self.revive_queue()  # after park: a parked worker may have freed a rework slot
