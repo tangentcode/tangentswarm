@@ -722,7 +722,7 @@ class Cascade(Advance):
         WAITS on it (self.waiting): no pull and no pre-merge, never a skip to the second Ready
         PR (Michal 2026-11-18 2:09 PM ET: "we should just do the first ticket. In ready.").
         A new head pushed for the fix stays in Ready (swarm-webhook handoff) and must be Codex
-        clean before it moves on (fixed_head). Nothing else in Ready is checked (tangentswarm
+        clean before it moves on (Flow.fixed_head). Nothing else in Ready is checked (tangentswarm
         #111). Returns cols (the top PR stays in Ready)."""
         from . import fill, flow
         self.waiting = None
@@ -734,14 +734,11 @@ class Cascade(Advance):
         if p is None:
             return cols
         n = p['number']
-        fx = fixes.get(str(n))
-        if fx and fx.get('head') != p['head']:
-            why = self.fixed_head(p)
-            if why:
-                self.f.blocked[n] = why
-                self.waiting = n
-                self.out(f"main check: #{n} {why}: the fill waits")
-                return cols
+        why = self.f.fixed_head(p)  # tangentswarm #146: a fix head waits for Codex
+        if why:
+            self.waiting = n
+            self.out(f"main check: #{n} {why}: the fill waits")
+            return cols
         with self.g['ScratchRepo']() as scratch:
             scratch.ensure_main()
             main = self.f.sha_of(scratch, scratch.main)
@@ -758,24 +755,6 @@ class Cascade(Advance):
         self.out(f"main check: #{n} conflicts with origin/main: it stays in Ready (pre-merging) and its worker "
                  "fixes it in place; the fill waits (no PR further down Ready is checked or pulled)")
         return cols
-
-    def fixed_head(self, p):
-        """tangentswarm #146: the top Ready PR got a new head for its fix in place. None when
-        Codex is clean on it (the record takes the new head), else why it waits. A Codex
-        finding moves the card the usual way (swarm-webhook codex)."""
-        from . import flow
-        n, head = p['number'], p['head']
-        try:
-            decision, detail = codex_decision(self.g['fetch'](n, refresh=True))
-        except Exception as e:
-            return f"its fixed head {head[:8]} cannot be read: {type(e).__name__}: {str(e)[:120]}"
-        if decision != 'clean':
-            return f"its fixed head {head[:8]} waits for Codex ({detail})"
-        if not self.dry:
-            with flow.fix_update() as recs:
-                if str(n) in recs:
-                    recs[str(n)]['head'] = head
-        return None
 
     def unblock(self, cols, pulled):
         """(2) Human Review or Staging is empty and no Ready PR could be pulled: never end

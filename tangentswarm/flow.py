@@ -240,9 +240,19 @@ def dispatch_tests(ref, workflows=None, repo=REPO):
 
 
 def tip_runs(tip, repo=REPO):
-    """The latest check runs on commit tip (advance.check_runs: REST, the minbot quota)."""
-    from . import advance
-    return advance.check_runs(tip, repo)
+    """The latest workflow run of each workflow on commit tip: [{name (the workflow file, as
+    rs.yml), status, conclusion}] (REST, newest first). Codex on PR #147: workflow runs, not
+    check runs, so a workflow that has not reported yet is seen as missing."""
+    r = proc.sh('gh', 'api', f'repos/{repo}/actions/runs?head_sha={tip}&per_page=100', check=False, who='swarm-flow')
+    if r.returncode:
+        raise RuntimeError(f"workflow runs of {tip[:8]}: {(r.stderr or r.stdout).strip()[:160]}")
+    out, seen = [], set()
+    for w in json.loads(r.stdout or '{}').get('workflow_runs') or []:
+        name = os.path.basename(w.get('path') or '') or w.get('name') or ''
+        if name not in seen:
+            seen.add(name)
+            out.append(dict(name=name, status=w.get('status'), conclusion=w.get('conclusion')))
+    return out
 
 
 def label_write(n, op, names, repo=REPO):
@@ -638,6 +648,10 @@ class Flow:
         # no other Ready PR is checked against main or the queue
         p = ready_order(ready, None, board.active_fast_track())[0]
         n = p['number']
+        held = self.fixed_head(p)
+        if held:  # tangentswarm #146: a fix head moves on only when Codex is clean on it
+            self.note(f"#{n} (the top Ready PR) {held}: the fill waits")
+            return None
         scratch.ensure(p['head'])
         if not strict and not self.clean(scratch, main, p['head']):
             files = self.files(scratch, main, p['head'])
@@ -748,6 +762,10 @@ class Flow:
             if len(batch) >= room:
                 break
             n = p['number']
+            held = self.fixed_head(p)
+            if held:  # tangentswarm #146: a fix head moves on only when Codex is clean on it
+                self.note(f"#{n} is next in the pick order: {held}: nothing behind it is pulled")
+                break
             t = self.premerge_one(p, scratch, fm)
             if not t:
                 self.note(f"#{n} is next in the pick order and is not merge-ready: nothing behind it is pulled")
@@ -1123,11 +1141,17 @@ class Flow:
         except Exception as e:
             return f"its tests on {vn} cannot be read: {type(e).__name__}: {str(e)[:120]}"
         from .advance import ci_problem
-        why = ci_problem(runs) if runs else 'its tests on the update onto main have not started yet'
+        runs = [r for r in runs or () if r.get('name') in PREMERGE_TESTS]
+        missing = [wf for wf in PREMERGE_TESTS if wf not in {r.get('name') for r in runs}]
+        if missing:  # Codex on PR #147: every workflow must report, not a green subset
+            why = f"CI is still running: {', '.join(missing)} not reported yet"
+        else:
+            why = ci_problem(runs)
         if why is None:
             if not self.dry:
                 set_premerge(n, dict(rec, tested=tip), only_if=lambda old: (old or {}).get('tip') == tip)
-                drop_fix(n)  # fixed and tested: the label comes off and it moves up
+                if (load_fixes().get(str(n)) or {}).get('head') == p.get('head'):
+                    drop_fix(n)  # fixed, reviewed and tested: the label comes off and it moves up
             self.change(f"#{n} tests pass on {vn} {tip[:8]}: it can move up")
             return None
         if why.startswith('CI is not green'):
@@ -1135,6 +1159,31 @@ class Flow:
             self.fix_in_place(p, 'tests', why, token=tip)
             return why
         return f"it is being updated onto main; its tests run on {vn} ({why})"
+
+    def fixed_head(self, p):
+        """tangentswarm #146: Ready PR p is fixed in place and has a new head. None when it may
+        move on (no fix record, the record's head, or Codex clean on the new head: the record
+        takes it), else why it waits. Every pull path asks it (Codex on PR #147: swarm-flow
+        step pulled an unreviewed fix head)."""
+        n, head = p['number'], p.get('head') or ''
+        fx = load_fixes().get(str(n))
+        if not fx or fx.get('head') == head:
+            return None
+        from .advance import codex_decision
+        try:
+            decision, detail = codex_decision(self.g['fetch'](n, refresh=True))
+        except Exception as e:
+            why = f"its fixed head {head[:8]} cannot be read: {type(e).__name__}: {str(e)[:120]}"
+        else:
+            why = None if decision == 'clean' else f"its fixed head {head[:8]} waits for Codex ({detail})"
+        if why:
+            self.blocked[n] = why
+            return why
+        if not self.dry:
+            with fix_update() as recs:
+                if str(n) in recs:
+                    recs[str(n)]['head'] = head
+        return None
 
     def fix_in_place(self, p, kind, why, files=(), token=None):
         """tangentswarm #146 (Michal 2026-11-18 2:18 PM ET: "it shouldn't be fixed in by moving it

@@ -13,9 +13,9 @@ from test_premerge import card, make, remote, run, world  # noqa: F401 (world is
 from test_webhook import Fake, codex_pr
 
 RD, ST, HR, IP = board.READY, board.STAGING, board.HUMAN_REVIEW, board.IN_PROGRESS
-GREEN = [{'name': 'rs tests', 'status': 'completed', 'conclusion': 'success'}]
-RUNNING = [{'name': 'rs tests', 'status': 'in_progress', 'conclusion': None}]
-RED = [{'name': 'rs tests', 'status': 'completed', 'conclusion': 'failure'}]
+GREEN = [{'name': 'rs.yml', 'status': 'completed', 'conclusion': 'success'}]
+RUNNING = [{'name': 'rs.yml', 'status': 'in_progress', 'conclusion': None}]
+RED = [{'name': 'rs.yml', 'status': 'completed', 'conclusion': 'failure'}]
 
 
 # -- 2. update the top Ready PR onto main and run its tests again ---------------------------------
@@ -101,9 +101,43 @@ def test_failing_tests_after_the_update_are_fixed_in_place(world, ci):
     f2.premerge({RD: [p9]}, s)
     assert flow.fixing(9) and flow.load_fixes()['9']['kind'] == 'tests'
     assert len(sent2) == 1 and sent2[0][2] is True and 'stays in Ready' in sent2[0][1]
-    assert '"rs tests" failure' in sent2[0][1] and p9['own_labels'] == ['pre-merging']
+    assert '"rs.yml" failure' in sent2[0][1] and p9['own_labels'] == ['pre-merging']
     f2.premerge({RD: [p9]}, s)
     assert len(sent2) == 1  # once per failed tip
+
+
+def test_a_green_subset_of_the_workflows_is_not_a_pass(world, ci, monkeypatch):
+    """Codex on PR #147: rs.yml green while mna.yml has not reported yet is not tested."""
+    monkeypatch.setattr(flow, 'PREMERGE_TESTS', ('rs.yml', 'mna.yml'))
+    w, s, h, origin = world
+    f, _ = make(world)
+    ci['install'](f)
+    ci['default'] = GREEN + [{'name': 'other.yml', 'status': 'completed', 'conclusion': 'success'}]
+    p9 = card(9, RD, h['z'])
+    tip = f.premerge({RD: [p9]}, s)[9]
+    f2, _ = make(world)
+    ci['install'](f2)
+    assert 'mna.yml not reported yet' in f2.tip_tests(p9, tip)
+    assert 'tested' not in flow.load_premerge()['9']
+    ci['default'] = GREEN + [{'name': 'mna.yml', 'status': 'completed', 'conclusion': 'success'}]
+    f3, _ = make(world)
+    ci['install'](f3)
+    assert f3.tip_tests(p9, tip) is None and flow.load_premerge()['9']['tested'] == tip
+
+
+def test_tip_runs_reads_the_latest_run_of_each_workflow(monkeypatch):
+    import json
+    from tangentswarm import proc
+    from types import SimpleNamespace as NS
+    runs = {'workflow_runs': [
+        {'path': '.github/workflows/rs.yml', 'status': 'completed', 'conclusion': 'failure'},
+        {'path': '.github/workflows/rs.yml', 'status': 'completed', 'conclusion': 'success'},
+        {'path': '.github/workflows/mna.yml', 'status': 'queued', 'conclusion': None}]}
+    seen = []
+    monkeypatch.setattr(proc, 'sh', lambda *a, **k: seen.append(a) or NS(returncode=0, stdout=json.dumps(runs), stderr=''))
+    assert flow.REAL_TIP_RUNS('t' * 40) == [dict(name='rs.yml', status='completed', conclusion='failure'),
+                                             dict(name='mna.yml', status='queued', conclusion=None)]
+    assert seen[0][:3] == ('gh', 'api', f'repos/{flow.REPO}/actions/runs?head_sha={"t" * 40}&per_page=100')
 
 
 def test_tests_that_do_not_start_are_tried_again_and_block_the_pull(world, ci):
@@ -238,3 +272,62 @@ def test_the_cascade_names_the_blocked_top_pr_in_its_stall_notice(monkeypatch, t
     cas.stall(cas.fill())
     assert any(l == ('STALL_NOTICE (would send): The flow into Human Review is stalled: Human Review has 1 of 2. '
                      '#580 (the top Ready PR) blocks it: it conflicts with main in f580.ts.') for l in out)
+
+
+# -- Codex on PR #147: every pull path waits for Codex on a fix head ---------------------------------
+
+def fix_record(n, head):
+    with flow.fix_update() as recs:
+        recs[str(n)] = dict(head=head, kind='conflict', relayed=head)
+
+
+def clean_review(head):
+    return {'nodes': [{'author': {'login': A.CODEX}, 'commit': {'oid': head}, 'comments': {'totalCount': 0}}]}
+
+
+def test_the_step_pull_waits_for_codex_on_a_fix_head(monkeypatch):
+    from test_flow import card as fcard, make_flow, premerged
+    prs = {1: fcard(1, HR), 7: fcard(7, RD, rank=0), 9: fcard(9, RD)}
+    fix_record(7, 'old' * 13 + 'o')
+    f, g = make_flow(prs)
+    reviews = {'nodes': []}
+    g['fetch'] = lambda n, refresh=False: {'number': n, 'headRefOid': prs[7]['head'], 'reviews': reviews}
+    premerged(monkeypatch, f, {7: 'v7', 9: 'v9'})
+    started = []
+    monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False, fm=None: started.append(p['number']))
+    f.step()
+    assert started == [] and any('#7 (the top Ready PR) its fixed head' in n and 'waits for Codex' in n for n in f.notes)
+    reviews.update(clean_review(prs[7]['head']))
+    f.step()
+    assert started == [7]
+
+
+def test_the_batch_pull_waits_for_codex_on_a_fix_head(world, monkeypatch):
+    w, s, h, origin = world
+    fix_record(9, 'old')
+    f, _ = make(world)
+    reviews = {'nodes': []}
+    f.g['fetch'] = lambda n, refresh=False: {'number': n, 'headRefOid': h['z'], 'reviews': reviews}
+    p9 = card(9, RD, h['z'])
+    assert f.pull_batch({}, {RD: [p9]}, s, room=1) == []
+    assert 'waits for Codex' in f.blocked[9] and remote(s, origin, 'b9-v1') is None  # not even pre-merged
+    reviews.update(clean_review(h['z']))
+    f2, _ = make(world)
+    f2.g['fetch'] = f.g['fetch']
+    assert [p['number'] for p in f2.pull_batch({}, {RD: [p9]}, s, room=1)] == [9]
+    assert flow.load_fixes()['9']['head'] == h['z']
+
+
+def test_green_tests_on_an_unreviewed_head_keep_the_fix_record(world, ci):
+    """Neighbor case: the tests pass on the -vN of a new head that Codex has not passed yet:
+    the fix record (and so the Codex gate) stays."""
+    w, s, h, origin = world
+    fix_record(9, 'old')
+    f, _ = make(world)
+    ci['install'](f)
+    ci['default'] = GREEN
+    p9 = card(9, RD, h['z'])
+    tip = f.premerge({RD: [p9]}, s)[9]
+    f2, _ = make(world)
+    ci['install'](f2)
+    assert f2.tip_tests(p9, tip) is None and flow.fixing(9)

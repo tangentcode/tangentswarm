@@ -69,6 +69,7 @@ def isolated_state(tmp_path, monkeypatch):
 
     def no_gh(*a, **k):
         raise AssertionError('a test called the real gh workflow run or check-run read')
+    monkeypatch.setattr(flow, 'REAL_TIP_RUNS', flow.tip_runs, raising=False)
     monkeypatch.setattr(flow, 'dispatch_tests', no_gh)
     monkeypatch.setattr(flow, 'tip_runs', no_gh)
     from tangentswarm import stall
