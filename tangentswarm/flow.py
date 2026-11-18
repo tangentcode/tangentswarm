@@ -66,8 +66,13 @@ PULL_TIMEOUT = int(os.environ.get('SWARM_PULL_TIMEOUT', str(90 * 60)))
 WORK = 'work'
 # tangentswarm #65 (Michal 2026-11-16 3:22 PM ET): pre-merge the top Ready PRs onto future main.
 # tangentswarm #111 (Michal 2026-11-17 10:45 AM ET): only the top one. Nothing else in Ready is
-# checked; a PR is pre-merged when it becomes the top.
-PREMERGE_AHEAD = int(os.environ.get('SWARM_PREMERGE_AHEAD', '1'))
+# checked; a PR is pre-merged when it becomes the top. tangentswarm #146 (Michal 2026-11-18 2:09 PM
+# ET: "we should just do the first ticket. In ready."): always one, not configurable.
+PREMERGE_AHEAD = 1
+# tangentswarm #146 (Michal 2026-11-18 2:16 PM ET): after every merge the top Ready PR is updated
+# onto the new main and its tests run again. The -vN tip gets these workflows (workflow_dispatch:
+# a -vN branch has no pull request, so no CI starts by itself). Empty: no tip tests.
+PREMERGE_TESTS = tuple(os.environ.get('SWARM_PREMERGE_TESTS', 'rs.yml mna.yml').split())
 PRE_MERGING, MERGE_READY = 'pre-merging', 'merge-ready'
 # A wait reason that is a job for the PR's worker, not a timeout (screenshots; status text in
 # the body, tangentswarm #130).
@@ -170,6 +175,74 @@ def set_premerge(n, rec, only_if=None):
         else:
             recs[str(n)] = rec
         return True
+
+
+FIX_STATE = STATE.with_name('fix-in-place.json')  # {PR: {head, kind, why, files, relayed, since}}
+
+
+def load_fixes():
+    """tangentswarm #146: the Ready PRs fixed in place (they stay in Ready, label pre-merging)."""
+    try:
+        d = json.loads(FIX_STATE.read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+@contextlib.contextmanager
+def fix_update():
+    """One locked read-modify-write of FIX_STATE (the webhook reads it, the cascade writes it)."""
+    import fcntl
+    import threading
+    FIX_STATE.parent.mkdir(parents=True, exist_ok=True)
+    with open(FIX_STATE.with_name(FIX_STATE.name + '.lock'), 'a') as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        recs = load_fixes()
+        yield recs
+        tmp = FIX_STATE.with_name(f'{FIX_STATE.name}.{os.getpid()}.{threading.get_ident()}.tmp')
+        tmp.write_text(json.dumps(recs, indent=1))
+        os.replace(tmp, FIX_STATE)
+
+
+def drop_fix(n):
+    """PR n is fixed (or left Ready): no fix-in-place record."""
+    if str(n) in load_fixes():
+        with fix_update() as recs:
+            recs.pop(str(n), None)
+
+
+def fixing(n):
+    """True while Ready PR n is fixed in place (a new head keeps the card in Ready)."""
+    return str(n) in load_fixes()
+
+
+def fix_text(n, branch, kind, why):
+    """tangentswarm #146: the relay for a top Ready PR fixed in place (never In Progress)."""
+    head = (f"Coordinator: #{n} is the top Ready PR and {why}. The card stays in Ready with the label "
+            f"pre-merging; the fill waits for it. Fix it in place on {branch or 'your branch'}: ")
+    if kind == 'tests':
+        steps = ("git fetch origin; git merge origin/main (no rebase, no force-push); reproduce the failure "
+                 "(the -vN branch named above is future main + your head); fix the root cause; run the tests; ")
+    else:
+        steps = ("git fetch origin; git merge origin/main (no rebase, no force-push); resolve the conflicts; "
+                 "run the tests; ")
+    return head + steps + "git push. Do not move the card. Report the new head and the test counts."
+
+
+def dispatch_tests(ref, workflows=None, repo=REPO):
+    """Start each PREMERGE_TESTS workflow on branch ref (gh workflow run). The errors, or []."""
+    errs = []
+    for wf in (PREMERGE_TESTS if workflows is None else workflows):
+        r = proc.sh('gh', 'workflow', 'run', wf, '-R', repo, '--ref', ref, check=False, who='swarm-flow')
+        if r.returncode:
+            errs.append(f"{wf}: {(r.stderr or r.stdout or '').strip()[:160] or f'rc={r.returncode}'}")
+    return errs
+
+
+def tip_runs(tip, repo=REPO):
+    """The latest check runs on commit tip (advance.check_runs: REST, the minbot quota)."""
+    from . import advance
+    return advance.check_runs(tip, repo)
 
 
 def label_write(n, op, names, repo=REPO):
@@ -470,6 +543,8 @@ class Flow:
         self.tool_timeout = 1800  # one hr-gate / pending-promote run; the cascade sets less
         self.stale_ok = False  # the cascade moves cards from a cache that is only stale (tangentswarm #136)
         self.landed = {}  # {n: column} of the pulled PRs this Flow moved (tangentswarm #144: landing)
+        self.blocked = {}  # {n: why}: why Ready PR n cannot move up now (tangentswarm #146: the stall notice)
+        self._tested = {}  # {(n, tip): why or None}: the tip tests, once per pass
         from .conflictmap import ConflictMap
         self.cmap = ConflictMap()  # merge-tree answers per SHA pair
         self.g = g if g is not None else runpy.run_path(str(BIN / 'hr-gate'), run_name='swarm_flow')
@@ -546,8 +621,9 @@ class Flow:
         tangentswarm #65: only the NEXT Ready PR in the pick order is pulled, as its
         pre-merged tip (premerge_one: <branch>-vN = future main + head); when it is not
         merge-ready, nothing behind it is pulled. Not strict (swarm-flow step): a PR that
-        does not merge onto main first goes back to its worker with a merge-main relay.
-        strict (the swarm-advance cascade): no such relay (main_check does it)."""
+        does not merge onto main is fixed in place (tangentswarm #146: it stays in Ready).
+        strict (the swarm-advance cascade): no such relay (main_check does it). It moves only
+        when its tests pass on its -vN tip (tip_tests)."""
         staging = cols.get(board.STAGING, [])
         st_t = STAGING_MIN if limit is None else limit
         if not fill.plan(cols, hr_target=HR_TARGET, staging_target=st_t).pull:
@@ -558,31 +634,29 @@ class Flow:
             return
         scratch.ensure_main()
         main = self.sha_of(scratch, scratch.main)  # a SHA, so the conflict map can key on it
-        hr = cols.get(board.HUMAN_REVIEW, [])
-        queue = self.staging_order(staging)
-        bases = [(f"#{p['number']}", p['head']) for p in hr + queue]
-        scratch.ensure(*[sha for _, sha in bases], *[p['head'] for p in ready])
-        conflicts = {}
-        for p in ready:
-            conflicts[p['number']] = sum(not self.clean(scratch, sha, p['head'])
-                                         for sha in [main] + [s for _, s in bases])
+        # tangentswarm #146 (Michal 2026-11-18 2:09 PM ET): only the top Ready PR is looked at;
+        # no other Ready PR is checked against main or the queue
+        p = ready_order(ready, None, board.active_fast_track())[0]
+        n = p['number']
+        scratch.ensure(p['head'])
+        if not strict and not self.clean(scratch, main, p['head']):
+            files = self.files(scratch, main, p['head'])
+            self.fix_in_place(p, 'conflict', f"it conflicts with main in {', '.join(files) or 'files unknown'}", files)
+            self.note(f"#{n} (the top Ready PR) is fixed in place (pre-merging): the fill waits; nothing behind "
+                      "it is checked")
+            return None
+        # tangentswarm #65: strict order; the next PR must be pre-merged onto future main
+        # (Codex on PR #66: also for swarm-flow step, so a queue conflict gets its -vN worker)
         fm = self.future_main(scratch, cols)
-        for p in ready_order(ready, conflicts, board.active_fast_track()):
-            n = p['number']
-            if not strict and not self.clean(scratch, main, p['head']):
-                self.fail(p, 'does not merge cleanly onto main: merge origin/main into the branch (no rebase)',
-                          relay='merge-main')
-                # tangentswarm #144 (Michal 2026-11-18 2:09 PM ET): only the top Ready PR; the
-                # fill waits, it never skips ahead to (or checks) the next one
-                self.note(f"#{n} (the top Ready PR) went to rework: the fill waits; nothing behind it is checked")
-                return None
-            # tangentswarm #65: strict order; the next PR must be pre-merged onto future main
-            # (Codex on PR #66: also for swarm-flow step, so a queue conflict gets its -vN worker)
-            tip = self.premerge_one(p, scratch, fm)
-            if not tip:
-                self.note(f"#{n} is next in the pick order and is not merge-ready: nothing behind it is pulled")
-                return None
-            return p if self.start_pull(p, scratch, tip, pre_merged=True, fm=fm) else None
+        tip = self.premerge_one(p, scratch, fm)
+        if not tip:
+            self.note(f"#{n} is next in the pick order and is not merge-ready: nothing behind it is pulled")
+            return None
+        why = self.tip_tests(p, tip)
+        if why:  # tangentswarm #146: it moves up only when its tests pass on the update onto main
+            self.note(f"#{n} is next in the pick order: {why}: nothing behind it is pulled")
+            return None
+        return p if self.start_pull(p, scratch, tip, pre_merged=True, fm=fm) else None
 
     def staging_order(self, staging):
         """Staging in the shared pick order (board.pick_key; tangentswarm #35)."""
@@ -677,6 +751,10 @@ class Flow:
             t = self.premerge_one(p, scratch, fm)
             if not t:
                 self.note(f"#{n} is next in the pick order and is not merge-ready: nothing behind it is pulled")
+                break
+            why = self.tip_tests(p, t)
+            if why:  # tangentswarm #146: it moves up only when its tests pass on the update onto main
+                self.note(f"#{n} is next in the pick order: {why}: nothing behind it is pulled")
                 break
             if target is not None:  # each tip is future main + one PR: they must merge with each other
                 why = []
@@ -839,11 +917,16 @@ class Flow:
     def kept_tip(self, scratch, rec, key, base, head):
         """tangentswarm #69: the merge-ready -vN tip of rec, kept on a changed future main
         (key, base) when it still merges cleanly onto it: the same head, every PR it was built
-        on still queued or in main, no conflict marker, and a clean merge with base. Else None."""
+        on still queued or in main, no conflict marker, and a clean merge with base. Else None.
+        tangentswarm #146 (Michal 2026-11-18 2:16 PM ET): only while main itself is in the tip;
+        after a merge into main the PR is updated onto the new main (a new -vN, tested again),
+        unless the tip already holds exactly the new main (assumed)."""
         if not (rec and rec.get('status') == 'ready' and rec.get('head') == head and rec.get('tip')
                 and rec.get('vbranch') and base is not None):
             return None
         main, tip = key.split()[0], rec['tip']
+        if not self.ancestor(scratch, main, tip):  # tangentswarm #146: main moved: update onto it, test again
+            return None
         if not self.deps_kept(scratch, rec, key.split()[1:], main):
             return None
         if marker_problem(scratch, main, tip):
@@ -883,6 +966,7 @@ class Flow:
         back (In Progress, Auto Review, Needs Input) loses both labels (its pre-merge is
         void). Returns {PR: tip or None} for the pre-merged Ready PRs."""
         self._premerged = {}  # a new pass: each PR is looked at again
+        self._tested = {}
         for c in (board.STAGING, board.HUMAN_REVIEW):
             for p in cols.get(c, []):
                 self.set_labels(p, MERGE_READY, drop=False)
@@ -922,9 +1006,8 @@ class Flow:
         if rec and rec.get('head') == head and rec.get('base') == key and rec.get('vbranch'):
             main = key.split()[0]
             if rec.get('status') == 'ready' and not marker_problem(scratch, main, rec['tip']):
-                self.set_labels(p, MERGE_READY)
                 self._premerged[n] = rec['tip']
-                return rec['tip']
+                return self.ready_label(p, rec['tip'])
             tip = self.fetch_branch(scratch, rec['vbranch'])
             bad = marker_problem(scratch, main, tip) if tip and tip != rec.get('seed') else None
             if bad:  # Codex on PR #66: an unresolved merge is never merge-ready
@@ -937,19 +1020,19 @@ class Flow:
                 if not self.dry:
                     rec.update(status='ready', tip=tip)
                     set_premerge(n, rec)
-                self.set_labels(p, MERGE_READY)
-                self.change(f"#{n} merge-ready: its worker resolved the pre-merge on {rec['vbranch']} ({tip[:8]})")
+                self.change(f"#{n} pre-merge resolved by its worker on {rec['vbranch']} ({tip[:8]})")
                 self._premerged[n] = tip
-                return tip
+                return self.ready_label(p, tip)
             self.set_labels(p, PRE_MERGING)
+            self.blocked[n] = (f"it conflicts with the PRs ahead of it in {', '.join(rec.get('files') or []) or 'files unknown'}; "
+                               f"its worker resolves it on {rec['vbranch']}")
             self.vn_worker(p, rec)
             self._premerged[n] = None
             return None
         held = self.assumed(scratch, rec, key, head)
         if held:  # tangentswarm #111: only PRs it was built on merged: no probe, no write
-            self.set_labels(p, MERGE_READY)
             self._premerged[n] = held
-            return held
+            return self.ready_label(p, held)
         kept = self.kept_tip(scratch, rec, key, base, head)
         if kept:  # tangentswarm #69: no new -vN for a tip that still merges onto future main
             if rec.get('checked') != key:
@@ -957,9 +1040,8 @@ class Flow:
                     set_premerge(n, dict(rec, checked=key),
                                  only_if=lambda old: (old or {}).get('vbranch') == rec['vbranch'])
                 self.change(f"#{n} keeps {rec['vbranch']} {kept[:8]}: it still merges cleanly onto future main ({key})")
-            self.set_labels(p, MERGE_READY)
             self._premerged[n] = kept
-            return kept
+            return self.ready_label(p, kept)
         if base is None:
             self.note(f"#{n}: not pre-merged: future main cannot be built ({why})")
             self._premerged[n] = None
@@ -971,21 +1053,128 @@ class Flow:
             if not self.dry:
                 git(scratch, 'push', '--quiet', self.g['origin_url'](), f'{merged}:refs/heads/{vn}')
                 set_premerge(n, dict(head=head, base=key, vbranch=vn, tip=merged, status='ready'))
-            self.set_labels(p, MERGE_READY)
-            self.change(f"#{n} pre-merged onto future main ({key}): {vn} {merged[:8]} is merge-ready")
+            self.change(f"#{n} pre-merged onto future main ({key}): {vn} {merged[:8]}")
             self._premerged[n] = merged
-            return merged
+            return self.ready_label(p, merged)
         files = conflict_files(scratch, base, head)
         rec = dict(head=head, base=key, vbranch=vn, seed=base, status='conflict', files=files, relayed='')
         if not self.dry:
             git(scratch, 'push', '--quiet', self.g['origin_url'](), f'{base}:refs/heads/{vn}')
             set_premerge(n, rec)
         self.set_labels(p, PRE_MERGING)
+        self.blocked[n] = (f"it conflicts with the PRs ahead of it in {', '.join(files) or 'files unknown'}; "
+                           f"its worker resolves it on {vn}")
         self.change(f"#{n} conflicts with future main ({key}) in {', '.join(files) or 'files unknown'}: "
                     f"{vn} holds future main for its worker")
         self.vn_worker(p, rec)
         self._premerged[n] = None
         return None
+
+    def ready_label(self, p, tip):
+        """tangentswarm #146: a Ready PR with a pre-merged tip carries merge-ready only when its
+        tests pass on the tip (tip_tests); while they run or fail it carries pre-merging
+        (Michal 2026-11-18 2:18 PM ET: the tag shows "that something is happening to affect
+        that ticket"). A queued Staging or Human Review PR is not tested here. Returns tip."""
+        why = self.tip_tests(p, tip) if p.get('col', board.READY) == board.READY else None
+        self.set_labels(p, PRE_MERGING if why else MERGE_READY)
+        return tip
+
+    def tip_tests(self, p, tip):
+        """tangentswarm #146 (Michal 2026-11-18 2:16 PM ET): the top Ready PR is updated onto
+        the new main (its -vN tip) and its tests run again there. None when they passed (or
+        PREMERGE_TESTS is empty), else why it cannot move up yet. The workflows start once per
+        tip (gh workflow run on its -vN); a pass reads the check runs on the tip until all are
+        green, and a green tip is kept in the record (no more reads). A failure is fixed in
+        place (fix_in_place, kind tests): the card stays in Ready."""
+        n = p['number']
+        if not PREMERGE_TESTS or not tip:
+            return None
+        if (n, tip) in self._tested:
+            return self._tested[(n, tip)]
+        rec = load_premerge().get(str(n)) or {}
+        why = self._tip_tests(p, tip, rec)
+        self._tested[(n, tip)] = why
+        if why:
+            self.blocked[n] = why
+        return why
+
+    def _tip_tests(self, p, tip, rec):
+        n, vn = p['number'], rec.get('vbranch')
+        if rec.get('tested') == tip:
+            return None
+        if not vn or rec.get('tip') != tip:
+            if self.dry:  # a dry pre-merge writes no record
+                self.change(f"#{n} would run its tests ({', '.join(PREMERGE_TESTS)}) on its -vN {tip[:8]}")
+                return "it is being updated onto main; its tests would start on its -vN"
+            return f"its update onto main ({tip[:8]}) has no -vN record to test"
+        if rec.get('dispatched') != tip:
+            if self.dry:
+                self.change(f"#{n} would run its tests ({', '.join(PREMERGE_TESTS)}) on {vn} {tip[:8]}")
+                return f"it is being updated onto main; its tests would start on {vn}"
+            errs = self.g.get('dispatch_tests', dispatch_tests)(vn)
+            if errs:
+                self.note(f"#{n}: the tests on {vn} did not start: {'; '.join(errs)}; the next pass tries again")
+                return f"it is updated onto main ({vn}), but its tests did not start: {errs[0]}"
+            set_premerge(n, dict(rec, dispatched=tip), only_if=lambda old: (old or {}).get('tip') == tip)
+            self.change(f"#{n} tests started on {vn} {tip[:8]} ({', '.join(PREMERGE_TESTS)})")
+            return f"it is being updated onto main; its tests run on {vn}"
+        try:
+            runs = self.g.get('tip_runs', tip_runs)(tip)
+        except Exception as e:
+            return f"its tests on {vn} cannot be read: {type(e).__name__}: {str(e)[:120]}"
+        from .advance import ci_problem
+        why = ci_problem(runs) if runs else 'its tests on the update onto main have not started yet'
+        if why is None:
+            if not self.dry:
+                set_premerge(n, dict(rec, tested=tip), only_if=lambda old: (old or {}).get('tip') == tip)
+                drop_fix(n)  # fixed and tested: the label comes off and it moves up
+            self.change(f"#{n} tests pass on {vn} {tip[:8]}: it can move up")
+            return None
+        if why.startswith('CI is not green'):
+            why = f"its tests fail after the update onto main ({vn}): {why[len('CI is not green: '):]}"
+            self.fix_in_place(p, 'tests', why, token=tip)
+            return why
+        return f"it is being updated onto main; its tests run on {vn} ({why})"
+
+    def fix_in_place(self, p, kind, why, files=(), token=None):
+        """tangentswarm #146 (Michal 2026-11-18 2:18 PM ET: "it shouldn't be fixed in by moving it
+        back to in progress. It should just be fixed in place."): Ready PR p conflicts with
+        main (kind 'conflict') or its tests fail after the update onto main (kind 'tests').
+        The card stays in Ready, gets the label pre-merging, and its worker gets the fix relay
+        once per token (the head, or the failed tip); a PR with no worker gets a worker start.
+        The fix-in-place record keeps a new head in Ready (swarm-webhook handoff); the fill
+        waits on the PR and never skips ahead. A pull of it ends (drop_pull)."""
+        n, head = p['number'], p.get('head') or ''
+        token = token or head
+        self.blocked[n] = why
+        self.set_labels(p, PRE_MERGING)
+        rec = load_fixes().get(str(n)) or {}
+        if self.dry:
+            self.change(f"#{n} stays in Ready (pre-merging) and its worker would fix it in place: {why[:200]}")
+            return False
+        drop_pull(n)
+        with fix_update() as recs:
+            r = recs.setdefault(str(n), dict(since=self.now()))
+            r.update(head=head, kind=kind, why=why[:300], files=list(files))
+        if rec.get('relayed') == token:
+            return True
+        text = fix_text(n, p.get('branch') or '', kind, why)
+        relay_path = RELAY_DIR / f"relay-{n}-fix.md"
+        try:
+            relay_path.write_text(text + '\n')
+        except OSError:
+            pass
+        rc, said = self.give_worker(n, text, priority=True)
+        if rc != 0 and no_worker(said):
+            said = self.start_worker(p, relay_path, said)
+        if rc != 0 and 'worker start' not in said:  # a queued start gives the new Claude the relay
+            self.note(f"NEEDS_WORKER #{n}: {why[:160]}; no worker took the fix ({said}); the next pass tries again")
+            return False
+        with fix_update() as recs:
+            if str(n) in recs:
+                recs[str(n)]['relayed'] = token
+        self.change(f"#{n} stays in Ready (pre-merging); its worker fixes it in place: {why[:200]} ({said})")
+        return True
 
     def next_vn(self, scratch, branch, rec=None):
         """<branch>-v(N+1): N is the highest -vN on origin (or in the record)."""
@@ -1136,7 +1325,9 @@ class Flow:
             return
         if verdict == 'fail':
             bad = gate_conflicts(rows)
-            if bad:  # tangentswarm #83: only a real conflict goes to In Progress
+            if bad and p['col'] == board.READY:  # tangentswarm #146: fixed in place, never In Progress
+                self.fix_in_place(p, 'conflict', f"it conflicts with main ({'; '.join(bad)[:200]})")
+            elif bad:  # tangentswarm #83: only a real conflict goes to In Progress
                 reason = '; '.join(bad)
                 self.fail(p, reason, relay='merge-main', text=merge_main_text(n, reason))
             else:

@@ -988,11 +988,11 @@ One step:
    the lowest number, then the soonest milestone due date, then the lowest number). If it
    does not stack cleanly on main + Human Review + Staging (local merge-tree only),
    nothing behind it is pulled (tangentswarm #65: no queue-jumping). A PR that does not
-   merge onto main goes back to In Progress with a merge-main relay. Merge the head into
+   merge onto main is fixed in place (tangentswarm #146, below). Merge the head into
    `work` as one merge commit and push it; the push redeploys staging.
 
 The cascade (`swarm-advance --cascade`) pre-merges the top Ready PR every pass
-(tangentswarm #65; tangentswarm #111: only the top one, `SWARM_PREMERGE_AHEAD`, default 1).
+(tangentswarm #65; tangentswarm #111 and #146: only the top one, always).
 The main check also looks only at the top Ready PR. The rest of Ready is never re-checked:
 a merge does not touch their labels, branches or columns. When a PR ahead of the top one
 merges into main as its head, the top one keeps its `-vN` with no probe and no write
@@ -1008,14 +1008,42 @@ and stops at the first PR that is not merge-ready. Staging and Human Review PRs 
 3. **Advance the pull.** Evaluate hr-gate on the pulled head. All pass: `hr-gate --apply`
    puts it into Staging. CI running or screenshots missing: wait (90 minutes at most). A
    real conflict at the final mergeability check (row 2: the head conflicts with
-   origin/main): back to In Progress with a merge-main relay. Anything else (a hard
+   origin/main): fixed in place (tangentswarm #146). Anything else (a hard
    failure, a timeout, a moved head) has no conflict: the pull ends and the card stays in
    Ready at its place in the pick order (tangentswarm #83). Its worker gets the reason once
    per head; a moved head gets no relay (the webhook moves it to Auto Review).
 
+**Only the top Ready PR (tangentswarm #146, Michal 2026-11-18 2:09-2:18 PM ET).** The fill
+looks only at the first Ready PR in the pick order (fast-track, milestone, lowest number).
+No PR further down Ready is checked against main, pre-merged or reworked until it reaches
+the top. If the top PR is blocked, the fill waits on it; it never skips ahead.
+
+- **Updated onto main after every merge.** A merge into main queues the cascade, and the
+  top PR gets a new `<branch>-vN` on the new main (a kept `-vN` that does not hold the new
+  main is not kept). Its tests run again on the `-vN` tip: the workflows in
+  `SWARM_PREMERGE_TESTS` (default `rs.yml mna.yml`; empty turns this off) start once per tip
+  with `gh workflow run --ref <branch>-vN`, and each pass reads the check runs on the tip.
+  It moves up only when they are green. While they run, the PR carries `pre-merging`.
+- **Fixed in place, never In Progress.** If the top Ready PR conflicts with main (the main
+  check, the step pull, or the row-2 check at the move) or its tests fail on the `-vN`, the
+  card stays in Ready with the label `pre-merging`, and its worker gets one fix relay per
+  head (or per failed tip): merge origin/main into the branch, fix, test, push. A worker
+  start is queued when it has no worktree. The fix-in-place record (`fix-in-place.json`
+  beside `pull.json`) keeps a new head in Ready (swarm-webhook does not move it to Auto
+  Review, and a Codex finding or red CI on it is relayed with no move). The new head must be
+  Codex clean before the fill goes on. When the tests pass on its new `-vN`, the record is
+  dropped, the label becomes `merge-ready`, and the PR moves up.
+- **A stall notice at once.** When Human Review is short of 2 after a cascade pass and no
+  pull in flight fills it, the cascade sends one plain-English notice that names the
+  blocked PR and why ("#580 (the top Ready PR) blocks it: it conflicts with main in
+  web/x.ts", or "Ready is empty"). It is a JSON POST `{source, kind: "stall", pr, text, at}`
+  to the URL in `~/.config/tangentswarm/stall-url` (`SWARM_STALL_URL_FILE`; optional bearer
+  key in `stall-key`, `SWARM_STALL_KEY_FILE`). With no URL, swarmbot is woken instead. It is
+  sent once per stall; a full Human Review resets it.
+
 There is no parking (tangentswarm #101, Michal 2026-11-17: this replaces the Nov 15 rule
-never to move a card into a column with no worker). A conflicting PR (the main check, the
-pull, the Staging main recheck, or an Auto Review rework) always goes to In Progress. Its
+never to move a card into a column with no worker). A conflicting PR out of Ready (the
+Staging main recheck, or an Auto Review rework) always goes to In Progress. Its
 Claude gets the relay now, or the relay waits for a Claude: a queued revive (`queued` in
 slots.json) or, with no worktree, a worker start with the relay as its brief (`unstarted`).
 The cascade runs both in the shared pick order when a worker slot or memory frees. Nothing

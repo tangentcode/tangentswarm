@@ -142,9 +142,10 @@ def test_the_top_is_the_first_ready_pr_in_the_pick_order_not_in_a_pull():
     assert fill.top({RD: []}) is None
 
 
-def test_a_top_conflict_sends_only_the_top_to_rework_and_the_fill_waits(monkeypatch, tmp_path):
+def test_a_top_conflict_fixes_only_the_top_in_place_and_the_fill_waits(monkeypatch, tmp_path):
     c = {HR: [], RD: [pr(n, RD) for n in (4, 5, 6)]}
     out, pulled = cascade(monkeypatch, tmp_path, c, CascadeGate(), main_dirty={4, 5})
     assert pulled == []
-    assert 'NEEDS_REWORK #4 f4.ts' in out and not any('#5' in l or '#6' in l for l in out)
-    assert any(l.startswith('fill: #4 (the top Ready PR) went to rework: the fill waits') for l in out)
+    assert 'NEEDS_FIX #4 f4.ts' in out and not any(('#5' in l or '#6' in l) and 'STALL' not in l for l in out)
+    assert any(l.startswith('fill: #4 (the top Ready PR) is fixed in place (pre-merging): the fill waits')
+               for l in out)

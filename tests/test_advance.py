@@ -452,58 +452,102 @@ def test_the_pull_order_puts_the_fast_track_pr_first():
     assert [p['number'] for p in flow.ready_order(ready, {9: 3})] == [9, 7, 5]
 
 
-def test_a_ready_pr_that_conflicts_with_main_goes_to_rework_with_its_files(monkeypatch, tmp_path):
+def test_a_ready_pr_that_conflicts_with_main_is_fixed_in_place_and_the_fill_waits(monkeypatch, tmp_path):
     """(1) Michal 9:10 PM ET: #481 and #484 conflicted with origin/main and the cascade ended
-    quietly. tangentswarm #144 (Michal 2026-11-18 2:09 PM ET): only the TOP Ready PR is checked;
-    it goes to rework and the fill waits: #484 and #486 are not checked, moved or pulled."""
+    quietly. tangentswarm #144 (Michal 2026-11-18 2:09 PM ET): only the TOP Ready PR is checked.
+    tangentswarm #146 (2:18 PM ET): it stays in Ready (pre-merging), its worker fixes it in
+    place, and the fill waits: #484 and #486 are not checked, moved or pulled."""
     cols = {board.READY: [pr(481, board.READY), pr(484, board.READY), pr(486, board.READY)]}
     out, pulled = cascade(monkeypatch, tmp_path, cols, CascadeGate(served_files=False), main_dirty={481, 484})
     assert pulled == []
-    assert 'NEEDS_REWORK #481 f481.ts' in out and not any('#484' in l or '#486' in l for l in out)
-    assert any(l.startswith('would move #481 Ready -> In Progress and send: Coordinator: #481 cannot enter '
-                            'Staging: it conflicts with origin/main: f481.ts. Merge origin/main') for l in out)
-    assert any(l.startswith('main check: #481 conflicts with origin/main: sent to rework; the fill waits') for l in out)
-    assert any(l.startswith('fill: #481 (the top Ready PR) went to rework: the fill waits') for l in out)
+    assert 'NEEDS_FIX #481 f481.ts' in out and not any('#484' in l or '#486' in l for l in out)
+    assert not any('In Progress' in l for l in out)
+    assert any(l.startswith('pull: would: #481 stays in Ready (pre-merging) and its worker would fix it in place: '
+                            'it conflicts with main in f481.ts') for l in out)
+    assert any(l.startswith('main check: #481 conflicts with origin/main: it stays in Ready (pre-merging)') for l in out)
+    assert any(l.startswith('fill: #481 (the top Ready PR) is fixed in place (pre-merging): the fill waits')
+               for l in out)
 
 
-def rework_case(monkeypatch, tmp_path, rc):
+def fix_case(monkeypatch, tmp_path, rc):
     from tangentswarm import flow as F, slots
     monkeypatch.setattr(F, 'log', lambda line: None)
     merge_fakes(monkeypatch, main_dirty={481})
     moved, revived = [], []
     g = CascadeGate()
     g['move'] = lambda item, col: moved.append((item, col))
-    monkeypatch.setattr(slots, 'revive', lambda n, msg, out=print, **k: revived.append((n, msg)) or rc)
+    monkeypatch.setattr(slots, 'revive', lambda n, msg, out=print, **k: revived.append((n, msg, k))
+                        or (rc and out('#481 has no surviving worktree')) or rc)
     out = []
     c = A.Cascade(g=g, dry_run=False, out=out.append, sleep=lambda s: None)
     cols = {board.READY: [pr(481, board.READY)]}
-    assert c.main_check(cols)[board.READY] == []
+    assert [p['number'] for p in c.main_check(cols)[board.READY]] == [481] and c.waiting == 481
     return c, cols, out, moved, revived
 
 
-def test_a_live_rework_moves_the_card_once_its_claude_has_the_relay(monkeypatch, tmp_path):
-    c, cols, out, moved, revived = rework_case(monkeypatch, tmp_path, rc=0)
-    assert moved == [('I481', board.IN_PROGRESS)]
-    assert revived[0][0] == 481 and 'conflicts with origin/main: f481.ts' in revived[0][1]
-    assert 'do not rebase' in revived[0][1].lower() and '\n' not in revived[0][1]
-    assert (tmp_path / 'relay-481-merge-main.md').read_text() == revived[0][1] + '\n'
-    assert not any(l.startswith('RELAY:') for l in out)
-    c.main_check(cols)  # same head: no second relay, no second move
-    assert len(revived) == 1 and len(moved) == 1
-    assert 'rework: #481 already has a relay for 00000000: not sent again' in out
+def test_a_live_fix_keeps_the_card_in_ready_and_relays_once_per_head(monkeypatch, tmp_path):
+    from tangentswarm import flow as F
+    c, cols, out, moved, revived = fix_case(monkeypatch, tmp_path, rc=0)
+    assert moved == []  # never In Progress (tangentswarm #146)
+    assert (481, 'add', [F.PRE_MERGING]) in F.LABELS_WRITTEN
+    n, text, kw = revived[0]
+    assert n == 481 and 'conflicts with main in f481.ts' in text and 'stays in Ready' in text
+    assert kw.get('priority') and 'no rebase' in text.lower() and '\n' not in text
+    assert (tmp_path / 'relay-481-fix.md').read_text() == text + '\n'
+    assert F.load_fixes()['481']['relayed'] == f'{481:040d}'
+    c.main_check(cols)  # same head: no second relay, no move
+    assert len(revived) == 1 and moved == [] and c.waiting == 481
 
 
-def test_a_rework_with_no_worker_goes_to_in_progress_and_waits(monkeypatch, tmp_path):
-    """tangentswarm #101 (Michal 2026-11-17 8:49 AM ET: drop parking; replaces the Nov 15 rule
-    never to demote into a column with no worker): the card goes to In Progress at once and
-    waits there for a Claude. Nothing is held, and one relay per head."""
+def test_a_fix_with_no_worker_starts_one_and_the_card_stays_in_ready(monkeypatch, tmp_path):
     from tangentswarm import flow as F, slots
-    c, cols, out, moved, revived = rework_case(monkeypatch, tmp_path, rc=3)  # rework slots full
-    assert moved == [('I481', board.IN_PROGRESS)] and len(revived) == 1
-    assert not F.HELD.exists() and not any(l.startswith('RELAY:') for l in out)
-    assert slots.load()['relayed']['481'] == f'{481:040d}'
-    c.main_check(cols)  # same head: no second relay, no second move
-    assert len(revived) == 1 and len(moved) == 1
+    monkeypatch.setattr(F.Flow, 'start_worker', lambda self, p, path, why: f"no worker ({why}); queued a worker start")
+    c, cols, out, moved, revived = fix_case(monkeypatch, tmp_path, rc=1)
+    assert moved == [] and F.fixing(481) and F.load_fixes()['481']['relayed'] == f'{481:040d}'
+    assert slots.load()['queued'] == {} and len(revived) == 1
+
+
+def test_a_fix_no_worker_takes_is_tried_again_next_pass(monkeypatch, tmp_path):
+    from tangentswarm import flow as F
+    monkeypatch.setattr(F.Flow, 'start_worker', lambda self, p, path, why: 'no start: memory')
+    c, cols, out, moved, revived = fix_case(monkeypatch, tmp_path, rc=1)
+    assert moved == [] and 'relayed' not in F.load_fixes()['481']
+    assert any('NEEDS_WORKER #481' in l for l in out)
+    c.main_check(cols)
+    assert len(revived) == 2
+
+
+def test_a_new_head_of_a_fix_waits_for_codex_then_moves_on(monkeypatch, tmp_path):
+    """tangentswarm #146: the worker pushed the fix (a new head, still in Ready). It waits for
+    Codex on that head; once Codex is clean the record takes the head and the main check runs."""
+    from tangentswarm import flow as F
+    merge_fakes(monkeypatch)
+    with F.fix_update() as recs:
+        recs['481'] = dict(head='0' * 40, kind='conflict', relayed='0' * 40)
+    g = CascadeGate()
+    reviews = {'nodes': []}
+    g['fetch'] = lambda n, refresh=False: {'number': n, 'headRefOid': f'{n:040d}', 'reviews': reviews}
+    out = []
+    c = A.Cascade(g=g, dry_run=False, out=out.append, sleep=lambda s: None)
+    cols = {board.READY: [pr(481, board.READY), pr(482, board.READY)]}
+    c.main_check(cols)
+    assert c.waiting == 481 and any('its fixed head 00000000 waits for Codex' in l for l in out)
+    assert 'waits for Codex' in c.f.blocked[481]
+    reviews['nodes'] = [{'author': {'login': A.CODEX}, 'commit': {'oid': f'{481:040d}'},
+                         'comments': {'totalCount': 0}}]
+    c.main_check(cols)
+    assert c.waiting is None and F.load_fixes()['481']['head'] == f'{481:040d}'
+
+
+def test_a_fix_record_of_a_pr_that_left_ready_is_dropped(monkeypatch, tmp_path):
+    from tangentswarm import flow as F
+    merge_fakes(monkeypatch)
+    with F.fix_update() as recs:
+        recs['481'] = dict(head='x', kind='conflict')
+    c = A.Cascade(g=CascadeGate(), dry_run=False, out=lambda l: None, sleep=lambda s: None)
+    c.main_check({board.IN_PROGRESS: [pr(481, board.IN_PROGRESS)], board.READY: []})
+    assert not F.fixing(481)
+
 
 def test_empty_ready_stops_the_fill_and_starts_coders_on_active_issues(monkeypatch, tmp_path):
     cols = {board.STAGING: [pr(1, board.STAGING)], board.HUMAN_REVIEW: []}
@@ -1090,7 +1134,7 @@ def test_the_main_check_looks_only_at_the_top_ready_pr(monkeypatch, tmp_path):
     c = A.Cascade(g=CascadeGate(served_files=False), dry_run=True, out=out.append, sleep=lambda s: None)
     cols = {board.READY: [pr(484, board.READY), pr(481, board.READY), pr(490, board.READY, draft=True)]}
     assert [p['number'] for p in c.main_check(cols)[board.READY]] == [484, 481, 490]
-    assert seen == [481] and not any('NEEDS_REWORK' in l for l in out)
+    assert seen == [481] and not any('NEEDS_FIX' in l for l in out)
 
 
 def test_a_pr_in_a_pull_is_not_the_top_for_the_main_check(monkeypatch, tmp_path):
@@ -1101,8 +1145,8 @@ def test_a_pr_in_a_pull_is_not_the_top_for_the_main_check(monkeypatch, tmp_path)
     out = []
     c = A.Cascade(g=CascadeGate(served_files=False), dry_run=True, out=out.append, sleep=lambda s: None)
     left = c.main_check({board.READY: [pr(3, board.READY), pr(9, board.READY), pr(10, board.READY)]})
-    assert [p['number'] for p in left[board.READY]] == [3, 10]
-    assert 'NEEDS_REWORK #9 f9.ts' in out and 'NEEDS_REWORK #3 f3.ts' not in out
+    assert [p['number'] for p in left[board.READY]] == [3, 9, 10]  # tangentswarm #146: #9 stays in Ready
+    assert 'NEEDS_FIX #9 f9.ts' in out and 'NEEDS_FIX #3 f3.ts' not in out
 
 
 def test_a_human_review_merge_moves_the_next_pr_up_and_checks_no_other_ready_pr(monkeypatch, tmp_path):
