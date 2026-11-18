@@ -242,7 +242,9 @@ def test_pr_that_does_not_merge_onto_main_goes_back_with_a_relay(monkeypatch, tm
     started = []
     monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False, fm=None: started.append((p['number'], tip, pre_merged)))
     f.step()
-    assert g.moves == [('I7', IP)] and started == [(9, 'v9', True)]
+    # tangentswarm #144: only the top Ready PR; the fill waits and never skips ahead to #9
+    assert g.moves == [('I7', IP)] and started == []
+    assert any('#7 (the top Ready PR) went to rework: the fill waits' in n for n in f.notes)
     assert 'merge origin/main' in (flow.RELAY_DIR / 'relay-7-merge-main.md').read_text()
 
 def test_empty_ready_is_a_refill_note():
@@ -571,8 +573,9 @@ def test_shots_relay_tells_the_worker_to_use_a_throwaway_user_or_scratch_root():
 
 def test_a_conflicting_pr_with_no_worker_goes_to_in_progress_and_nothing_behind_it_waits(monkeypatch):
     """tangentswarm #101 (Michal 2026-11-17 8:49 AM ET): #7 conflicts with main and no Claude
-    can run (rework slots full). It goes to In Progress, not Ready; #9 behind it is pulled at
-    once; and when a slot frees, its Claude starts with the saved feedback."""
+    can run (rework slots full). It goes to In Progress, not Ready; the fill waits (tangentswarm
+    #144: #9 behind it is not pulled in this pass); and when a slot frees, its Claude starts
+    with the saved feedback."""
     from tangentswarm import moves, slots
     calls = []
 
@@ -593,7 +596,7 @@ def test_a_conflicting_pr_with_no_worker_goes_to_in_progress_and_nothing_behind_
     started = []
     monkeypatch.setattr(f, 'start_pull', lambda p, s, tip=None, pre_merged=False, fm=None: started.append(p['number']))
     f.step()
-    assert g.moves == [('I7', IP)] and started == [9]
+    assert g.moves == [('I7', IP)] and started == []
     assert any(d.startswith('did: #7 -> In Progress, WAITING_FOR_CLAUDE') for d in f.did)
     assert not flow.HELD.exists()
     assert 'waiting for a Claude' in moves.LOG.read_text()

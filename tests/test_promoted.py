@@ -227,7 +227,10 @@ def test_needs_pull_only_when_on_and_staging_short_with_ready(monkeypatch):
     monkeypatch.setattr(P, 'PULL', True)
     assert P.needs_pull({board.READY: [1]}, None)
     assert P.needs_pull({}, {'pr': 4})  # a running pull must advance
-    assert not P.needs_pull({board.READY: [1], board.STAGING: [1, 2, 3]}, None)
+    full = {board.HUMAN_REVIEW: [5, 6]}
+    assert not P.needs_pull(dict(full, **{board.READY: [1], board.STAGING: [1, 2, 3]}), None)
+    # tangentswarm #144: two of the three Staging PRs fill Human Review, so Staging is short again
+    assert P.needs_pull({board.READY: [1], board.STAGING: [1, 2, 3]}, None)
     assert not P.needs_pull({}, None)
 
 
