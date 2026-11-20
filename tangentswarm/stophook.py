@@ -204,36 +204,49 @@ def move_card(g, item, col, sh, n=None):
     board.move_card(g, item, col, sh, n=n)
 
 
-def needs_input(cwd, branch, transcript, g=None, dry=False, out=None, sh=None):
+def needs_input(cwd, branch, transcript, g=None, dry=False, out=None, sh=None, merges=None):
     """A Claude that stops with a question for Michal (a final "?", or partial scope, or
     waiting for a decision) goes to Needs Input, ALWAYS before any handoff, even with a clean,
     pushed head (platform #541, 2026-11-15: the hook marked it ready, asked Codex, the MinBot
     pass moved it to Ready, and only a racing later run moved it to Needs Input). The card
-    moves from In Progress or Auto Review to Needs Input; the question is posted on the
-    issue (with QUESTION_MARK, which the MinBot pass reads); once per question. Never ready."""
+    moves from In Progress or Auto Review to Needs Input; the question is posted on the PR and
+    on its issue (with QUESTION_MARK, which the MinBot pass reads; tangentswarm #156: the
+    comment stands on its own and a brief-only PR body gets a summary); once per question and
+    target. Never ready."""
     import hashlib
+    from . import questioncard as qc
     q = last_question(transcript)
     if not q:
         return None
     key = f"q:{branch}:{hashlib.sha1(q.encode()).hexdigest()[:12]}"
-    if seen(key):
-        return say(f"{branch}: the question was already handed to Michal: no handoff", out)
     g = g if g is not None else hr_gate()
     found = find_pr(g, branch, issues=True)
     if not found:
         return None
     n, item, col, _, issues = found
-    if col not in (board.IN_PROGRESS, board.AUTO_REVIEW):
+    every = qc.targets(n, issues)
+    todo = [t for t in every if not seen(key + t[2])]
+    if not todo:
+        return say(f"{branch}: the question was already handed to Michal: no handoff", out)
+    partial = len(todo) < len(every)  # a retry: the move and one post went through before
+    if col not in (board.IN_PROGRESS, board.AUTO_REVIEW) and not (col == board.NEEDS_INPUT and partial):
         return say(f"#{n}: the Claude asks a question, but the card is in {col}: not moved", out)
-    body = (f"{QUESTION_MARK}\nQuestion from the worker on #{n} (the card is in Needs Input):\n\n"
-            + '\n'.join('> ' + l for l in q.strip()[-1500:].splitlines()))
+    where = ' and '.join(f"{'issue ' if noun == 'issue' else ''}#{num}" for noun, num, _ in todo)
     if not dry:
-        move_card(g, item, board.NEEDS_INPUT, sh, n=n)
-        for i in (issues or [n])[:1]:
-            sh(['gh', 'issue', 'comment', str(i), '-R', REPO, '--body', body])
-        _mark_seen(key)
+        if col != board.NEEDS_INPUT:
+            move_card(g, item, board.NEEDS_INPUT, sh, n=n)
+        pr = qc.info(g, n, REPO)
+        try:
+            qc.summarize(n, pr, issues, REPO, sh)
+        except Exception as e:
+            say(f"#{n}: the summary was not added to the PR body: {type(e).__name__}: {str(e)[:160]}", out)
+        _, head = pushed_head(cwd)
+        conflict = qc.conflicts(pr, cwd, head, merges or merges_onto_main)
+        body = qc.body(QUESTION_MARK, n, q, pr, issues, conflict)
+        for noun, num, suffix in todo:
+            sh(qc.comment_argv(noun, num, REPO, body))
+            _mark_seen(key + suffix)
     short = ' '.join(q.split())[-160:]
-    where = f"issue #{issues[0]}" if issues else f"#{n}"
     return say(f"#{n} the Claude stopped with a question: ...{short} Moved the card to Needs Input and posted "
                f"the question on {where}; not marked ready." + (' (dry run)' if dry else ''), out)
 
@@ -300,7 +313,7 @@ def _run(cwd, g, dry, out, sh, sleep, merges, minbot, transcript, procs, tell, f
     from . import tick, workerprocs
     branch, head = pushed_head(cwd)
     if branch and transcript:  # a question for Michal goes first, whatever the head
-        asked = needs_input(cwd, branch, transcript, g=g, dry=dry, out=out, sh=sh)
+        asked = needs_input(cwd, branch, transcript, g=g, dry=dry, out=out, sh=sh, merges=merges)
         if asked:
             outcome['state'] = 'question'
             return asked

@@ -292,7 +292,10 @@ async def request_review() -> dict:
 
 async def needs_input(pr: int, question: str) -> dict:
     """Ask Michal a question only he can answer, instead of asking in your pane. The
-    question goes on the ticket, the card moves to Needs Input and Michal is pinged. Then end
+    question goes on your PR and its issue, the card moves to Needs Input and Michal is
+    pinged. Write it so it stands on its own: what the PR is for, the choice in plain
+    English, the options with what each one changes, and your pick. Never only "see the
+    issue". Then end
     your turn: the server closes this session with /exit (the window stays) and resumes it
     with his answer. On a problem: {'ok': false, 'error': '...'}."""
     return await anyio.to_thread.run_sync(lambda: via_daemon('needs_input', pr=int(pr), question=question))

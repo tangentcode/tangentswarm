@@ -64,7 +64,7 @@ REDEPLOY_LATE = int(os.environ.get('SWARM_REDEPLOY_LATE', '600'))  # lag warning
 DEPLOY_FALLBACK = int(os.environ.get('SWARM_DEPLOY_FALLBACK', '180'))  # then accept a .deploy-sha that contains the head
 
 CODEX_FIELDS = """number state isDraft headRefOid headRefName baseRefName mergeable body
- closingIssuesReferences(first:3){nodes{number comments(last:1){nodes{body}}}}
+ closingIssuesReferences(first:3){nodes{number comments(last:1){nodes{body createdAt}}}}
  comments(last:40){nodes{author{login} body createdAt}}
  commits(last:1){nodes{commit{committedDate}}}
  reviews(last:30){nodes{author{login} commit{oid} comments{totalCount}}}
@@ -158,15 +158,34 @@ OPEN_QUESTION_RE = re.compile(r'(?im)^\s*(?:#+\s*|\*\*)?(?:open\s+)?questions?\s
 def open_question(pr):
     """platform #541 (2026-11-15): no MinBot pass while the PR has an open question for Michal:
     a "Question(s) for Michal" heading or line in the PR body, or a linked issue whose
-    latest comment is the Stop hook's Needs Input question (nobody answered after it)."""
+    latest comment is the Stop hook's Needs Input question (nobody answered after it).
+    tangentswarm #156: the question is on the PR too, so an answer there answers the issue's
+    question as well, but only an answer after that issue question (answered_on_pr)."""
     from .stophook import QUESTION_MARK
     if OPEN_QUESTION_RE.search(pr.get('body') or ''):
         return 'the PR body has an open question for Michal'
     for i in ((pr.get('closingIssuesReferences') or {}).get('nodes') or []):
         last = ((i.get('comments') or {}).get('nodes') or [{}])[-1]
-        if QUESTION_MARK in (last.get('body') or ''):
+        if QUESTION_MARK in (last.get('body') or '') and not answered_on_pr(pr, last.get('createdAt')):
             return f"issue #{i.get('number')} has an unanswered question for Michal"
     return None
+
+
+def answered_on_pr(pr, asked_at):
+    """True when Michal commented on the PR after the issue question of asked_at (an ISO
+    time) and after the PR's own last Needs Input question (Codex on PR #159: an answer to an
+    older question must not clear a newer one). No time: False (the hold stays). Only Michal's
+    own comments count, as in webhook.comments_since_head and issue_answers: never a bot
+    (Codex, MinBot, github-actions, a deploy bot) and never a swarm comment."""
+    from .stophook import QUESTION_MARK
+    from .webhook import MICHAL, login, ours, worker_status
+    if not asked_at:
+        return False
+    cs = (pr.get('comments') or {}).get('nodes') or []
+    asked = [k for k, c in enumerate(cs) if QUESTION_MARK in (c.get('body') or '')]
+    after = cs[asked[-1] + 1:] if asked else cs
+    return any((c.get('createdAt') or '') > asked_at and login(c.get('author')) == MICHAL
+               and not ours(c.get('body')) and not worker_status(c.get('body')) for c in after)
 
 
 def minbot_order(prs, active=None):

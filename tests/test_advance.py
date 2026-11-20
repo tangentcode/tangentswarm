@@ -920,6 +920,41 @@ def test_no_minbot_pass_while_the_pr_has_an_open_question_for_michal():
     assert A.open_question({'body': 'Fixes #419', 'closingIssuesReferences': {'nodes': [answered]}}) is None
 
 
+
+def test_an_answer_on_the_pr_answers_the_issue_question_too():
+    """tangentswarm #156: the question goes on the PR and the issue; Michal may answer on either.
+    Codex on PR #159: only an answer after the open issue question counts."""
+    from tangentswarm.stophook import QUESTION_MARK
+    issue = {'number': 419, 'comments': {'nodes': [{'body': QUESTION_MARK + '\nQ2', 'createdAt': '2026-11-20T10:00:00Z'}]}}
+
+    def c(body, at, who='tangentstorm'):
+        return {'author': {'login': who}, 'body': body, 'createdAt': at}
+    q2 = c(QUESTION_MARK + '\nQ2', '2026-11-20T10:00:01Z')
+    pr = {'body': 'Fixes #419', 'closingIssuesReferences': {'nodes': [issue]}, 'comments': {'nodes': [q2]}}
+    held = 'issue #419 has an unanswered question for Michal'
+    assert A.open_question(pr) == held
+    for not_an_answer in (c('Codex Review: x', '2026-11-20T11:00:00Z', 'chatgpt-codex-connector'),
+                          c('@codex review', '2026-11-20T11:00:00Z'), c('hello', '2026-11-20T11:00:00Z', 'tangent-minbot'),
+                          c('MERGE-READY abc', '2026-11-20T11:00:00Z'),
+                          c('Preview deployment succeeded.', '2026-11-20T11:00:00Z', 'github-actions'),  # Codex on PR #159
+                          c('Deployed.', '2026-11-20T11:00:00Z', 'vercel[bot]'), c('+1', '2026-11-20T11:00:00Z', 'someone')):
+        pr['comments']['nodes'] = [q2, not_an_answer]
+        assert A.open_question(pr) == held, not_an_answer
+    pr['comments']['nodes'] = [q2, c('Use the new colors.', '2026-11-20T11:00:00Z')]
+    assert A.open_question(pr) is None
+    # an old question and its answer on the PR; the new question reached only the issue (the PR post failed)
+    pr['comments']['nodes'] = [c(QUESTION_MARK + '\nQ1', '2026-11-19T09:00:00Z'), c('Port 80.', '2026-11-19T12:00:00Z')]
+    assert A.open_question(pr) == held
+    # the PR question is newer than its answer: still open
+    pr['comments']['nodes'] = [c('old note', '2026-11-20T11:00:00Z'), c(QUESTION_MARK + '\nQ3', '2026-11-20T12:00:00Z')]
+    assert A.open_question(pr) == held
+    # an issue comment without its time (an old read): the hold stays
+    del issue['comments']['nodes'][0]['createdAt']
+    pr['comments']['nodes'] = [q2, c('Use the new colors.', '2026-11-20T11:00:00Z')]
+    assert A.open_question(pr) == held
+    assert 'comments(last:1){nodes{body createdAt}}' in A.CODEX_FIELDS
+
+
 def test_a_minbot_pass_from_green_ci_queues_a_cascade(board_read, monkeypatch):
     """Codex on PR #26: a CI-driven pass moved the PR to Ready and nothing restocked Staging."""
     cols = {board.HUMAN_REVIEW: [1, 2], board.STAGING: [],

@@ -22,11 +22,13 @@ Actions:
                review", Auto Review; a Codex-clean head gets the MinBot check). Then the
                Claude is closed with /exit once idle (slots park: the window and its shell
                stay, the session is kept for swarm-revive).
-  needs-input  the question goes on the ticket (with the Stop hook's QUESTION_MARK, so the
-               MinBot pass waits), the card moves to Needs Input, and the Claude is closed
+  needs-input  the question goes on the PR and on its issue (with the Stop hook's QUESTION_MARK,
+               so the MinBot pass waits; questioncard, tangentswarm #156: it stands on its own,
+               names a conflict with main, and a brief-only PR body gets a summary), the card
+               moves to Needs Input, and the Claude is closed
                with /exit (a dirty worktree is fine). When Michal moves the card back to In
                Progress, swarm-webhook's 'answered' action resumes it with the answer.
-  blocked      the blocker goes on the ticket and the card moves to Needs Input; the Claude
+  blocked      the blocker goes on the PR and its issue the same way and the card moves to Needs Input; the Claude
                keeps running, so a reply can unblock it.
   working      the row only (progress).
 
@@ -37,6 +39,8 @@ import hashlib
 import json
 import re
 import time
+
+from . import questioncard
 
 STATES = ('done', 'needs-input', 'blocked', 'working')
 ALIASES = {'needs_input': 'needs-input', 'question': 'needs-input', 'input': 'needs-input',
@@ -77,6 +81,8 @@ def check(state, pr, window, message=None, question=None):
     question = (question or '').strip()[:TEXT_MAX]
     if s == 'needs-input' and not (question or message):
         raise ReportError('needs-input needs the question: pass question="..."')
+    if s == 'needs-input' and questioncard.pointer_only(question or message):
+        raise ReportError(f'the question only points elsewhere: {questioncard.HOW}')
     if s == 'blocked' and not message:
         raise ReportError('blocked needs the reason: pass message="..."')
     return dict(state=s, pr=n, window=w, message=message, question=question or (message if s == 'needs-input' else ''))
@@ -181,8 +187,9 @@ class Reporter:
 
     def __init__(self, g=None, sh=None, resolve=None, running=None, handoff=None, park=None, exit_claude=None,
                  tell=None, pushed_head=None, sleep=time.sleep, clock=time.monotonic, close_wait=CLOSE_WAIT,
-                 slots_path=None, lock=None):
+                 slots_path=None, lock=None, merges=None):
         self._g, self.sh = g, sh
+        self._merges = merges
         self._resolve, self._running, self._handoff = resolve, running, handoff
         self._park, self._exit, self._tell, self._pushed = park, exit_claude, tell, pushed_head
         self.sleep, self.clock, self.close_wait = sleep, clock, close_wait
@@ -278,18 +285,18 @@ class Reporter:
         self.say(f"#{n} done at {head[:7]}: " + (line or 'the handoff had nothing to do (already handed off)'))
         self.close(rep, wt, branch, head, strict=True)
 
-    def post(self, rep, wt, branch, item, issues, kind, text, body):
-        """Post text on the ticket once (keyed by its hash, never by the card column: Codex on
-        PR #54) and move the card to Needs Input unless it is there already. Returns False when
-        the card is in another column (nothing done)."""
-        from . import board, stophook
+    def post(self, rep, wt, branch, item, issues, kind, text, mark):
+        """Post text on the PR and on its first issue, once each (keyed by its hash, never by
+        the card column: Codex on PR #54), and move the card to Needs Input unless it is there
+        already. The comment stands on its own and a brief-only PR body gets a summary first
+        (tangentswarm #156). Returns False when the card is in another column (nothing done)."""
+        from . import board, questioncard as qc, stophook
         n = rep['pr']
         key = f"{kind[0]}:{branch}:{hashlib.sha1(text.encode()).hexdigest()[:12]}"
-        where = (issues or [n])[0]
-        on = f"{'issue ' if issues else ''}#{where}"
         with stophook.branch_lock(wt):  # the Stop hook's own question path holds it too
             col = self.card(branch)[2]  # under the lock: the Stop hook may have moved it
-            if stophook.seen(key):
+            todo = [t for t in qc.targets(n, issues) if not stophook.seen(key + t[2])]
+            if not todo:
                 self.say(f"#{n}: this {kind} was already posted")
                 return True
             if col not in (board.IN_PROGRESS, board.AUTO_REVIEW, board.NEEDS_INPUT):
@@ -298,18 +305,33 @@ class Reporter:
             moved = col != board.NEEDS_INPUT
             if moved:
                 stophook.move_card(self.g, item, board.NEEDS_INPUT, self.run_sh)
-            self.run_sh(['gh', 'issue', 'comment', str(where), '-R', stophook.REPO, '--body', body])
-            stophook._mark_seen(key)
+            pr = qc.info(self.g, n, stophook.REPO)
+            self.summarize(n, pr, issues, kind)
+            _, head = self.pushed_head(wt)
+            conflict = qc.conflicts(pr, wt, head, self._merges or stophook.merges_onto_main)
+            body = qc.body(mark, n, text, pr, issues, conflict, kind, how='reported with report_status')
+            for noun, number, suffix in todo:
+                self.run_sh(qc.comment_argv(noun, number, stophook.REPO, body))
+                stophook._mark_seen(key + suffix)
+        on = ' and '.join(f"{'issue ' if noun == 'issue' else ''}#{number}" for noun, number, _ in todo)
         self.say(f"#{n} {rep['state']}: " + ('moved the card to Needs Input and ' if moved else
-                                             'the card was already in Needs Input; ') + f"posted the {kind} on {on}")
+                                             'the card was already in Needs Input; ') + f"posted the {kind} on {on}"
+                 + (' (it also conflicts with main: the worker fixes that after the answer)' if conflict else ''))
         return True
+
+    def summarize(self, n, pr, issues, kind):
+        """A short summary at the top of a brief-only PR body (tangentswarm #156). A failed
+        edit is said, never fatal: the question must still be posted."""
+        from . import questioncard as qc, stophook
+        try:
+            if qc.summarize(n, pr, issues, stophook.REPO, self.run_sh, kind):
+                self.say(f"#{n}: the PR body was only the brief: added a short summary at the top")
+        except Exception as e:
+            self.say(f"#{n}: the summary was not added to the PR body: {type(e).__name__}: {str(e)[:160]}")
 
     def do_needs_input(self, rep, wt, branch, item, col, issues):
         from . import stophook
-        n, q = rep['pr'], rep['question']
-        body = (f"{stophook.QUESTION_MARK}\nQuestion from the worker on #{n} (the card is in Needs "
-                f"Input; reported with report_status):\n\n" + quote(q))
-        if not self.post(rep, wt, branch, item, issues, 'question', q, body):
+        if not self.post(rep, wt, branch, item, issues, 'question', rep['question'], stophook.QUESTION_MARK):
             return
         _, head = self.pushed_head(wt)
         self.close(rep, wt, branch, head if len(head or '') == 40 else '', strict=False)
@@ -317,9 +339,7 @@ class Reporter:
     def do_blocked(self, rep, wt, branch, item, col, issues):
         from . import stophook
         n = rep['pr']
-        body = (f"{stophook.QUESTION_MARK}\n{BLOCKED_MARK}\nThe worker on #{n} is blocked (the card is in Needs "
-                f"Input; reported with report_status):\n\n" + quote(rep['message']))
-        if self.post(rep, wt, branch, item, issues, 'blocker', rep['message'], body):
+        if self.post(rep, wt, branch, item, issues, 'blocker', rep['message'], f"{stophook.QUESTION_MARK}\n{BLOCKED_MARK}"):
             self.say(f"#{n}: the Claude keeps running")
 
     def do_working(self, rep, *_):
@@ -401,10 +421,6 @@ class Reporter:
 def busy(why):
     """True for a park refusal that only means "not idle yet" (try again)."""
     return any(w in (why or '') for w in ('busy', 'prompt is not empty', 'screen changed', 'not idle'))
-
-
-def quote(text):
-    return '\n'.join('> ' + line for line in (text or '').strip()[-1500:].splitlines())
 
 
 def exit_idle(c, out, wait=30.0, sleep=time.sleep):
