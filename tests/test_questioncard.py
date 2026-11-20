@@ -40,7 +40,10 @@ def test_targets_are_the_issue_and_the_pr_each_with_its_own_key():
 @pytest.mark.parametrize('q, pointer', [
     ('see the issue', True), ('See #588.', True), ('Please read the brief', True),
     ('see https://github.com/tangentcode/platform/issues/588', True), ('Look at the ticket comments', True),
+    ('See the issue. Read the brief!', True), ('see #588; see the PR', True), ('', False),
     ('Which port, 80 or 8080?', False), (Q, False),
+    ('See the issue for context. Should we use port 80 or 8080? I recommend 8080.', False),  # Codex on PR #159
+    ('see the issue: which port, 80 or 8080?', False), ('Read the brief. Old or new colors? I pick new.', False),
     ('See: ' + 'the badge can use old or new colors; old changes nothing, new changes shots. ' * 3, False),
 ])
 def test_a_question_that_only_points_elsewhere(q, pointer):

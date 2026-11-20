@@ -922,22 +922,35 @@ def test_no_minbot_pass_while_the_pr_has_an_open_question_for_michal():
 
 
 def test_an_answer_on_the_pr_answers_the_issue_question_too():
-    """tangentswarm #156: the question goes on the PR and the issue; Michal may answer on either."""
+    """tangentswarm #156: the question goes on the PR and the issue; Michal may answer on either.
+    Codex on PR #159: only an answer after the open issue question counts."""
     from tangentswarm.stophook import QUESTION_MARK
-    issue = {'number': 419, 'comments': {'nodes': [{'body': QUESTION_MARK + '\nQuestion from the worker'}]}}
-    q = {'author': {'login': 'tangentstorm'}, 'body': QUESTION_MARK + '\nQuestion from the worker'}
-    pr = {'body': 'Fixes #419', 'closingIssuesReferences': {'nodes': [issue]}, 'comments': {'nodes': [q]}}
-    assert A.open_question(pr) == 'issue #419 has an unanswered question for Michal'
-    for not_an_answer in ({'author': {'login': 'chatgpt-codex-connector'}, 'body': 'Codex Review: x'},
-                          {'author': {'login': 'tangentstorm'}, 'body': '@codex review'},
-                          {'author': {'login': 'tangent-minbot'}, 'body': 'hello'},
-                          {'author': {'login': 'tangentstorm'}, 'body': 'MERGE-READY abc'}):
-        pr['comments']['nodes'] = [q, not_an_answer]
-        assert A.open_question(pr), not_an_answer
-    pr['comments']['nodes'] = [q, {'author': {'login': 'tangentstorm'}, 'body': 'Use the new colors.'}]
+    issue = {'number': 419, 'comments': {'nodes': [{'body': QUESTION_MARK + '\nQ2', 'createdAt': '2026-11-20T10:00:00Z'}]}}
+
+    def c(body, at, who='tangentstorm'):
+        return {'author': {'login': who}, 'body': body, 'createdAt': at}
+    q2 = c(QUESTION_MARK + '\nQ2', '2026-11-20T10:00:01Z')
+    pr = {'body': 'Fixes #419', 'closingIssuesReferences': {'nodes': [issue]}, 'comments': {'nodes': [q2]}}
+    held = 'issue #419 has an unanswered question for Michal'
+    assert A.open_question(pr) == held
+    for not_an_answer in (c('Codex Review: x', '2026-11-20T11:00:00Z', 'chatgpt-codex-connector'),
+                          c('@codex review', '2026-11-20T11:00:00Z'), c('hello', '2026-11-20T11:00:00Z', 'tangent-minbot'),
+                          c('MERGE-READY abc', '2026-11-20T11:00:00Z')):
+        pr['comments']['nodes'] = [q2, not_an_answer]
+        assert A.open_question(pr) == held, not_an_answer
+    pr['comments']['nodes'] = [q2, c('Use the new colors.', '2026-11-20T11:00:00Z')]
     assert A.open_question(pr) is None
-    pr['comments']['nodes'] = [{'author': {'login': 'tangentstorm'}, 'body': 'old note'}, q]  # asked again
-    assert A.open_question(pr) == 'issue #419 has an unanswered question for Michal'
+    # an old question and its answer on the PR; the new question reached only the issue (the PR post failed)
+    pr['comments']['nodes'] = [c(QUESTION_MARK + '\nQ1', '2026-11-19T09:00:00Z'), c('Port 80.', '2026-11-19T12:00:00Z')]
+    assert A.open_question(pr) == held
+    # the PR question is newer than its answer: still open
+    pr['comments']['nodes'] = [c('old note', '2026-11-20T11:00:00Z'), c(QUESTION_MARK + '\nQ3', '2026-11-20T12:00:00Z')]
+    assert A.open_question(pr) == held
+    # an issue comment without its time (an old read): the hold stays
+    del issue['comments']['nodes'][0]['createdAt']
+    pr['comments']['nodes'] = [q2, c('Use the new colors.', '2026-11-20T11:00:00Z')]
+    assert A.open_question(pr) == held
+    assert 'comments(last:1){nodes{body createdAt}}' in A.CODEX_FIELDS
 
 
 def test_a_minbot_pass_from_green_ci_queues_a_cascade(board_read, monkeypatch):

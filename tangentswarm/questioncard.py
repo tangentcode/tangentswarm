@@ -24,16 +24,17 @@ INFO_Q = ('query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,n
 POINTER_RE = re.compile(
     r'^\W*(?:please\s+)?(?:see|read|check|look\s+at|refer\s+to)\s+(?:the\s+)?'
     r'(?:issue|ticket|pr|brief|comment|spec|#\d+|https?://\S+)', re.I)
-POINTER_MAX = 160  # chars: a longer question has room for its own options
+SENTENCE_RE = re.compile(r'(?<=[.!?;:])\s+')
 CLOSES_RE = re.compile(r'(?im)^\s*(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?)\s+(?:[\w.-]+/[\w.-]+)?#\d+\s*\.?\s*$')
 HOW = ('Ask a question that stands on its own: what this PR is for, the choice in plain English, '
        'the options with what each one changes, and your pick. Never only "see the issue".')
 
 
 def pointer_only(q):
-    """True when q only points elsewhere ("see the issue", "see #588") and asks nothing itself."""
-    q = ' '.join((q or '').split())
-    return len(q) < POINTER_MAX and bool(POINTER_RE.match(q))
+    """True when q only points elsewhere ("see the issue", "see #588") and asks nothing itself:
+    every sentence of q is a pointer. "See the issue for context. Port 80 or 8080?" asks."""
+    parts = [s for s in SENTENCE_RE.split(' '.join((q or '').split())) if s.strip(' .!?;:')]
+    return bool(parts) and all(POINTER_RE.match(s) for s in parts)
 
 
 def info(g, n, repo):
