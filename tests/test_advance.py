@@ -935,7 +935,9 @@ def test_an_answer_on_the_pr_answers_the_issue_question_too():
     assert A.open_question(pr) == held
     for not_an_answer in (c('Codex Review: x', '2026-11-20T11:00:00Z', 'chatgpt-codex-connector'),
                           c('@codex review', '2026-11-20T11:00:00Z'), c('hello', '2026-11-20T11:00:00Z', 'tangent-minbot'),
-                          c('MERGE-READY abc', '2026-11-20T11:00:00Z')):
+                          c('MERGE-READY abc', '2026-11-20T11:00:00Z'),
+                          c('Preview deployment succeeded.', '2026-11-20T11:00:00Z', 'github-actions'),  # Codex on PR #159
+                          c('Deployed.', '2026-11-20T11:00:00Z', 'vercel[bot]'), c('+1', '2026-11-20T11:00:00Z', 'someone')):
         pr['comments']['nodes'] = [q2, not_an_answer]
         assert A.open_question(pr) == held, not_an_answer
     pr['comments']['nodes'] = [q2, c('Use the new colors.', '2026-11-20T11:00:00Z')]

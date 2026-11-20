@@ -172,19 +172,20 @@ def open_question(pr):
 
 
 def answered_on_pr(pr, asked_at):
-    """True when a person commented on the PR after the issue question of asked_at (an ISO
+    """True when Michal commented on the PR after the issue question of asked_at (an ISO
     time) and after the PR's own last Needs Input question (Codex on PR #159: an answer to an
-    older question must not clear a newer one). No time: False (the hold stays)."""
+    older question must not clear a newer one). No time: False (the hold stays). Only Michal's
+    own comments count, as in webhook.comments_since_head and issue_answers: never a bot
+    (Codex, MinBot, github-actions, a deploy bot) and never a swarm comment."""
     from .stophook import QUESTION_MARK
-    from .webhook import is_bot_self, is_codex, ours, worker_status
+    from .webhook import MICHAL, login, ours, worker_status
     if not asked_at:
         return False
     cs = (pr.get('comments') or {}).get('nodes') or []
     asked = [k for k, c in enumerate(cs) if QUESTION_MARK in (c.get('body') or '')]
     after = cs[asked[-1] + 1:] if asked else cs
-    return any((c.get('createdAt') or '') > asked_at and not ours(c.get('body')) and not worker_status(c.get('body'))
-               and not is_codex(c.get('author'), c.get('body')) and not is_bot_self(c.get('author'))
-               for c in after)
+    return any((c.get('createdAt') or '') > asked_at and login(c.get('author')) == MICHAL
+               and not ours(c.get('body')) and not worker_status(c.get('body')) for c in after)
 
 
 def minbot_order(prs, active=None):
