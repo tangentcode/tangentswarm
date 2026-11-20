@@ -71,7 +71,8 @@ messages addressed to you and remembers how far you have read.
 
 A swarm worker reports its state with report_status(state, pr, window, message, question):
 state is done (committed and pushed; the swarm hands off the PR and closes you), needs-input
-(pass the question; it goes on the ticket and you are closed until it is answered), blocked
+(pass the question; it goes on the PR and its issue and you are closed until it is answered;
+it must stand on its own: the choice, the options with what each changes, and your pick), blocked
 (pass the reason), or working. pr is your PR number; window is your tmux window name. End
 your turn right after a done or needs-input report."""
 
@@ -260,8 +261,10 @@ async def report_status(state: str, pr: int, window: str, ctx: Context, message:
     """Tell the swarm your state, instead of letting it guess from your screen.
     state: done (your work is committed and pushed: the swarm hands off the PR, advances the
     card and closes this Claude with /exit; the window stays), needs-input (pass question:
-    it goes on the ticket, the card moves to Needs Input and you are closed until it is
-    answered), blocked (pass message: the reason), or working (progress, logged only).
+    it goes on the PR and its issue, the card moves to Needs Input and you are closed until
+    it is answered; the question must stand on its own: what the PR is for, the choice in
+    plain English, the options with what each one changes, and your pick; never only "see
+    the issue"), blocked (pass message: the reason), or working (progress, logged only).
     pr: your PR number. window: your tmux window name (tmux display-message -p '#W').
     End your turn right after done or needs-input."""
     from . import agent_report as R

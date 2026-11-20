@@ -185,10 +185,43 @@ def test_a_question_moves_an_unfinished_card_to_needs_input(wt, tmp_path):
     line = stophook.run(wt, g=g, sh=calls.append, transcript=str(t))
     assert calls[0] == ['gh', 'project', 'item-edit', '--id', 'ITEM7', '--project-id', 'PROJ', '--field-id', 'FIELD',
                         '--single-select-option-id', board.OPTION[board.NEEDS_INPUT]]
-    assert calls[1][:4] == ['gh', 'issue', 'comment', '7'] and stophook.QUESTION_MARK in calls[1][-1]
+    assert calls[1][:4] == ['gh', 'pr', 'comment', '7'] and stophook.QUESTION_MARK in calls[1][-1]
     assert 'stopped with a question' in line and line.endswith('not marked ready.')
     again = stophook.run(wt, g=g, sh=calls.append, transcript=str(t))
     assert 'already handed to Michal' in again and len(calls) == 2  # once per question
+
+
+def test_a_question_goes_on_the_pr_and_its_issue_standing_on_its_own(wt, tmp_path, monkeypatch):
+    """tangentswarm #156: the card in Needs Input is the PR, so the question goes there too, with
+    a summary on a brief-only body and a note on a conflict with main."""
+    from tangentswarm import brief, questioncard as qc
+    (wt / 'b.txt').write_text('half done\n')
+    g = G(run(wt, 'rev-parse', 'HEAD'))
+    g['OPT'] = {'In Progress': 'x'}
+    g['project_id'], g['STATUS_FIELD'] = (lambda: 'PROJ'), 'FIELD'
+    board_gql = g['gql']
+    info = {'title': 'Badge colors', 'body': 'Fixes #5\n' + brief.section('b'), 'mergeable': 'CONFLICTING',
+            'closingIssuesReferences': {'nodes': [{'number': 5, 'title': 'Old badge'}]}}
+    g['gql'] = lambda q, **v: {'repository': {'pullRequest': info}} if q == qc.INFO_Q else board_gql(q, **v)
+    real = stophook.find_pr
+    monkeypatch.setattr(stophook, 'find_pr', lambda g, b, issues=False, **k: real(g, b, **k) + ([5],))
+    calls = []
+    t = transcript(tmp_path, 'Old colors change nothing; new ones match the doc. I pick new. Old or new?')
+    line = stophook.run(wt, g=g, sh=calls.append, transcript=str(t))
+    move, patch, issue, pr = calls
+    assert move[-1] == board.OPTION[board.NEEDS_INPUT] and patch[:4] == ['gh', 'api', '-X', 'PATCH']
+    assert issue[:4] == ['gh', 'issue', 'comment', '5'] and pr[:4] == ['gh', 'pr', 'comment', '7']
+    assert pr[-1] == issue[-1] and 'PR #7: Badge colors. It fixes issue #5 (Old badge).' in pr[-1]
+    assert 'also conflicts with main. The worker will fix the conflict after your answer' in pr[-1]
+    assert 'posted the question on issue #5 and #7' in line
+    calls.clear()  # the PR post failed last time: a retry posts it alone, the card already in Needs Input
+    info['body'] = patch[-1][len('body='):]  # the summary went in last time
+    marks = json.loads(stophook.SEEN.read_text())
+    stophook.SEEN.write_text(json.dumps({k: v for k, v in marks.items() if not k.endswith(':pr7')}))
+    g2 = G(run(wt, 'rev-parse', 'HEAD'), col=board.NEEDS_INPUT)
+    g2['OPT'], g2['gql'] = g['OPT'], g['gql']
+    line = stophook.run(wt, g=g2, sh=calls.append, transcript=str(t))
+    assert [c[:2] for c in calls] == [['gh', 'pr']] and 'on #7' in line
 
 
 def test_no_question_means_no_needs_input(wt, tmp_path):

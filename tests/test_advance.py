@@ -920,6 +920,26 @@ def test_no_minbot_pass_while_the_pr_has_an_open_question_for_michal():
     assert A.open_question({'body': 'Fixes #419', 'closingIssuesReferences': {'nodes': [answered]}}) is None
 
 
+
+def test_an_answer_on_the_pr_answers_the_issue_question_too():
+    """tangentswarm #156: the question goes on the PR and the issue; Michal may answer on either."""
+    from tangentswarm.stophook import QUESTION_MARK
+    issue = {'number': 419, 'comments': {'nodes': [{'body': QUESTION_MARK + '\nQuestion from the worker'}]}}
+    q = {'author': {'login': 'tangentstorm'}, 'body': QUESTION_MARK + '\nQuestion from the worker'}
+    pr = {'body': 'Fixes #419', 'closingIssuesReferences': {'nodes': [issue]}, 'comments': {'nodes': [q]}}
+    assert A.open_question(pr) == 'issue #419 has an unanswered question for Michal'
+    for not_an_answer in ({'author': {'login': 'chatgpt-codex-connector'}, 'body': 'Codex Review: x'},
+                          {'author': {'login': 'tangentstorm'}, 'body': '@codex review'},
+                          {'author': {'login': 'tangent-minbot'}, 'body': 'hello'},
+                          {'author': {'login': 'tangentstorm'}, 'body': 'MERGE-READY abc'}):
+        pr['comments']['nodes'] = [q, not_an_answer]
+        assert A.open_question(pr), not_an_answer
+    pr['comments']['nodes'] = [q, {'author': {'login': 'tangentstorm'}, 'body': 'Use the new colors.'}]
+    assert A.open_question(pr) is None
+    pr['comments']['nodes'] = [{'author': {'login': 'tangentstorm'}, 'body': 'old note'}, q]  # asked again
+    assert A.open_question(pr) == 'issue #419 has an unanswered question for Michal'
+
+
 def test_a_minbot_pass_from_green_ci_queues_a_cascade(board_read, monkeypatch):
     """Codex on PR #26: a CI-driven pass moved the PR to Ready and nothing restocked Staging."""
     cols = {board.HUMAN_REVIEW: [1, 2], board.STAGING: [],

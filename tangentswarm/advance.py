@@ -158,15 +158,30 @@ OPEN_QUESTION_RE = re.compile(r'(?im)^\s*(?:#+\s*|\*\*)?(?:open\s+)?questions?\s
 def open_question(pr):
     """platform #541 (2026-11-15): no MinBot pass while the PR has an open question for Michal:
     a "Question(s) for Michal" heading or line in the PR body, or a linked issue whose
-    latest comment is the Stop hook's Needs Input question (nobody answered after it)."""
+    latest comment is the Stop hook's Needs Input question (nobody answered after it).
+    tangentswarm #156: the question is on the PR too, so an answer there (a comment the swarm
+    did not post, after the PR's last question) answers the issue's question as well."""
     from .stophook import QUESTION_MARK
     if OPEN_QUESTION_RE.search(pr.get('body') or ''):
         return 'the PR body has an open question for Michal'
+    if answered_on_pr(pr):
+        return None
     for i in ((pr.get('closingIssuesReferences') or {}).get('nodes') or []):
         last = ((i.get('comments') or {}).get('nodes') or [{}])[-1]
         if QUESTION_MARK in (last.get('body') or ''):
             return f"issue #{i.get('number')} has an unanswered question for Michal"
     return None
+
+
+def answered_on_pr(pr):
+    """True when a person commented on the PR after its last Needs Input question."""
+    from .stophook import QUESTION_MARK
+    from .webhook import is_bot_self, is_codex, ours, worker_status
+    cs = (pr.get('comments') or {}).get('nodes') or []
+    asked = [k for k, c in enumerate(cs) if QUESTION_MARK in (c.get('body') or '')]
+    return bool(asked) and any(not ours(c.get('body')) and not worker_status(c.get('body'))
+                               and not is_codex(c.get('author'), c.get('body')) and not is_bot_self(c.get('author'))
+                               for c in cs[asked[-1] + 1:])
 
 
 def minbot_order(prs, active=None):

@@ -106,15 +106,18 @@ class Fake:
     """The daemon's outside world: one PR #12 on branch feat in window mn-12-feat."""
 
     def __init__(self, monkeypatch, tmp_path, col=board.IN_PROGRESS, issues=(7,), statuses=('busy', 'idle'),
-                 pushed=('feat', HEAD), park_why=()):
+                 pushed=('feat', HEAD), park_why=(), pr=None, merges=True):
         self.moves, self.sh, self.told, self.parked, self.exited, self.handoffs = [], [], [], [], [], []
+        self.pr = pr if pr is not None else dict(title='Badge colors', body='Fixes #7\n\nThe badge gets new colors.', mergeable='MERGEABLE',
+                                                closingIssuesReferences={'nodes': [{'number': 7, 'title': 'Old badge'}]})
         self.statuses, self.park_why = list(statuses), list(park_why)
         self.slots_path = tmp_path / 'slots.json'
         self.col = col
         monkeypatch.setattr(stophook, 'find_pr', lambda g, b, **k: (12, 'ITEM12', self.col, False, list(issues)))
         monkeypatch.setattr(stophook, 'move_card', self.move)
         self.reporter = R.Reporter(
-            g={}, sh=self.sh.append, resolve=lambda pr: ('mn-12-feat', WT, 'feat'),
+            g={'gql': lambda q, **v: {'repository': {'pullRequest': self.pr}}}, sh=self.sh.append,
+            merges=lambda wt, head: merges, resolve=lambda pr: ('mn-12-feat', WT, 'feat'),
             running=self.running, handoff=lambda wt: self.handoffs.append(wt) or '#12 handed off',
             park=lambda c, out: self.parked.append(c['pane']) or (self.park_why.pop(0) if self.park_why else None),
             exit_claude=lambda c, out: self.exited.append(c['pane']), tell=lambda n, t: self.told.append(t),
@@ -164,10 +167,10 @@ def test_needs_input_posts_the_question_moves_the_card_and_closes_the_claude(mon
     res = f.run('needs-input', question='Port 80 or 8080?')
     assert res['ok']
     assert f.moves == [('ITEM12', board.NEEDS_INPUT)]
-    (argv,) = f.sh
-    assert argv[:4] == ['gh', 'issue', 'comment', '7']
-    body = argv[argv.index('--body') + 1]
-    assert stophook.QUESTION_MARK in body and '> Port 80 or 8080?' in body
+    issue, pr = f.sh  # tangentswarm #156: on the issue and on the PR (the card Michal opens)
+    assert issue[:4] == ['gh', 'issue', 'comment', '7'] and pr[:4] == ['gh', 'pr', 'comment', '12']
+    body = issue[issue.index('--body') + 1]
+    assert pr[-1] == body and stophook.QUESTION_MARK in body and '> Port 80 or 8080?' in body
     assert f.exited == ['%5'] and f.parked == []  # not strict: a dirty worktree may be closed
     assert slots.load(f.slots_path)['parked']['12']['reason'] == 'needs-input'
     f.sh.clear()
@@ -179,13 +182,57 @@ def test_a_new_question_on_a_card_already_in_needs_input_is_posted_without_a_mov
     # Codex on PR #54: after a blocked report the card is in Needs Input; a later question must still reach Michal
     f = Fake(monkeypatch, tmp_path, col=board.NEEDS_INPUT)
     res = f.run('needs-input', question='Which?')
-    assert f.moves == [] and len(f.sh) == 1 and '> Which?' in f.sh[0][-1] and f.exited == ['%5']
-    assert any('already in Needs Input; posted the question' in l for l in res['lines'])
+    assert f.moves == [] and len(f.sh) == 2 and '> Which?' in f.sh[0][-1] and f.exited == ['%5']
+    assert any('already in Needs Input; posted the question on issue #7 and #12' in l for l in res['lines'])
     f.sh.clear()
     f.run('needs-input', question='Which?')
     assert f.sh == []  # the same question once only
     f.run('blocked', message='new blocker')
-    assert f.moves == [] and len(f.sh) == 1 and R.BLOCKED_MARK in f.sh[0][-1]
+    assert f.moves == [] and len(f.sh) == 2 and all(R.BLOCKED_MARK in c[-1] for c in f.sh)
+
+
+def test_the_589_case_a_brief_only_conflicting_pr_gets_a_summary_and_a_standalone_question(monkeypatch, tmp_path):
+    """tangentswarm #156 (platform #589, 2026-11-19): the question was only on the issue, and the
+    PR had only the brief and a merge-conflict banner."""
+    from tangentswarm import brief, questioncard as qc
+    body = 'Fixes #7\n\n' + brief.section('Task #7: the brief')
+    f = Fake(monkeypatch, tmp_path, merges=True,
+             pr=dict(title='Badge colors', body=body, mergeable='CONFLICTING',
+                     closingIssuesReferences={'nodes': [{'number': 7, 'title': 'Old badge'}]}))
+    res = f.run('needs-input', question='Old or new badge colors? Old changes nothing; new matches the doc. I pick new.')
+    patch, issue, pr = f.sh
+    assert patch[:5] == ['gh', 'api', '-X', 'PATCH', 'repos/tangentcode/platform/pulls/12']
+    assert patch[-1].startswith(f'body={qc.SUMMARY_MARK}\n## Summary\n\nPR #12: Badge colors. It fixes issue #7')
+    assert patch[-1].endswith(body)
+    assert issue[:4] == ['gh', 'issue', 'comment', '7'] and pr[:4] == ['gh', 'pr', 'comment', '12']
+    text = pr[-1]
+    assert 'What this PR is for:** PR #12: Badge colors. It fixes issue #7 (Old badge).' in text
+    assert '> Old or new badge colors?' in text and 'I pick new.' in text
+    assert 'PR #12 also conflicts with main. The worker will fix the conflict after your answer' in text
+    assert any('summary at the top' in l for l in res['lines'])
+    assert any('on issue #7 and #12 (it also conflicts with main' in l for l in res['lines'])
+
+
+def test_a_failed_summary_still_posts_the_question(monkeypatch, tmp_path):
+    f = Fake(monkeypatch, tmp_path, pr=dict(title='T', body='Fixes #7', mergeable='UNKNOWN'), merges=False)
+
+    def sh(argv):
+        if argv[1] == 'api':
+            raise RuntimeError('gh: 422')
+        f.sh.append(argv)
+    f.reporter.sh = sh
+    res = f.run('needs-input', question='Which port, 80 or 8080?')
+    assert [c[1] for c in f.sh] == ['issue', 'pr'] and 'also conflicts with main' in f.sh[0][-1]  # UNKNOWN: git says
+    assert any('summary was not added' in l and '422' in l for l in res['lines'])
+
+
+def test_a_question_that_only_says_see_the_issue_is_refused():
+    for q in ('see the issue', 'See #588.', 'please read the brief'):
+        with pytest.raises(R.ReportError, match='stands on its own'):
+            R.check('needs-input', 12, 'w', question=q)
+    with pytest.raises(R.ReportError, match='stands on its own'):
+        R.check('needs-input', 12, 'w', message='see the ticket')
+    R.check('blocked', 12, 'w', message='see the issue: staging is down')  # a blocker is not a question
 
 
 def test_a_failed_post_is_posted_on_retry(monkeypatch, tmp_path):
@@ -204,7 +251,21 @@ def test_a_failed_post_is_posted_on_retry(monkeypatch, tmp_path):
     col = {'v': board.NEEDS_INPUT}
     monkeypatch.setattr(stophook, 'find_pr', lambda g, b, **k: (12, 'ITEM12', col['v'], False, [7]))
     f.run('needs-input', question='Which?')
-    assert len(calls) == 2 and '> Which?' in calls[1][-1]
+    assert len(calls) == 3 and '> Which?' in calls[1][-1]
+    assert [c[1] for c in calls] == ['issue', 'issue', 'pr']
+    calls.clear()  # tangentswarm #156: a failed PR post after the issue post retries the PR only
+    fail = {'pr'}
+
+    def sh2(argv):
+        calls.append(argv)
+        if argv[1] in fail:
+            fail.discard(argv[1])
+            raise RuntimeError('gh: 502')
+    f.reporter.sh = sh2
+    with pytest.raises(RuntimeError, match='502'):
+        f.run('needs-input', question='Which port: 80 or 8080?')
+    f.run('needs-input', question='Which port: 80 or 8080?')
+    assert [c[1] for c in calls] == ['issue', 'pr', 'pr']
 
 
 def test_a_card_in_another_column_is_left_alone(monkeypatch, tmp_path):
@@ -231,7 +292,7 @@ def test_blocked_posts_and_moves_but_keeps_the_claude(monkeypatch, tmp_path):
     f = Fake(monkeypatch, tmp_path, issues=())
     f.run('blocked', message='staging is down')
     assert f.moves == [('ITEM12', board.NEEDS_INPUT)]
-    assert f.sh[0][:4] == ['gh', 'issue', 'comment', '12'] and R.BLOCKED_MARK in f.sh[0][-1]
+    assert f.sh[0][:4] == ['gh', 'pr', 'comment', '12'] and R.BLOCKED_MARK in f.sh[0][-1] and len(f.sh) == 1
     assert f.exited == [] and f.parked == []
     f.sh.clear()
     f.run('blocked', message='staging is down')  # the same blocker again: not posted twice
